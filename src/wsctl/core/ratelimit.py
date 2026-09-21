@@ -47,3 +47,23 @@ class RateLimiter:
 
     def reset(self, key: str) -> None:
         self._events.pop(key, None)
+
+
+class TokenBucket:
+    """Simple token bucket used to cap sustained input throughput."""
+
+    def __init__(self, rate: float, capacity: float) -> None:
+        self.rate = rate
+        self.capacity = capacity
+        self._tokens = capacity
+        self._last = time.monotonic()
+
+    def allow(self, amount: float, *, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        elapsed = max(0.0, now - self._last)
+        self._last = now
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+        if self._tokens >= amount:
+            self._tokens -= amount
+            return True
+        return False

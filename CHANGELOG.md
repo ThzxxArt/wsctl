@@ -41,9 +41,15 @@ RBAC, auditing, a file panel and observability.
 - Structured JSON logging (`--log-json`).
 
 **CLI**
-- `serve`, `connect` (terminal thin client), `login`, `logout`,
-  `session list|kill`, `user add|list|del|passwd|role|totp`, `audit`,
-  `config show|path`, `version`.
+- `serve` (`--new`), `connect` (terminal thin client), `login`, `logout`,
+  `session list|new|kill|attach`, `user add|list|del|passwd|role|totp`, `audit`,
+  `config show|path|edit`, `version`.
+
+**Limits & robustness**
+- Per-session client limit (`session_max_clients`) and per-connection input rate
+  limiting via a token bucket (`input_rate_limit` / `input_rate_burst`).
+- Session renaming (`PATCH /api/sessions/{id}`, double-click a tab in the UI).
+- Concurrency and large-output load tests (`pytest -m slow` for the heavy one).
 
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.

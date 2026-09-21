@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     idle_timeout: float | None = None
     max_life: float | None = None
     max_sessions: int = 64
+    session_max_clients: int = 0
+    input_rate_limit: int = 0
+    input_rate_burst: int = 0
     scrollback_bytes: int = DEFAULT_MAX_BYTES
 
     data_dir: Path = Field(default_factory=default_data_dir)

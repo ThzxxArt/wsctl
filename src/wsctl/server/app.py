@@ -66,6 +66,10 @@ class SessionCreate(BaseModel):
     rows: int = 24
 
 
+class SessionRename(BaseModel):
+    name: str
+
+
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -108,6 +112,7 @@ def create_app(
     *,
     store: Store | None = None,
     manager: SessionManager | None = None,
+    startup_command: str | None = None,
 ) -> FastAPI:
     async def _maintenance() -> None:
         while True:
@@ -127,6 +132,20 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("wsctl %s listening on %s:%s", __version__, settings.host, settings.port)
         maint = asyncio.create_task(_maintenance())
+        if startup_command:
+            argv = shlex.split(startup_command)
+            spec = SessionSpec(
+                name=Path(argv[0]).name if argv else "shell",
+                argv=argv,
+                cwd=settings.default_cwd,
+                idle_timeout=settings.idle_timeout,
+                max_life=settings.max_life,
+                max_clients=settings.session_max_clients,
+                scrollback_bytes=settings.scrollback_bytes,
+            )
+            session = await app.state.manager.create(spec)
+            app.state.store.term_session_upsert(session.id, name=spec.name, owner_id=None)
+            log.info("startup session %s: %s", session.id, startup_command)
         try:
             yield
         finally:
@@ -303,6 +322,7 @@ def create_app(
             rows=body.rows,
             idle_timeout=settings.idle_timeout,
             max_life=settings.max_life,
+            max_clients=settings.session_max_clients,
             scrollback_bytes=settings.scrollback_bytes,
         )
         session = await manager.create(spec, owner_id=user.id)
@@ -330,6 +350,21 @@ def create_app(
         app.state.store.term_session_set_status(sid, "killed")
         app.state.store.log_event("session_kill", user_id=user.id, term_session_id=sid)
         return {"ok": True}
+
+    @app.patch("/api/sessions/{sid}")
+    async def rename_session(
+        sid: str, body: SessionRename, user: User = Depends(current_user)
+    ) -> dict[str, Any]:
+        session = app.state.manager.get(sid)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such session")
+        if not can_access(user, session):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not your session")
+        name = session.rename(body.name)
+        app.state.store.term_session_upsert(
+            sid, name=name, owner_id=session.owner_id, cwd=session.spec.cwd
+        )
+        return _serialize(session)
 
     # -- users (admin only) --------------------------------------------
 

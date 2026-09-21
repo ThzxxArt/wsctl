@@ -173,6 +173,19 @@
       if (e.target.classList.contains("close")) return;
       activateTab(id);
     });
+    tabEl.addEventListener("dblclick", async (e) => {
+      if (e.target.classList.contains("close")) return;
+      e.stopPropagation();
+      const name = window.prompt("Rename session", s.name);
+      if (!name) return;
+      try {
+        const info = await api("PATCH", `/api/sessions/${id}`, { name });
+        s.name = info.name;
+        tabEl.querySelector(".label").textContent = info.name;
+      } catch (err) {
+        setConnection(String(err.message || err), "bad");
+      }
+    });
     tabEl.querySelector(".close").addEventListener("click", (e) => {
       e.stopPropagation();
       closeTab(id);

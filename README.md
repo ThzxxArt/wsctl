@@ -87,14 +87,17 @@ wsctl connect          # opens a remote shell in this terminal
 
 ```
 wsctl serve                 Start the server
+wsctl serve --new "htop"    Start the server with one session
 wsctl connect [URL]         Attach this terminal to a server
 wsctl login URL             Authenticate and cache a token
 wsctl logout                Forget cached credentials
 wsctl session list          List sessions on a running server
+wsctl session new [-x CMD]  Create a session
+wsctl session attach ID     Attach this terminal to a session
 wsctl session kill ID       Kill a session
 wsctl user add|list|del|passwd|role|totp
 wsctl audit                 Show the audit log (admin)
-wsctl config show|path      Inspect configuration
+wsctl config show|path|edit Inspect or edit configuration
 wsctl version
 ```
 
@@ -121,6 +124,9 @@ audit_input = false          # record submitted command lines
 idle_timeout = 3600          # kill sessions idle for this long (optional)
 max_life = 86400             # kill sessions older than this (optional)
 max_sessions = 64
+session_max_clients = 0      # max clients per session (0 = unlimited)
+input_rate_limit = 0         # per-connection input bytes/sec (0 = unlimited)
+input_rate_burst = 0         # token bucket capacity (default: limit)
 scrollback_bytes = 4194304
 
 file_root = "/home/me"       # root for the web file panel (default: home)

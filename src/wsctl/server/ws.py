@@ -21,6 +21,7 @@ from starlette.websockets import WebSocketState
 
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
+from wsctl.core.ratelimit import TokenBucket
 from wsctl.core.session import ClientGone, SessionManager, SessionSpec, TermSession
 from wsctl.core.store import Store, User
 
@@ -56,6 +57,7 @@ def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
         rows=rows,
         idle_timeout=settings.idle_timeout,
         max_life=settings.max_life,
+        max_clients=settings.session_max_clients,
         scrollback_bytes=settings.scrollback_bytes,
     )
 
@@ -103,7 +105,8 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             ip=ip,
         )
         on_line = _input_auditor(store, settings, user.id, session.id)
-        await _pump(websocket, client, session, on_line)
+        bucket = _input_bucket(settings)
+        await _pump(websocket, client, session, on_line, bucket)
     except Exception:
         log.exception("websocket handler failed")
     finally:
@@ -169,7 +172,11 @@ async def _handshake(
         )
 
     session.resize(cols, rows)
-    await session.attach(client)
+    try:
+        await session.attach(client)
+    except ClientGone as exc:
+        client.put({"type": "error", "msg": str(exc)})
+        return None
     return session
 
 
@@ -191,13 +198,28 @@ def _input_auditor(
     return record
 
 
+def _input_bucket(settings: Settings) -> TokenBucket | None:
+    if settings.input_rate_limit <= 0:
+        return None
+    capacity = settings.input_rate_burst or settings.input_rate_limit
+    return TokenBucket(float(settings.input_rate_limit), float(capacity))
+
+
 async def _pump(
     websocket: WebSocket,
     client: WsClient,
     session: TermSession,
     on_line: Callable[[str], None] | None = None,
+    bucket: TokenBucket | None = None,
 ) -> None:
     line_buffer = bytearray()
+
+    def over_limit(size: int) -> bool:
+        return bucket is not None and not bucket.allow(size)
+
+    def reject() -> None:
+        with contextlib.suppress(ClientGone):
+            client.put({"type": "error", "msg": "input rate limit exceeded"})
 
     def feed_audit(data: bytes) -> None:
         if on_line is None:
@@ -218,6 +240,9 @@ async def _pump(
             return
         data_bytes = message.get("bytes")
         if data_bytes is not None:
+            if over_limit(len(data_bytes)):
+                reject()
+                return
             session.write_input(data_bytes)
             feed_audit(data_bytes)
             continue
@@ -233,6 +258,9 @@ async def _pump(
             session.resize(int(data.get("cols") or 80), int(data.get("rows") or 24))
         elif kind == "input":
             chunk = str(data.get("data", "")).encode("utf-8")
+            if over_limit(len(chunk)):
+                reject()
+                return
             session.write_input(chunk)
             feed_audit(chunk)
         elif kind == "ping":

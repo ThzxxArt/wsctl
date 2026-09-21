@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import secrets
+import subprocess
 import time
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -89,6 +91,9 @@ def serve(
     ssl_key: Annotated[Path | None, typer.Option(help="TLS key file.")] = None,
     log_level: Annotated[str | None, typer.Option(help="Log level.")] = None,
     log_json: Annotated[bool, typer.Option("--log-json", help="Emit JSON logs.")] = False,
+    new: Annotated[
+        str | None, typer.Option("--new", help="Create a session running this command at startup.")
+    ] = None,
 ) -> None:
     """Start the wsctl server."""
     overrides: dict[str, object] = {
@@ -111,7 +116,7 @@ def serve(
 
     store = Store(settings.db_path)
     _ensure_admin(store, settings, admin_password)
-    application = create_app(settings, store=store)
+    application = create_app(settings, store=store, startup_command=new)
 
     import uvicorn
 
@@ -313,6 +318,56 @@ def config_path(config: Annotated[Path | None, typer.Option("--config", "-c")] =
     console.print(str(settings.config_path))
 
 
+CONFIG_TEMPLATE = """# wsctl configuration
+host = "127.0.0.1"
+port = 7681
+
+# auth_required = true
+# session_ttl = 43200
+# cookie_secure = false
+# trust_proxy = false
+
+# allowed_ips = ["10.0.0.0/8"]
+# login_rate_limit = 10
+# login_rate_window = 300
+# audit_input = false
+
+# idle_timeout = 3600
+# max_life = 86400
+# max_sessions = 64
+# session_max_clients = 0
+# input_rate_limit = 0
+# input_rate_burst = 0
+# scrollback_bytes = 4194304
+
+# file_root = "/home/me"
+# file_max_upload = 104857600
+
+# metrics_enabled = true
+# log_level = "info"
+# log_json = false
+
+# ssl_cert = "/etc/wsctl/cert.pem"
+# ssl_key = "/etc/wsctl/key.pem"
+"""
+
+
+@config_app.command("edit")
+def config_edit(config: Annotated[Path | None, typer.Option("--config", "-c")] = None) -> None:
+    """Create (if needed) and open the configuration file in your editor."""
+    settings = _settings_from(config)
+    path = settings.config_path
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        console.print(f"[green]Created[/] {path}")
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    try:
+        subprocess.call([editor, str(path)])
+    except OSError as exc:
+        _fail(f"cannot launch editor '{editor}': {exc}")
+
+
 @session_app.command("list")
 def session_list(
     url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
@@ -343,6 +398,44 @@ def session_kill(
     except ApiError as exc:
         _fail(str(exc))
     console.print(f"[green]Killed session[/] {sid}")
+
+
+@session_app.command("new")
+def session_new(
+    name: Annotated[str | None, typer.Option("--name", "-n", help="Session name.")] = None,
+    command: Annotated[
+        str | None, typer.Option("--command", "-x", help="Command to run instead of a shell.")
+    ] = None,
+    cwd: Annotated[str | None, typer.Option("--cwd", help="Working directory.")] = None,
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """Create a session on a running server."""
+    client = _api_client(url)
+    body = {
+        key: value
+        for key, value in {"name": name, "command": command, "cwd": cwd}.items()
+        if value is not None
+    }
+    try:
+        info = client.request("POST", "/api/sessions", body)
+    except ApiError as exc:
+        _fail(str(exc))
+    console.print(f"[green]Created session[/] {info['id']} ([cyan]{info['name']}[/])")
+
+
+@session_app.command("attach")
+def session_attach(
+    sid: Annotated[str, typer.Argument(help="Session id.")],
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+    token: Annotated[
+        str | None, typer.Option("--token", envvar="WSCTL_TOKEN", help="Bearer token.")
+    ] = None,
+) -> None:
+    """Attach this terminal to an existing session."""
+    try:
+        run_connect(url, sid, token)
+    except ConnectError as exc:
+        _fail(str(exc))
 
 
 @app.command()

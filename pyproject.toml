@@ -98,3 +98,6 @@ files = ["src/wsctl"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+markers = [
+    "slow: heavier tests not run by default (select with -m slow)",
+]

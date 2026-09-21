@@ -7,7 +7,7 @@ from collections.abc import Callable
 import pytest
 
 from conftest import FakeClient
-from wsctl.core.session import SessionManager, SessionSpec
+from wsctl.core.session import ClientGone, SessionManager, SessionSpec
 
 SHELL = "/bin/sh"
 pytestmark = pytest.mark.skipif(not os.path.exists(SHELL), reason="requires /bin/sh")
@@ -125,5 +125,30 @@ async def test_reap_expired() -> None:
         reaped = await manager.reap_expired(now=session.last_active + 3600)
         assert session.id in reaped
         assert manager.get(session.id) is None
+    finally:
+        await manager.shutdown()
+
+
+async def test_rename() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        assert session.rename("  build ") == "build"
+        assert session.spec.name == "build"
+        # blank names are ignored
+        assert session.rename("   ") == "build"
+    finally:
+        await manager.shutdown()
+
+
+async def test_max_clients() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL], max_clients=1))
+    first = FakeClient()
+    try:
+        await session.attach(first)
+        assert session.client_count == 1
+        with pytest.raises(ClientGone):
+            await session.attach(FakeClient())
     finally:
         await manager.shutdown()

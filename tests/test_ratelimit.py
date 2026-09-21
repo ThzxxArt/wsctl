@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from wsctl.core.ratelimit import RateLimiter
+from wsctl.core.ratelimit import RateLimiter, TokenBucket
 
 
 def test_blocks_after_limit() -> None:
@@ -37,3 +37,18 @@ def test_zero_limit_never_blocks() -> None:
     rl = RateLimiter(limit=0, window=60)
     rl.record_failure("k")
     assert not rl.is_blocked("k")
+
+
+def test_token_bucket_depletes_and_refills() -> None:
+    bucket = TokenBucket(rate=10.0, capacity=10.0)
+    assert bucket.allow(10.0, now=0.0)
+    assert not bucket.allow(1.0, now=0.0)
+    assert bucket.allow(5.0, now=1.0)
+
+
+def test_token_bucket_caps_at_capacity() -> None:
+    bucket = TokenBucket(rate=10.0, capacity=10.0)
+    assert bucket.allow(1.0, now=0.0)
+    # after a long idle period the bucket refills to capacity, not beyond
+    assert bucket.allow(10.0, now=1000.0)
+    assert not bucket.allow(0.1, now=1000.0)

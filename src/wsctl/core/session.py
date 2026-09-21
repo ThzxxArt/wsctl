@@ -48,6 +48,7 @@ class SessionSpec:
     rows: int = 24
     idle_timeout: float | None = None
     max_life: float | None = None
+    max_clients: int = 0
     scrollback_bytes: int = DEFAULT_MAX_BYTES
 
 
@@ -108,6 +109,13 @@ class TermSession:
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
 
+    def rename(self, name: str) -> str:
+        """Rename the session; blank names are ignored. Returns the new name."""
+        cleaned = name.strip()
+        if cleaned:
+            self.spec.name = cleaned
+        return self.spec.name
+
     def is_expired(self, now: float | None = None) -> bool:
         """Whether the session has exceeded its idle or maximum lifetime."""
         now = time.time() if now is None else now
@@ -128,6 +136,8 @@ class TermSession:
         async with self._lock:
             if self.closed:
                 raise ClientGone("session is closed")
+            if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
+                raise ClientGone("session has reached its client limit")
             replay = self._scrollback.snapshot()
             self._clients[id(client)] = _ClientEntry(client)
             if replay:

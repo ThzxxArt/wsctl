@@ -111,17 +111,22 @@ settings(key, value)
 
 > 命名约定：`auth_sessions` 指**登录态**，`term_sessions` 指**终端会话**。
 
-## 6. CLI 命令树
+## 6. CLI 命令树（已实现）
 
 ```
 wsctl serve                     # 起控制面，默认配置开箱即用
-wsctl serve --new "bash"        # 顺带开一个会话（快速单会话模式）
+wsctl serve --new "bash"        # 启动时顺带开一个会话
 wsctl session list|new|kill|attach
-wsctl connect <url> [session]   # 瘦客户端：本地 raw 终端直连
-wsctl user add|list|del|passwd|role
-wsctl config show|set|edit
+wsctl connect [url] [-s id]     # 瘦客户端：本地 raw 终端直连
+wsctl login|logout              # 缓存/清除服务端凭据
+wsctl user add|list|del|passwd|role|totp
+wsctl audit                     # 查看审计日志（admin）
+wsctl config show|path|edit
 wsctl version
 ```
+
+> `config set` 未实现：配置以文件为准，用 `config edit` 修改（避免命令行与文件两套写入口）。
+
 
 ## 7. 目录结构
 
@@ -175,18 +180,28 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 | **M3** | 审计日志 + 安全加固（限速 / allowlist / TOTP / Origin）|
 | **M4** | Web 文件面板 + 可观测（/healthz · /metrics · JSON 日志）|
 | **M5** | CLI `connect` 瘦客户端 + 文档 + PyPI Trusted Publishing |
+| **M6** | 缺口补齐：`session new/attach`、`serve --new`、`config edit`、会话重命名、每会话连接上限、输入速率限制、并发压测 |
 
-> 实现进度：M0 完成；M1 核心已落地（SessionManager、PTY 保活、attach/detach、
-> 重连回放、二进制 WS 协议、最小前端、登录 + 会话创建）。M2 已落地（多会话归属 +
-> RBAC、多标签 UI、空闲/寿命回收、管理员用户 API、CLI `login`/`session`）。
-> M3 已落地（全量审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头）。
-> M4 已落地（Web 文件面板 list/download/upload + 防穿越、`/metrics` Prometheus
-> 指标、JSON 结构化日志）。M5 已落地（CLI `connect` 瘦客户端、README/SECURITY
-> 文档、Release 工作流 + Trusted Publishing）。v0.1.0 功能完成。
+## 10.1 实现状态（截至 0.1.0）
+
+**已实现**：M0–M6 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
+多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
+文件面板（防穿越 + 上传限流）、`/metrics`、JSON 日志、`connect` 瘦客户端、
+会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测。
+
+**尚未实现（见 §11 Backlog）**：会话级读写/分享三级权限、服务重启恢复会话、
+优雅重启、独立 SIGCHLD 回收、`settings` 表与 `term_sessions` 完整字段、
+主题/字体/快捷键可配、移动端专项适配、`config set`。
+
+> 说明：进程回收目前依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
+> `wait()`，未安装全局 SIGCHLD handler；已跟踪会话不会残留僵尸进程。
 
 ## 11. Backlog（后续）
 
-ZMODEM/lrzsz · Sixel · SSH 跳板 · asciinema 录制回放 · Webhook · 分享链接/二维码 · 主题市场
+ZMODEM/lrzsz · Sixel · SSH 跳板 · asciinema 录制回放 · Webhook · 分享链接/二维码 ·
+主题市场 · 会话读写/分享三级权限 · 服务重启恢复会话 · 优雅重启 · 独立 SIGCHLD 回收 ·
+`settings` 表与 `term_sessions` 完整字段 · 主题/字体/快捷键可配 · 移动端专项适配 ·
+`config set`
 
 ## 12. 发布
 

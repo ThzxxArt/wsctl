@@ -17,7 +17,9 @@ ADMIN = ("admin", "adminpw")
 BOB = ("bob", "bobpw")
 
 
-def build_app(tmp_path: Path, **overrides: object) -> object:
+def build_app(
+    tmp_path: Path, *, startup_command: str | None = None, **overrides: object
+) -> object:
     settings = load_settings(
         data_dir=tmp_path,
         auth_required=True,
@@ -28,7 +30,9 @@ def build_app(tmp_path: Path, **overrides: object) -> object:
     store = Store(tmp_path / "test.db")
     store.user_create(*ADMIN, role="admin")
     store.user_create(*BOB, role="user")
-    return create_app(settings, store=store, manager=SessionManager())
+    return create_app(
+        settings, store=store, manager=SessionManager(), startup_command=startup_command
+    )
 
 
 def login(client: TestClient, creds: tuple[str, str]) -> None:
@@ -270,3 +274,61 @@ def test_metrics_can_be_disabled(tmp_path: Path) -> None:
     app = build_app(tmp_path, metrics_enabled=False)
     with TestClient(app) as client:
         assert client.get("/metrics").status_code == 404
+
+
+# -- M6: gap closure --------------------------------------------------
+
+
+def test_rename_session(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        r = client.patch(f"/api/sessions/{sid}", json={"name": "renamed"})
+        assert r.status_code == 200
+        assert r.json()["name"] == "renamed"
+        names = {s["id"]: s["name"] for s in client.get("/api/sessions").json()}
+        assert names[sid] == "renamed"
+
+
+def _recv_control(ws: object, wanted: set[str], timeout: float = 5.0) -> dict[str, object] | None:
+    import time
+
+    end = time.time() + timeout
+    while time.time() < end:
+        message = ws.receive()  # type: ignore[attr-defined]
+        if message.get("type") == "websocket.close":
+            return None
+        text = message.get("text")
+        if not text:
+            continue
+        data = json.loads(text)
+        if data.get("type") in wanted:
+            return data
+    return None
+
+
+def test_session_max_clients_enforced(tmp_path: Path) -> None:
+    app = build_app(tmp_path, session_max_clients=1)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        attach = {"type": "attach", "session": sid, "cols": 80, "rows": 24}
+
+        with client.websocket_connect("/ws") as first:
+            first.send_text(json.dumps(attach))
+            assert _recv_control(first, {"attached"}) is not None
+
+            with client.websocket_connect("/ws") as second:
+                second.send_text(json.dumps(attach))
+                msg = _recv_control(second, {"error", "attached"})
+                assert msg is not None and msg["type"] == "error"
+                assert "client limit" in str(msg["msg"])
+
+
+def test_startup_command_creates_session(tmp_path: Path) -> None:
+    app = build_app(tmp_path, startup_command="sleep 30")
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sessions = client.get("/api/sessions").json()
+        assert sessions
+        assert sessions[0]["name"] == "sleep"
