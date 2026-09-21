@@ -23,7 +23,7 @@ from wsctl.core.session import ClientGone, SessionSpec, TermSession
 from wsctl.core.store import Store, User
 
 from .client import WsClient
-from .security import COOKIE_NAME, is_origin_allowed
+from .security import COOKIE_NAME, can_access, is_origin_allowed
 
 log = logging.getLogger("wsctl.ws")
 
@@ -92,9 +92,11 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             with contextlib.suppress(Exception):
                 await session.detach(client)
         client.close()
+        # Let the writer drain queued control messages (e.g. a final error)
+        # before tearing the connection down.
+        with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            await asyncio.wait_for(writer, timeout=2.0)
         writer.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await writer
         if websocket.application_state == WebSocketState.CONNECTED:
             with contextlib.suppress(Exception):
                 await websocket.close()
@@ -123,8 +125,11 @@ async def _handshake(
         if session is None:
             client.put({"type": "error", "msg": f"no such session: {sid}"})
             return None
+        if not can_access(user, session):
+            client.put({"type": "error", "msg": "not authorized for this session"})
+            return None
     else:
-        if len(manager.list()) >= settings.max_sessions:
+        if len(manager.list_sessions()) >= settings.max_sessions:
             client.put({"type": "error", "msg": "session limit reached"})
             return None
         spec = _default_spec(settings, cols, rows)

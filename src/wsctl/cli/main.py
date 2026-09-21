@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import secrets
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from wsctl import __version__
+from wsctl.cli.client import (
+    ApiClient,
+    ApiError,
+    clear_credentials,
+    load_credentials,
+    save_credentials,
+)
+from wsctl.cli.client import (
+    login as api_login,
+)
 from wsctl.core.config import Settings, load_settings
 from wsctl.core.store import Store
 
@@ -30,6 +41,20 @@ app.add_typer(session_app)
 
 console = Console()
 err_console = Console(stderr=True)
+
+
+def _fail(message: str) -> NoReturn:
+    err_console.print(f"[red]{message}[/]")
+    raise typer.Exit(code=1)
+
+
+def _api_client(url: str | None) -> ApiClient:
+    creds = load_credentials()
+    base = url or (str(creds["url"]) if creds.get("url") else None)
+    if not base:
+        _fail("no server URL: pass --url or run 'wsctl login <url>' first")
+    token = str(creds["token"]) if creds.get("token") else None
+    return ApiClient(base, token)
 
 
 def _settings_from(config: Path | None, **overrides: object) -> Settings:
@@ -232,16 +257,63 @@ def config_path(config: Annotated[Path | None, typer.Option("--config", "-c")] =
 
 
 @session_app.command("list")
-def session_list() -> None:
-    """List sessions (requires a running server)."""
-    err_console.print("[yellow]not implemented yet[/] (planned for M2)")
+def session_list(
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """List sessions held by a running server."""
+    client = _api_client(url)
+    try:
+        sessions = client.request("GET", "/api/sessions")
+    except ApiError as exc:
+        _fail(str(exc))
+    table = Table("id", "name", "pid", "clients", "owner")
+    for s in sessions:
+        table.add_row(
+            str(s["id"]), str(s["name"]), str(s["pid"]), str(s["clients"]), str(s["owner_id"])
+        )
+    console.print(table)
 
 
 @session_app.command("kill")
-def session_kill(sid: Annotated[str, typer.Argument(help="Session id.")]) -> None:
-    """Kill a session (requires a running server)."""
-    _ = sid
-    err_console.print("[yellow]not implemented yet[/] (planned for M2)")
+def session_kill(
+    sid: Annotated[str, typer.Argument(help="Session id.")],
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """Kill a session on a running server."""
+    client = _api_client(url)
+    try:
+        client.request("DELETE", f"/api/sessions/{sid}")
+    except ApiError as exc:
+        _fail(str(exc))
+    console.print(f"[green]Killed session[/] {sid}")
+
+
+@app.command()
+def login(
+    url: Annotated[str, typer.Argument(help="Server URL, e.g. http://127.0.0.1:7681")],
+    username: Annotated[str, typer.Option("--username", "-u", help="Username.")] = "admin",
+    password: Annotated[str | None, typer.Option("--password", "-p", help="Password.")] = None,
+) -> None:
+    """Authenticate against a server and cache the token for later commands."""
+    if password is None:
+        password = typer.prompt("Password", hide_input=True)
+    try:
+        token = api_login(url, username, password)
+    except ApiError as exc:
+        _fail(f"login failed: {exc}")
+    save_credentials(url, token)
+    console.print(f"[green]Logged in as[/] {username} @ {url}")
+
+
+@app.command()
+def logout() -> None:
+    """Remove cached server credentials."""
+    creds = load_credentials()
+    if creds.get("url") and creds.get("token"):
+        with contextlib.suppress(ApiError):
+            ApiClient(str(creds["url"]), str(creds["token"])).request("POST", "/api/logout")
+    clear_credentials()
+    console.print("[green]Logged out.[/]")
 
 
 @app.command()

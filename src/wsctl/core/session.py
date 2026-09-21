@@ -66,10 +66,12 @@ class TermSession:
         spec: SessionSpec,
         *,
         loop: asyncio.AbstractEventLoop,
+        owner_id: int | None = None,
         on_close: Callable[[TermSession], None] | None = None,
     ) -> None:
         self.id = sid
         self.spec = spec
+        self.owner_id = owner_id
         self.created_at = time.time()
         self.last_active = self.created_at
         self.exit_code: int | None = None
@@ -105,6 +107,15 @@ class TermSession:
 
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
+
+    def is_expired(self, now: float | None = None) -> bool:
+        """Whether the session has exceeded its idle or maximum lifetime."""
+        now = time.time() if now is None else now
+        if self.spec.max_life is not None and now - self.created_at >= self.spec.max_life:
+            return True
+        if self.spec.idle_timeout is None:
+            return False
+        return now - self.last_active >= self.spec.idle_timeout
 
     # -- client attachment ---------------------------------------------
 
@@ -233,7 +244,7 @@ class SessionManager:
         self._sessions: dict[str, TermSession] = {}
         self._lock = asyncio.Lock()
 
-    def list(self) -> list[TermSession]:
+    def list_sessions(self) -> list[TermSession]:
         self._reap()
         return list(self._sessions.values())
 
@@ -241,15 +252,30 @@ class SessionManager:
         self._reap()
         return self._sessions.get(sid)
 
-    async def create(self, spec: SessionSpec, *, sid: str | None = None) -> TermSession:
+    async def create(
+        self,
+        spec: SessionSpec,
+        *,
+        sid: str | None = None,
+        owner_id: int | None = None,
+    ) -> TermSession:
         loop = self._loop or asyncio.get_running_loop()
         async with self._lock:
             sid = sid or self._new_id()
             if sid in self._sessions:
                 raise ValueError(f"session id already exists: {sid}")
-            session = TermSession(sid, spec, loop=loop, on_close=self._on_session_close)
+            session = TermSession(
+                sid, spec, loop=loop, owner_id=owner_id, on_close=self._on_session_close
+            )
             self._sessions[sid] = session
             return session
+
+    async def reap_expired(self, now: float | None = None) -> list[str]:
+        """Stop and remove sessions past their idle/max lifetime."""
+        expired = [s for s in self.list_sessions() if s.is_expired(now)]
+        for session in expired:
+            await session.stop()
+        return [s.id for s in expired]
 
     async def remove(self, sid: str, *, sig: int | None = None) -> bool:
         async with self._lock:

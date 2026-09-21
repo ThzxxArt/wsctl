@@ -11,13 +11,15 @@
 <body>
   <header class="topbar">
     <span class="brand">wsctl</span>
-    <span id="session-label" class="session-label">no session</span>
-    <span id="status" class="status">idle</span>
+    <div id="tabs" class="tabs"></div>
+    <button id="new-tab" class="icon-btn" title="New session">+</button>
+    <div class="spacer"></div>
+    <span id="connection" class="status">idle</span>
+    <span id="whoami" class="whoami"></span>
+    <button id="logout" class="text-btn" title="Sign out">sign out</button>
   </header>
 
-  <main id="terminal-wrap">
-    <div id="terminal"></div>
-  </main>
+  <main id="terminal-wrap"></main>
 
   <div id="login-overlay" class="overlay hidden">
     <form id="login-form" class="login-card">

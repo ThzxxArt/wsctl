@@ -241,6 +241,66 @@ class Store:
             )
         return cur.rowcount
 
+    # -- term session metadata -----------------------------------------
+
+    def term_session_upsert(
+        self,
+        sid: str,
+        *,
+        name: str,
+        owner_id: int | None,
+        backend: str = "local",
+        command: str | None = None,
+        cwd: str | None = None,
+        status: str = "running",
+    ) -> None:
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO term_sessions"
+                "(id, name, owner_id, backend, command, cwd, status, created_at, last_active)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET"
+                " name=excluded.name, status=excluded.status, last_active=excluded.last_active",
+                (sid, name, owner_id, backend, command, cwd, status, now, now),
+            )
+
+    def term_session_set_status(self, sid: str, status: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE term_sessions SET status = ?, last_active = ? WHERE id = ?",
+                (status, time.time(), sid),
+            )
+
+    def term_session_stop_missing(self, alive_ids: set[str]) -> int:
+        """Mark rows for sessions no longer held in memory as stopped."""
+        with self._lock, self._conn:
+            if alive_ids:
+                placeholders = ",".join("?" for _ in alive_ids)
+                cur = self._conn.execute(
+                    f"UPDATE term_sessions SET status = 'stopped'"
+                    f" WHERE status = 'running' AND id NOT IN ({placeholders})",
+                    tuple(alive_ids),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE term_sessions SET status = 'stopped' WHERE status = 'running'"
+                )
+        return cur.rowcount
+
+    def term_session_list(self, owner_id: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if owner_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM term_sessions ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM term_sessions WHERE owner_id = ? ORDER BY created_at DESC",
+                    (owner_id,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
     # -- audit ---------------------------------------------------------
 
     def log_event(

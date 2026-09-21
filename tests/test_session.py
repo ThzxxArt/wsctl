@@ -88,3 +88,42 @@ async def test_manager_remove() -> None:
     assert await manager.remove(session.id)
     assert manager.get(session.id) is None
     assert not await manager.remove("does-not-exist")
+
+
+async def test_owner_id_is_recorded() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]), owner_id=42)
+    try:
+        assert session.owner_id == 42
+    finally:
+        await manager.shutdown()
+
+
+async def test_idle_expiry() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL], idle_timeout=3600))
+    try:
+        assert not session.is_expired()
+        assert session.is_expired(now=session.last_active + 3601)
+    finally:
+        await manager.shutdown()
+
+
+async def test_max_life_expiry() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL], max_life=60))
+    try:
+        assert session.is_expired(now=session.created_at + 61)
+    finally:
+        await manager.shutdown()
+
+
+async def test_reap_expired() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL], idle_timeout=1))
+    try:
+        reaped = await manager.reap_expired(now=session.last_active + 3600)
+        assert session.id in reaped
+        assert manager.get(session.id) is None
+    finally:
+        await manager.shutdown()

@@ -177,8 +177,9 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 | **M5** | CLI `connect` 瘦客户端 + 文档 + PyPI Trusted Publishing |
 
 > 实现进度：M0 完成；M1 核心已落地（SessionManager、PTY 保活、attach/detach、
-> 重连回放、二进制 WS 协议、最小前端、登录 + 会话创建）。`session`/`connect`
-> 子命令为占位，待 M2 / M5。
+> 重连回放、二进制 WS 协议、最小前端、登录 + 会话创建）。M2 已落地（多会话归属 +
+> RBAC、多标签 UI、空闲/寿命回收、管理员用户 API、CLI `login`/`session`）。
+> `connect` 瘦客户端待 M5。
 
 ## 11. Backlog（后续）
 

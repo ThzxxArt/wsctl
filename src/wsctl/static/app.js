@@ -1,163 +1,276 @@
 "use strict";
 
 (() => {
-  const statusEl = document.getElementById("status");
-  const sessionLabel = document.getElementById("session-label");
-  const overlay = document.getElementById("login-overlay");
-  const loginForm = document.getElementById("login-form");
-  const loginError = document.getElementById("login-error");
+  const els = {
+    tabs: document.getElementById("tabs"),
+    newTab: document.getElementById("new-tab"),
+    wrap: document.getElementById("terminal-wrap"),
+    connection: document.getElementById("connection"),
+    whoami: document.getElementById("whoami"),
+    logout: document.getElementById("logout"),
+    overlay: document.getElementById("login-overlay"),
+    loginForm: document.getElementById("login-form"),
+    loginError: document.getElementById("login-error"),
+  };
 
   const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
+  const sessions = new Map();
+  let activeId = null;
+  let me = null;
 
-  let ws = null;
-  let sessionId = null;
-  let reconnectDelay = 500;
-  let reconnectTimer = null;
-  let heartbeat = null;
-  let intentionalClose = false;
-
-  const term = new Terminal({
+  const TERM_OPTIONS = {
     cursorBlink: true,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace',
     fontSize: 14,
     theme: { background: "#10131a", foreground: "#d7dae0" },
     scrollback: 10000,
-  });
-  const fitAddon = new FitAddon.FitAddon();
-  term.loadAddon(fitAddon);
-  if (window.WebLinksAddon) {
-    term.loadAddon(new WebLinksAddon.WebLinksAddon());
-  }
-  term.open(document.getElementById("terminal"));
-  fitAddon.fit();
-
-  function setStatus(text, cls) {
-    statusEl.textContent = text;
-    statusEl.className = "status" + (cls ? " " + cls : "");
-  }
+  };
 
   function wsUrl() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     return `${proto}//${location.host}/ws`;
   }
 
-  function sendControl(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(obj));
+  function setConnection(text, cls) {
+    els.connection.textContent = text;
+    els.connection.className = "status" + (cls ? " " + cls : "");
+  }
+
+  async function api(method, path, body) {
+    const res = await fetch(path, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 401) {
+      showLogin("请先登录");
+      throw new Error("unauthorized");
     }
-  }
-
-  function sendInput(data) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(encoder.encode(data));
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
+      throw new Error(detail);
     }
+    if (res.status === 204) return null;
+    return res.json();
   }
 
-  function scheduleReconnect() {
-    if (reconnectTimer) return;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connect();
-    }, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+  function sendControl(s, obj) {
+    if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify(obj));
   }
 
-  function connect() {
-    intentionalClose = false;
-    setStatus("connecting", "");
-    ws = new WebSocket(wsUrl());
+  function sendInput(s, data) {
+    if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(encoder.encode(data));
+  }
+
+  function markTab(s, state) {
+    s.tabEl.classList.toggle("connected", state === "connected");
+    s.tabEl.classList.toggle("exited", state === "exited");
+  }
+
+  function scheduleReconnect(s) {
+    if (s.exited || s.reconnectTimer) return;
+    s.reconnectTimer = setTimeout(() => {
+      s.reconnectTimer = null;
+      connect(s);
+    }, s.delay);
+    s.delay = Math.min(s.delay * 2, 8000);
+  }
+
+  function connect(s) {
+    s.intentional = false;
+    setConnection("connecting", "");
+    const ws = new WebSocket(wsUrl());
     ws.binaryType = "arraybuffer";
+    s.ws = ws;
 
     ws.onopen = () => {
-      reconnectDelay = 500;
-      setStatus("connected", "ok");
-      sendControl({ type: "attach", session: sessionId, cols: term.cols, rows: term.rows });
-      if (heartbeat) clearInterval(heartbeat);
-      heartbeat = setInterval(() => sendControl({ type: "ping" }), 25000);
+      s.delay = 500;
+      markTab(s, "connected");
+      setConnection("connected", "ok");
+      sendControl(s, { type: "attach", session: s.id, cols: s.term.cols, rows: s.term.rows });
+      if (s.heartbeat) clearInterval(s.heartbeat);
+      s.heartbeat = setInterval(() => sendControl(s, { type: "ping" }), 25000);
     };
 
     ws.onmessage = (event) => {
       if (typeof event.data === "string") {
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
-        handleControl(msg);
+        handleControl(s, msg);
       } else {
-        term.write(new Uint8Array(event.data));
+        s.term.write(new Uint8Array(event.data));
       }
     };
 
     ws.onclose = (event) => {
-      if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+      if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
       if (event.code === 4401 || event.code === 4403) {
-        setStatus("unauthorized", "bad");
+        setConnection("unauthorized", "bad");
         showLogin("请先登录");
         return;
       }
-      setStatus("disconnected", "bad");
-      if (!intentionalClose) scheduleReconnect();
+      setConnection("disconnected", "bad");
+      if (!s.intentional && !s.exited) scheduleReconnect(s);
     };
 
-    ws.onerror = () => setStatus("error", "bad");
+    ws.onerror = () => setConnection("error", "bad");
   }
 
-  function handleControl(msg) {
+  function handleControl(s, msg) {
     switch (msg.type) {
       case "attached":
-        sessionId = msg.session;
-        sessionLabel.textContent = `${msg.name} · ${msg.session}`;
+        s.name = msg.name;
+        s.tabEl.querySelector(".label").textContent = msg.name;
         break;
       case "exit":
-        term.write(`\r\n\x1b[33m[wsctl] session exited (code ${msg.code})\x1b[0m\r\n`);
-        term.write("\x1b[90m[wsctl] 会话已结束，正在新建会话...\x1b[0m\r\n");
-        sessionId = null;
+        s.exited = true;
+        markTab(s, "exited");
+        s.term.write(`\r\n\x1b[33m[wsctl] session exited (code ${msg.code})\x1b[0m\r\n`);
         break;
       case "error":
-        term.write(`\r\n\x1b[31m[wsctl] ${msg.msg}\x1b[0m\r\n`);
+        s.term.write(`\r\n\x1b[31m[wsctl] ${msg.msg}\x1b[0m\r\n`);
         break;
       default:
         break;
     }
   }
 
-  term.onData(sendInput);
+  function createTab(id, name) {
+    const pane = document.createElement("div");
+    pane.className = "term-pane";
+    els.wrap.appendChild(pane);
 
-  const resizeObserver = new ResizeObserver(() => {
-    try { fitAddon.fit(); } catch { /* ignore */ }
-    sendControl({ type: "resize", cols: term.cols, rows: term.rows });
+    const term = new Terminal(TERM_OPTIONS);
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    if (window.WebLinksAddon) term.loadAddon(new WebLinksAddon.WebLinksAddon());
+    term.open(pane);
+
+    const tabEl = document.createElement("div");
+    tabEl.className = "tab";
+    tabEl.innerHTML = '<span class="dot"></span><span class="label"></span><span class="close">\u00d7</span>';
+    tabEl.querySelector(".label").textContent = name;
+    els.tabs.appendChild(tabEl);
+
+    const s = {
+      id, name, term, fit, pane, tabEl,
+      ws: null, heartbeat: null, reconnectTimer: null, delay: 500,
+      intentional: false, exited: false,
+    };
+    sessions.set(id, s);
+
+    tabEl.addEventListener("click", (e) => {
+      if (e.target.classList.contains("close")) return;
+      activateTab(id);
+    });
+    tabEl.querySelector(".close").addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeTab(id);
+    });
+
+    term.onData((data) => sendInput(s, data));
+    term.onResize(({ cols, rows }) => sendControl(s, { type: "resize", cols, rows }));
+
+    connect(s);
+    activateTab(id);
+    return s;
+  }
+
+  function activateTab(id) {
+    activeId = id;
+    for (const s of sessions.values()) {
+      const on = s.id === id;
+      s.pane.classList.toggle("active", on);
+      s.tabEl.classList.toggle("active", on);
+    }
+    const s = sessions.get(id);
+    if (!s) return;
+    requestAnimationFrame(() => {
+      try { s.fit.fit(); } catch { /* hidden */ }
+      s.term.focus();
+      sendControl(s, { type: "resize", cols: s.term.cols, rows: s.term.rows });
+    });
+  }
+
+  async function closeTab(id) {
+    const s = sessions.get(id);
+    if (!s) return;
+    s.intentional = true;
+    if (s.heartbeat) clearInterval(s.heartbeat);
+    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+    if (s.ws) s.ws.close();
+    s.term.dispose();
+    s.pane.remove();
+    s.tabEl.remove();
+    sessions.delete(id);
+
+    try { await api("DELETE", `/api/sessions/${id}`); } catch { /* already gone */ }
+
+    if (activeId === id) {
+      const next = sessions.keys().next();
+      if (!next.done) activateTab(next.value);
+      else activeId = null;
+    }
+  }
+
+  async function newSession() {
+    const info = await api("POST", "/api/sessions", {});
+    createTab(info.id, info.name || "shell");
+    return info;
+  }
+
+  window.addEventListener("resize", () => {
+    const s = activeId && sessions.get(activeId);
+    if (s) {
+      try { s.fit.fit(); } catch { /* ignore */ }
+    }
   });
-  resizeObserver.observe(document.getElementById("terminal-wrap"));
+
+  window.addEventListener("beforeunload", () => {
+    for (const s of sessions.values()) {
+      s.intentional = true;
+      if (s.ws) s.ws.close();
+    }
+  });
+
+  els.newTab.addEventListener("click", () => {
+    newSession().catch((err) => setConnection(String(err.message || err), "bad"));
+  });
+
+  els.logout.addEventListener("click", async () => {
+    try { await api("POST", "/api/logout"); } catch { /* ignore */ }
+    location.reload();
+  });
 
   function showLogin(message) {
     if (message) {
-      loginError.textContent = message;
-      loginError.classList.remove("hidden");
+      els.loginError.textContent = message;
+      els.loginError.classList.remove("hidden");
     }
-    overlay.classList.remove("hidden");
+    els.overlay.classList.remove("hidden");
     document.getElementById("username").focus();
   }
 
   function hideLogin() {
-    overlay.classList.add("hidden");
-    loginError.classList.add("hidden");
+    els.overlay.classList.add("hidden");
+    els.loginError.classList.add("hidden");
   }
 
-  loginForm.addEventListener("submit", async (e) => {
+  els.loginForm.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const username = document.getElementById("username").value;
-    const password = document.getElementById("password").value;
     try {
       const res = await fetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({
+          username: document.getElementById("username").value,
+          password: document.getElementById("password").value,
+        }),
       });
-      if (!res.ok) {
-        showLogin("用户名或密码错误");
-        return;
-      }
+      if (!res.ok) { showLogin("用户名或密码错误"); return; }
       hideLogin();
-      connect();
+      bootstrap();
     } catch {
       showLogin("网络错误");
     }
@@ -165,15 +278,21 @@
 
   async function bootstrap() {
     try {
-      const res = await fetch("/api/me");
-      if (res.ok) {
-        hideLogin();
-        connect();
-      } else {
-        showLogin("");
-      }
+      me = await api("GET", "/api/me");
     } catch {
-      showLogin("");
+      return;
+    }
+    els.whoami.textContent = `${me.username} (${me.role})`;
+    hideLogin();
+    try {
+      const list = await api("GET", "/api/sessions");
+      if (list.length) {
+        list.forEach((s) => createTab(s.id, s.name));
+      } else {
+        await newSession();
+      }
+    } catch (err) {
+      setConnection(String(err.message || err), "bad");
     }
   }
 

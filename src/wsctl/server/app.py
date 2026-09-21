@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import shlex
 from collections.abc import AsyncIterator
@@ -16,13 +18,14 @@ from pydantic import BaseModel
 
 from wsctl import __version__
 from wsctl.core.config import Settings
-from wsctl.core.session import SessionManager, SessionSpec
+from wsctl.core.session import SessionManager, SessionSpec, TermSession
 from wsctl.core.store import Store, User
 
-from .security import COOKIE_NAME
+from .security import COOKIE_NAME, can_access
 from .ws import terminal_endpoint
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+MAINTENANCE_INTERVAL = 5.0
 
 log = logging.getLogger("wsctl.app")
 
@@ -38,6 +41,16 @@ class SessionCreate(BaseModel):
     cwd: str | None = None
     cols: int = 80
     rows: int = 24
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+
+class UserRoleUpdate(BaseModel):
+    role: str
 
 
 def _token_from_request(request: Request) -> str | None:
@@ -61,18 +74,42 @@ def current_user(request: Request) -> User:
     return user
 
 
+def require_admin(user: User = Depends(current_user)) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin role required")
+    return user
+
+
 def create_app(
     settings: Settings,
     *,
     store: Store | None = None,
     manager: SessionManager | None = None,
 ) -> FastAPI:
+    async def _maintenance() -> None:
+        while True:
+            await asyncio.sleep(MAINTENANCE_INTERVAL)
+            try:
+                for sid in await app.state.manager.reap_expired():
+                    app.state.store.term_session_set_status(sid, "expired")
+                alive = {s.id for s in app.state.manager.list_sessions()}
+                app.state.store.term_session_stop_missing(alive)
+                app.state.store.purge_expired_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("maintenance task failed")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("wsctl %s listening on %s:%s", __version__, settings.host, settings.port)
+        maint = asyncio.create_task(_maintenance())
         try:
             yield
         finally:
+            maint.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await maint
             await app.state.manager.shutdown()
             app.state.store.close()
 
@@ -94,8 +131,10 @@ def create_app(
         return {
             "status": "ok",
             "version": __version__,
-            "sessions": len(app.state.manager.list()),
+            "sessions": len(app.state.manager.list_sessions()),
         }
+
+    # -- auth ----------------------------------------------------------
 
     @app.post("/api/login")
     async def login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
@@ -136,33 +175,38 @@ def create_app(
     async def me(user: User = Depends(current_user)) -> dict[str, Any]:
         return {"username": user.username, "role": user.role}
 
+    # -- sessions ------------------------------------------------------
+
+    def _serialize(session: TermSession) -> dict[str, Any]:
+        return {
+            "id": session.id,
+            "name": session.spec.name,
+            "pid": session.pid,
+            "owner_id": session.owner_id,
+            "clients": session.client_count,
+            "alive": session.is_alive,
+            "created_at": session.created_at,
+            "last_active": session.last_active,
+        }
+
     @app.get("/api/sessions")
     async def list_sessions(user: User = Depends(current_user)) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": s.id,
-                "name": s.spec.name,
-                "pid": s.pid,
-                "clients": s.client_count,
-                "alive": s.is_alive,
-                "created_at": s.created_at,
-                "last_active": s.last_active,
-            }
-            for s in app.state.manager.list()
-        ]
+        sessions = app.state.manager.list_sessions()
+        return [_serialize(s) for s in sessions if can_access(user, s)]
 
     @app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
     async def create_session(
         body: SessionCreate, user: User = Depends(current_user)
     ) -> dict[str, Any]:
         manager: SessionManager = app.state.manager
-        if len(manager.list()) >= settings.max_sessions:
+        if len(manager.list_sessions()) >= settings.max_sessions:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="session limit"
             )
         argv = shlex.split(body.command) if body.command else [settings.shell]
+        name = body.name or (Path(argv[0]).name if argv else "shell")
         spec = SessionSpec(
-            name=body.name or (Path(argv[0]).name if argv else "shell"),
+            name=name,
             argv=argv,
             cwd=body.cwd or settings.default_cwd,
             cols=body.cols,
@@ -171,18 +215,63 @@ def create_app(
             max_life=settings.max_life,
             scrollback_bytes=settings.scrollback_bytes,
         )
-        session = await manager.create(spec)
-        app.state.store.log_event(
-            "session_create", user_id=user.id, term_session_id=session.id, payload=spec.name
+        session = await manager.create(spec, owner_id=user.id)
+        app.state.store.term_session_upsert(
+            session.id,
+            name=name,
+            owner_id=user.id,
+            command=body.command,
+            cwd=spec.cwd,
         )
-        return {"id": session.id, "name": session.spec.name, "pid": session.pid}
+        app.state.store.log_event(
+            "session_create", user_id=user.id, term_session_id=session.id, payload=name
+        )
+        return _serialize(session)
 
     @app.delete("/api/sessions/{sid}")
     async def delete_session(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
-        removed = await app.state.manager.remove(sid)
-        if not removed:
+        session = app.state.manager.get(sid)
+        if session is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such session")
+        if not can_access(user, session):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not your session")
+        await app.state.manager.remove(sid)
+        app.state.store.term_session_set_status(sid, "killed")
         app.state.store.log_event("session_kill", user_id=user.id, term_session_id=sid)
+        return {"ok": True}
+
+    # -- users (admin only) --------------------------------------------
+
+    @app.get("/api/users")
+    async def list_users(_: User = Depends(require_admin)) -> list[dict[str, Any]]:
+        return [
+            {"id": u.id, "username": u.username, "role": u.role, "disabled": u.disabled}
+            for u in app.state.store.user_list()
+        ]
+
+    @app.post("/api/users", status_code=status.HTTP_201_CREATED)
+    async def create_user(body: UserCreate, _: User = Depends(require_admin)) -> dict[str, Any]:
+        if body.role not in ("admin", "user"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role")
+        if app.state.store.user_get(body.username) is not None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="user exists")
+        user = app.state.store.user_create(body.username, body.password, role=body.role)
+        return {"id": user.id, "username": user.username, "role": user.role}
+
+    @app.delete("/api/users/{username}")
+    async def delete_user(username: str, _: User = Depends(require_admin)) -> dict[str, bool]:
+        if not app.state.store.user_delete(username):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such user")
+        return {"ok": True}
+
+    @app.patch("/api/users/{username}")
+    async def set_user_role(
+        username: str, body: UserRoleUpdate, _: User = Depends(require_admin)
+    ) -> dict[str, bool]:
+        if body.role not in ("admin", "user"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role")
+        if not app.state.store.user_set_role(username, body.role):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such user")
         return {"ok": True}
 
     @app.websocket("/ws")
