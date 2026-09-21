@@ -100,6 +100,11 @@ RBAC, auditing, sharing, a file panel and observability.
 
 ### Fixed
 
+- tmux-backed sessions now default `TERM` (xterm-256color), so they work in
+  headless environments where `TERM` is unset (previously the tmux client
+  exited immediately and restart recovery failed).
+- A tmux client is never signalled as a process group on shutdown, so the
+  freshly forked tmux server (and the preserved session) cannot be killed.
 - Revoked/expired share tokens are now enforced promptly: input is rejected
   immediately and the connection is closed, and a periodic re-check detaches
   viewers even on sessions that produce no output.
