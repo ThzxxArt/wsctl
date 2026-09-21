@@ -185,6 +185,21 @@ async def test_share_writable() -> None:
         await manager.shutdown()
 
 
+async def test_revoking_share_detaches_clients() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    token = session.create_share()
+    client = FakeClient()
+    try:
+        await session.attach(client, writable=False, share=token)
+        assert session.client_count == 1
+        session.revoke_share()
+        session.write_input(b"echo x\n")  # triggers a broadcast
+        assert await wait_for(lambda: session.client_count == 0)
+    finally:
+        await manager.shutdown()
+
+
 async def test_share_expiry() -> None:
     manager = SessionManager()
     session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))

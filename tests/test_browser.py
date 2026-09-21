@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -26,7 +27,17 @@ sync_playwright = playwright_api.sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
-PORT = 7694
+
+
+def _free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+PORT = _free_port()
 BASE = f"http://127.0.0.1:{PORT}"
 
 pytestmark = pytest.mark.browser
@@ -71,6 +82,11 @@ def test_browser_flow(tmp_path: Path) -> None:
             browser = p.chromium.launch()
             context = browser.new_context(viewport={"width": 1280, "height": 800})
             page = context.new_page()
+            console_errors: list[str] = []
+            page.on(
+                "console",
+                lambda m: console_errors.append(m.text) if m.type == "error" else None,
+            )
             page.goto(BASE)
 
             # login
@@ -183,6 +199,10 @@ def test_browser_flow(tmp_path: Path) -> None:
                 "() => document.getElementById('replay-host').children.length > 0",
                 timeout=15000,
             )
+            # the cast must actually load (regression: CSP blocked blob: fetches)
+            assert not any(
+                "Content Security Policy" in e or "blob" in e.lower() for e in console_errors
+            ), console_errors
             page.evaluate("() => document.getElementById('replay-close').click()")
             page.wait_for_selector("#replay-overlay.hidden", state="attached", timeout=5000)
 
@@ -193,6 +213,16 @@ def test_browser_flow(tmp_path: Path) -> None:
             vpage.wait_for_selector(".tab", timeout=15000)
             assert "shared" in (vpage.get_attribute("body", "class") or "")
             vpage.wait_for_selector(".readonly-badge", timeout=15000)
+
+            # a read-only viewer cannot type into the session
+            vpage.click(".term-pane.active .xterm-screen")
+            vpage.keyboard.type("echo SHOULD-NOT-APPEAR")
+            vpage.keyboard.press("Enter")
+            vpage.wait_for_timeout(800)
+            rows = vpage.eval_on_selector(
+                ".term-pane.active .xterm-rows", "el => el.innerText"
+            )
+            assert "SHOULD-NOT-APPEAR" not in rows
             viewer.close()
 
             browser.close()

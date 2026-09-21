@@ -63,3 +63,18 @@ def test_reload_invalid_value_is_noop(tmp_path: Path) -> None:
     config.write_text('max_sessions = "not-an-int"\n', encoding="utf-8")
     assert reload_settings_file(settings) == []
     assert settings.max_sessions == 64
+
+
+def test_reload_respects_env_precedence(tmp_path: Path, monkeypatch: object) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("max_sessions = 5\n", encoding="utf-8")
+    monkeypatch.setenv("WSCTL_MAX_SESSIONS", "99")  # type: ignore[attr-defined]
+
+    settings = load_settings(config_path=config)
+    assert settings.max_sessions == 99  # env wins at load time
+
+    config.write_text("max_sessions = 5\n", encoding="utf-8")
+    changed = reload_settings_file(settings)
+    assert "max_sessions" not in changed
+    assert settings.max_sessions == 99  # env still wins after reload

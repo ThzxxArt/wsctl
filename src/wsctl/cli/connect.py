@@ -98,55 +98,58 @@ async def _run(base: str, session: str | None, token: str | None) -> None:
         loop = asyncio.get_running_loop()
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
-        tty.setraw(fd)
-
-        outbound: asyncio.Queue[bytes | str | None] = asyncio.Queue()
-
-        def on_stdin() -> None:
-            try:
-                data = os.read(fd, READ_SIZE)
-            except OSError:
-                data = b""
-            outbound.put_nowait(data if data else None)
-
-        def on_resize() -> None:
-            width, height = _winsize()
-            outbound.put_nowait(json.dumps({"type": "resize", "cols": width, "rows": height}))
-
-        loop.add_reader(fd, on_stdin)
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(signal.SIGWINCH, on_resize)
-
-        async def sender() -> None:
-            while True:
-                item = await outbound.get()
-                if item is None:
-                    await ws.close()
-                    return
-                await ws.send(item)
-
-        send_task = asyncio.create_task(sender())
+        send_task: asyncio.Task[None] | None = None
         notice: str | None = None
+        tty.setraw(fd)
         try:
-            async for message in ws:
-                if isinstance(message, bytes):
-                    os.write(sys.stdout.fileno(), message)
-                    continue
-                data = json.loads(message)
-                kind = data.get("type")
-                if kind == "exit":
-                    notice = f"session exited (code {data.get('code')})"
-                    break
-                if kind == "error":
-                    notice = str(data.get("msg"))
-                    break
-        except ConnectionClosed:
-            notice = "connection closed"
+            outbound: asyncio.Queue[bytes | str | None] = asyncio.Queue()
+
+            def on_stdin() -> None:
+                try:
+                    data = os.read(fd, READ_SIZE)
+                except OSError:
+                    data = b""
+                outbound.put_nowait(data if data else None)
+
+            def on_resize() -> None:
+                width, height = _winsize()
+                outbound.put_nowait(json.dumps({"type": "resize", "cols": width, "rows": height}))
+
+            loop.add_reader(fd, on_stdin)
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(signal.SIGWINCH, on_resize)
+
+            async def sender() -> None:
+                while True:
+                    item = await outbound.get()
+                    if item is None:
+                        await ws.close()
+                        return
+                    await ws.send(item)
+
+            send_task = asyncio.create_task(sender())
+            try:
+                async for message in ws:
+                    if isinstance(message, bytes):
+                        os.write(sys.stdout.fileno(), message)
+                        continue
+                    data = json.loads(message)
+                    kind = data.get("type")
+                    if kind == "exit":
+                        notice = f"session exited (code {data.get('code')})"
+                        break
+                    if kind == "error":
+                        notice = str(data.get("msg"))
+                        break
+            except ConnectionClosed:
+                notice = "connection closed"
         finally:
-            send_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await send_task
-            loop.remove_reader(fd)
+            if send_task is not None:
+                send_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await send_task
+            with contextlib.suppress(Exception):
+                loop.remove_reader(fd)
             with contextlib.suppress(NotImplementedError):
                 loop.remove_signal_handler(signal.SIGWINCH)
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)

@@ -20,6 +20,8 @@ if sys.platform != "win32":  # pragma: no cover - platform specific
     import termios
 
 READ_SIZE = 65536
+MAX_WRITE_BUFFER = 1024 * 1024
+MAX_DIMENSION = 65535
 
 
 class PtyError(RuntimeError):
@@ -72,6 +74,8 @@ class PosixPty:
     ) -> None:
         if sys.platform == "win32":  # pragma: no cover - platform specific
             raise PtyError("PosixPty is not available on Windows")
+        if not argv:
+            raise PtyError("cannot spawn an empty command")
 
         self._loop = loop or asyncio.get_event_loop()
         master_fd, slave_fd = os.openpty()
@@ -86,8 +90,12 @@ class PosixPty:
                 start_new_session=True,
                 close_fds=True,
             )
-        finally:
+        except BaseException:
+            # Never leak the master fd (or a partially started child) on failure.
             os.close(slave_fd)
+            os.close(master_fd)
+            raise
+        os.close(slave_fd)
 
         self._fd = master_fd
         os.set_blocking(master_fd, False)
@@ -130,6 +138,10 @@ class PosixPty:
     def write(self, data: bytes) -> None:
         if not data:
             return
+        if len(self._write_buf) >= MAX_WRITE_BUFFER:
+            # The child is not draining its stdin; drop input rather than grow
+            # without bound (memory hard limit for the write path).
+            return
         self._write_buf.extend(data)
         self._flush()
 
@@ -157,6 +169,8 @@ class PosixPty:
             self._writer_registered = False
 
     def resize(self, cols: int, rows: int) -> None:
+        cols = min(max(1, int(cols)), MAX_DIMENSION)
+        rows = min(max(1, int(rows)), MAX_DIMENSION)
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
         with contextlib.suppress(OSError):
             fcntl.ioctl(self._fd, termios.TIOCSWINSZ, winsize)

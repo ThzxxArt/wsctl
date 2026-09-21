@@ -76,6 +76,14 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     metrics: Metrics = app.state.metrics
 
     ip = client_ip(websocket, settings)
+    user = _resolve_user(websocket, store, settings.auth_required)
+    share_param = websocket.query_params.get("share")
+
+    # Accept first so the client receives a WebSocket close *code* (a close
+    # before accept becomes an opaque HTTP 403 / code 1006 in browsers).
+    await websocket.accept()
+    metrics.inc("wsctl_ws_connections_total")
+
     if not ip_allowed(ip, settings.allowed_ips):
         store.log_event("ip_rejected", ip=ip, payload="ws")
         await websocket.close(code=4403)
@@ -89,16 +97,11 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         await websocket.close(code=4403)
         return
 
-    user = _resolve_user(websocket, store, settings.auth_required)
-    share_param = websocket.query_params.get("share")
     # An unauthenticated connection is only allowed when it presents a share
     # token (validated during the handshake).
     if user is None and not share_param:
         await websocket.close(code=4401)
         return
-
-    await websocket.accept()
-    metrics.inc("wsctl_ws_connections_total")
 
     client = WsClient(websocket, max_bytes=settings.client_max_bytes)
     writer = asyncio.create_task(client.run())
@@ -186,35 +189,41 @@ async def _handshake(
             return None
         spec = _default_spec(settings, cols, rows)
         session = await manager.create(spec, owner_id=user.id)
-        if settings.auto_record:
-            session.start_recording(
-                settings.recordings_dir / f"{session.id}.cast",
-                record_input=settings.record_input,
+        try:
+            if settings.auto_record:
+                session.start_recording(
+                    settings.recordings_dir / f"{session.id}.cast",
+                    record_input=settings.record_input,
+                )
+            websocket.app.state.metrics.inc("wsctl_sessions_created_total")
+            store: Store = websocket.app.state.store
+            store.term_session_upsert(
+                session.id,
+                name=spec.name,
+                owner_id=user.id,
+                backend=spec.backend,
+                command=None,
+                argv=spec.argv,
+                env=spec.env,
+                cwd=spec.cwd,
+                idle_timeout=spec.idle_timeout,
+                max_life=spec.max_life,
             )
-        websocket.app.state.metrics.inc("wsctl_sessions_created_total")
-        store: Store = websocket.app.state.store
-        store.term_session_upsert(
-            session.id,
-            name=spec.name,
-            owner_id=user.id,
-            backend=spec.backend,
-            command=None,
-            argv=spec.argv,
-            env=spec.env,
-            cwd=spec.cwd,
-            idle_timeout=spec.idle_timeout,
-            max_life=spec.max_life,
-        )
-        store.log_event(
-            "session_create",
-            user_id=user.id,
-            term_session_id=session.id,
-            payload=msg.get("name") or session.spec.name,
-        )
+            store.log_event(
+                "session_create",
+                user_id=user.id,
+                term_session_id=session.id,
+                payload=msg.get("name") or session.spec.name,
+            )
+        except Exception:
+            # Do not leave a live process/fd behind if post-create setup fails.
+            await manager.remove(session.id)
+            client.put({"type": "error", "msg": "failed to create session"})
+            return None
 
     session.resize(cols, rows)
     try:
-        await session.attach(client, writable=writable)
+        await session.attach(client, writable=writable, share=share)
     except ClientGone as exc:
         client.put({"type": "error", "msg": str(exc)})
         return None
@@ -310,7 +319,8 @@ async def _pump(
             continue
         kind = data.get("type")
         if kind == "resize":
-            session.resize(int(data.get("cols") or 80), int(data.get("rows") or 24))
+            if writable:
+                session.resize(int(data.get("cols") or 80), int(data.get("rows") or 24))
         elif kind == "input":
             if not writable:
                 reject_readonly()

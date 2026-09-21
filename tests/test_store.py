@@ -76,6 +76,19 @@ def test_expired_session(tmp_path: Path) -> None:
         store.close()
 
 
+def test_disabling_a_user_invalidates_sessions(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        user = store.user_create("gina", "pw")
+        token = store.create_auth_session(user.id, ttl=3600)
+        assert store.resolve_auth_session(token) is not None
+        assert store.user_set_disabled("gina", True)
+        assert store.resolve_auth_session(token) is None
+        assert store.user_authenticate("gina", "pw") is None
+    finally:
+        store.close()
+
+
 def test_audit_roundtrip(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:

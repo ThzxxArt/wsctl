@@ -140,10 +140,19 @@
 
   const prefs = Object.assign(
     { theme: "dark", termTheme: "dark", fontSize: 14, keybindings: {}, customThemes: {} },
-    JSON.parse(localStorage.getItem("wsctl-prefs") || "{}"),
+    readPrefs(),
   );
   prefs.keybindings = Object.assign({}, DEFAULT_KEYS, prefs.keybindings);
   prefs.customThemes = prefs.customThemes || {};
+
+  function readPrefs() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem("wsctl-prefs") || "{}");
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
 
   function resolveTheme() {
     if (prefs.customThemes[prefs.termTheme]) return prefs.customThemes[prefs.termTheme];
@@ -178,7 +187,7 @@
       body: body ? JSON.stringify(body) : undefined,
     });
     if (res.status === 401) {
-      showLogin("请先登录");
+      if (!sharedMode) showLogin("请先登录");
       throw new Error("unauthorized");
     }
     if (!res.ok) {
@@ -221,6 +230,12 @@
 
     ws.onopen = () => {
       s.delay = 500;
+      if (s.everConnected) {
+        // Reconnect: clear the local screen so the server's replay rebuilds it
+        // instead of appending to stale content.
+        try { s.term.reset(); } catch { /* ignore */ }
+      }
+      s.everConnected = true;
       markTab(s, "connected");
       setConnection("connected", "ok");
       sendControl(s, {
@@ -260,7 +275,7 @@
         showLogin("请先登录");
         return;
       }
-      setConnection("disconnected", "bad");
+      setConnection(s.intentional ? "idle" : "disconnected", s.intentional ? "" : "bad");
       if (!s.intentional && !s.exited) scheduleReconnect(s);
     };
 
@@ -321,8 +336,10 @@
       intentional: false, exited: false,
       share: options.share || null,
       writable: options.writable !== false,
+      recording: Boolean(options.recording),
       sentry: null,
       zmodemActive: false,
+      everConnected: false,
     };
     sessions.set(id, s);
 
@@ -399,7 +416,7 @@
 
   async function newSession() {
     const info = await api("POST", "/api/sessions", {});
-    createTab(info.id, info.name || "shell");
+    createTab(info.id, info.name || "shell", { recording: info.recording });
     return info;
   }
 
@@ -477,7 +494,7 @@
     try {
       const list = await api("GET", "/api/sessions");
       if (list.length) {
-        list.forEach((s) => createTab(s.id, s.name));
+        list.forEach((s) => createTab(s.id, s.name, { recording: s.recording }));
       } else {
         await newSession();
       }
@@ -499,6 +516,7 @@
       setConnection("no active session", "bad");
       return;
     }
+    shareSid = s.id;
     try {
       const info = await api("POST", `/api/sessions/${s.id}/share`, {
         writable: els.shareWrite.checked,
@@ -525,10 +543,9 @@
     }
   });
   els.shareRevoke.addEventListener("click", async () => {
-    const s = activeId && sessions.get(activeId);
-    if (!s) return;
+    if (!shareSid) return;
     try {
-      await api("DELETE", `/api/sessions/${s.id}/share`);
+      await api("DELETE", `/api/sessions/${shareSid}/share`);
       els.shareOverlay.classList.add("hidden");
     } catch (err) {
       showShareNote(String(err.message || err));
@@ -538,6 +555,8 @@
   // -- recording -------------------------------------------------------
 
   let replayBlobUrl = null;
+  let replayPlayer = null;
+  let shareSid = null;
 
   els.recordBtn.addEventListener("click", async () => {
     const s = activeId && sessions.get(activeId);
@@ -577,7 +596,7 @@
       if (replayBlobUrl) URL.revokeObjectURL(replayBlobUrl);
       replayBlobUrl = URL.createObjectURL(new Blob([text], { type: "application/x-asciicast" }));
       if (window.AsciinemaPlayer) {
-        AsciinemaPlayer.create(replayBlobUrl, els.replayHost, {
+        replayPlayer = AsciinemaPlayer.create(replayBlobUrl, els.replayHost, {
           autoPlay: true,
           fit: "width",
           controls: true,
@@ -595,6 +614,14 @@
   els.replayClose.addEventListener("click", () => {
     els.replayOverlay.classList.add("hidden");
     els.replayHost.innerHTML = "";
+    if (replayPlayer && replayPlayer.dispose) {
+      try { replayPlayer.dispose(); } catch { /* ignore */ }
+    }
+    replayPlayer = null;
+    if (replayBlobUrl) {
+      URL.revokeObjectURL(replayBlobUrl);
+      replayBlobUrl = null;
+    }
   });
 
   // -- zmodem (sz/rz file transfer) ------------------------------------
@@ -711,6 +738,7 @@
   document.addEventListener(
     "keydown",
     (event) => {
+      if (sharedMode) return;
       const combo = comboOf(event);
       if (!combo) return;
       for (const [action, binding] of Object.entries(prefs.keybindings)) {
@@ -880,21 +908,25 @@
 
   async function uploadFiles(files) {
     if (!files || !files.length) return;
-    for (const file of files) {
-      const form = new FormData();
-      form.append("path", filePath);
-      form.append("file", file);
-      els.fileStatus.textContent = `uploading ${file.name}...`;
-      const res = await fetch("/api/files/upload", { method: "POST", body: form });
-      if (!res.ok) {
-        let detail = res.statusText;
-        try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
-        els.fileStatus.textContent = `failed: ${detail}`;
-        return;
+    try {
+      for (const file of files) {
+        const form = new FormData();
+        form.append("path", filePath);
+        form.append("file", file);
+        els.fileStatus.textContent = `uploading ${file.name}...`;
+        const res = await fetch("/api/files/upload", { method: "POST", body: form });
+        if (!res.ok) {
+          let detail = res.statusText;
+          try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
+          els.fileStatus.textContent = `failed: ${detail}`;
+          return;
+        }
       }
+      els.fileStatus.textContent = "upload complete";
+      await loadFiles(filePath);
+    } catch (err) {
+      els.fileStatus.textContent = `failed: ${err.message || err}`;
     }
-    els.fileStatus.textContent = "upload complete";
-    await loadFiles(filePath);
   }
 
   els.filesToggle.addEventListener("click", () => {

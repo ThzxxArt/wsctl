@@ -201,6 +201,7 @@ body.shared #record-btn,
 body.shared #replay-btn,
 body.shared #zmodem-btn,
 body.shared #logout { display: none; }
+body.shared .tab .close { display: none; }
 
 .replay-card {
   width: min(960px, 92vw);

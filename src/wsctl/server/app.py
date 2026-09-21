@@ -7,6 +7,7 @@ import contextlib
 import io
 import logging
 import shlex
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -68,8 +69,8 @@ class SessionCreate(BaseModel):
     cwd: str | None = None
     backend: str | None = None
     ssh: SshConfig | None = None
-    cols: int = 80
-    rows: int = 24
+    cols: int = Field(default=80, ge=1, le=1000)
+    rows: int = Field(default=24, ge=1, le=1000)
 
 
 class SessionRename(BaseModel):
@@ -456,7 +457,14 @@ def create_app(
             argv = target.argv()
             name = body.name or f"ssh:{target.destination()}"
         else:
-            argv = shlex.split(body.command) if body.command else [settings.shell]
+            if body.command is not None:
+                argv = shlex.split(body.command)
+                if not argv:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST, detail="empty command"
+                    )
+            else:
+                argv = [settings.shell]
             name = body.name or (Path(argv[0]).name if argv else "shell")
         spec = SessionSpec(
             name=name,
@@ -472,26 +480,33 @@ def create_app(
             scrollback_bytes=settings.scrollback_bytes,
         )
         session = await manager.create(spec, owner_id=user.id)
-        if settings.auto_record:
-            session.start_recording(
-                settings.recordings_dir / f"{session.id}.cast",
-                record_input=settings.record_input,
+        try:
+            if settings.auto_record:
+                session.start_recording(
+                    settings.recordings_dir / f"{session.id}.cast",
+                    record_input=settings.record_input,
+                )
+            app.state.store.term_session_upsert(
+                session.id,
+                name=name,
+                owner_id=user.id,
+                backend=backend,
+                command=body.command,
+                argv=spec.argv,
+                env=spec.env,
+                cwd=spec.cwd,
+                idle_timeout=spec.idle_timeout,
+                max_life=spec.max_life,
             )
-        app.state.store.term_session_upsert(
-            session.id,
-            name=name,
-            owner_id=user.id,
-            backend=backend,
-            command=body.command,
-            argv=spec.argv,
-            env=spec.env,
-            cwd=spec.cwd,
-            idle_timeout=spec.idle_timeout,
-            max_life=spec.max_life,
-        )
-        app.state.store.log_event(
-            "session_create", user_id=user.id, term_session_id=session.id, payload=name
-        )
+            app.state.store.log_event(
+                "session_create", user_id=user.id, term_session_id=session.id, payload=name
+            )
+        except Exception as exc:
+            await manager.remove(session.id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="failed to create session",
+            ) from exc
         metrics.inc("wsctl_sessions_created_total")
         return _serialize(session)
 
@@ -629,7 +644,12 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role")
         if app.state.store.user_get(body.username) is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="user exists")
-        user = app.state.store.user_create(body.username, body.password, role=body.role)
+        try:
+            user = app.state.store.user_create(body.username, body.password, role=body.role)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="user exists"
+            ) from exc
         app.state.store.log_event(
             "user_create", user_id=actor.id, payload=f"{user.username}:{user.role}"
         )
@@ -712,6 +732,11 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not a directory")
 
         dest = directory / name
+        # Refuse to follow a symlink planted at the destination (write escape).
+        if dest.is_symlink():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="refusing to overwrite a symlink"
+            )
         size = 0
         try:
             with dest.open("wb") as handle:

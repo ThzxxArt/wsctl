@@ -7,7 +7,6 @@ from pathlib import Path
 import pyotp
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
 
 from wsctl.core import ssh, tmux
 from wsctl.core.config import load_settings
@@ -114,13 +113,11 @@ def test_ws_rejects_foreign_session(tmp_path: Path) -> None:
             assert "not authorized" in msg["msg"]
 
 
-def test_ws_unauthenticated_rejected(tmp_path: Path) -> None:
-    with (
-        TestClient(build_app(tmp_path)) as client,
-        pytest.raises(WebSocketDisconnect),
-        client.websocket_connect("/ws") as ws,
-    ):
-        ws.receive_text()
+def test_ws_unauthenticated_rejected_with_close_code(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client, client.websocket_connect("/ws") as ws:
+        message = ws.receive()
+        assert message["type"] == "websocket.close"
+        assert message["code"] == 4401
 
 
 # -- M3: security hardening -------------------------------------------
@@ -455,13 +452,14 @@ def test_share_attach_writable(tmp_path: Path) -> None:
             assert attached["writable"] is True
 
 
-def test_ws_without_auth_or_share_rejected(tmp_path: Path) -> None:
+def test_ws_origin_mismatch_rejected_with_close_code(tmp_path: Path) -> None:
     with (
         TestClient(build_app(tmp_path)) as client,
-        pytest.raises(WebSocketDisconnect),
-        client.websocket_connect("/ws") as ws,
+        client.websocket_connect("/ws", headers={"origin": "http://evil.example"}) as ws,
     ):
-        ws.receive_text()
+        message = ws.receive()
+        assert message["type"] == "websocket.close"
+        assert message["code"] == 4403
 
 
 # -- M9: SSH backend --------------------------------------------------
@@ -546,3 +544,45 @@ def test_config_reload_admin_only(tmp_path: Path) -> None:
     with TestClient(build_app(tmp_path)) as client:
         login(client, BOB)
         assert client.post("/api/config/reload").status_code == 403
+
+
+# -- M21: hardening after adversarial review --------------------------
+
+
+def test_empty_command_rejected(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.post("/api/sessions", json={"command": "   "}).status_code == 400
+
+
+def test_out_of_range_dimensions_rejected(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.post("/api/sessions", json={"cols": 100000}).status_code == 422
+        assert client.post("/api/sessions", json={"rows": 0}).status_code == 422
+
+
+def test_upload_rejects_symlink(tmp_path: Path) -> None:
+    app = build_app(tmp_path, file_root=tmp_path)
+    outside = tmp_path.parent / "outside-target.txt"
+    outside.write_text("secret")
+    (tmp_path / "link").symlink_to(outside)
+    try:
+        with TestClient(app) as client:
+            login(client, ADMIN)
+            r = client.post(
+                "/api/files/upload",
+                data={"path": ""},
+                files={"file": ("link", b"overwritten")},
+            )
+            assert r.status_code == 400
+            assert outside.read_text() == "secret"  # untouched
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_duplicate_user_conflict(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        r = client.post("/api/users", json={"username": "admin", "password": "x"})
+        assert r.status_code == 409

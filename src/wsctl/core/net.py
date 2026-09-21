@@ -16,11 +16,15 @@ def make_reuse_socket(host: str, port: int) -> socket.socket:
     infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
     family, socktype, proto, _, sockaddr = infos[0]
     sock = socket.socket(family, socktype, proto)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, "SO_REUSEPORT"):
-        with contextlib.suppress(OSError):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(sockaddr)
-    sock.listen(2048)
-    sock.set_inheritable(True)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.bind(sockaddr)
+        sock.listen(2048)
+        sock.set_inheritable(True)
+    except BaseException:
+        sock.close()
+        raise
     return sock

@@ -61,6 +61,7 @@ class SessionSpec:
 class _ClientEntry:
     client: Client
     writable: bool = True
+    share: str | None = None
     joined_at: float = field(default_factory=time.time)
 
 
@@ -165,7 +166,9 @@ class TermSession:
 
     # -- client attachment ---------------------------------------------
 
-    async def attach(self, client: Client, *, writable: bool = True) -> None:
+    async def attach(
+        self, client: Client, *, writable: bool = True, share: str | None = None
+    ) -> None:
         """Attach a client, replaying buffered output first.
 
         Replay is enqueued and the client registered while holding the same
@@ -179,7 +182,8 @@ class TermSession:
             if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
                 raise ClientGone("session has reached its client limit")
             replay = self._scrollback.snapshot()
-            self._clients[id(client)] = _ClientEntry(client, writable=writable)
+            self._clients[id(client)] = _ClientEntry(client, writable=writable, share=share)
+            self.last_active = time.time()
             if replay:
                 client.put(replay)
             client.put(
@@ -272,8 +276,8 @@ class TermSession:
     def resize(self, cols: int, rows: int) -> None:
         if self.closed:
             return
-        cols = max(1, cols)
-        rows = max(1, rows)
+        cols = min(max(1, cols), 1000)
+        rows = min(max(1, rows), 1000)
         self.spec.cols = cols
         self.spec.rows = rows
         self._pty.resize(cols, rows)
@@ -285,6 +289,9 @@ class TermSession:
                 self._recorder.output(data)
             dead: list[int] = []
             for key, entry in self._clients.items():
+                if entry.share is not None and not self.share_valid(entry.share):
+                    dead.append(key)
+                    continue
                 try:
                     entry.client.put(data)
                 except ClientGone:

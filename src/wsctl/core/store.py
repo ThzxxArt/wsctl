@@ -217,6 +217,14 @@ class Store:
             )
         return cur.rowcount > 0
 
+    def user_set_disabled(self, username: str, disabled: bool) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE users SET disabled = ? WHERE username = ?",
+                (1 if disabled else 0, username),
+            )
+        return cur.rowcount > 0
+
     def user_set_totp(self, username: str, secret: str) -> bool:
         with self._lock, self._conn:
             cur = self._conn.execute(
@@ -288,7 +296,11 @@ class Store:
             self._conn.execute(
                 "UPDATE auth_sessions SET last_seen = ? WHERE token_hash = ?", (now, token_hash)
             )
-        return self.user_get_by_id(int(row["user_id"]))
+        user = self.user_get_by_id(int(row["user_id"]))
+        if user is not None and user.disabled:
+            self.delete_auth_session(token)
+            return None
+        return user
 
     def delete_auth_session(self, token: str) -> None:
         with self._lock, self._conn:
