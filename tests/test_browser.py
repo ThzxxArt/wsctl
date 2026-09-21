@@ -158,6 +158,11 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click("#settings-btn")
             page.select_option("#set-theme", "light")
             assert page.get_attribute("html", "data-theme") == "light"
+
+            # terminal theme gallery (theme marketplace) applies a theme
+            page.click(".theme-swatch:has-text('dracula')")
+            stored = page.evaluate("() => JSON.parse(localStorage.getItem('wsctl-prefs'))")
+            assert stored["termTheme"] == "dracula"
             page.click("#settings-close")
 
             # record the session, then replay it in the asciinema player

@@ -86,6 +86,14 @@
           <option value="18">18</option>
         </select>
       </label>
+      <div class="hotkey-title">Terminal theme</div>
+      <div id="theme-gallery" class="theme-gallery"></div>
+      <details class="custom-theme">
+        <summary>custom theme</summary>
+        <input id="custom-theme-name" placeholder="name" />
+        <textarea id="custom-theme-json" rows="3" placeholder='{"background":"#000","foreground":"#fff"}'></textarea>
+        <button id="custom-theme-add" type="button" class="text-btn">add theme</button>
+      </details>
       <div class="hotkey-title">Shortcuts</div>
       <div id="hotkey-list" class="hotkey-list"></div>
       <button id="hotkeys-reset" type="button" class="text-btn">reset shortcuts</button>

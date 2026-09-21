@@ -43,6 +43,10 @@
     zmodemBtn: document.getElementById("zmodem-btn"),
     hotkeyList: document.getElementById("hotkey-list"),
     hotkeysReset: document.getElementById("hotkeys-reset"),
+    themeGallery: document.getElementById("theme-gallery"),
+    customThemeName: document.getElementById("custom-theme-name"),
+    customThemeJson: document.getElementById("custom-theme-json"),
+    customThemeAdd: document.getElementById("custom-theme-add"),
   };
 
   const DEFAULT_KEYS = {
@@ -74,21 +78,83 @@
   };
 
   const THEMES = {
-    dark: { background: "#10131a", foreground: "#d7dae0" },
-    light: { background: "#f6f7f9", foreground: "#1b2029" },
+    dark: { background: "#10131a", foreground: "#d7dae0", cursor: "#4f9cf9", selectionBackground: "#2a3446" },
+    light: { background: "#f6f7f9", foreground: "#1b2029", cursor: "#2f6fd0", selectionBackground: "#cfd8e6" },
+    dracula: {
+      background: "#282a36", foreground: "#f8f8f2", cursor: "#f8f8f2", selectionBackground: "#44475a",
+      black: "#21222c", red: "#ff5555", green: "#50fa7b", yellow: "#f1fa8c",
+      blue: "#bd93f9", magenta: "#ff79c6", cyan: "#8be9fd", white: "#f8f8f2",
+      brightBlack: "#6272a4", brightRed: "#ff6e6e", brightGreen: "#69ff94", brightYellow: "#ffffa5",
+      brightBlue: "#d6acff", brightMagenta: "#ff92df", brightCyan: "#a4ffff", brightWhite: "#ffffff",
+    },
+    solarized_dark: {
+      background: "#002b36", foreground: "#839496", cursor: "#93a1a1", selectionBackground: "#073642",
+      black: "#073642", red: "#dc322f", green: "#859900", yellow: "#b58900",
+      blue: "#268bd2", magenta: "#d33682", cyan: "#2aa198", white: "#eee8d5",
+      brightBlack: "#586e75", brightRed: "#cb4b16", brightGreen: "#586e75", brightYellow: "#657b83",
+      brightBlue: "#839496", brightMagenta: "#6c71c4", brightCyan: "#93a1a1", brightWhite: "#fdf6e3",
+    },
+    solarized_light: {
+      background: "#fdf6e3", foreground: "#657b83", cursor: "#586e75", selectionBackground: "#eee8d5",
+      black: "#073642", red: "#dc322f", green: "#859900", yellow: "#b58900",
+      blue: "#268bd2", magenta: "#d33682", cyan: "#2aa198", white: "#eee8d5",
+      brightBlack: "#002b36", brightRed: "#cb4b16", brightGreen: "#586e75", brightYellow: "#657b83",
+      brightBlue: "#839496", brightMagenta: "#6c71c4", brightCyan: "#93a1a1", brightWhite: "#fdf6e3",
+    },
+    nord: {
+      background: "#2e3440", foreground: "#d8dee9", cursor: "#d8dee9", selectionBackground: "#434c5e",
+      black: "#3b4252", red: "#bf616a", green: "#a3be8c", yellow: "#ebcb8b",
+      blue: "#81a1c1", magenta: "#b48ead", cyan: "#88c0d0", white: "#e5e9f0",
+      brightBlack: "#4c566a", brightRed: "#bf616a", brightGreen: "#a3be8c", brightYellow: "#ebcb8b",
+      brightBlue: "#81a1c1", brightMagenta: "#b48ead", brightCyan: "#8fbcbb", brightWhite: "#eceff4",
+    },
+    gruvbox: {
+      background: "#282828", foreground: "#ebdbb2", cursor: "#ebdbb2", selectionBackground: "#504945",
+      black: "#282828", red: "#cc241d", green: "#98971a", yellow: "#d79921",
+      blue: "#458588", magenta: "#b16286", cyan: "#689d6a", white: "#a89984",
+      brightBlack: "#928374", brightRed: "#fb4934", brightGreen: "#b8bb26", brightYellow: "#fabd2f",
+      brightBlue: "#83a598", brightMagenta: "#d3869b", brightCyan: "#8ec07c", brightWhite: "#ebdbb2",
+    },
+    monokai: {
+      background: "#272822", foreground: "#f8f8f2", cursor: "#f8f8f0", selectionBackground: "#49483e",
+      black: "#272822", red: "#f92672", green: "#a6e22e", yellow: "#f4bf75",
+      blue: "#66d9ef", magenta: "#ae81ff", cyan: "#a1efe4", white: "#f8f8f2",
+      brightBlack: "#75715e", brightRed: "#f92672", brightGreen: "#a6e22e", brightYellow: "#f4bf75",
+      brightBlue: "#66d9ef", brightMagenta: "#ae81ff", brightCyan: "#a1efe4", brightWhite: "#f9f8f5",
+    },
+    one_dark: {
+      background: "#282c34", foreground: "#abb2bf", cursor: "#528bff", selectionBackground: "#3e4451",
+      black: "#282c34", red: "#e06c75", green: "#98c379", yellow: "#e5c07b",
+      blue: "#61afef", magenta: "#c678dd", cyan: "#56b6c2", white: "#abb2bf",
+      brightBlack: "#5c6370", brightRed: "#e06c75", brightGreen: "#98c379", brightYellow: "#e5c07b",
+      brightBlue: "#61afef", brightMagenta: "#c678dd", brightCyan: "#56b6c2", brightWhite: "#ffffff",
+    },
+    tokyo_night: {
+      background: "#1a1b26", foreground: "#c0caf5", cursor: "#c0caf5", selectionBackground: "#33467c",
+      black: "#15161e", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
+      blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
+      brightBlack: "#414868", brightRed: "#f7768e", brightGreen: "#9ece6a", brightYellow: "#e0af68",
+      brightBlue: "#7aa2f7", brightMagenta: "#bb9af7", brightCyan: "#7dcfff", brightWhite: "#c0caf5",
+    },
   };
 
   const prefs = Object.assign(
-    { theme: "dark", fontSize: 14, keybindings: {} },
+    { theme: "dark", termTheme: "dark", fontSize: 14, keybindings: {}, customThemes: {} },
     JSON.parse(localStorage.getItem("wsctl-prefs") || "{}"),
   );
   prefs.keybindings = Object.assign({}, DEFAULT_KEYS, prefs.keybindings);
+  prefs.customThemes = prefs.customThemes || {};
+
+  function resolveTheme() {
+    if (prefs.customThemes[prefs.termTheme]) return prefs.customThemes[prefs.termTheme];
+    return THEMES[prefs.termTheme] || THEMES.dark;
+  }
 
   function applyPrefs() {
     document.documentElement.dataset.theme = prefs.theme;
     for (const s of sessions.values()) {
       s.term.options.fontSize = prefs.fontSize;
-      s.term.options.theme = THEMES[prefs.theme] || THEMES.dark;
+      s.term.options.theme = resolveTheme();
       try { s.fit.fit(); } catch { /* hidden */ }
     }
     localStorage.setItem("wsctl-prefs", JSON.stringify(prefs));
@@ -235,7 +301,7 @@
 
     const term = new Terminal(Object.assign({}, TERM_OPTIONS, {
       fontSize: prefs.fontSize,
-      theme: THEMES[prefs.theme] || THEMES.dark,
+      theme: resolveTheme(),
     }));
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
@@ -694,6 +760,44 @@
     applyPrefs();
   });
   renderHotkeys();
+
+  function renderThemeGallery() {
+    els.themeGallery.innerHTML = "";
+    const names = Object.keys(THEMES).concat(Object.keys(prefs.customThemes));
+    for (const name of names) {
+      const theme = prefs.customThemes[name] || THEMES[name];
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "theme-swatch" + (prefs.termTheme === name ? " active" : "");
+      button.style.background = theme.background || "#000";
+      button.style.color = theme.foreground || "#fff";
+      button.textContent = name;
+      button.addEventListener("click", () => {
+        prefs.termTheme = name;
+        applyPrefs();
+        renderThemeGallery();
+      });
+      els.themeGallery.appendChild(button);
+    }
+  }
+
+  els.customThemeAdd.addEventListener("click", () => {
+    const name = els.customThemeName.value.trim();
+    if (!name) return;
+    try {
+      const theme = JSON.parse(els.customThemeJson.value);
+      if (!theme || typeof theme !== "object") throw new Error("invalid");
+      prefs.customThemes[name] = theme;
+      prefs.termTheme = name;
+      els.customThemeName.value = "";
+      els.customThemeJson.value = "";
+      applyPrefs();
+      renderThemeGallery();
+    } catch {
+      setConnection("invalid theme JSON", "bad");
+    }
+  });
+  renderThemeGallery();
 
   els.setTheme.value = prefs.theme;
   els.setFontsize.value = String(prefs.fontSize);
