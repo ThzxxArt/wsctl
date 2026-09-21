@@ -38,6 +38,7 @@ CLI (wsctl connect) ┘             │
 - 🔐 **SSH sessions** — run a session as an `ssh` connection to a remote host
 - ⏺️ **Recording** — capture sessions as asciinema cast files (optionally
   auto-record every session)
+- 🔔 **Webhooks** — POST every audit event to a URL of your choice
 - 📁 **Web file panel** — browse, download and upload within a configured root
 - 📝 **Auditing** — logins, sessions, file transfers and admin actions recorded
 - 🛡️ **Security built in** — Argon2, TOTP 2FA, login rate limiting, CIDR IP
@@ -110,6 +111,7 @@ wsctl session recording ID [-o FILE]  Download a recording
 wsctl user add|list|del|passwd|role|totp
 wsctl audit                 Show the audit log (admin)
 wsctl config show|path|edit Inspect or edit configuration
+wsctl config set KEY VALUE  Set a configuration value
 wsctl version
 ```
 
@@ -153,6 +155,8 @@ log_json = false
 
 auto_record = false          # record every session to data_dir/recordings
 record_input = false         # include typed input in recordings
+
+webhook_url = "https://example.com/wsctl-hook"  # POST audit events here (optional)
 
 ssl_cert = "/etc/wsctl/cert.pem"
 ssl_key = "/etc/wsctl/key.pem"

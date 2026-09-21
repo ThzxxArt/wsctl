@@ -115,8 +115,8 @@ users(id, username, password_hash, role[admin|user], totp_secret, disabled, crea
 
 auth_sessions(id, user_id, token_hash, ip, user_agent, exp, last_seen)   -- 登录态
 
-term_sessions(id, name, owner_id, backend[local|ssh], command, argv, cwd, env,
-              created_at, last_active, idle_timeout, max_life, status)    -- 终端会话元数据
+term_sessions(id, name, owner_id, backend[local|tmux|ssh], command, argv, env,
+              cwd, idle_timeout, max_life, status, created_at, last_active)
 
 audit_logs(id, user_id, term_session_id, event, payload, ip, ts)
 
@@ -124,6 +124,7 @@ settings(key, value)
 ```
 
 > 命名约定：`auth_sessions` 指**登录态**，`term_sessions` 指**终端会话**。
+> 模式版本 2；旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补齐新列。
 
 ## 6. CLI 命令树（已实现）
 
@@ -203,18 +204,21 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 | **M9** | SSH 后端：`backend=ssh` 结构化目标（host/user/port/identity/options/远端命令） |
 | **M10** | 录制回放：asciinema cast v2 录制（可含输入）+ 自动录制 + 下载 API/CLI |
 | **M11** | 优雅重启：SO_REUSEPORT 监听 socket，新实例先接管再停旧实例（零停机） |
+| **M12** | 杂项：`settings` 表 + `term_sessions` 完整字段（含迁移）、Webhook、`config set`、主题/字体可配、移动端适配 |
 
 ## 10.1 实现状态（截至 0.1.0）
 
-**已实现**：M0–M11 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
+**已实现**：M0–M12 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
 文件面板（防穿越 + 上传限流）、`/metrics`、JSON 日志、`connect` 瘦客户端、
 会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测、**可选 tmux 后端
 （会话跨服务重启恢复）**、**只读分享（share token + 二维码 + 匿名观看）**、
-**SSH 后端**、**asciinema 录制回放**、**SO_REUSEPORT 零停机重启**。
+**SSH 后端**、**asciinema 录制回放**、**SO_REUSEPORT 零停机重启**、
+**Webhook**、**`settings` 表与完整 `term_sessions` 字段（含迁移）**、
+**主题/字体可配 + 移动端适配**、**`config set`**。
 
-**尚未实现（见 §11 Backlog）**：可写分享、`settings` 表与 `term_sessions`
-完整字段、主题/字体/快捷键可配、移动端专项适配、`config set`、录制的前端回放 UI。
+**尚未实现（见 §11 Backlog）**：可写分享、录制的前端回放 UI、
+`config set` 之外的运行时热更新。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
@@ -222,9 +226,8 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 
 ## 11. Backlog（后续）
 
-ZMODEM/lrzsz · Sixel · Webhook · 可写分享 · 录制前端回放 UI ·
-主题市场 · `settings` 表与 `term_sessions` 完整字段 ·
-主题/字体/快捷键可配 · 移动端专项适配 · `config set`
+ZMODEM/lrzsz · Sixel · 可写分享 · 录制前端回放 UI · 主题市场 ·
+配置运行时热更新
 
 ## 12. 发布
 

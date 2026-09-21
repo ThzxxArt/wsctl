@@ -28,6 +28,11 @@
     shareRevoke: document.getElementById("share-revoke"),
     shareClose: document.getElementById("share-close"),
     shareNote: document.getElementById("share-note"),
+    settingsBtn: document.getElementById("settings-btn"),
+    settingsOverlay: document.getElementById("settings-overlay"),
+    setTheme: document.getElementById("set-theme"),
+    setFontsize: document.getElementById("set-fontsize"),
+    settingsClose: document.getElementById("settings-close"),
   };
 
   const params = new URLSearchParams(location.search);
@@ -47,6 +52,26 @@
     theme: { background: "#10131a", foreground: "#d7dae0" },
     scrollback: 10000,
   };
+
+  const THEMES = {
+    dark: { background: "#10131a", foreground: "#d7dae0" },
+    light: { background: "#f6f7f9", foreground: "#1b2029" },
+  };
+
+  const prefs = Object.assign(
+    { theme: "dark", fontSize: 14 },
+    JSON.parse(localStorage.getItem("wsctl-prefs") || "{}"),
+  );
+
+  function applyPrefs() {
+    document.documentElement.dataset.theme = prefs.theme;
+    for (const s of sessions.values()) {
+      s.term.options.fontSize = prefs.fontSize;
+      s.term.options.theme = THEMES[prefs.theme] || THEMES.dark;
+      try { s.fit.fit(); } catch { /* hidden */ }
+    }
+    localStorage.setItem("wsctl-prefs", JSON.stringify(prefs));
+  }
 
   function wsUrl(s) {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -178,7 +203,10 @@
     pane.className = "term-pane";
     els.wrap.appendChild(pane);
 
-    const term = new Terminal(TERM_OPTIONS);
+    const term = new Terminal(Object.assign({}, TERM_OPTIONS, {
+      fontSize: prefs.fontSize,
+      theme: THEMES[prefs.theme] || THEMES.dark,
+    }));
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     if (window.WebLinksAddon) term.loadAddon(new WebLinksAddon.WebLinksAddon());
@@ -404,6 +432,23 @@
       showShareNote(String(err.message || err));
     }
   });
+
+  // -- preferences -----------------------------------------------------
+
+  els.setTheme.value = prefs.theme;
+  els.setFontsize.value = String(prefs.fontSize);
+  els.settingsBtn.addEventListener("click", () => els.settingsOverlay.classList.remove("hidden"));
+  els.settingsClose.addEventListener("click", () =>
+    els.settingsOverlay.classList.add("hidden"));
+  els.setTheme.addEventListener("change", () => {
+    prefs.theme = els.setTheme.value;
+    applyPrefs();
+  });
+  els.setFontsize.addEventListener("change", () => {
+    prefs.fontSize = Number(els.setFontsize.value);
+    applyPrefs();
+  });
+  applyPrefs();
 
   // -- file panel ------------------------------------------------------
 

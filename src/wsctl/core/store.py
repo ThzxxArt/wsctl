@@ -7,6 +7,7 @@ and ``sqlite3`` with WAL mode is plenty fast for a single-server deployment.
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import sqlite3
 import threading
@@ -17,10 +18,15 @@ from typing import Any
 
 from .passwords import hash_password, verify_password
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
@@ -52,7 +58,11 @@ CREATE TABLE IF NOT EXISTS term_sessions (
     owner_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
     backend     TEXT NOT NULL DEFAULT 'local',
     command     TEXT,
+    argv        TEXT,
+    env         TEXT,
     cwd         TEXT,
+    idle_timeout REAL,
+    max_life    REAL,
     status      TEXT NOT NULL DEFAULT 'running',
     created_at  REAL NOT NULL,
     last_active REAL NOT NULL
@@ -93,15 +103,21 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._sink: Any = None
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        self._migrate()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def set_event_sink(self, sink: Any) -> None:
+        """Register a callback invoked with every audit event (e.g. a webhook)."""
+        self._sink = sink
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
@@ -109,6 +125,29 @@ class Store:
             self._conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
+            )
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema (idempotent)."""
+        additions = {
+            "term_sessions": {
+                "argv": "TEXT",
+                "env": "TEXT",
+                "idle_timeout": "REAL",
+                "max_life": "REAL",
+            }
+        }
+        with self._lock, self._conn:
+            for table, columns in additions.items():
+                existing = {
+                    str(row["name"])
+                    for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for name, decl in columns.items():
+                    if name not in existing:
+                        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            self._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
             )
 
     def _row_to_user(self, row: sqlite3.Row) -> User:
@@ -274,18 +313,39 @@ class Store:
         owner_id: int | None,
         backend: str = "local",
         command: str | None = None,
+        argv: list[str] | None = None,
+        env: dict[str, str] | None = None,
         cwd: str | None = None,
+        idle_timeout: float | None = None,
+        max_life: float | None = None,
         status: str = "running",
     ) -> None:
         now = time.time()
+        argv_json = json.dumps(argv) if argv is not None else None
+        env_json = json.dumps(env) if env is not None else None
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO term_sessions"
-                "(id, name, owner_id, backend, command, cwd, status, created_at, last_active)"
-                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "(id, name, owner_id, backend, command, argv, env, cwd, idle_timeout,"
+                " max_life, status, created_at, last_active)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET"
                 " name=excluded.name, status=excluded.status, last_active=excluded.last_active",
-                (sid, name, owner_id, backend, command, cwd, status, now, now),
+                (
+                    sid,
+                    name,
+                    owner_id,
+                    backend,
+                    command,
+                    argv_json,
+                    env_json,
+                    cwd,
+                    idle_timeout,
+                    max_life,
+                    status,
+                    now,
+                    now,
+                ),
             )
 
     def term_session_set_status(self, sid: str, status: str) -> None:
@@ -324,6 +384,26 @@ class Store:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    # -- settings ------------------------------------------------------
+
+    def setting_get(self, key: str, default: str | None = None) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def setting_set(self, key: str, value: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def setting_all(self) -> dict[str, str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
+
     # -- audit ---------------------------------------------------------
 
     def log_event(
@@ -335,11 +415,23 @@ class Store:
         payload: str | None = None,
         ip: str | None = None,
     ) -> None:
+        now = time.time()
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO audit_logs(user_id, term_session_id, event, payload, ip, ts)"
                 " VALUES(?, ?, ?, ?, ?, ?)",
-                (user_id, term_session_id, event, payload, ip, time.time()),
+                (user_id, term_session_id, event, payload, ip, now),
+            )
+        if self._sink is not None:
+            self._sink(
+                {
+                    "event": event,
+                    "user_id": user_id,
+                    "term_session_id": term_session_id,
+                    "payload": payload,
+                    "ip": ip,
+                    "ts": now,
+                }
             )
 
     def recent_audit(self, limit: int = 100) -> list[dict[str, Any]]:

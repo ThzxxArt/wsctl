@@ -8,6 +8,7 @@ import secrets
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -397,6 +398,38 @@ def config_edit(config: Annotated[Path | None, typer.Option("--config", "-c")] =
         subprocess.call([editor, str(path)])
     except OSError as exc:
         _fail(f"cannot launch editor '{editor}': {exc}")
+
+
+@config_app.command("set")
+def config_set(
+    key: Annotated[str, typer.Argument(help="Configuration key.")],
+    value: Annotated[
+        str, typer.Argument(help='TOML value, e.g. 8080, "text", true, ["a", "b"]')
+    ],
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+) -> None:
+    """Set a configuration value in the config file."""
+    settings = _settings_from(config)
+    try:
+        tomllib.loads(f"__value__ = {value}")
+    except tomllib.TOMLDecodeError:
+        _fail('value must be valid TOML, e.g. 8080, "text", true, ["a", "b"]')
+
+    path = settings.config_path
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    replaced = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if "=" in stripped and stripped.split("=", 1)[0].strip() == key:
+            lines[index] = f"{key} = {value}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{key} = {value}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    console.print(f"[green]Set[/] {key} = {value}  [dim]({path})[/]")
 
 
 @session_app.command("list")

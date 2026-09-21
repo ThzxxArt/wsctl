@@ -37,6 +37,7 @@ from wsctl.core.metrics import Metrics
 from wsctl.core.ratelimit import RateLimiter
 from wsctl.core.session import SessionManager, SessionSpec, TermSession
 from wsctl.core.store import Store, User
+from wsctl.core.webhook import WebhookDispatcher
 
 from .security import (
     COOKIE_NAME,
@@ -185,6 +186,8 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("wsctl %s listening on %s:%s", __version__, settings.host, settings.port)
         maint = asyncio.create_task(_maintenance())
+        if webhook is not None:
+            webhook.start()
         await _restore_tmux_sessions(app)
         if startup_command:
             argv = shlex.split(startup_command)
@@ -209,6 +212,8 @@ def create_app(
             maint.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await maint
+            if webhook is not None:
+                await webhook.stop()
             await app.state.manager.shutdown(preserve=settings.tmux_preserve_on_shutdown)
             app.state.store.close()
 
@@ -218,6 +223,10 @@ def create_app(
     app.state.settings = settings
     app.state.store = store or Store(settings.db_path)
     app.state.manager = manager or SessionManager()
+
+    webhook = WebhookDispatcher(settings.webhook_url) if settings.webhook_url else None
+    if webhook is not None:
+        app.state.store.set_event_sink(webhook.emit)
 
     metrics = Metrics()
     app.state.metrics = metrics
@@ -432,7 +441,11 @@ def create_app(
             owner_id=user.id,
             backend=backend,
             command=body.command,
+            argv=spec.argv,
+            env=spec.env,
             cwd=spec.cwd,
+            idle_timeout=spec.idle_timeout,
+            max_life=spec.max_life,
         )
         app.state.store.log_event(
             "session_create", user_id=user.id, term_session_id=session.id, payload=name

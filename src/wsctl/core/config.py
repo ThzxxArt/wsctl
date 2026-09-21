@@ -101,6 +101,7 @@ class Settings(BaseSettings):
 
     auto_record: bool = False
     record_input: bool = False
+    webhook_url: str | None = None
 
     @property
     def db_path(self) -> Path:

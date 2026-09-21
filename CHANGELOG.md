@@ -81,6 +81,15 @@ RBAC, auditing, a file panel and observability.
 - `reuse_port` / `--reuse-port` binds with `SO_REUSEPORT` so a new instance can
   take over the port before the old one exits (no connection-refused window).
 
+**Miscellaneous**
+- `settings` table and full `term_sessions` columns (`argv`, `env`,
+  `idle_timeout`, `max_life`) with an idempotent schema migration.
+- Optional webhooks (`webhook_url`): every audit event is POSTed as JSON by a
+  background dispatcher.
+- `wsctl config set KEY VALUE` (validated TOML) for editing the config file.
+- Web UI preferences: dark/light theme and font size, persisted locally, plus
+  responsive/mobile layout adjustments.
+
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
 - GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release

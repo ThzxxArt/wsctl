@@ -189,6 +189,7 @@ body { display: flex; flex-direction: column; }
 body.shared #new-tab,
 body.shared #files-toggle,
 body.shared #share-btn,
+body.shared #settings-btn,
 body.shared #logout { display: none; }
 .readonly-badge {
   color: #e0a24f;
@@ -197,5 +198,34 @@ body.shared #logout { display: none; }
   padding: 1px 6px;
   font-size: 11px;
 }
+
+html[data-theme="light"] {
+  --bg: #f6f7f9;
+  --bg-2: #eceef2;
+  --bg-3: #e2e5ea;
+  --fg: #1b2029;
+  --muted: #5c6675;
+  --accent: #2f6fd0;
+  --border: #d3d8e0;
+  --danger: #c0392b;
+}
+
+.login-card select {
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 14px;
+}
+
+@media (max-width: 640px) {
+  .topbar { height: auto; flex-wrap: wrap; padding: 6px 8px; gap: 6px; }
+  .tabs { max-width: 100%; order: 3; width: 100%; }
+  .spacer { display: none; }
+  .file-panel { width: 100%; top: 0; }
+  .share-card { width: 90vw; }
+}
+
 
 

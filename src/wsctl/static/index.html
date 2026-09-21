@@ -16,6 +16,7 @@
     <div class="spacer"></div>
     <span id="connection" class="status">idle</span>
     <button id="share-btn" class="text-btn" title="Share session">share</button>
+    <button id="settings-btn" class="text-btn" title="Settings">settings</button>
     <button id="files-toggle" class="text-btn" title="Files">files</button>
     <span id="whoami" class="whoami"></span>
     <button id="logout" class="text-btn" title="Sign out">sign out</button>
@@ -59,6 +60,30 @@
         <button id="share-close" type="button">close</button>
       </div>
       <p id="share-note" class="error hidden"></p>
+    </div>
+  </div>
+
+  <div id="settings-overlay" class="overlay hidden">
+    <div class="login-card">
+      <h1>Settings</h1>
+      <label>Theme
+        <select id="set-theme">
+          <option value="dark">dark</option>
+          <option value="light">light</option>
+        </select>
+      </label>
+      <label>Font size
+        <select id="set-fontsize">
+          <option value="12">12</option>
+          <option value="13">13</option>
+          <option value="14">14</option>
+          <option value="16">16</option>
+          <option value="18">18</option>
+        </select>
+      </label>
+      <div class="share-actions">
+        <button id="settings-close" type="button">close</button>
+      </div>
     </div>
   </div>
 

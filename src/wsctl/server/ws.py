@@ -200,7 +200,11 @@ async def _handshake(
             owner_id=user.id,
             backend=spec.backend,
             command=None,
+            argv=spec.argv,
+            env=spec.env,
             cwd=spec.cwd,
+            idle_timeout=spec.idle_timeout,
+            max_life=spec.max_life,
         )
         store.log_event(
             "session_create",

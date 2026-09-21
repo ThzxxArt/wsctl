@@ -98,3 +98,42 @@ def test_totp_secret_lifecycle(tmp_path: Path) -> None:
         assert not store.user_set_totp("nobody", "X")
     finally:
         store.close()
+
+
+def test_settings_table(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        assert store.setting_get("k") is None
+        assert store.setting_get("k", "default") == "default"
+        store.setting_set("k", "v1")
+        store.setting_set("k", "v2")
+        assert store.setting_get("k") == "v2"
+        assert store.setting_all() == {"k": "v2"}
+    finally:
+        store.close()
+
+
+def test_term_session_full_fields(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        store.term_session_upsert(
+            "s1",
+            name="shell",
+            owner_id=None,
+            backend="local",
+            command="bash",
+            argv=["bash", "-l"],
+            env={"TERM": "xterm"},
+            cwd="/tmp",
+            idle_timeout=60.0,
+            max_life=3600.0,
+        )
+        rows = store.term_session_list()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["argv"] == '["bash", "-l"]'
+        assert row["env"] == '{"TERM": "xterm"}'
+        assert row["idle_timeout"] == 60.0
+        assert row["max_life"] == 3600.0
+    finally:
+        store.close()
