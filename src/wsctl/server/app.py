@@ -160,6 +160,7 @@ async def _restore_tmux_sessions(app: FastAPI) -> None:
             idle_timeout=settings.idle_timeout,
             max_life=settings.max_life,
             max_clients=settings.session_max_clients,
+            memory_limit=settings.session_memory_limit,
             scrollback_bytes=settings.scrollback_bytes,
         )
         try:
@@ -222,6 +223,7 @@ def create_app(
                 idle_timeout=settings.idle_timeout,
                 max_life=settings.max_life,
                 max_clients=settings.session_max_clients,
+                memory_limit=settings.session_memory_limit,
                 scrollback_bytes=settings.scrollback_bytes,
             )
             session = await app.state.manager.create(spec)
@@ -263,6 +265,11 @@ def create_app(
         "wsctl_clients",
         "Current number of attached terminal clients",
         lambda: float(sum(s.client_count for s in app.state.manager.list_sessions())),
+    )
+    metrics.collect(
+        "wsctl_session_bytes",
+        "Approximate bytes buffered across all sessions",
+        lambda: float(sum(s.memory_usage() for s in app.state.manager.list_sessions())),
     )
 
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
@@ -451,6 +458,7 @@ def create_app(
             idle_timeout=settings.idle_timeout,
             max_life=settings.max_life,
             max_clients=settings.session_max_clients,
+            memory_limit=settings.session_memory_limit,
             scrollback_bytes=settings.scrollback_bytes,
         )
         session = await manager.create(spec, owner_id=user.id)

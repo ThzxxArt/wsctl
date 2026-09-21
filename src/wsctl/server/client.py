@@ -21,21 +21,42 @@ class WsClient:
     keep up, so it is dropped: it can reconnect and receive a scrollback replay.
     """
 
-    def __init__(self, websocket: WebSocket, *, max_pending: int = MAX_PENDING) -> None:
+    def __init__(
+        self,
+        websocket: WebSocket,
+        *,
+        max_pending: int = MAX_PENDING,
+        max_bytes: int = 0,
+    ) -> None:
         self._ws = websocket
         self._queue: asyncio.Queue[bytes | dict[str, Any] | None] = asyncio.Queue(
             maxsize=max_pending
         )
+        self._max_bytes = max_bytes
+        self._pending_bytes = 0
         self._closed = False
+
+    @property
+    def pending_bytes(self) -> int:
+        return self._pending_bytes
 
     def put(self, item: bytes | dict[str, Any]) -> None:
         if self._closed:
             raise ClientGone("client closed")
+        if (
+            isinstance(item, bytes)
+            and self._max_bytes > 0
+            and self._pending_bytes + len(item) > self._max_bytes
+        ):
+            self._closed = True
+            raise ClientGone("client byte limit exceeded")
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
             self._closed = True
             raise ClientGone("client backlog overflow") from None
+        if isinstance(item, bytes):
+            self._pending_bytes += len(item)
 
     def close(self) -> None:
         if self._closed:
@@ -52,6 +73,7 @@ class WsClient:
                     return
                 if isinstance(item, bytes):
                     await self._ws.send_bytes(item)
+                    self._pending_bytes = max(0, self._pending_bytes - len(item))
                 else:
                     await self._ws.send_json(item)
         except asyncio.CancelledError:

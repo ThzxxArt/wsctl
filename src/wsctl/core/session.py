@@ -53,6 +53,7 @@ class SessionSpec:
     idle_timeout: float | None = None
     max_life: float | None = None
     max_clients: int = 0
+    memory_limit: int = 0
     scrollback_bytes: int = DEFAULT_MAX_BYTES
 
 
@@ -85,6 +86,7 @@ class TermSession:
         self._on_close = on_close
         self._loop = loop
         self._scrollback = Scrollback(spec.scrollback_bytes)
+        self._memory_limit = spec.memory_limit
         self._clients: dict[int, _ClientEntry] = {}
         self._lock = asyncio.Lock()
         self._share_token: str | None = None
@@ -124,6 +126,26 @@ class TermSession:
 
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
+
+    def memory_usage(self) -> int:
+        """Approximate bytes held by this session (scrollback + client backlogs)."""
+        total = self._scrollback.size
+        for entry in self._clients.values():
+            total += int(getattr(entry.client, "pending_bytes", 0))
+        return total
+
+    def _enforce_memory_limit(self) -> None:
+        if self._memory_limit <= 0:
+            return
+        while self._clients and self.memory_usage() > self._memory_limit:
+            key, entry = max(
+                self._clients.items(),
+                key=lambda kv: int(getattr(kv[1].client, "pending_bytes", 0)),
+            )
+            self._clients.pop(key, None)
+            close = getattr(entry.client, "close", None)
+            if callable(close):
+                close()
 
     def rename(self, name: str) -> str:
         """Rename the session; blank names are ignored. Returns the new name."""
@@ -269,6 +291,7 @@ class TermSession:
                     dead.append(key)
             for key in dead:
                 self._clients.pop(key, None)
+            self._enforce_memory_limit()
 
     async def _notify(self, message: dict[str, Any]) -> None:
         async with self._lock:

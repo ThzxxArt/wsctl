@@ -213,3 +213,33 @@ async def test_recording_captures_output(tmp_path: Path) -> None:
     text = path.read_text()
     assert '"o"' in text and "REC-MARK" in text
     assert '"i"' in text
+
+
+class PendingClient:
+    def __init__(self, pending: int = 0) -> None:
+        self.pending_bytes = pending
+        self.items: list[object] = []
+        self.closed = False
+
+    def put(self, item: object) -> None:
+        self.items.append(item)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+async def test_memory_limit_drops_largest_backlog() -> None:
+    manager = SessionManager()
+    session = await manager.create(
+        SessionSpec(name="sh", argv=[SHELL], memory_limit=1000, scrollback_bytes=1000)
+    )
+    big = PendingClient(pending=5000)
+    small = PendingClient(pending=10)
+    try:
+        await session.attach(big)
+        await session.attach(small)
+        session.write_input(b"echo mem\n")
+        assert await wait_for(lambda: big.closed, timeout=5.0)
+        assert not small.closed
+    finally:
+        await manager.shutdown()

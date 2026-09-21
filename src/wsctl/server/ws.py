@@ -63,6 +63,7 @@ def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
         idle_timeout=settings.idle_timeout,
         max_life=settings.max_life,
         max_clients=settings.session_max_clients,
+        memory_limit=settings.session_memory_limit,
         scrollback_bytes=settings.scrollback_bytes,
     )
 
@@ -99,7 +100,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     metrics.inc("wsctl_ws_connections_total")
 
-    client = WsClient(websocket)
+    client = WsClient(websocket, max_bytes=settings.client_max_bytes)
     writer = asyncio.create_task(client.run())
     session: TermSession | None = None
     user_id = user.id if user is not None else None

@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     max_life: float | None = None
     max_sessions: int = 64
     session_max_clients: int = 0
+    session_memory_limit: int = 64 * 1024 * 1024
+    client_max_bytes: int = 8 * 1024 * 1024
     input_rate_limit: int = 0
     input_rate_burst: int = 0
     scrollback_bytes: int = DEFAULT_MAX_BYTES
@@ -165,6 +167,8 @@ HOT_FIELDS = frozenset(
         "max_life",
         "max_sessions",
         "session_max_clients",
+        "session_memory_limit",
+        "client_max_bytes",
         "input_rate_limit",
         "input_rate_burst",
         "scrollback_bytes",
