@@ -60,24 +60,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
           sudo apt-get update && sudo apt-get install -y tmux
-      - name: tmux path diagnostic
-        run: |
-          python - <<'PY'
-          import os, pty, subprocess, time
-          m, s = pty.openpty()
-          p = subprocess.Popen(
-              ["tmux", "new-session", "-A", "-s", "wsctl-probe", "/bin/sh"],
-              stdin=s, stdout=s, stderr=s, start_new_session=True,
-          )
-          os.close(s)
-          time.sleep(1.5)
-          ls = subprocess.run(["tmux", "ls"], capture_output=True, text=True)
-          print("harness tmux ls stdout:", repr(ls.stdout), "stderr:", repr(ls.stderr))
-          print("has-session rc:", subprocess.run(["tmux", "has-session", "-t", "wsctl-probe"]).returncode)
-          print("TMUX_TMPDIR:", os.environ.get("TMUX_TMPDIR"), "HOME:", os.environ.get("HOME"))
-          print("client alive:", p.poll() is None)
-          subprocess.run(["tmux", "kill-server"], check=False)
-          PY
-
       - name: Backend end-to-end scenarios
         run: python scripts/e2e/run_all.py

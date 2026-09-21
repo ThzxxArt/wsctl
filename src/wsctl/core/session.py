@@ -9,6 +9,7 @@ clients can rebuild their screen.
 from __future__ import annotations
 
 import asyncio
+import os
 import secrets
 import signal
 import time
@@ -103,13 +104,17 @@ class TermSession:
         self._record_input = False
         self.recording_path: Path | None = None
         argv = spec.argv
+        env = spec.env
         if spec.backend == "tmux":
             self._tmux_name = tmux.session_name(sid)
             argv = tmux.wrap_argv(self._tmux_name, spec.argv)
+            # tmux needs a usable TERM; a headless/CI environment may not set it.
+            env = dict(os.environ if env is None else env)
+            env.setdefault("TERM", "xterm-256color")
         self._pty: Pty = create_pty(
             argv,
             cwd=spec.cwd,
-            env=spec.env,
+            env=env,
             cols=spec.cols,
             rows=spec.rows,
             loop=loop,
