@@ -35,6 +35,7 @@ CLI (wsctl connect) ┘             │
 - 🔗 **Read-only sharing** — generate a share link + QR code; viewers watch but
   cannot type
 - 🧑💻 **CLI thin client** — `wsctl connect` bridges your local terminal to a server
+- 🔐 **SSH sessions** — run a session as an `ssh` connection to a remote host
 - 📁 **Web file panel** — browse, download and upload within a configured root
 - 📝 **Auditing** — logins, sessions, file transfers and admin actions recorded
 - 🛡️ **Security built in** — Argon2, TOTP 2FA, login rate limiting, CIDR IP
@@ -98,6 +99,7 @@ wsctl login URL             Authenticate and cache a token
 wsctl logout                Forget cached credentials
 wsctl session list          List sessions on a running server
 wsctl session new [-x CMD] [--backend tmux]  Create a session
+wsctl session new --ssh user@host [--ssh-port N] [--ssh-identity FILE]  SSH session
 wsctl session attach ID     Attach this terminal to a session
 wsctl session kill ID       Kill a session
 wsctl user add|list|del|passwd|role|totp

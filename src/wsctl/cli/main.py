@@ -412,19 +412,45 @@ def session_new(
     ] = None,
     cwd: Annotated[str | None, typer.Option("--cwd", help="Working directory.")] = None,
     backend: Annotated[
-        str | None, typer.Option("--backend", help="Backend: local or tmux.")
+        str | None, typer.Option("--backend", help="Backend: local, tmux or ssh.")
+    ] = None,
+    ssh_host: Annotated[
+        str | None, typer.Option("--ssh", help="SSH target host (implies --backend ssh).")
+    ] = None,
+    ssh_user: Annotated[str | None, typer.Option("--ssh-user", help="SSH user.")] = None,
+    ssh_port: Annotated[int | None, typer.Option("--ssh-port", help="SSH port.")] = None,
+    ssh_identity: Annotated[
+        str | None, typer.Option("--ssh-identity", help="SSH identity file.")
+    ] = None,
+    ssh_option: Annotated[
+        list[str] | None, typer.Option("--ssh-option", help="Extra ssh -o option (repeatable).")
     ] = None,
     url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
 ) -> None:
     """Create a session on a running server."""
     client = _api_client(url)
-    body = {
+    ssh_body: dict[str, object] | None = None
+    if ssh_host:
+        ssh_body = {"host": ssh_host}
+        if ssh_user:
+            ssh_body["user"] = ssh_user
+        if ssh_port:
+            ssh_body["port"] = ssh_port
+        if ssh_identity:
+            ssh_body["identity"] = ssh_identity
+        if ssh_option:
+            ssh_body["options"] = ssh_option
+        if command:
+            ssh_body["command"] = command
+        backend = backend or "ssh"
+    body: dict[str, object] = {
         key: value
         for key, value in {
             "name": name,
-            "command": command,
+            "command": command if ssh_body is None else None,
             "cwd": cwd,
             "backend": backend,
+            "ssh": ssh_body,
         }.items()
         if value is not None
     }

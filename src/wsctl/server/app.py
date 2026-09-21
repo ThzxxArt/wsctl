@@ -26,12 +26,12 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import RequestResponseEndpoint
 
 from wsctl import __version__
 from wsctl.core import fs as fs_mod
-from wsctl.core import tmux, totp
+from wsctl.core import ssh, tmux, totp
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
 from wsctl.core.ratelimit import RateLimiter
@@ -65,6 +65,7 @@ class SessionCreate(BaseModel):
     command: str | None = None
     cwd: str | None = None
     backend: str | None = None
+    ssh: SshConfig | None = None
     cols: int = 80
     rows: int = 24
 
@@ -75,6 +76,15 @@ class SessionRename(BaseModel):
 
 class SessionShare(BaseModel):
     ttl: int | None = None
+
+
+class SshConfig(BaseModel):
+    host: str
+    user: str | None = None
+    port: int | None = None
+    identity: str | None = None
+    options: list[str] = Field(default_factory=list)
+    command: str | None = None
 
 
 class UserCreate(BaseModel):
@@ -358,7 +368,7 @@ def create_app(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="session limit"
             )
         backend = body.backend or settings.default_backend
-        if backend not in ("local", "tmux"):
+        if backend not in ("local", "tmux", "ssh"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=f"unknown backend: {backend}"
             )
@@ -366,8 +376,33 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="tmux is not installed"
             )
-        argv = shlex.split(body.command) if body.command else [settings.shell]
-        name = body.name or (Path(argv[0]).name if argv else "shell")
+        if backend == "ssh":
+            if body.ssh is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="ssh config is required"
+                )
+            if not ssh.ssh_available():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="ssh client is not installed"
+                )
+            try:
+                target = ssh.SshTarget(
+                    host=body.ssh.host,
+                    user=body.ssh.user,
+                    port=body.ssh.port,
+                    identity=body.ssh.identity,
+                    options=body.ssh.options,
+                    remote_command=body.ssh.command or body.command,
+                )
+            except ssh.SshError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+                ) from exc
+            argv = target.argv()
+            name = body.name or f"ssh:{target.destination()}"
+        else:
+            argv = shlex.split(body.command) if body.command else [settings.shell]
+            name = body.name or (Path(argv[0]).name if argv else "shell")
         spec = SessionSpec(
             name=name,
             argv=argv,

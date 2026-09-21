@@ -66,6 +66,12 @@ RBAC, auditing, a file panel and observability.
 - QR code for a share link (`GET /api/sessions/{id}/qr.svg`) plus a share dialog
   in the web UI.
 
+**SSH sessions**
+- `backend="ssh"` builds a safe `ssh` argv from a structured target
+  (host/user/port/identity/options/remote command); `wsctl session new --ssh`.
+- Hosts and users are validated and passed as separate arguments (no shell
+  interpolation).
+
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
 - GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release

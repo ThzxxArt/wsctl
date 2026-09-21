@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from wsctl.core import tmux
+from wsctl.core import ssh, tmux
 from wsctl.core.config import load_settings
 from wsctl.core.session import SessionManager
 from wsctl.core.store import Store
@@ -431,3 +431,32 @@ def test_ws_without_auth_or_share_rejected(tmp_path: Path) -> None:
         client.websocket_connect("/ws") as ws,
     ):
         ws.receive_text()
+
+
+# -- M9: SSH backend --------------------------------------------------
+
+
+def test_ssh_backend_requires_config(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.post("/api/sessions", json={"backend": "ssh"}).status_code == 400
+
+
+@pytest.mark.skipif(not ssh.ssh_available(), reason="requires ssh client")
+def test_ssh_backend_creates_session(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        r = client.post(
+            "/api/sessions",
+            json={"backend": "ssh", "ssh": {"host": "127.0.0.1", "port": 1}},
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["backend"] == "ssh"
+        assert r.json()["name"].startswith("ssh:")
+
+
+def test_ssh_backend_rejects_bad_host(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        r = client.post("/api/sessions", json={"backend": "ssh", "ssh": {"host": "-evil"}})
+        assert r.status_code == 400
