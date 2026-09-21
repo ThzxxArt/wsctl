@@ -152,3 +152,31 @@ async def test_max_clients() -> None:
             await session.attach(FakeClient())
     finally:
         await manager.shutdown()
+
+
+async def test_share_lifecycle() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        assert not session.is_shared
+        token = session.create_share()
+        assert session.is_shared
+        assert session.peek_share() == token
+        assert session.share_valid(token)
+        assert not session.share_valid("nope")
+        assert not session.share_valid(None)
+        session.revoke_share()
+        assert not session.share_valid(token)
+    finally:
+        await manager.shutdown()
+
+
+async def test_share_expiry() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        token = session.create_share(ttl=-1)
+        assert not session.is_shared
+        assert not session.share_valid(token)
+    finally:
+        await manager.shutdown()

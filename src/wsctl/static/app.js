@@ -20,7 +20,20 @@
     fileRefresh: document.getElementById("file-refresh"),
     fileInput: document.getElementById("file-input"),
     fileStatus: document.getElementById("file-status"),
+    shareBtn: document.getElementById("share-btn"),
+    shareOverlay: document.getElementById("share-overlay"),
+    shareQr: document.getElementById("share-qr"),
+    shareUrl: document.getElementById("share-url"),
+    shareCopy: document.getElementById("share-copy"),
+    shareRevoke: document.getElementById("share-revoke"),
+    shareClose: document.getElementById("share-close"),
+    shareNote: document.getElementById("share-note"),
   };
+
+  const params = new URLSearchParams(location.search);
+  const sharedSession = params.get("session");
+  const shareToken = params.get("share");
+  const sharedMode = Boolean(sharedSession && shareToken);
 
   const encoder = new TextEncoder();
   const sessions = new Map();
@@ -35,9 +48,10 @@
     scrollback: 10000,
   };
 
-  function wsUrl() {
+  function wsUrl(s) {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${location.host}/ws`;
+    const query = s && s.share ? `?share=${encodeURIComponent(s.share)}` : "";
+    return `${proto}//${location.host}/ws${query}`;
   }
 
   function setConnection(text, cls) {
@@ -89,7 +103,7 @@
   function connect(s) {
     s.intentional = false;
     setConnection("connecting", "");
-    const ws = new WebSocket(wsUrl());
+    const ws = new WebSocket(wsUrl(s));
     ws.binaryType = "arraybuffer";
     s.ws = ws;
 
@@ -97,7 +111,13 @@
       s.delay = 500;
       markTab(s, "connected");
       setConnection("connected", "ok");
-      sendControl(s, { type: "attach", session: s.id, cols: s.term.cols, rows: s.term.rows });
+      sendControl(s, {
+        type: "attach",
+        session: s.id,
+        cols: s.term.cols,
+        rows: s.term.rows,
+        share: s.share || undefined,
+      });
       if (s.heartbeat) clearInterval(s.heartbeat);
       s.heartbeat = setInterval(() => sendControl(s, { type: "ping" }), 25000);
     };
@@ -130,7 +150,14 @@
     switch (msg.type) {
       case "attached":
         s.name = msg.name;
+        s.writable = msg.writable !== false;
         s.tabEl.querySelector(".label").textContent = msg.name;
+        if (s.writable === false && !s.tabEl.querySelector(".ro")) {
+          const badge = document.createElement("span");
+          badge.className = "readonly-badge ro";
+          badge.textContent = "read-only";
+          s.tabEl.appendChild(badge);
+        }
         break;
       case "exit":
         s.exited = true;
@@ -145,7 +172,8 @@
     }
   }
 
-  function createTab(id, name) {
+  function createTab(id, name, opts) {
+    const options = opts || {};
     const pane = document.createElement("div");
     pane.className = "term-pane";
     els.wrap.appendChild(pane);
@@ -166,6 +194,8 @@
       id, name, term, fit, pane, tabEl,
       ws: null, heartbeat: null, reconnectTimer: null, delay: 500,
       intentional: false, exited: false,
+      share: options.share || null,
+      writable: options.writable !== false,
     };
     sessions.set(id, s);
 
@@ -191,7 +221,10 @@
       closeTab(id);
     });
 
-    term.onData((data) => sendInput(s, data));
+    term.onData((data) => {
+      if (s.writable === false) return;
+      sendInput(s, data);
+    });
     term.onResize(({ cols, rows }) => sendControl(s, { type: "resize", cols, rows }));
 
     connect(s);
@@ -299,6 +332,13 @@
   });
 
   async function bootstrap() {
+    if (sharedMode) {
+      document.body.classList.add("shared");
+      hideLogin();
+      els.whoami.textContent = "shared (read-only)";
+      createTab(sharedSession, "shared", { share: shareToken, writable: false });
+      return;
+    }
     try {
       me = await api("GET", "/api/me");
     } catch {
@@ -317,6 +357,53 @@
       setConnection(String(err.message || err), "bad");
     }
   }
+
+  // -- sharing ---------------------------------------------------------
+
+  function showShareNote(text) {
+    els.shareNote.textContent = text;
+    els.shareNote.classList.remove("hidden");
+  }
+
+  async function openShare() {
+    const s = activeId && sessions.get(activeId);
+    if (!s) {
+      setConnection("no active session", "bad");
+      return;
+    }
+    try {
+      const info = await api("POST", `/api/sessions/${s.id}/share`, {});
+      els.shareUrl.value =
+        `${location.origin}/?session=${s.id}&share=${encodeURIComponent(info.token)}`;
+      els.shareQr.src = `/api/sessions/${s.id}/qr.svg?origin=${encodeURIComponent(location.origin)}`;
+      els.shareNote.classList.add("hidden");
+      els.shareOverlay.classList.remove("hidden");
+    } catch (err) {
+      setConnection(String(err.message || err), "bad");
+    }
+  }
+
+  els.shareBtn.addEventListener("click", openShare);
+  els.shareClose.addEventListener("click", () => els.shareOverlay.classList.add("hidden"));
+  els.shareCopy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(els.shareUrl.value);
+      showShareNote("copied to clipboard");
+    } catch {
+      els.shareUrl.select();
+      document.execCommand("copy");
+    }
+  });
+  els.shareRevoke.addEventListener("click", async () => {
+    const s = activeId && sessions.get(activeId);
+    if (!s) return;
+    try {
+      await api("DELETE", `/api/sessions/${s.id}/share`);
+      els.shareOverlay.classList.add("hidden");
+    } catch (err) {
+      showShareNote(String(err.message || err));
+    }
+  });
 
   // -- file panel ------------------------------------------------------
 

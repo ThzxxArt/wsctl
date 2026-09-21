@@ -32,6 +32,8 @@ CLI (wsctl connect) ┘             │
 - ♻️ **Restart-safe sessions (optional)** — with the `tmux` backend a session
   survives a full server restart and is reattached automatically
 - 👥 **Multi-user + RBAC** — admins manage everything, users only their sessions
+- 🔗 **Read-only sharing** — generate a share link + QR code; viewers watch but
+  cannot type
 - 🧑💻 **CLI thin client** — `wsctl connect` bridges your local terminal to a server
 - 📁 **Web file panel** — browse, download and upload within a configured root
 - 📝 **Auditing** — logins, sessions, file transfers and admin actions recorded
@@ -202,6 +204,7 @@ only to trusted users over a trusted network:
 - optional TOTP two-factor auth (`wsctl user totp <user>`)
 - login failures are rate limited; `allowed_ips` restricts source networks
 - WebSocket handshakes are validated against an Origin allowlist (anti-CSWSH)
+- share links are unguessable, read-only, optionally time-limited and revocable
 - every sensitive action is written to the audit log
 - TLS via a reverse proxy (recommended) or `ssl_cert` / `ssl_key`
 

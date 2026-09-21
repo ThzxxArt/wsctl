@@ -39,6 +39,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "itsdangerous>=2.2",
     "pyotp>=2.9",
+    "segno>=1.6",
     "websockets>=13",
 ]
 

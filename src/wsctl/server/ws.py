@@ -27,7 +27,7 @@ from wsctl.core.session import ClientGone, SessionManager, SessionSpec, TermSess
 from wsctl.core.store import Store, User
 
 from .client import WsClient
-from .security import COOKIE_NAME, can_access, client_ip, ip_allowed, is_origin_allowed
+from .security import COOKIE_NAME, client_ip, ip_allowed, is_origin_allowed
 
 log = logging.getLogger("wsctl.ws")
 
@@ -89,7 +89,10 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         return
 
     user = _resolve_user(websocket, store, settings.auth_required)
-    if user is None:
+    share_param = websocket.query_params.get("share")
+    # An unauthenticated connection is only allowed when it presents a share
+    # token (validated during the handshake).
+    if user is None and not share_param:
         await websocket.close(code=4401)
         return
 
@@ -99,19 +102,22 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     client = WsClient(websocket)
     writer = asyncio.create_task(client.run())
     session: TermSession | None = None
+    user_id = user.id if user is not None else None
     try:
-        session = await _handshake(websocket, client, settings, manager, user)
-        if session is None:
+        result = await _handshake(websocket, client, settings, manager, user, share_param)
+        if result is None:
             return
+        session, writable = result
         store.log_event(
             "session_attach",
-            user_id=user.id,
+            user_id=user_id,
             term_session_id=session.id,
             ip=ip,
+            payload="readonly" if not writable else None,
         )
-        on_line = _input_auditor(store, settings, user.id, session.id)
+        on_line = _input_auditor(store, settings, user_id, session.id)
         bucket = _input_bucket(settings)
-        await _pump(websocket, client, session, on_line, bucket)
+        await _pump(websocket, client, session, on_line, bucket, writable=writable)
     except Exception:
         log.exception("websocket handler failed")
     finally:
@@ -119,7 +125,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             with contextlib.suppress(Exception):
                 await session.detach(client)
             store.log_event(
-                "session_detach", user_id=user.id, term_session_id=session.id, ip=ip
+                "session_detach", user_id=user_id, term_session_id=session.id, ip=ip
             )
         client.close()
         # Let the writer drain queued control messages (e.g. a final error)
@@ -132,13 +138,23 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
                 await websocket.close()
 
 
+def _access(user: User | None, session: TermSession, share: str | None) -> str | None:
+    """Return ``"write"``, ``"read"`` or ``None`` for a session attach."""
+    if user is not None and (user.role == "admin" or session.owner_id == user.id):
+        return "write"
+    if session.share_valid(share):
+        return "read"
+    return None
+
+
 async def _handshake(
     websocket: WebSocket,
     client: WsClient,
     settings: Settings,
     manager: SessionManager,
-    user: User,
-) -> TermSession | None:
+    user: User | None,
+    share_param: str | None = None,
+) -> tuple[TermSession, bool] | None:
     raw = await websocket.receive_text()
     msg = json.loads(raw)
     if msg.get("type") != "attach":
@@ -148,17 +164,24 @@ async def _handshake(
     cols = int(msg.get("cols") or 80)
     rows = int(msg.get("rows") or 24)
     sid = msg.get("session")
+    share = msg.get("share") or share_param
 
     session: TermSession | None
+    writable = True
     if sid:
         session = manager.get(str(sid))
         if session is None:
             client.put({"type": "error", "msg": f"no such session: {sid}"})
             return None
-        if not can_access(user, session):
+        access = _access(user, session, share)
+        if access is None:
             client.put({"type": "error", "msg": "not authorized for this session"})
             return None
+        writable = access == "write"
     else:
+        if user is None:
+            client.put({"type": "error", "msg": "authentication required to create a session"})
+            return None
         if len(manager.list_sessions()) >= settings.max_sessions:
             client.put({"type": "error", "msg": "session limit reached"})
             return None
@@ -183,15 +206,15 @@ async def _handshake(
 
     session.resize(cols, rows)
     try:
-        await session.attach(client)
+        await session.attach(client, writable=writable)
     except ClientGone as exc:
         client.put({"type": "error", "msg": str(exc)})
         return None
-    return session
+    return session, writable
 
 
 def _input_auditor(
-    store: Store, settings: Settings, user_id: int, session_id: str
+    store: Store, settings: Settings, user_id: int | None, session_id: str
 ) -> Callable[[str], None] | None:
     """Return a line callback that audits submitted input, if enabled."""
     if not settings.audit_input:
@@ -221,8 +244,11 @@ async def _pump(
     session: TermSession,
     on_line: Callable[[str], None] | None = None,
     bucket: TokenBucket | None = None,
+    *,
+    writable: bool = True,
 ) -> None:
     line_buffer = bytearray()
+    read_only_notice = False
 
     def over_limit(size: int) -> bool:
         return bucket is not None and not bucket.allow(size)
@@ -230,6 +256,14 @@ async def _pump(
     def reject() -> None:
         with contextlib.suppress(ClientGone):
             client.put({"type": "error", "msg": "input rate limit exceeded"})
+
+    def reject_readonly() -> None:
+        nonlocal read_only_notice
+        if read_only_notice:
+            return
+        read_only_notice = True
+        with contextlib.suppress(ClientGone):
+            client.put({"type": "error", "msg": "session is read-only"})
 
     def feed_audit(data: bytes) -> None:
         if on_line is None:
@@ -250,6 +284,9 @@ async def _pump(
             return
         data_bytes = message.get("bytes")
         if data_bytes is not None:
+            if not writable:
+                reject_readonly()
+                continue
             if over_limit(len(data_bytes)):
                 reject()
                 return
@@ -267,6 +304,9 @@ async def _pump(
         if kind == "resize":
             session.resize(int(data.get("cols") or 80), int(data.get("rows") or 24))
         elif kind == "input":
+            if not writable:
+                reject_readonly()
+                continue
             chunk = str(data.get("data", "")).encode("utf-8")
             if over_limit(len(chunk)):
                 reject()

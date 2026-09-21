@@ -169,3 +169,33 @@ body { display: flex; flex-direction: column; }
 .file-list .fmeta { color: var(--muted); font-size: 11px; }
 .file-list.dragover { outline: 2px dashed var(--accent); outline-offset: -6px; }
 
+.share-card { width: 340px; }
+.share-card h1 { margin-bottom: 2px; }
+.share-hint { color: var(--muted); font-size: 12px; margin: 0; }
+.share-card img { width: 200px; height: 200px; align-self: center; background: #fff; border-radius: 8px; padding: 8px; }
+.share-card input { width: 100%; font-size: 12px; }
+.share-actions { display: flex; gap: 6px; }
+.share-actions button {
+  flex: 1;
+  padding: 7px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.share-actions button:hover { border-color: var(--accent); color: var(--accent); }
+
+body.shared #new-tab,
+body.shared #files-toggle,
+body.shared #share-btn,
+body.shared #logout { display: none; }
+.readonly-badge {
+  color: #e0a24f;
+  border: 1px solid #e0a24f;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+}
+
+

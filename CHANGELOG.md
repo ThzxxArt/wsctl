@@ -58,6 +58,14 @@ RBAC, auditing, a file panel and observability.
 - Graceful shutdown preserves tmux sessions (`tmux_preserve_on_shutdown`); an
   explicit kill still tears them down.
 
+**Read-only sharing**
+- Per-session share tokens (`POST/DELETE /api/sessions/{id}/share`) that are
+  unguessable, optionally time-limited and revocable.
+- Anonymous read-only viewers can attach with a share link (`?session=&share=`)
+  without an account; their input is refused and the UI shows a read-only badge.
+- QR code for a share link (`GET /api/sessions/{id}/qr.svg`) plus a share dialog
+  in the web UI.
+
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
 - GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release

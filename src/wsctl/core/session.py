@@ -57,6 +57,7 @@ class SessionSpec:
 @dataclass
 class _ClientEntry:
     client: Client
+    writable: bool = True
     joined_at: float = field(default_factory=time.time)
 
 
@@ -84,6 +85,8 @@ class TermSession:
         self._scrollback = Scrollback(spec.scrollback_bytes)
         self._clients: dict[int, _ClientEntry] = {}
         self._lock = asyncio.Lock()
+        self._share_token: str | None = None
+        self._share_expires: float | None = None
         self._tmux_name: str | None = None
         argv = spec.argv
         if spec.backend == "tmux":
@@ -134,11 +137,13 @@ class TermSession:
 
     # -- client attachment ---------------------------------------------
 
-    async def attach(self, client: Client) -> None:
+    async def attach(self, client: Client, *, writable: bool = True) -> None:
         """Attach a client, replaying buffered output first.
 
         Replay is enqueued and the client registered while holding the same
         lock used by broadcasting, guaranteeing replay-before-live ordering.
+        A read-only client is still attached (and receives output) but its
+        input is ignored by the caller.
         """
         async with self._lock:
             if self.closed:
@@ -146,7 +151,7 @@ class TermSession:
             if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
                 raise ClientGone("session has reached its client limit")
             replay = self._scrollback.snapshot()
-            self._clients[id(client)] = _ClientEntry(client)
+            self._clients[id(client)] = _ClientEntry(client, writable=writable)
             if replay:
                 client.put(replay)
             client.put(
@@ -156,12 +161,42 @@ class TermSession:
                     "name": self.spec.name,
                     "cols": self.spec.cols,
                     "rows": self.spec.rows,
+                    "writable": writable,
                 }
             )
 
     async def detach(self, client: Client) -> None:
         async with self._lock:
             self._clients.pop(id(client), None)
+
+    # -- sharing -------------------------------------------------------
+
+    def create_share(self, ttl: float | None = None) -> str:
+        """Create (or replace) a read-only share token for this session."""
+        self._share_token = secrets.token_urlsafe(24)
+        self._share_expires = time.time() + ttl if ttl else None
+        return self._share_token
+
+    def revoke_share(self) -> None:
+        self._share_token = None
+        self._share_expires = None
+
+    def share_valid(self, token: str | None) -> bool:
+        if not token or self._share_token is None:
+            return False
+        if self._share_expires is not None and time.time() >= self._share_expires:
+            return False
+        return secrets.compare_digest(token, self._share_token)
+
+    @property
+    def is_shared(self) -> bool:
+        return self._share_token is not None and (
+            self._share_expires is None or time.time() < self._share_expires
+        )
+
+    def peek_share(self) -> str | None:
+        """Return the active share token, or ``None`` if not shared."""
+        return self._share_token if self.is_shared else None
 
     # -- I/O -----------------------------------------------------------
 

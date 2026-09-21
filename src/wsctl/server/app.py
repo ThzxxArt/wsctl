@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import segno
 from fastapi import (
     Depends,
     FastAPI,
@@ -43,6 +44,7 @@ from .security import (
     can_access,
     client_ip,
     ip_allowed,
+    is_origin_allowed,
 )
 from .ws import terminal_endpoint
 
@@ -69,6 +71,10 @@ class SessionCreate(BaseModel):
 
 class SessionRename(BaseModel):
     name: str
+
+
+class SessionShare(BaseModel):
+    ttl: int | None = None
 
 
 class UserCreate(BaseModel):
@@ -330,6 +336,7 @@ def create_app(
             "pid": session.pid,
             "owner_id": session.owner_id,
             "backend": session.backend,
+            "shared": session.is_shared,
             "clients": session.client_count,
             "alive": session.is_alive,
             "created_at": session.created_at,
@@ -414,6 +421,47 @@ def create_app(
             sid, name=name, owner_id=session.owner_id, cwd=session.spec.cwd
         )
         return _serialize(session)
+
+    # -- sharing -------------------------------------------------------
+
+    def _owned(sid: str, user: User) -> TermSession:
+        manager: SessionManager = app.state.manager
+        session = manager.get(sid)
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such session")
+        if not can_access(user, session):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not your session")
+        return session
+
+    @app.post("/api/sessions/{sid}/share")
+    async def create_share(
+        sid: str, body: SessionShare, user: User = Depends(current_user)
+    ) -> dict[str, Any]:
+        session = _owned(sid, user)
+        token = session.create_share(ttl=float(body.ttl) if body.ttl else None)
+        app.state.store.log_event("session_share", user_id=user.id, term_session_id=sid)
+        return {"token": token, "ttl": body.ttl}
+
+    @app.delete("/api/sessions/{sid}/share")
+    async def revoke_share(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
+        session = _owned(sid, user)
+        session.revoke_share()
+        app.state.store.log_event("session_unshare", user_id=user.id, term_session_id=sid)
+        return {"ok": True}
+
+    @app.get("/api/sessions/{sid}/qr.svg")
+    async def share_qr(
+        request: Request, sid: str, origin: str = "", user: User = Depends(current_user)
+    ) -> Response:
+        session = _owned(sid, user)
+        token = session.peek_share()
+        if token is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="not shared")
+        allowed = is_origin_allowed(origin, request.headers.get("host"), settings.allowed_origins)
+        base = origin if (origin and allowed) else str(request.base_url).rstrip("/")
+        url = f"{base}/?session={sid}&share={token}"
+        svg = segno.make(url, error="m").svg_inline()
+        return Response(content=svg, media_type="image/svg+xml")
 
     # -- users (admin only) --------------------------------------------
 

@@ -15,6 +15,7 @@
     <button id="new-tab" class="icon-btn" title="New session">+</button>
     <div class="spacer"></div>
     <span id="connection" class="status">idle</span>
+    <button id="share-btn" class="text-btn" title="Share session">share</button>
     <button id="files-toggle" class="text-btn" title="Files">files</button>
     <span id="whoami" class="whoami"></span>
     <button id="logout" class="text-btn" title="Sign out">sign out</button>
@@ -44,6 +45,21 @@
       <label>Password<input id="password" name="password" type="password" autocomplete="current-password" /></label>
       <button type="submit">Sign in</button>
     </form>
+  </div>
+
+  <div id="share-overlay" class="overlay hidden">
+    <div class="login-card share-card">
+      <h1>Share session</h1>
+      <p class="share-hint">Read-only link. Anyone with it can watch this terminal.</p>
+      <img id="share-qr" alt="Share QR code" />
+      <input id="share-url" readonly />
+      <div class="share-actions">
+        <button id="share-copy" type="button">copy link</button>
+        <button id="share-revoke" type="button">revoke</button>
+        <button id="share-close" type="button">close</button>
+      </div>
+      <p id="share-note" class="error hidden"></p>
+    </div>
   </div>
 
   <script src="/static/vendor/xterm.js"></script>

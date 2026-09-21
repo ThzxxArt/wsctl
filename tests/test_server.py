@@ -370,3 +370,64 @@ def test_startup_restores_tmux_session(tmp_path: Path) -> None:
             assert any(s["id"] == sid and s["backend"] == "tmux" for s in sessions)
     finally:
         tmux.kill_session(name)
+
+
+# -- M8: read-only sharing --------------------------------------------
+
+
+def test_share_flow(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+
+        r = client.post(f"/api/sessions/{sid}/share", json={})
+        assert r.status_code == 200, r.text
+        assert r.json()["token"]
+
+        assert client.get("/api/sessions").json()[0]["shared"] is True
+
+        qr = client.get(f"/api/sessions/{sid}/qr.svg")
+        assert qr.status_code == 200
+        assert "svg" in qr.headers["content-type"]
+        assert "<svg" in qr.text
+
+        assert client.delete(f"/api/sessions/{sid}/share").status_code == 200
+        assert client.get(f"/api/sessions/{sid}/qr.svg").status_code == 400
+
+
+def test_share_requires_owner(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        client.post("/api/logout")
+
+        login(client, BOB)
+        assert client.post(f"/api/sessions/{sid}/share", json={}).status_code == 403
+
+
+def test_share_attach_readonly_without_login(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(f"/api/sessions/{sid}/share", json={}).json()["token"]
+        client.cookies.clear()  # simulate an anonymous viewer
+
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            attached = _recv_control(ws, {"attached", "error"})
+            assert attached is not None and attached["type"] == "attached"
+            assert attached["writable"] is False
+
+            # input from a read-only client is refused
+            ws.send_text(json.dumps({"type": "input", "data": "echo NOPE\r"}))
+            err = _recv_control(ws, {"error"})
+            assert err is not None and "read-only" in str(err["msg"])
+
+
+def test_ws_without_auth_or_share_rejected(tmp_path: Path) -> None:
+    with (
+        TestClient(build_app(tmp_path)) as client,
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/ws") as ws,
+    ):
+        ws.receive_text()
