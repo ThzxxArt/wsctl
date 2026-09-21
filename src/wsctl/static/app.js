@@ -166,7 +166,11 @@
       s.term.options.theme = resolveTheme();
       try { s.fit.fit(); } catch { /* hidden */ }
     }
-    localStorage.setItem("wsctl-prefs", JSON.stringify(prefs));
+    try {
+      localStorage.setItem("wsctl-prefs", JSON.stringify(prefs));
+    } catch {
+      /* storage unavailable/full: preferences just won't persist */
+    }
   }
 
   function wsUrl(s) {
@@ -272,7 +276,7 @@
       if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
       if (event.code === 4401 || event.code === 4403) {
         setConnection("unauthorized", "bad");
-        showLogin("请先登录");
+        if (!sharedMode) showLogin("请先登录");
         return;
       }
       setConnection(s.intentional ? "idle" : "disconnected", s.intentional ? "" : "bad");
@@ -386,6 +390,7 @@
     }
     const s = sessions.get(id);
     if (!s) return;
+    els.recordBtn.classList.toggle("rec-on", Boolean(s.recording));
     requestAnimationFrame(() => {
       try { s.fit.fit(); } catch { /* hidden */ }
       s.term.focus();

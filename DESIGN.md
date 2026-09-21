@@ -232,6 +232,10 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 **尚未实现**：无。唯一验证缺口：ZMODEM 的真实 `rz`/`sz` 传输未在 CI 端到端跑通
 （环境无 lrzsz），仅验证了集成不破坏常规终端 I/O。
 
+> 回归测试：`scripts/e2e/run_all.py` 提供 5 个后端端到端场景（server / CLI /
+> connect / tmux 重启恢复 / SO_REUSEPORT 优雅重启）；`pytest -m browser` 为浏览器级
+> 测试；`pytest -m slow` 为并发/大输出压测。CI 在独立 job 中运行浏览器测试。
+
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
 > 会话不会残留僵尸进程。

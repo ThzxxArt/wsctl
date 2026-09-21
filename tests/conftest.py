@@ -6,14 +6,18 @@ import pytest
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip browser tests unless explicitly selected with ``-m browser``."""
+    """Skip opt-in suites unless explicitly selected (``-m browser`` / ``-m slow``)."""
     marker_expr = config.getoption("-m", default="") or ""
-    if "browser" in marker_expr:
-        return
-    skip = pytest.mark.skip(reason="browser tests: select with -m browser")
-    for item in items:
-        if "browser" in item.keywords:
-            item.add_marker(skip)
+    if "browser" not in marker_expr:
+        skip_browser = pytest.mark.skip(reason="browser tests: select with -m browser")
+        for item in items:
+            if "browser" in item.keywords:
+                item.add_marker(skip_browser)
+    if "slow" not in marker_expr:
+        skip_slow = pytest.mark.skip(reason="slow tests: select with -m slow")
+        for item in items:
+            if "slow" in item.keywords:
+                item.add_marker(skip_slow)
 
 
 class FakeClient:

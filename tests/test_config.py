@@ -5,7 +5,10 @@ from pathlib import Path
 from wsctl.core.config import Settings, load_settings, reload_settings_file
 
 
-def test_defaults() -> None:
+def test_defaults(tmp_path: Path, monkeypatch: object) -> None:
+    # Hermetic: point at a non-existent config file so a developer's real
+    # ~/.config/wsctl/config.toml cannot change the result.
+    monkeypatch.setenv("WSCTL_CONFIG", str(tmp_path / "missing.toml"))  # type: ignore[attr-defined]
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.host == "127.0.0.1"
     assert settings.port == 7681
@@ -78,3 +81,16 @@ def test_reload_respects_env_precedence(tmp_path: Path, monkeypatch: object) -> 
     changed = reload_settings_file(settings)
     assert "max_sessions" not in changed
     assert settings.max_sessions == 99  # env still wins after reload
+
+
+def test_reload_skips_explicitly_empty_env(tmp_path: Path, monkeypatch: object) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('default_shell = "/bin/zsh"\n', encoding="utf-8")
+    monkeypatch.setenv("WSCTL_DEFAULT_SHELL", "")  # type: ignore[attr-defined]
+
+    settings = load_settings(config_path=config)
+    assert settings.default_shell == ""  # env (empty) wins at load
+    changed = reload_settings_file(settings)
+    assert "default_shell" not in changed
+    assert settings.default_shell == ""

@@ -211,8 +211,9 @@ def reload_settings_file(settings: Settings) -> list[str]:
         return []
     changed: list[str] = []
     for key in sorted(HOT_FIELDS):
-        # Environment variables take precedence over the file (see load order).
-        if os.environ.get(f"WSCTL_{key.upper()}"):
+        # Environment variables take precedence over the file (see load order),
+        # including explicitly-set empty values.
+        if f"WSCTL_{key.upper()}" in os.environ:
             continue
         if key in data and getattr(settings, key) != getattr(candidate, key):
             setattr(settings, key, getattr(candidate, key))

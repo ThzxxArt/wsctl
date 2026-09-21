@@ -49,6 +49,7 @@ dev = [
     "mypy>=1.11",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
     "httpx>=0.27",
     "build>=1.2",
     "twine>=5.1",
@@ -98,7 +99,8 @@ files = ["src/wsctl"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+timeout = 120
 markers = [
-    "slow: heavier tests not run by default (select with -m slow)",
-    "browser: Playwright browser tests, skipped by default (select with -m browser)",
+    "slow: heavier tests, run with -m slow (skipped by default)",
+    "browser: Playwright browser tests, run with -m browser (skipped by default)",
 ]

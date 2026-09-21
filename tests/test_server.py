@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import time
 from pathlib import Path
 
 import pyotp
@@ -346,14 +348,19 @@ def test_create_and_kill_tmux_session(tmp_path: Path) -> None:
         r = client.post("/api/sessions", json={"backend": "tmux", "name": "tmuxed"})
         assert r.status_code == 201, r.text
         sid = r.json()["id"]
-        assert r.json()["backend"] == "tmux"
-        assert client.delete(f"/api/sessions/{sid}").status_code == 200
+        try:
+            assert r.json()["backend"] == "tmux"
+            assert client.delete(f"/api/sessions/{sid}").status_code == 200
+        finally:
+            tmux.kill_session(tmux.session_name(sid))
 
 
 @pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
 def test_orphan_tmux_sessions_are_reaped(tmp_path: Path) -> None:
-    name = tmux.session_name("orphan-xyz")
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True)
+    name = tmux.session_name(f"orphan-{os.getpid()}-{int(time.time() * 1000)}")
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True, timeout=10
+    )
     try:
         assert tmux.has_session(name)
         app = build_app(tmp_path)  # startup should reap the orphan
@@ -366,9 +373,11 @@ def test_orphan_tmux_sessions_are_reaped(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
 def test_startup_restores_tmux_session(tmp_path: Path) -> None:
-    sid = "restore-test"
+    sid = f"restore-{os.getpid()}-{int(time.time() * 1000)}"
     name = tmux.session_name(sid)
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True)
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True, timeout=10
+    )
     try:
         settings = load_settings(data_dir=tmp_path, auth_required=True, default_shell="/bin/sh")
         store = Store(tmp_path / "test.db")
@@ -586,3 +595,51 @@ def test_duplicate_user_conflict(tmp_path: Path) -> None:
         login(client, ADMIN)
         r = client.post("/api/users", json={"username": "admin", "password": "x"})
         assert r.status_code == 409
+
+
+def _recv_until_close(ws: object, timeout: float = 5.0) -> dict[str, object]:
+    end = time.time() + timeout
+    while time.time() < end:
+        message = ws.receive()  # type: ignore[attr-defined]
+        if message.get("type") == "websocket.close":
+            return message
+    raise AssertionError("connection was not closed")
+
+
+def test_revoked_writable_share_blocks_input(tmp_path: Path) -> None:
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": True}
+        ).json()["token"]
+        client.cookies.clear()  # anonymous share viewer
+
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            attached = _recv_control(ws, {"attached", "error"})
+            assert attached is not None and attached["writable"] is True
+
+            app.state.manager.get(sid).revoke_share()  # type: ignore[attr-defined]
+            ws.send_text(json.dumps({"type": "input", "data": "echo X\r"}))
+            close = _recv_until_close(ws)
+            assert close["code"] == 4401
+
+
+def test_readonly_attach_does_not_resize(tmp_path: Path) -> None:
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={"cols": 100, "rows": 40}).json()["id"]
+        token = client.post(f"/api/sessions/{sid}/share", json={}).json()["token"]
+        client.cookies.clear()
+
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 1, "rows": 1}))
+            attached = _recv_control(ws, {"attached", "error"})
+            assert attached is not None and attached["writable"] is False
+
+        session = app.state.manager.get(sid)  # type: ignore[attr-defined]
+        assert session is not None
+        assert (session.spec.cols, session.spec.rows) == (100, 40)

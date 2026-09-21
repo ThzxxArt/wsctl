@@ -97,28 +97,31 @@ RBAC, auditing, sharing, a file panel and observability.
 
 ### Fixed
 
+- Revoked/expired share tokens are now enforced promptly: input is rejected
+  immediately and the connection is closed, and a periodic re-check detaches
+  viewers even on sessions that produce no output.
+- Read-only clients can no longer resize the shared terminal at attach time.
+- Authorization failures during the WebSocket handshake are delivered as close
+  codes (4401), so clients stop reconnecting instead of looping forever.
+- File upload opens the destination with `O_NOFOLLOW` (race-free symlink guard).
+- Config hot-reload treats an explicitly-empty environment variable as set.
+- Web UI: `localStorage.setItem` is guarded, and the record button reflects the
+  actual recording state on load and when switching tabs.
 - PTY no longer leaks the master fd or the child process when a spawn fails,
   and out-of-range terminal dimensions are clamped instead of raising.
-- Read-only share clients can no longer resize the shared terminal.
-- Revoking or expiring a share now detaches clients that already connected
-  with that token.
 - The PTY write buffer is bounded, so a child that stops reading stdin cannot
   grow server memory without limit.
 - Sessions are stopped if post-create setup fails (REST and WebSocket paths),
   instead of leaking a live process with no metadata.
-- File upload refuses to overwrite a symlink at the destination.
-- Config hot-reload respects environment-variable precedence.
 - Disabled users' existing sessions are invalidated.
 - Empty commands (400), out-of-range dimensions (422) and duplicate users (409)
   are rejected cleanly instead of erroring out.
-- WebSocket auth/origin failures now deliver close codes (4401/4403) to the
-  browser instead of an opaque HTTP 403 that caused endless reconnects.
 - CSP allows `blob:` so the recording player actually loads its cast, and
   `connect-src` was tightened to `'self'`.
-- Web UI: guarded `localStorage` parsing, restored recording state on reload,
-  reset the screen on reconnect (no duplicated scrollback), share "revoke"
-  targets the session the dialog was opened for, read-only viewers can no
-  longer trigger the login modal, and the replay player/blob URL is disposed.
+- Web UI: guarded `localStorage` parsing, reset the screen on reconnect (no
+  duplicated scrollback), share "revoke" targets the session the dialog was
+  opened for, read-only viewers can no longer trigger the login modal, and the
+  replay player/blob URL is disposed.
 - WebSocket teardown now drains queued control messages before closing.
 - WebSocket auto-created sessions record `owner_id` and persist metadata.
 - `safe_resolve` rejects absolute paths instead of silently re-rooting them.
@@ -129,13 +132,14 @@ RBAC, auditing, sharing, a file panel and observability.
 
 ### Testing
 
-- 147 unit/integration tests plus concurrency and large-output load tests
-  (`pytest -m slow`).
-- Browser-level end-to-end tests with Playwright (`pytest -m browser`, extra
-  `wsctl[e2e]`) covering login, terminal I/O, multi-tab, hotkeys, file panel,
-  sharing with QR, recording replay, theme switching, read-only input blocking
-  and anonymous share links; run in CI in a dedicated job.
-- Five backend end-to-end scripts (server, CLI, `connect`, tmux restart
-  recovery, SO_REUSEPORT graceful restart).
+- 149 unit/integration tests; concurrency and large-output load tests are opt-in
+  (`pytest -m slow`), browser tests are opt-in (`pytest -m browser`), and a
+  120-second per-test timeout guards against hangs.
+- Browser-level end-to-end tests with Playwright (`wsctl[e2e]`) covering login,
+  terminal I/O, multi-tab, hotkeys, file panel, sharing with QR, recording
+  replay, theme switching, read-only input blocking and anonymous share links;
+  run in CI in a dedicated job.
+- `scripts/e2e/run_all.py` runs five backend end-to-end scenarios: server,
+  CLI, `connect`, tmux restart recovery and SO_REUSEPORT graceful restart.
 
 [0.1.0]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.0

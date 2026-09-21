@@ -32,6 +32,7 @@ from .security import COOKIE_NAME, client_ip, ip_allowed, is_origin_allowed
 log = logging.getLogger("wsctl.ws")
 
 MAX_AUDIT_LINE = 512
+ACCESS_RECHECK = 5.0
 
 
 def _resolve_user(websocket: WebSocket, store: Store, auth_required: bool) -> User | None:
@@ -66,6 +67,15 @@ def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
         memory_limit=settings.session_memory_limit,
         scrollback_bytes=settings.scrollback_bytes,
     )
+
+
+class _Denied(Exception):
+    """Handshake denial: the client is told and the socket closed with a code."""
+
+    def __init__(self, message: str, code: int = 4401) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
 
 
 async def terminal_endpoint(websocket: WebSocket) -> None:
@@ -107,11 +117,12 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     writer = asyncio.create_task(client.run())
     session: TermSession | None = None
     user_id = user.id if user is not None else None
+    close_code = 1000
     try:
         result = await _handshake(websocket, client, settings, manager, user, share_param)
         if result is None:
             return
-        session, writable = result
+        session, writable, share = result
         store.log_event(
             "session_attach",
             user_id=user_id,
@@ -121,7 +132,13 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         )
         on_line = _input_auditor(store, settings, user_id, session.id)
         bucket = _input_bucket(settings)
-        await _pump(websocket, client, session, on_line, bucket, writable=writable)
+        await _pump(
+            websocket, client, session, on_line, bucket, writable=writable, share=share
+        )
+    except _Denied as exc:
+        close_code = exc.code
+        with contextlib.suppress(ClientGone):
+            client.put({"type": "error", "msg": exc.message})
     except Exception:
         log.exception("websocket handler failed")
     finally:
@@ -139,7 +156,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         writer.cancel()
         if websocket.application_state == WebSocketState.CONNECTED:
             with contextlib.suppress(Exception):
-                await websocket.close()
+                await websocket.close(code=close_code)
 
 
 def _access(user: User | None, session: TermSession, share: str | None) -> str | None:
@@ -156,7 +173,7 @@ async def _handshake(
     manager: SessionManager,
     user: User | None,
     share_param: str | None = None,
-) -> tuple[TermSession, bool] | None:
+) -> tuple[TermSession, bool, str | None] | None:
     raw = await websocket.receive_text()
     msg = json.loads(raw)
     if msg.get("type") != "attach":
@@ -173,17 +190,14 @@ async def _handshake(
     if sid:
         session = manager.get(str(sid))
         if session is None:
-            client.put({"type": "error", "msg": f"no such session: {sid}"})
-            return None
+            raise _Denied(f"no such session: {sid}")
         access = _access(user, session, share)
         if access is None:
-            client.put({"type": "error", "msg": "not authorized for this session"})
-            return None
+            raise _Denied("not authorized for this session")
         writable = access == "write"
     else:
         if user is None:
-            client.put({"type": "error", "msg": "authentication required to create a session"})
-            return None
+            raise _Denied("authentication required to create a session")
         if len(manager.list_sessions()) >= settings.max_sessions:
             client.put({"type": "error", "msg": "session limit reached"})
             return None
@@ -221,13 +235,16 @@ async def _handshake(
             client.put({"type": "error", "msg": "failed to create session"})
             return None
 
-    session.resize(cols, rows)
+    # Only writers may set the shared terminal size; a read-only viewer must not
+    # be able to shrink the owner's window at attach time.
+    if writable:
+        session.resize(cols, rows)
     try:
         await session.attach(client, writable=writable, share=share)
     except ClientGone as exc:
         client.put({"type": "error", "msg": str(exc)})
         return None
-    return session, writable
+    return session, writable, share
 
 
 def _input_auditor(
@@ -263,9 +280,19 @@ async def _pump(
     bucket: TokenBucket | None = None,
     *,
     writable: bool = True,
+    share: str | None = None,
 ) -> None:
     line_buffer = bytearray()
     read_only_notice = False
+
+    def share_revoked() -> bool:
+        return share is not None and not session.share_valid(share)
+
+    async def deny(message: str) -> None:
+        with contextlib.suppress(ClientGone):
+            client.put({"type": "error", "msg": message})
+        with contextlib.suppress(Exception):
+            await websocket.close(code=4401)
 
     def over_limit(size: int) -> bool:
         return bucket is not None and not bucket.allow(size)
@@ -295,12 +322,23 @@ async def _pump(
                 on_line(line.decode("utf-8", "replace"))
 
     while True:
-        message = await websocket.receive()
+        try:
+            message = await asyncio.wait_for(websocket.receive(), timeout=ACCESS_RECHECK)
+        except TimeoutError:
+            # Re-validate periodically so a revoked/expired share is enforced
+            # even on a session that produces no output.
+            if share_revoked():
+                await deny("share revoked or expired")
+                return
+            continue
         msg_type = message.get("type")
         if msg_type == "websocket.disconnect":
             return
         data_bytes = message.get("bytes")
         if data_bytes is not None:
+            if share_revoked():
+                await deny("share revoked or expired")
+                return
             if not writable:
                 reject_readonly()
                 continue

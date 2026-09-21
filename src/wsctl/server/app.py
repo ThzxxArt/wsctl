@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import io
 import logging
+import os
 import shlex
 import sqlite3
 from collections.abc import AsyncIterator
@@ -732,14 +733,18 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not a directory")
 
         dest = directory / name
-        # Refuse to follow a symlink planted at the destination (write escape).
-        if dest.is_symlink():
+        # O_NOFOLLOW refuses to follow a symlink planted at the destination.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(dest, flags, 0o644)
+        except OSError as exc:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="refusing to overwrite a symlink"
-            )
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="refusing to overwrite a symlink or invalid path",
+            ) from exc
         size = 0
         try:
-            with dest.open("wb") as handle:
+            with os.fdopen(fd, "wb") as handle:
                 while chunk := await file.read(1 << 20):
                     size += len(chunk)
                     if size > settings.file_max_upload:
