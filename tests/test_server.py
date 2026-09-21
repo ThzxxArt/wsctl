@@ -354,6 +354,20 @@ def test_create_and_kill_tmux_session(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
+def test_orphan_tmux_sessions_are_reaped(tmp_path: Path) -> None:
+    name = tmux.session_name("orphan-xyz")
+    subprocess.run(["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True)
+    try:
+        assert tmux.has_session(name)
+        app = build_app(tmp_path)  # startup should reap the orphan
+        with TestClient(app) as client:
+            login(client, ADMIN)
+        assert not tmux.has_session(name)
+    finally:
+        tmux.kill_session(name)
+
+
+@pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
 def test_startup_restores_tmux_session(tmp_path: Path) -> None:
     sid = "restore-test"
     name = tmux.session_name(sid)

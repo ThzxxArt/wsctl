@@ -64,3 +64,19 @@ def kill_session(name: str) -> None:
         stderr=subprocess.DEVNULL,
         check=False,
     )
+
+
+def list_sessions() -> list[str]:
+    """Return the names of all tmux sessions (empty if tmux is unavailable)."""
+    tmux = tmux_path()
+    if tmux is None:
+        return []
+    result = subprocess.run(
+        [tmux, "list-sessions", "-F", "#{session_name}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]

@@ -145,6 +145,16 @@ async def _restore_tmux_sessions(app: FastAPI) -> None:
     manager: SessionManager = app.state.manager
     if not tmux.is_available():
         return
+    # Kill tmux sessions we own that no longer have a running DB row (orphans).
+    known = {
+        str(row["id"])
+        for row in store.term_session_list()
+        if row.get("backend") == "tmux" and row.get("status") in ("running", "interrupted")
+    }
+    for name in tmux.list_sessions():
+        if name.startswith(tmux.PREFIX) and name[len(tmux.PREFIX):] not in known:
+            tmux.kill_session(name)
+            log.info("reaped orphan tmux session %s", name)
     for row in store.term_session_list():
         if row.get("backend") != "tmux" or row.get("status") not in ("running", "interrupted"):
             continue
