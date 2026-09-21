@@ -40,6 +40,7 @@
     replayHost: document.getElementById("replay-host"),
     replayNote: document.getElementById("replay-note"),
     replayClose: document.getElementById("replay-close"),
+    zmodemBtn: document.getElementById("zmodem-btn"),
     hotkeyList: document.getElementById("hotkey-list"),
     hotkeysReset: document.getElementById("hotkeys-reset"),
   };
@@ -173,7 +174,16 @@
         try { msg = JSON.parse(event.data); } catch { return; }
         handleControl(s, msg);
       } else {
-        s.term.write(new Uint8Array(event.data));
+        const bytes = new Uint8Array(event.data);
+        if (s.sentry) {
+          try {
+            s.sentry.consume(bytes);
+          } catch {
+            s.term.write(bytes);
+          }
+        } else {
+          s.term.write(bytes);
+        }
       }
     };
 
@@ -230,6 +240,7 @@
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     if (window.WebLinksAddon) term.loadAddon(new WebLinksAddon.WebLinksAddon());
+    if (window.ImageAddon) term.loadAddon(new ImageAddon.ImageAddon());
     term.open(pane);
 
     const tabEl = document.createElement("div");
@@ -244,6 +255,8 @@
       intentional: false, exited: false,
       share: options.share || null,
       writable: options.writable !== false,
+      sentry: null,
+      zmodemActive: false,
     };
     sessions.set(id, s);
 
@@ -271,6 +284,7 @@
 
     term.onData((data) => {
       if (s.writable === false) return;
+      if (s.zmodemActive) return;
       sendInput(s, data);
     });
     term.onResize(({ cols, rows }) => sendControl(s, { type: "resize", cols, rows }));
@@ -515,6 +529,69 @@
   els.replayClose.addEventListener("click", () => {
     els.replayOverlay.classList.add("hidden");
     els.replayHost.innerHTML = "";
+  });
+
+  // -- zmodem (sz/rz file transfer) ------------------------------------
+
+  function makeSentry(s) {
+    if (!window.Zmodem) return null;
+    return new Zmodem.Sentry({
+      to_terminal: (octets) => s.term.write(new Uint8Array(octets)),
+      sender: (octets) => {
+        if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(new Uint8Array(octets));
+      },
+      on_detect: (detection) => handleZmodem(s, detection),
+      on_retract: () => {},
+    });
+  }
+
+  function handleZmodem(s, detection) {
+    if (!window.Zmodem) return;
+    let zsession;
+    try {
+      zsession = detection.confirm();
+    } catch {
+      return;
+    }
+    s.zmodemActive = true;
+    const done = () => {
+      s.zmodemActive = false;
+    };
+    if (zsession.type === "send") {
+      // we send files to the remote (rz)
+      const picker = document.createElement("input");
+      picker.type = "file";
+      picker.multiple = true;
+      picker.addEventListener("change", () => {
+        Zmodem.Browser.send_files(zsession, picker.files, {})
+          .then(() => zsession.close())
+          .then(done, done);
+      });
+      picker.click();
+    } else {
+      // the remote sends files to us (sz)
+      zsession.on("offer", (xfer) => {
+        const name = xfer.get_details().name;
+        const payload = [];
+        xfer.on("input", (chunk) => payload.push(new Uint8Array(chunk)));
+        xfer.accept().then(() => Zmodem.Browser.save_to_disk(payload, name));
+      });
+      zsession.on("session_end", done);
+      zsession.start();
+    }
+  }
+
+  els.zmodemBtn.addEventListener("click", () => {
+    const s = activeId && sessions.get(activeId);
+    if (!s) return;
+    if (s.sentry) {
+      s.sentry = null;
+      s.zmodemActive = false;
+      els.zmodemBtn.classList.remove("rec-on");
+    } else {
+      s.sentry = makeSentry(s);
+      if (s.sentry) els.zmodemBtn.classList.add("rec-on");
+    }
   });
 
   // -- preferences -----------------------------------------------------

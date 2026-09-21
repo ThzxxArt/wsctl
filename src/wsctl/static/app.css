@@ -199,6 +199,7 @@ body.shared #share-btn,
 body.shared #settings-btn,
 body.shared #record-btn,
 body.shared #replay-btn,
+body.shared #zmodem-btn,
 body.shared #logout { display: none; }
 
 .replay-card {

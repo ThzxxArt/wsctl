@@ -97,6 +97,23 @@ def test_browser_flow(tmp_path: Path) -> None:
                 timeout=15000,
             )
 
+            # bundled addons are available
+            assert page.evaluate("() => typeof window.ImageAddon") != "undefined"
+            assert page.evaluate("() => typeof ImageAddon.ImageAddon") == "function"
+            assert page.evaluate("() => typeof window.Zmodem") != "undefined"
+
+            # enabling ZMODEM must not break normal terminal I/O
+            page.click("#zmodem-btn")
+            page.click(".term-pane.active .xterm-screen")
+            page.keyboard.type("echo ZMODEM-ON-OK")
+            page.keyboard.press("Enter")
+            page.wait_for_function(
+                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
+                " return r && r.innerText.includes('ZMODEM-ON-OK'); }",
+                timeout=15000,
+            )
+            page.click("#zmodem-btn")
+
             # create a second session and switch tabs
             page.click("#new-tab")
             page.wait_for_function(
