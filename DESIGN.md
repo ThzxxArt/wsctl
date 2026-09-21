@@ -29,7 +29,7 @@ wsctl **不在原始吞吐上对标 ttyd**。纯 Python 无法在 `cat` 大文�
 | 用户体系 | 单一 basic-auth 凭据 | 多用户 + RBAC（admin/user） |
 | 审计 | 无 | 结构化审计日志（可扩展录制） |
 | 连接语义 | 连接与会话耦合 | 解耦，断线重连回放屏幕 |
-| 配置 | 命令行参数 | 配置文件 + CLI + 热更新 |
+| 配置 | 命令行参数 | 配置文件 + CLI（热更新见 §11） |
 | 可观测 | 基础日志 | `/healthz` · `/metrics` · JSON 日志 |
 | 管理面 | 无 | REST API（可扩展 Webhook） |
 | 扩展 | C | Python |
@@ -205,20 +205,21 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 | **M10** | 录制回放：asciinema cast v2 录制（可含输入）+ 自动录制 + 下载 API/CLI |
 | **M11** | 优雅重启：SO_REUSEPORT 监听 socket，新实例先接管再停旧实例（零停机） |
 | **M12** | 杂项：`settings` 表 + `term_sessions` 完整字段（含迁移）、Webhook、`config set`、主题/字体可配、移动端适配 |
+| **M13** | 前端浏览器级验证：Playwright 无头 Chromium 跑通登录/终端/多标签/文件面板/分享+二维码/主题/只读分享 |
 
 ## 10.1 实现状态（截至 0.1.0）
 
-**已实现**：M0–M12 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
+**已实现**：M0–M13 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
 文件面板（防穿越 + 上传限流）、`/metrics`、JSON 日志、`connect` 瘦客户端、
 会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测、**可选 tmux 后端
 （会话跨服务重启恢复）**、**只读分享（share token + 二维码 + 匿名观看）**、
 **SSH 后端**、**asciinema 录制回放**、**SO_REUSEPORT 零停机重启**、
 **Webhook**、**`settings` 表与完整 `term_sessions` 字段（含迁移）**、
-**主题/字体可配 + 移动端适配**、**`config set`**。
+**主题/字体可配 + 移动端适配**、**`config set`**、**前端浏览器级自动化测试**。
 
 **尚未实现（见 §11 Backlog）**：可写分享、录制的前端回放 UI、
-`config set` 之外的运行时热更新。
+自定义快捷键、配置运行时热更新、每会话内存硬上限。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
@@ -226,8 +227,8 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 
 ## 11. Backlog（后续）
 
-ZMODEM/lrzsz · Sixel · 可写分享 · 录制前端回放 UI · 主题市场 ·
-配置运行时热更新
+ZMODEM/lrzsz · Sixel · 可写分享 · 录制前端回放 UI · 自定义快捷键 ·
+主题市场 · 配置运行时热更新 · 每会话内存硬上限
 
 ## 12. 发布
 

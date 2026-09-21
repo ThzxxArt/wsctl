@@ -45,6 +45,7 @@ dependencies = [
 
 [project.optional-dependencies]
 win = ["pywinpty>=2.0"]
+e2e = ["playwright>=1.44"]
 dev = [
     "ruff>=0.6",
     "mypy>=1.11",
@@ -101,4 +102,5 @@ asyncio_mode = "auto"
 addopts = "-ra"
 markers = [
     "slow: heavier tests not run by default (select with -m slow)",
+    "browser: Playwright browser tests, skipped by default (select with -m browser)",
 ]

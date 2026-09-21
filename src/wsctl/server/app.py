@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import logging
 import shlex
 from collections.abc import AsyncIterator
@@ -518,8 +519,10 @@ def create_app(
         allowed = is_origin_allowed(origin, request.headers.get("host"), settings.allowed_origins)
         base = origin if (origin and allowed) else str(request.base_url).rstrip("/")
         url = f"{base}/?session={sid}&share={token}"
-        svg = segno.make(url, error="m").svg_inline()
-        return Response(content=svg, media_type="image/svg+xml")
+        # A standalone SVG document (with xmlns) so it renders inside an <img>.
+        buffer = io.BytesIO()
+        segno.make(url, error="m").save(buffer, kind="svg")
+        return Response(content=buffer.getvalue(), media_type="image/svg+xml")
 
     # -- recordings ----------------------------------------------------
 

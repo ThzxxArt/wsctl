@@ -390,6 +390,7 @@ def test_share_flow(tmp_path: Path) -> None:
         assert qr.status_code == 200
         assert "svg" in qr.headers["content-type"]
         assert "<svg" in qr.text
+        assert 'xmlns="http://www.w3.org/2000/svg"' in qr.text
 
         assert client.delete(f"/api/sessions/{sid}/share").status_code == 200
         assert client.get(f"/api/sessions/{sid}/qr.svg").status_code == 400

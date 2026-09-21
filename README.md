@@ -250,6 +250,14 @@ pip install -e ".[dev]"
 ruff check . && mypy src && pytest
 ```
 
+Browser-level tests (Playwright, headless Chromium):
+
+```bash
+pip install -e ".[e2e]"
+playwright install chromium
+pytest -m browser
+```
+
 See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 
 ## License

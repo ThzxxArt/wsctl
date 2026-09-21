@@ -90,6 +90,14 @@ RBAC, auditing, a file panel and observability.
 - Web UI preferences: dark/light theme and font size, persisted locally, plus
   responsive/mobile layout adjustments.
 
+### Testing
+
+- Browser-level end-to-end tests with Playwright (`pytest -m browser`, extra
+  `wsctl[e2e]`) covering login, terminal I/O, multi-tab, file panel, sharing
+  with QR, theme switching and anonymous read-only share links.
+- Fixed the share QR endpoint to emit a standalone SVG (with `xmlns`) so it
+  renders inside an `<img>`; the previous inline SVG was blank in browsers.
+
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
 - GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release
