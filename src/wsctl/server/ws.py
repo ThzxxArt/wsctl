@@ -142,9 +142,7 @@ def _access(user: User | None, session: TermSession, share: str | None) -> str |
     """Return ``"write"``, ``"read"`` or ``None`` for a session attach."""
     if user is not None and (user.role == "admin" or session.owner_id == user.id):
         return "write"
-    if session.share_valid(share):
-        return "read"
-    return None
+    return session.share_access(share)
 
 
 async def _handshake(

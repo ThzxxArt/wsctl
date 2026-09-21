@@ -89,6 +89,7 @@ class TermSession:
         self._lock = asyncio.Lock()
         self._share_token: str | None = None
         self._share_expires: float | None = None
+        self._share_writable = False
         self._tmux_name: str | None = None
         self._recorder: Recorder | None = None
         self._record_input = False
@@ -176,22 +177,34 @@ class TermSession:
 
     # -- sharing -------------------------------------------------------
 
-    def create_share(self, ttl: float | None = None) -> str:
-        """Create (or replace) a read-only share token for this session."""
+    def create_share(self, ttl: float | None = None, *, writable: bool = False) -> str:
+        """Create (or replace) a share token for this session."""
         self._share_token = secrets.token_urlsafe(24)
         self._share_expires = time.time() + ttl if ttl else None
+        self._share_writable = writable
         return self._share_token
 
     def revoke_share(self) -> None:
         self._share_token = None
         self._share_expires = None
+        self._share_writable = False
+
+    def share_access(self, token: str | None) -> str | None:
+        """Return ``"write"``, ``"read"`` or ``None`` for a share token."""
+        if not token or self._share_token is None:
+            return None
+        if self._share_expires is not None and time.time() >= self._share_expires:
+            return None
+        if not secrets.compare_digest(token, self._share_token):
+            return None
+        return "write" if self._share_writable else "read"
 
     def share_valid(self, token: str | None) -> bool:
-        if not token or self._share_token is None:
-            return False
-        if self._share_expires is not None and time.time() >= self._share_expires:
-            return False
-        return secrets.compare_digest(token, self._share_token)
+        return self.share_access(token) is not None
+
+    @property
+    def share_writable(self) -> bool:
+        return self._share_writable and self.is_shared
 
     @property
     def is_shared(self) -> bool:

@@ -172,6 +172,13 @@ body { display: flex; flex-direction: column; }
 .share-card { width: 340px; }
 .share-card h1 { margin-bottom: 2px; }
 .share-hint { color: var(--muted); font-size: 12px; margin: 0; }
+.share-write {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
 .share-card img { width: 200px; height: 200px; align-self: center; background: #fff; border-radius: 8px; padding: 8px; }
 .share-card input { width: 100%; font-size: 12px; }
 .share-actions { display: flex; gap: 6px; }

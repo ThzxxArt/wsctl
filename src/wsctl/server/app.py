@@ -78,6 +78,7 @@ class SessionRename(BaseModel):
 
 class SessionShare(BaseModel):
     ttl: int | None = None
+    writable: bool = False
 
 
 class SshConfig(BaseModel):
@@ -361,6 +362,7 @@ def create_app(
             "owner_id": session.owner_id,
             "backend": session.backend,
             "shared": session.is_shared,
+            "share_writable": session.share_writable,
             "recording": session.is_recording,
             "clients": session.client_count,
             "alive": session.is_alive,
@@ -497,9 +499,16 @@ def create_app(
         sid: str, body: SessionShare, user: User = Depends(current_user)
     ) -> dict[str, Any]:
         session = _owned(sid, user)
-        token = session.create_share(ttl=float(body.ttl) if body.ttl else None)
-        app.state.store.log_event("session_share", user_id=user.id, term_session_id=sid)
-        return {"token": token, "ttl": body.ttl}
+        token = session.create_share(
+            ttl=float(body.ttl) if body.ttl else None, writable=body.writable
+        )
+        app.state.store.log_event(
+            "session_share",
+            user_id=user.id,
+            term_session_id=sid,
+            payload="write" if body.writable else "read",
+        )
+        return {"token": token, "ttl": body.ttl, "writable": body.writable}
 
     @app.delete("/api/sessions/{sid}/share")
     async def revoke_share(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:

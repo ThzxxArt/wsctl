@@ -425,6 +425,22 @@ def test_share_attach_readonly_without_login(tmp_path: Path) -> None:
             assert err is not None and "read-only" in str(err["msg"])
 
 
+def test_share_attach_writable(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": True}
+        ).json()["token"]
+        client.cookies.clear()
+
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            attached = _recv_control(ws, {"attached", "error"})
+            assert attached is not None and attached["type"] == "attached"
+            assert attached["writable"] is True
+
+
 def test_ws_without_auth_or_share_rejected(tmp_path: Path) -> None:
     with (
         TestClient(build_app(tmp_path)) as client,

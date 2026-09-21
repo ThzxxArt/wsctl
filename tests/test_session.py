@@ -164,10 +164,23 @@ async def test_share_lifecycle() -> None:
         assert session.is_shared
         assert session.peek_share() == token
         assert session.share_valid(token)
+        assert session.share_access(token) == "read"
+        assert not session.share_writable
         assert not session.share_valid("nope")
         assert not session.share_valid(None)
         session.revoke_share()
         assert not session.share_valid(token)
+    finally:
+        await manager.shutdown()
+
+
+async def test_share_writable() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        token = session.create_share(writable=True)
+        assert session.share_access(token) == "write"
+        assert session.share_writable
     finally:
         await manager.shutdown()
 

@@ -23,6 +23,7 @@
     shareBtn: document.getElementById("share-btn"),
     shareOverlay: document.getElementById("share-overlay"),
     shareQr: document.getElementById("share-qr"),
+    shareWrite: document.getElementById("share-write"),
     shareUrl: document.getElementById("share-url"),
     shareCopy: document.getElementById("share-copy"),
     shareRevoke: document.getElementById("share-revoke"),
@@ -400,7 +401,9 @@
       return;
     }
     try {
-      const info = await api("POST", `/api/sessions/${s.id}/share`, {});
+      const info = await api("POST", `/api/sessions/${s.id}/share`, {
+        writable: els.shareWrite.checked,
+      });
       els.shareUrl.value =
         `${location.origin}/?session=${s.id}&share=${encodeURIComponent(info.token)}`;
       els.shareQr.src = `/api/sessions/${s.id}/qr.svg?origin=${encodeURIComponent(location.origin)}`;
