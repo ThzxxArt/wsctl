@@ -510,3 +510,25 @@ def test_recordings_admin_only(tmp_path: Path) -> None:
     with TestClient(build_app(tmp_path)) as client:
         login(client, BOB)
         assert client.get("/api/recordings").status_code == 403
+
+
+# -- M17: config hot reload -------------------------------------------
+
+
+def test_config_reload_endpoint(tmp_path: Path) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("max_sessions = 5\n", encoding="utf-8")
+    app = build_app(tmp_path, config_path=config)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.post("/api/config/reload")
+        assert r.status_code == 200, r.text
+        assert "max_sessions" in r.json()["changed"]
+        assert app.state.settings.max_sessions == 5  # type: ignore[attr-defined]
+
+
+def test_config_reload_admin_only(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, BOB)
+        assert client.post("/api/config/reload").status_code == 403

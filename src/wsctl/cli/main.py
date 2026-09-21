@@ -432,6 +432,20 @@ def config_set(
     console.print(f"[green]Set[/] {key} = {value}  [dim]({path})[/]")
 
 
+@config_app.command("reload")
+def config_reload(
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """Ask a running server to reload its configuration (admin)."""
+    client = _api_client(url)
+    try:
+        info = client.request("POST", "/api/config/reload")
+    except ApiError as exc:
+        _fail(str(exc))
+    changed = info.get("changed") or []
+    console.print("[green]Reloaded[/] config; changed: " + (", ".join(changed) or "none"))
+
+
 @session_app.command("list")
 def session_list(
     url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,

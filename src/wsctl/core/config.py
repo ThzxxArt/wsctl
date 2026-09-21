@@ -143,3 +143,67 @@ def load_settings(**overrides: Any) -> Settings:
     """Load settings, allowing CLI overrides on top of the normal precedence."""
     filtered: dict[str, Any] = {k: v for k, v in overrides.items() if v is not None}
     return Settings(**filtered)
+
+
+# Fields that can be changed at runtime without restarting the server.
+HOT_FIELDS = frozenset(
+    {
+        "session_ttl",
+        "cookie_secure",
+        "trust_proxy",
+        "allowed_origins",
+        "allowed_ips",
+        "security_headers",
+        "login_rate_limit",
+        "login_rate_window",
+        "audit_input",
+        "default_shell",
+        "default_cwd",
+        "default_backend",
+        "tmux_preserve_on_shutdown",
+        "idle_timeout",
+        "max_life",
+        "max_sessions",
+        "session_max_clients",
+        "input_rate_limit",
+        "input_rate_burst",
+        "scrollback_bytes",
+        "file_root",
+        "file_max_upload",
+        "metrics_enabled",
+        "auto_record",
+        "record_input",
+        "totp_issuer",
+    }
+)
+
+# Fields that require a restart to take effect.
+RESTART_FIELDS = frozenset(
+    {"host", "port", "ssl_cert", "ssl_key", "reuse_port", "data_dir", "config_path",
+     "log_level", "log_json", "webhook_url"}
+)
+
+
+def reload_settings_file(settings: Settings) -> list[str]:
+    """Re-read the config file and apply hot-reloadable fields in place.
+
+    Returns the list of field names that changed.
+    """
+    path = settings.config_path
+    if not path.is_file():
+        return []
+    import tomllib
+
+    try:
+        data = tomllib.loads(path.read_text("utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    candidate = Settings(**data)
+    changed: list[str] = []
+    for key in sorted(HOT_FIELDS):
+        if key in data and getattr(settings, key) != getattr(candidate, key):
+            setattr(settings, key, getattr(candidate, key))
+            changed.append(key)
+    return changed

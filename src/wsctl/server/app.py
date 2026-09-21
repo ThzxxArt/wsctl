@@ -33,7 +33,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from wsctl import __version__
 from wsctl.core import fs as fs_mod
 from wsctl.core import ssh, tmux, totp
-from wsctl.core.config import Settings
+from wsctl.core.config import Settings, reload_settings_file
 from wsctl.core.metrics import Metrics
 from wsctl.core.ratelimit import RateLimiter
 from wsctl.core.session import SessionManager, SessionSpec, TermSession
@@ -131,6 +131,13 @@ def require_admin(user: User = Depends(current_user)) -> User:
     return user
 
 
+def _config_mtime(settings: Settings) -> float:
+    try:
+        return settings.config_path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 async def _restore_tmux_sessions(app: FastAPI) -> None:
     """Reattach to tmux-backed sessions that outlived a previous server run."""
     settings: Settings = app.state.settings
@@ -170,6 +177,16 @@ def create_app(
     manager: SessionManager | None = None,
     startup_command: str | None = None,
 ) -> FastAPI:
+    config_clock = {"mtime": _config_mtime(settings)}
+
+    def _reload_config() -> list[str]:
+        changed = reload_settings_file(settings)
+        if changed:
+            limiter.limit = settings.login_rate_limit
+            limiter.window = float(settings.login_rate_window)
+            log.info("config reloaded: %s", ", ".join(changed))
+        return changed
+
     async def _maintenance() -> None:
         while True:
             await asyncio.sleep(MAINTENANCE_INTERVAL)
@@ -179,6 +196,10 @@ def create_app(
                 alive = {s.id for s in app.state.manager.list_sessions()}
                 app.state.store.term_session_stop_missing(alive)
                 app.state.store.purge_expired_sessions()
+                mtime = _config_mtime(settings)
+                if mtime != config_clock["mtime"]:
+                    config_clock["mtime"] = mtime
+                    _reload_config()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -622,6 +643,14 @@ def create_app(
     ) -> list[dict[str, Any]]:
         store_: Store = app.state.store
         return store_.recent_audit(limit=min(max(limit, 1), 1000))
+
+    @app.post("/api/config/reload")
+    async def reload_config(actor: User = Depends(require_admin)) -> dict[str, Any]:
+        changed = _reload_config()
+        app.state.store.log_event(
+            "config_reload", user_id=actor.id, payload=",".join(changed) or None
+        )
+        return {"changed": changed}
 
     # -- files (rooted at settings.files_root) -------------------------
 
