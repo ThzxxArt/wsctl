@@ -460,3 +460,36 @@ def test_ssh_backend_rejects_bad_host(tmp_path: Path) -> None:
         login(client, ADMIN)
         r = client.post("/api/sessions", json={"backend": "ssh", "ssh": {"host": "-evil"}})
         assert r.status_code == 400
+
+
+# -- M10: recording ---------------------------------------------------
+
+
+def test_recording_endpoints(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+
+        assert client.post(f"/api/sessions/{sid}/recording/start", json={}).status_code == 200
+        assert client.post(f"/api/sessions/{sid}/recording/start", json={}).status_code == 409
+        assert client.post(f"/api/sessions/{sid}/recording/stop").status_code == 200
+
+        download = client.get(f"/api/sessions/{sid}/recording")
+        assert download.status_code == 200
+        assert download.content.startswith(b'{"version": 2')
+        assert client.get("/api/recordings").status_code == 200
+
+
+def test_auto_record(tmp_path: Path) -> None:
+    app = build_app(tmp_path, auto_record=True)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        client.post("/api/sessions", json={})
+        assert client.get("/api/sessions").json()[0]["recording"] is True
+        assert list((tmp_path / "recordings").glob("*.cast"))
+
+
+def test_recordings_admin_only(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, BOB)
+        assert client.get("/api/recordings").status_code == 403

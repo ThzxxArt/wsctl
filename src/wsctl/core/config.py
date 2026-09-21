@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     log_level: str = "info"
     log_json: bool = False
 
+    auto_record: bool = False
+    record_input: bool = False
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "wsctl.db"
@@ -106,6 +109,10 @@ class Settings(BaseSettings):
     def files_root(self) -> Path:
         """Root directory exposed by the web file panel."""
         return (self.file_root or Path.home()).expanduser().resolve()
+
+    @property
+    def recordings_dir(self) -> Path:
+        return self.data_dir / "recordings"
 
     @property
     def shell(self) -> str:

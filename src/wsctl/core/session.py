@@ -13,10 +13,12 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from . import tmux
 from .pty import Pty, create_pty
+from .recording import Recorder
 from .scrollback import DEFAULT_MAX_BYTES, Scrollback
 
 
@@ -88,6 +90,9 @@ class TermSession:
         self._share_token: str | None = None
         self._share_expires: float | None = None
         self._tmux_name: str | None = None
+        self._recorder: Recorder | None = None
+        self._record_input = False
+        self.recording_path: Path | None = None
         argv = spec.argv
         if spec.backend == "tmux":
             self._tmux_name = tmux.session_name(sid)
@@ -198,12 +203,35 @@ class TermSession:
         """Return the active share token, or ``None`` if not shared."""
         return self._share_token if self.is_shared else None
 
+    # -- recording -----------------------------------------------------
+
+    def start_recording(self, path: Path | str, *, record_input: bool = False) -> Path:
+        """Begin recording this session to an asciinema cast file."""
+        self.stop_recording()
+        self._recorder = Recorder(
+            Path(path), width=self.spec.cols, height=self.spec.rows
+        )
+        self._record_input = record_input
+        self.recording_path = Path(path)
+        return self.recording_path
+
+    def stop_recording(self) -> None:
+        if self._recorder is not None:
+            self._recorder.close()
+            self._recorder = None
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder is not None and not self._recorder.closed
+
     # -- I/O -----------------------------------------------------------
 
     def write_input(self, data: bytes) -> None:
         if self.closed:
             return
         self.last_active = time.time()
+        if self._recorder is not None and self._record_input:
+            self._recorder.input(data)
         self._pty.write(data)
 
     def resize(self, cols: int, rows: int) -> None:
@@ -218,6 +246,8 @@ class TermSession:
     async def _broadcast(self, data: bytes) -> None:
         async with self._lock:
             self._scrollback.append(data)
+            if self._recorder is not None:
+                self._recorder.output(data)
             dead: list[int] = []
             for key, entry in self._clients.items():
                 try:
@@ -257,6 +287,7 @@ class TermSession:
         if self.closed:
             return
         self.closed = True
+        self.stop_recording()
         code = self._pty.poll()
         if code is None:
             try:

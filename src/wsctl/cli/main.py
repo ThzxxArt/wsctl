@@ -6,6 +6,7 @@ import contextlib
 import os
 import secrets
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -474,6 +475,60 @@ def session_attach(
         run_connect(url, sid, token)
     except ConnectError as exc:
         _fail(str(exc))
+
+
+@session_app.command("record")
+def session_record(
+    sid: Annotated[str, typer.Argument(help="Session id.")],
+    record_input: Annotated[
+        bool, typer.Option("--input", help="Also record typed input.")
+    ] = False,
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """Start recording a session to an asciinema cast file."""
+    client = _api_client(url)
+    try:
+        info = client.request(
+            "POST", f"/api/sessions/{sid}/recording/start", {"record_input": record_input}
+        )
+    except ApiError as exc:
+        _fail(str(exc))
+    console.print(f"[green]Recording[/] {sid} -> {info['path']}")
+
+
+@session_app.command("record-stop")
+def session_record_stop(
+    sid: Annotated[str, typer.Argument(help="Session id.")],
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """Stop recording a session."""
+    client = _api_client(url)
+    try:
+        client.request("POST", f"/api/sessions/{sid}/recording/stop")
+    except ApiError as exc:
+        _fail(str(exc))
+    console.print(f"[green]Stopped recording[/] {sid}")
+
+
+@session_app.command("recording")
+def session_recording(
+    sid: Annotated[str, typer.Argument(help="Session id.")],
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Write the cast here.")
+    ] = None,
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """Download a session recording (asciinema cast)."""
+    client = _api_client(url)
+    try:
+        data = client.download(f"/api/sessions/{sid}/recording")
+    except ApiError as exc:
+        _fail(str(exc))
+    if output is None:
+        sys.stdout.buffer.write(data)
+    else:
+        output.write_bytes(data)
+        console.print(f"[green]Wrote[/] {output}")
 
 
 @app.command()

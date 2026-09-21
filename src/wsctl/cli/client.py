@@ -93,6 +93,21 @@ class ApiClient:
             return None
         return json.loads(payload)
 
+    def download(self, path: str) -> bytes:
+        """Fetch a raw (non-JSON) resource such as a recording."""
+        headers = {"Accept": "*/*"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(f"{self.base_url}{path}", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data: bytes = resp.read()
+                return data
+        except urllib.error.HTTPError as exc:
+            raise ApiError(exc.code, exc.read().decode("utf-8", "replace")) from exc
+        except urllib.error.URLError as exc:
+            raise ApiError(0, f"cannot reach {self.base_url}: {exc.reason}") from exc
+
 
 def login(base_url: str, username: str, password: str, *, timeout: float = 15.0) -> str:
     """Authenticate and return the opaque session token from the cookie."""

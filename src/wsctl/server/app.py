@@ -87,6 +87,10 @@ class SshConfig(BaseModel):
     command: str | None = None
 
 
+class RecordingStart(BaseModel):
+    record_input: bool = False
+
+
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -347,6 +351,7 @@ def create_app(
             "owner_id": session.owner_id,
             "backend": session.backend,
             "shared": session.is_shared,
+            "recording": session.is_recording,
             "clients": session.client_count,
             "alive": session.is_alive,
             "created_at": session.created_at,
@@ -416,6 +421,11 @@ def create_app(
             scrollback_bytes=settings.scrollback_bytes,
         )
         session = await manager.create(spec, owner_id=user.id)
+        if settings.auto_record:
+            session.start_recording(
+                settings.recordings_dir / f"{session.id}.cast",
+                record_input=settings.record_input,
+            )
         app.state.store.term_session_upsert(
             session.id,
             name=name,
@@ -497,6 +507,48 @@ def create_app(
         url = f"{base}/?session={sid}&share={token}"
         svg = segno.make(url, error="m").svg_inline()
         return Response(content=svg, media_type="image/svg+xml")
+
+    # -- recordings ----------------------------------------------------
+
+    @app.post("/api/sessions/{sid}/recording/start")
+    async def start_recording(
+        sid: str, body: RecordingStart, user: User = Depends(current_user)
+    ) -> dict[str, str]:
+        session = _owned(sid, user)
+        if session.is_recording:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="already recording")
+        path = session.start_recording(
+            settings.recordings_dir / f"{sid}.cast", record_input=body.record_input
+        )
+        app.state.store.log_event("recording_start", user_id=user.id, term_session_id=sid)
+        return {"path": str(path)}
+
+    @app.post("/api/sessions/{sid}/recording/stop")
+    async def stop_recording(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
+        session = _owned(sid, user)
+        session.stop_recording()
+        app.state.store.log_event("recording_stop", user_id=user.id, term_session_id=sid)
+        return {"ok": True}
+
+    @app.get("/api/sessions/{sid}/recording")
+    async def download_recording(sid: str, user: User = Depends(current_user)) -> FileResponse:
+        session = _owned(sid, user)
+        path = session.recording_path
+        if path is None or not path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no recording")
+        return FileResponse(
+            path, media_type="application/x-asciicast", filename=f"{sid}.cast"
+        )
+
+    @app.get("/api/recordings")
+    async def list_recordings(_: User = Depends(require_admin)) -> list[dict[str, Any]]:
+        directory = settings.recordings_dir
+        if not directory.is_dir():
+            return []
+        return [
+            {"name": entry.name, "size": entry.stat().st_size}
+            for entry in sorted(directory.glob("*.cast"))
+        ]
 
     # -- users (admin only) --------------------------------------------
 

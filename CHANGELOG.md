@@ -72,6 +72,11 @@ RBAC, auditing, a file panel and observability.
 - Hosts and users are validated and passed as separate arguments (no shell
   interpolation).
 
+**Session recording**
+- asciinema cast v2 recording (`core/recording.py`), optionally including input.
+- Per-session start/stop/download endpoints and `auto_record` / `record_input`
+  settings; CLI `session record`, `record-stop` and `recording`.
+
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
 - GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release

@@ -187,6 +187,11 @@ async def _handshake(
             return None
         spec = _default_spec(settings, cols, rows)
         session = await manager.create(spec, owner_id=user.id)
+        if settings.auto_record:
+            session.start_recording(
+                settings.recordings_dir / f"{session.id}.cast",
+                record_input=settings.record_input,
+            )
         websocket.app.state.metrics.inc("wsctl_sessions_created_total")
         store: Store = websocket.app.state.store
         store.term_session_upsert(

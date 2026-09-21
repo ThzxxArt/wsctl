@@ -201,19 +201,20 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 | **M7** | 可选 tmux 后端：会话跨服务重启恢复；优雅关闭时保留 tmux 会话；启动自动 reattach |
 | **M8** | 会话只读分享：share token（可限时/可撤销）+ 二维码 + 匿名只读观看（输入被拒） |
 | **M9** | SSH 后端：`backend=ssh` 结构化目标（host/user/port/identity/options/远端命令） |
+| **M10** | 录制回放：asciinema cast v2 录制（可含输入）+ 自动录制 + 下载 API/CLI |
 
 ## 10.1 实现状态（截至 0.1.0）
 
-**已实现**：M0–M9 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
+**已实现**：M0–M10 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
 文件面板（防穿越 + 上传限流）、`/metrics`、JSON 日志、`connect` 瘦客户端、
 会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测、**可选 tmux 后端
 （会话跨服务重启恢复）**、**只读分享（share token + 二维码 + 匿名观看）**、
-**SSH 后端**。
+**SSH 后端**、**asciinema 录制回放**。
 
 **尚未实现（见 §11 Backlog）**：可写分享、优雅重启（监听无缝交接）、
 `settings` 表与 `term_sessions` 完整字段、主题/字体/快捷键可配、移动端专项适配、
-`config set`。
+`config set`、录制的前端回放 UI。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
@@ -221,7 +222,7 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 
 ## 11. Backlog（后续）
 
-ZMODEM/lrzsz · Sixel · asciinema 录制回放 · Webhook · 可写分享 ·
+ZMODEM/lrzsz · Sixel · Webhook · 可写分享 · 录制前端回放 UI ·
 主题市场 · 优雅重启（SO_REUSEPORT / socket 交接）· `settings` 表与
 `term_sessions` 完整字段 · 主题/字体/快捷键可配 · 移动端专项适配 · `config set`
 

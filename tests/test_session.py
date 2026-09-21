@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -180,3 +181,22 @@ async def test_share_expiry() -> None:
         assert not session.share_valid(token)
     finally:
         await manager.shutdown()
+
+
+async def test_recording_captures_output(tmp_path: Path) -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    path = tmp_path / "s.cast"
+    client = FakeClient()
+    try:
+        session.start_recording(path, record_input=True)
+        assert session.is_recording
+        await session.attach(client)
+        session.write_input(b"echo REC-MARK\n")
+        assert await wait_for(lambda: b"REC-MARK" in client.output())
+    finally:
+        session.stop_recording()
+        await manager.shutdown()
+    text = path.read_text()
+    assert '"o"' in text and "REC-MARK" in text
+    assert '"i"' in text

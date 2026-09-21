@@ -36,6 +36,8 @@ CLI (wsctl connect) ┘             │
   cannot type
 - 🧑💻 **CLI thin client** — `wsctl connect` bridges your local terminal to a server
 - 🔐 **SSH sessions** — run a session as an `ssh` connection to a remote host
+- ⏺️ **Recording** — capture sessions as asciinema cast files (optionally
+  auto-record every session)
 - 📁 **Web file panel** — browse, download and upload within a configured root
 - 📝 **Auditing** — logins, sessions, file transfers and admin actions recorded
 - 🛡️ **Security built in** — Argon2, TOTP 2FA, login rate limiting, CIDR IP
@@ -102,6 +104,9 @@ wsctl session new [-x CMD] [--backend tmux]  Create a session
 wsctl session new --ssh user@host [--ssh-port N] [--ssh-identity FILE]  SSH session
 wsctl session attach ID     Attach this terminal to a session
 wsctl session kill ID       Kill a session
+wsctl session record ID     Start recording (asciinema cast)
+wsctl session record-stop ID
+wsctl session recording ID [-o FILE]  Download a recording
 wsctl user add|list|del|passwd|role|totp
 wsctl audit                 Show the audit log (admin)
 wsctl config show|path|edit Inspect or edit configuration
@@ -145,6 +150,9 @@ file_max_upload = 104857600
 metrics_enabled = true
 log_level = "info"
 log_json = false
+
+auto_record = false          # record every session to data_dir/recordings
+record_input = false         # include typed input in recordings
 
 ssl_cert = "/etc/wsctl/cert.pem"
 ssl_key = "/etc/wsctl/key.pem"
