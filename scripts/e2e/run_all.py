@@ -127,6 +127,15 @@ def _tmux_has(name: str) -> bool:
     ).returncode == 0
 
 
+def _wait_tmux(name: str, timeout: float = 10.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if _tmux_has(name):
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def _tmux_ls() -> list[str]:
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name}"],
@@ -252,11 +261,11 @@ def scenario_tmux() -> None:
             ws.send(b"echo TMUX-MARK\r")
             assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK")
 
-        assert _tmux_has(f"wsctl-{sid}"), (
+        assert _wait_tmux(f"wsctl-{sid}"), (
             "tmux session missing while the server is running: " + " ".join(_tmux_ls())
         )
         stop(first)  # graceful: preserves the tmux session
-        if not _tmux_has(f"wsctl-{sid}"):
+        if not _wait_tmux(f"wsctl-{sid}"):
             raise AssertionError(
                 "tmux session lost after server stop: " + " ".join(_tmux_ls())
             )

@@ -379,6 +379,10 @@ def test_startup_restores_tmux_session(tmp_path: Path) -> None:
         ["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True, timeout=10
     )
     try:
+        deadline = time.time() + 5
+        while time.time() < deadline and not tmux.has_session(name):
+            time.sleep(0.2)
+        assert tmux.has_session(name), "tmux session did not become visible"
         settings = load_settings(data_dir=tmp_path, auth_required=True, default_shell="/bin/sh")
         store = Store(tmp_path / "test.db")
         store.user_create("admin", "adminpw", role="admin")
