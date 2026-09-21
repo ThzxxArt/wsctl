@@ -54,3 +54,12 @@ def test_reload_settings_file(tmp_path: Path, monkeypatch: object) -> None:
 def test_reload_missing_file_is_noop(tmp_path: Path) -> None:
     settings = load_settings(config_path=tmp_path / "nope.toml")
     assert reload_settings_file(settings) == []
+
+
+def test_reload_invalid_value_is_noop(tmp_path: Path) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    settings = load_settings(config_path=config)
+    config.write_text('max_sessions = "not-an-int"\n', encoding="utf-8")
+    assert reload_settings_file(settings) == []
+    assert settings.max_sessions == 64

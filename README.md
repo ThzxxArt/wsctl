@@ -134,11 +134,18 @@ auth_required = true
 session_ttl = 43200          # login session lifetime (seconds)
 cookie_secure = false        # set true when serving over HTTPS
 trust_proxy = false          # honour X-Forwarded-For from a reverse proxy
+allowed_origins = []         # WebSocket Origin allowlist (empty = same host)
 
 allowed_ips = ["10.0.0.0/8"] # CIDR allowlist; empty = allow all
 login_rate_limit = 10        # failed attempts before a key is blocked
 login_rate_window = 300      # sliding window (seconds)
 audit_input = false          # record submitted command lines
+security_headers = true      # send nosniff / frame-deny / CSP headers
+totp_issuer = "wsctl"        # issuer label in TOTP authenticator apps
+
+default_shell = "/bin/bash"  # shell for local sessions (default: $SHELL)
+default_cwd = "/home/me"     # working directory for new sessions
+data_dir = "/var/lib/wsctl"  # database and recordings location
 
 idle_timeout = 3600          # kill sessions idle for this long (optional)
 max_life = 86400             # kill sessions older than this (optional)

@@ -204,7 +204,11 @@ def reload_settings_file(settings: Settings) -> list[str]:
         return []
     if not isinstance(data, dict):
         return []
-    candidate = Settings(**data)
+    try:
+        candidate = Settings(**data)
+    except Exception:
+        # invalid values must not break a running server
+        return []
     changed: list[str] = []
     for key in sorted(HOT_FIELDS):
         if key in data and getattr(settings, key) != getattr(candidate, key):

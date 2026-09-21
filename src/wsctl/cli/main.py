@@ -40,7 +40,9 @@ app = typer.Typer(
     add_completion=False,
 )
 user_app = typer.Typer(name="user", help="Manage users.", no_args_is_help=True)
-config_app = typer.Typer(name="config", help="Inspect configuration.", no_args_is_help=True)
+config_app = typer.Typer(
+    name="config", help="Inspect and manage configuration.", no_args_is_help=True
+)
 session_app = typer.Typer(name="session", help="Manage terminal sessions.", no_args_is_help=True)
 app.add_typer(user_app)
 app.add_typer(config_app)

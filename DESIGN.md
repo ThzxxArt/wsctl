@@ -169,10 +169,12 @@ wsctl/
 ## 8. 依赖
 
 ```
-fastapi  uvicorn[standard]  jinja2  typer  rich
-pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
+fastapi  uvicorn[standard]  typer  rich
+pydantic  pydantic-settings  argon2-cffi  python-multipart
+pyotp  segno  websockets
 
 [win] → pywinpty
+[e2e] → playwright
 [dev] → ruff mypy pytest pytest-asyncio httpx build twine
 ```
 
