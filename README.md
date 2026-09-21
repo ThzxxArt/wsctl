@@ -32,13 +32,17 @@ CLI (wsctl connect) ┘             │
 - ♻️ **Restart-safe sessions (optional)** — with the `tmux` backend a session
   survives a full server restart and is reattached automatically
 - 👥 **Multi-user + RBAC** — admins manage everything, users only their sessions
-- 🔗 **Read-only sharing** — generate a share link + QR code; viewers watch but
-  cannot type
+- 🔗 **Sharing** — read-only or read-write share links with QR codes; viewers
+  can watch, or type if you allow it
 - 🧑💻 **CLI thin client** — `wsctl connect` bridges your local terminal to a server
 - 🔐 **SSH sessions** — run a session as an `ssh` connection to a remote host
-- ⏺️ **Recording** — capture sessions as asciinema cast files (optionally
-  auto-record every session)
+- ⏺️ **Recording** — capture sessions as asciinema cast files and replay them in
+  the browser
+- 🖼️ **Sixel images** and **opt-in ZMODEM** (`sz`/`rz`) file transfer
+- 🎨 **Themes & shortcuts** — a terminal theme gallery, custom themes and
+  configurable keyboard shortcuts
 - 🔔 **Webhooks** — POST every audit event to a URL of your choice
+- ⚙️ **Hot reload** — change config and apply it without restarting
 - 📁 **Web file panel** — browse, download and upload within a configured root
 - 📝 **Auditing** — logins, sessions, file transfers and admin actions recorded
 - 🛡️ **Security built in** — Argon2, TOTP 2FA, login rate limiting, CIDR IP
@@ -112,6 +116,7 @@ wsctl user add|list|del|passwd|role|totp
 wsctl audit                 Show the audit log (admin)
 wsctl config show|path|edit Inspect or edit configuration
 wsctl config set KEY VALUE  Set a configuration value
+wsctl config reload         Ask a running server to reload config
 wsctl version
 ```
 
@@ -139,6 +144,8 @@ idle_timeout = 3600          # kill sessions idle for this long (optional)
 max_life = 86400             # kill sessions older than this (optional)
 max_sessions = 64
 session_max_clients = 0      # max clients per session (0 = unlimited)
+session_memory_limit = 67108864   # per-session buffer cap in bytes
+client_max_bytes = 8388608        # per-client backlog cap in bytes
 input_rate_limit = 0         # per-connection input bytes/sec (0 = unlimited)
 input_rate_burst = 0         # token bucket capacity (default: limit)
 scrollback_bytes = 4194304

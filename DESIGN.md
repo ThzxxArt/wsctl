@@ -29,7 +29,7 @@ wsctl **不在原始吞吐上对标 ttyd**。纯 Python 无法在 `cat` 大文�
 | 用户体系 | 单一 basic-auth 凭据 | 多用户 + RBAC（admin/user） |
 | 审计 | 无 | 结构化审计日志（可扩展录制） |
 | 连接语义 | 连接与会话耦合 | 解耦，断线重连回放屏幕 |
-| 配置 | 命令行参数 | 配置文件 + CLI（热更新见 §11） |
+| 配置 | 命令行参数 | 配置文件 + CLI + 热更新 |
 | 可观测 | 基础日志 | `/healthz` · `/metrics` · JSON 日志 |
 | 管理面 | 无 | REST API（可扩展 Webhook） |
 | 扩展 | C | Python |
@@ -132,12 +132,13 @@ settings(key, value)
 wsctl serve                     # 起控制面，默认配置开箱即用
 wsctl serve --new "bash"        # 启动时顺带开一个会话
 wsctl serve --backend tmux      # 默认使用 tmux 后端（跨重启恢复）
-wsctl session list|new|kill|attach   # new 支持 --backend local|tmux
+wsctl session list|new|kill|attach   # new 支持 --backend local|tmux|ssh
+wsctl session record|record-stop|recording
 wsctl connect [url] [-s id]     # 瘦客户端：本地 raw 终端直连
 wsctl login|logout              # 缓存/清除服务端凭据
 wsctl user add|list|del|passwd|role|totp
 wsctl audit                     # 查看审计日志（admin）
-wsctl config show|path|edit
+wsctl config show|path|edit|set|reload
 wsctl version
 ```
 
@@ -206,20 +207,28 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 | **M11** | 优雅重启：SO_REUSEPORT 监听 socket，新实例先接管再停旧实例（零停机） |
 | **M12** | 杂项：`settings` 表 + `term_sessions` 完整字段（含迁移）、Webhook、`config set`、主题/字体可配、移动端适配 |
 | **M13** | 前端浏览器级验证：Playwright 无头 Chromium 跑通登录/终端/多标签/文件面板/分享+二维码/主题/只读分享 |
+| **M14** | 可写分享（share writable） |
+| **M15** | 录制前端回放 UI（vendored asciinema-player）+ 录制开关 |
+| **M16** | 自定义快捷键（可编辑、本地持久化） |
+| **M17** | 配置运行时热更新（文件监听 + 管理端点 + CLI） |
+| **M18** | 每会话内存硬上限 + 每客户端字节上限 |
+| **M19** | Sixel 图像渲染（addon-image）+ 可选 ZMODEM 传输（zmodem.js） |
+| **M20** | 终端主题市场（10 内置主题 + 自定义 JSON 主题） |
 
 ## 10.1 实现状态（截至 0.1.0）
 
-**已实现**：M0–M13 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
+**已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
 文件面板（防穿越 + 上传限流）、`/metrics`、JSON 日志、`connect` 瘦客户端、
-会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测、**可选 tmux 后端
-（会话跨服务重启恢复）**、**只读分享（share token + 二维码 + 匿名观看）**、
-**SSH 后端**、**asciinema 录制回放**、**SO_REUSEPORT 零停机重启**、
-**Webhook**、**`settings` 表与完整 `term_sessions` 字段（含迁移）**、
-**主题/字体可配 + 移动端适配**、**`config set`**、**前端浏览器级自动化测试**。
+会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测、可选 tmux 后端
+（跨重启恢复）、只读/可写分享（share token + 二维码 + 匿名观看）、SSH 后端、
+asciinema 录制 + 前端回放、SO_REUSEPORT 零停机重启、Webhook、
+`settings` 表与完整 `term_sessions` 字段、主题/字体/快捷键可配 + 移动端适配、
+`config set`/`reload`、前端浏览器级自动化测试、每会话内存硬上限、
+Sixel 渲染、可选 ZMODEM、终端主题市场。
 
-**尚未实现（见 §11 Backlog）**：可写分享、录制的前端回放 UI、
-自定义快捷键、配置运行时热更新、每会话内存硬上限。
+**尚未实现**：无。唯一验证缺口：ZMODEM 的真实 `rz`/`sz` 传输未在 CI 端到端跑通
+（环境无 lrzsz），仅验证了集成不破坏常规终端 I/O。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
@@ -227,8 +236,8 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 
 ## 11. Backlog（后续）
 
-ZMODEM/lrzsz · Sixel · 可写分享 · 录制前端回放 UI · 自定义快捷键 ·
-主题市场 · 配置运行时热更新 · 每会话内存硬上限
+无（v0.1.0 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
+更多终端协议（Kitty graphics 等）。
 
 ## 12. 发布
 

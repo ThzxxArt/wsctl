@@ -93,10 +93,29 @@ RBAC, auditing, a file panel and observability.
 ### Testing
 
 - Browser-level end-to-end tests with Playwright (`pytest -m browser`, extra
-  `wsctl[e2e]`) covering login, terminal I/O, multi-tab, file panel, sharing
-  with QR, theme switching and anonymous read-only share links.
+  `wsctl[e2e]`) covering login, terminal I/O, multi-tab, hotkeys, file panel,
+  sharing with QR, recording replay, theme switching and anonymous read-only
+  share links.
 - Fixed the share QR endpoint to emit a standalone SVG (with `xmlns`) so it
   renders inside an `<img>`; the previous inline SVG was blank in browsers.
+
+### Added after M13
+
+- **Read-write share links**: share tokens carry a writable flag; the share
+  dialog has an "allow typing" option.
+- **Recording replay UI**: record toggle + in-browser asciinema player; vendored
+  `asciinema-player`, `@xterm/addon-image` and `zmodem.js`.
+- **Configurable keyboard shortcuts** (Alt+N/W/←/→/F/S/H by default), editable
+  and persisted locally.
+- **Runtime config hot-reload**: file-mtime watcher, `POST /api/config/reload`
+  and `wsctl config reload`; restart-only fields are ignored.
+- **Per-session memory hard limit** and per-client byte cap
+  (`session_memory_limit`, `client_max_bytes`); metric `wsctl_session_bytes`.
+- **Sixel image rendering** via `@xterm/addon-image`.
+- **Opt-in ZMODEM** (`sz`/`rz`) file transfer in the browser via `zmodem.js`.
+- **Terminal theme marketplace**: 10 built-in themes plus custom JSON themes.
+- CSP updated to allow `'wasm-unsafe-eval'` and `worker-src blob:` for the
+  recording player.
 
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
