@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import secrets
+import time
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -23,6 +24,7 @@ from wsctl.cli.client import (
 from wsctl.cli.client import (
     login as api_login,
 )
+from wsctl.core import totp
 from wsctl.core.config import Settings, load_settings
 from wsctl.core.store import Store
 
@@ -236,6 +238,60 @@ def user_role(
     finally:
         store.close()
     console.print(f"[green]{username}[/] is now [cyan]{role}[/]")
+
+
+@user_app.command("totp")
+def user_totp(
+    username: Annotated[str, typer.Argument(help="Username.")],
+    disable: Annotated[bool, typer.Option("--disable", help="Disable TOTP.")] = False,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+) -> None:
+    """Enable or disable TOTP two-factor authentication for a user."""
+    settings = _settings_from(config)
+    store = Store(settings.db_path)
+    try:
+        if store.user_get(username) is None:
+            _fail(f"no such user: {username}")
+        if disable:
+            store.user_clear_totp(username)
+            console.print(f"[green]TOTP disabled[/] for {username}")
+            return
+        secret = totp.generate_secret()
+        uri = totp.provisioning_uri(secret, username, issuer=settings.totp_issuer)
+        console.print(f"Secret: [bold]{secret}[/]")
+        console.print(f"otpauth URI: {uri}")
+        console.print("[dim]Scan the URI in your authenticator app, then confirm.[/]")
+        code = typer.prompt("One-time code")
+        if not totp.verify(secret, code):
+            _fail("code did not verify; TOTP was not enabled")
+        store.user_set_totp(username, secret)
+        console.print(f"[green]TOTP enabled[/] for {username}")
+    finally:
+        store.close()
+
+
+@app.command()
+def audit(
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Number of entries.")] = 50,
+    url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
+) -> None:
+    """Show the server audit log (admin only)."""
+    client = _api_client(url)
+    try:
+        rows = client.request("GET", f"/api/audit?limit={limit}")
+    except ApiError as exc:
+        _fail(str(exc))
+    table = Table("time", "event", "user", "session", "ip", "payload")
+    for row in rows:
+        table.add_row(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["ts"])),
+            str(row["event"]),
+            str(row["user_id"]),
+            str(row["term_session_id"] or ""),
+            str(row["ip"] or ""),
+            (str(row["payload"]) if row["payload"] else "")[:40],
+        )
+    console.print(table)
 
 
 @config_app.command("show")

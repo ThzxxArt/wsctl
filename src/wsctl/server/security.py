@@ -2,12 +2,56 @@
 
 from __future__ import annotations
 
+import ipaddress
 from urllib.parse import urlparse
 
+from fastapi import Request, WebSocket
+
+from wsctl.core.config import Settings
 from wsctl.core.session import TermSession
 from wsctl.core.store import User
 
 COOKIE_NAME = "wsctl_session"
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self' ws: wss:"
+    ),
+}
+
+
+def client_ip(conn: Request | WebSocket, settings: Settings) -> str | None:
+    """Resolve the client IP, honouring ``X-Forwarded-For`` behind a proxy."""
+    if settings.trust_proxy:
+        forwarded = conn.headers.get("x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first
+    return conn.client.host if conn.client else None
+
+
+def ip_allowed(ip: str | None, allowed: list[str]) -> bool:
+    """Whether ``ip`` falls within the allowlist (empty allowlist allows all)."""
+    if not allowed:
+        return True
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for entry in allowed:
+        try:
+            if addr in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def can_access(user: User, session: TermSession) -> bool:

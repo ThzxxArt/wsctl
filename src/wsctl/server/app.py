@@ -12,16 +12,25 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import RequestResponseEndpoint
 
 from wsctl import __version__
+from wsctl.core import totp
 from wsctl.core.config import Settings
+from wsctl.core.ratelimit import RateLimiter
 from wsctl.core.session import SessionManager, SessionSpec, TermSession
 from wsctl.core.store import Store, User
 
-from .security import COOKIE_NAME, can_access
+from .security import (
+    COOKIE_NAME,
+    SECURITY_HEADERS,
+    can_access,
+    client_ip,
+    ip_allowed,
+)
 from .ws import terminal_endpoint
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -33,6 +42,7 @@ log = logging.getLogger("wsctl.app")
 class LoginRequest(BaseModel):
     username: str
     password: str
+    totp: str | None = None
 
 
 class SessionCreate(BaseModel):
@@ -120,6 +130,20 @@ def create_app(
     app.state.store = store or Store(settings.db_path)
     app.state.manager = manager or SessionManager()
 
+    limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
+
+    @app.middleware("http")
+    async def _guard(request: Request, call_next: RequestResponseEndpoint) -> Response:
+        ip = client_ip(request, settings)
+        if not ip_allowed(ip, settings.allowed_ips):
+            app.state.store.log_event("ip_rejected", ip=ip, payload=request.url.path)
+            return JSONResponse({"detail": "forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+        response = await call_next(request)
+        if settings.security_headers:
+            for key, value in SECURITY_HEADERS.items():
+                response.headers.setdefault(key, value)
+        return response
+
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", include_in_schema=False)
@@ -139,15 +163,39 @@ def create_app(
     @app.post("/api/login")
     async def login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
         store_: Store = request.app.state.store
+        ip = client_ip(request, settings)
+        key = f"{ip or '-'}:{body.username}"
+
+        if limiter.is_blocked(key):
+            retry_after = int(limiter.retry_after(key)) + 1
+            store_.log_event("login_blocked", ip=ip, payload=body.username)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="too many attempts, try again later",
+                headers={"Retry-After": str(retry_after)},
+            )
+
         user = store_.user_authenticate(body.username, body.password)
         if user is None:
+            limiter.record_failure(key)
+            store_.log_event("login_failed", ip=ip, payload=body.username)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials"
             )
+
+        secret = store_.user_totp_secret(body.username)
+        if secret is not None and not totp.verify(secret, body.totp or ""):
+            limiter.record_failure(key)
+            store_.log_event("login_totp_failed", user_id=user.id, ip=ip, payload=body.username)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid one-time code"
+            )
+
+        limiter.reset(key)
         token = store_.create_auth_session(
             user.id,
             ttl=settings.session_ttl,
-            ip=request.client.host if request.client else None,
+            ip=ip,
             user_agent=request.headers.get("user-agent"),
         )
         response.set_cookie(
@@ -159,7 +207,6 @@ def create_app(
             samesite="lax",
             path="/",
         )
-        ip = request.client.host if request.client else None
         store_.log_event("login", user_id=user.id, ip=ip)
         return {"username": user.username, "role": user.role}
 
@@ -167,7 +214,13 @@ def create_app(
     async def logout(request: Request, response: Response) -> dict[str, bool]:
         token = _token_from_request(request)
         if token:
+            user = request.app.state.store.resolve_auth_session(token)
             request.app.state.store.delete_auth_session(token)
+            request.app.state.store.log_event(
+                "logout",
+                user_id=user.id if user else None,
+                ip=client_ip(request, settings),
+            )
         response.delete_cookie(COOKIE_NAME, path="/")
         return {"ok": True}
 
@@ -250,29 +303,43 @@ def create_app(
         ]
 
     @app.post("/api/users", status_code=status.HTTP_201_CREATED)
-    async def create_user(body: UserCreate, _: User = Depends(require_admin)) -> dict[str, Any]:
+    async def create_user(body: UserCreate, actor: User = Depends(require_admin)) -> dict[str, Any]:
         if body.role not in ("admin", "user"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role")
         if app.state.store.user_get(body.username) is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="user exists")
         user = app.state.store.user_create(body.username, body.password, role=body.role)
+        app.state.store.log_event(
+            "user_create", user_id=actor.id, payload=f"{user.username}:{user.role}"
+        )
         return {"id": user.id, "username": user.username, "role": user.role}
 
     @app.delete("/api/users/{username}")
-    async def delete_user(username: str, _: User = Depends(require_admin)) -> dict[str, bool]:
+    async def delete_user(
+        username: str, actor: User = Depends(require_admin)
+    ) -> dict[str, bool]:
         if not app.state.store.user_delete(username):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such user")
+        app.state.store.log_event("user_delete", user_id=actor.id, payload=username)
         return {"ok": True}
 
     @app.patch("/api/users/{username}")
     async def set_user_role(
-        username: str, body: UserRoleUpdate, _: User = Depends(require_admin)
+        username: str, body: UserRoleUpdate, actor: User = Depends(require_admin)
     ) -> dict[str, bool]:
         if body.role not in ("admin", "user"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid role")
         if not app.state.store.user_set_role(username, body.role):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such user")
+        app.state.store.log_event("user_role", user_id=actor.id, payload=f"{username}:{body.role}")
         return {"ok": True}
+
+    @app.get("/api/audit")
+    async def get_audit(
+        _: User = Depends(require_admin), limit: int = 100
+    ) -> list[dict[str, Any]]:
+        store_: Store = app.state.store
+        return store_.recent_audit(limit=min(max(limit, 1), 1000))
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

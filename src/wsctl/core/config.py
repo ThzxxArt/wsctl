@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     trust_proxy: bool = False
 
+    allowed_ips: list[str] = Field(default_factory=list)
+    security_headers: bool = True
+    login_rate_limit: int = 10
+    login_rate_window: int = 300
+    audit_input: bool = False
+    totp_issuer: str = APP_NAME
+
     default_shell: str | None = None
     default_cwd: str | None = None
     allowed_origins: list[str] = Field(default_factory=list)

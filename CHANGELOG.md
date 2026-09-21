@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (M3 — audit & hardening)
+
+- Full audit trail: login success/failure/TOTP failure/rate-limit, logout, IP
+  rejection, session create/attach/detach/kill and user management, queryable via
+  the admin-only `GET /api/audit` and the `wsctl audit` command.
+- Optional submitted-input auditing (`audit_input`), disabled by default.
+- Login rate limiting (sliding window per IP + username) returning `429` with
+  `Retry-After`; successful logins reset the counter.
+- IP allowlist (`allowed_ips`, CIDR-capable) enforced on HTTP and WebSocket, with
+  optional `X-Forwarded-For` support behind a trusted proxy.
+- TOTP two-factor authentication: enforced at login, managed with
+  `wsctl user totp <user> [--disable]`.
+- Security response headers (nosniff, frame DENY, referrer policy, CSP).
+
 ### Added (M2 — multi-session, RBAC, CLI)
 
 - Per-session ownership and role-based access control: admins see and control every

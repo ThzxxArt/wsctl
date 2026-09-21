@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from wsctl.server.security import can_access, is_origin_allowed
+from wsctl.server.security import can_access, ip_allowed, is_origin_allowed
 
 
 def test_missing_origin_allowed_for_non_browser() -> None:
@@ -30,3 +30,17 @@ def test_can_access_owner_and_admin() -> None:
     assert can_access(owner, session)
     assert not can_access(other, session)
     assert can_access(admin, session)
+
+
+def test_ip_allowlist_empty_allows_all() -> None:
+    assert ip_allowed("203.0.113.5", [])
+    assert ip_allowed(None, [])
+
+
+def test_ip_allowlist_cidr() -> None:
+    allowed = ["10.0.0.0/8", "192.168.1.0/24"]
+    assert ip_allowed("10.1.2.3", allowed)
+    assert ip_allowed("192.168.1.50", allowed)
+    assert not ip_allowed("192.168.2.1", allowed)
+    assert not ip_allowed(None, allowed)
+    assert not ip_allowed("not-an-ip", allowed)

@@ -84,3 +84,17 @@ def test_audit_roundtrip(tmp_path: Path) -> None:
         assert rows and rows[0]["event"] == "login"
     finally:
         store.close()
+
+
+def test_totp_secret_lifecycle(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        store.user_create("frank", "pw")
+        assert store.user_totp_secret("frank") is None
+        assert store.user_set_totp("frank", "ABCDEF")
+        assert store.user_totp_secret("frank") == "ABCDEF"
+        assert store.user_clear_totp("frank")
+        assert store.user_totp_secret("frank") is None
+        assert not store.user_set_totp("nobody", "X")
+    finally:
+        store.close()

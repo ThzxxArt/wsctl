@@ -178,6 +178,29 @@ class Store:
             )
         return cur.rowcount > 0
 
+    def user_set_totp(self, username: str, secret: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE users SET totp_secret = ? WHERE username = ?", (secret, username)
+            )
+        return cur.rowcount > 0
+
+    def user_clear_totp(self, username: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE users SET totp_secret = NULL WHERE username = ?", (username,)
+            )
+        return cur.rowcount > 0
+
+    def user_totp_secret(self, username: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT totp_secret FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        if row is None or row["totp_secret"] is None:
+            return None
+        return str(row["totp_secret"])
+
     def user_authenticate(self, username: str, password: str) -> User | None:
         with self._lock:
             row = self._conn.execute(

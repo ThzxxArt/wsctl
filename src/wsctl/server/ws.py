@@ -13,19 +13,22 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
-from wsctl.core.session import ClientGone, SessionSpec, TermSession
+from wsctl.core.config import Settings
+from wsctl.core.session import ClientGone, SessionManager, SessionSpec, TermSession
 from wsctl.core.store import Store, User
 
 from .client import WsClient
-from .security import COOKIE_NAME, can_access, is_origin_allowed
+from .security import COOKIE_NAME, can_access, client_ip, ip_allowed, is_origin_allowed
 
 log = logging.getLogger("wsctl.ws")
+
+MAX_AUDIT_LINE = 512
 
 
 def _resolve_user(websocket: WebSocket, store: Store, auth_required: bool) -> User | None:
@@ -42,7 +45,7 @@ def _resolve_user(websocket: WebSocket, store: Store, auth_required: bool) -> Us
     return store.resolve_auth_session(token)
 
 
-def _default_spec(settings: Any, cols: int, rows: int) -> SessionSpec:
+def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
     shell = settings.shell
     return SessionSpec(
         name=Path(shell).name or "shell",
@@ -61,6 +64,12 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     settings = app.state.settings
     store: Store = app.state.store
     manager = app.state.manager
+
+    ip = client_ip(websocket, settings)
+    if not ip_allowed(ip, settings.allowed_ips):
+        store.log_event("ip_rejected", ip=ip, payload="ws")
+        await websocket.close(code=4403)
+        return
 
     if not is_origin_allowed(
         websocket.headers.get("origin"),
@@ -84,13 +93,23 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         session = await _handshake(websocket, client, settings, manager, user)
         if session is None:
             return
-        await _pump(websocket, client, session)
+        store.log_event(
+            "session_attach",
+            user_id=user.id,
+            term_session_id=session.id,
+            ip=ip,
+        )
+        on_line = _input_auditor(store, settings, user.id, session.id)
+        await _pump(websocket, client, session, on_line)
     except Exception:
         log.exception("websocket handler failed")
     finally:
         if session is not None:
             with contextlib.suppress(Exception):
                 await session.detach(client)
+            store.log_event(
+                "session_detach", user_id=user.id, term_session_id=session.id, ip=ip
+            )
         client.close()
         # Let the writer drain queued control messages (e.g. a final error)
         # before tearing the connection down.
@@ -105,8 +124,8 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
 async def _handshake(
     websocket: WebSocket,
     client: WsClient,
-    settings: Any,
-    manager: Any,
+    settings: Settings,
+    manager: SessionManager,
     user: User,
 ) -> TermSession | None:
     raw = await websocket.receive_text()
@@ -133,9 +152,12 @@ async def _handshake(
             client.put({"type": "error", "msg": "session limit reached"})
             return None
         spec = _default_spec(settings, cols, rows)
-        session = await manager.create(spec)
-        settings_store: Store = websocket.app.state.store
-        settings_store.log_event(
+        session = await manager.create(spec, owner_id=user.id)
+        store: Store = websocket.app.state.store
+        store.term_session_upsert(
+            session.id, name=spec.name, owner_id=user.id, command=None, cwd=spec.cwd
+        )
+        store.log_event(
             "session_create",
             user_id=user.id,
             term_session_id=session.id,
@@ -147,7 +169,44 @@ async def _handshake(
     return session
 
 
-async def _pump(websocket: WebSocket, client: WsClient, session: TermSession) -> None:
+def _input_auditor(
+    store: Store, settings: Settings, user_id: int, session_id: str
+) -> Callable[[str], None] | None:
+    """Return a line callback that audits submitted input, if enabled."""
+    if not settings.audit_input:
+        return None
+
+    def record(line: str) -> None:
+        store.log_event(
+            "input",
+            user_id=user_id,
+            term_session_id=session_id,
+            payload=line[:MAX_AUDIT_LINE],
+        )
+
+    return record
+
+
+async def _pump(
+    websocket: WebSocket,
+    client: WsClient,
+    session: TermSession,
+    on_line: Callable[[str], None] | None = None,
+) -> None:
+    line_buffer = bytearray()
+
+    def feed_audit(data: bytes) -> None:
+        if on_line is None:
+            return
+        line_buffer.extend(data)
+        while b"\r" in line_buffer or b"\n" in line_buffer:
+            indices = [i for i in (line_buffer.find(b"\r"), line_buffer.find(b"\n")) if i >= 0]
+            cut = min(indices)
+            line = bytes(line_buffer[:cut])
+            del line_buffer[: cut + 1]
+            if line.strip():
+                on_line(line.decode("utf-8", "replace"))
+
     while True:
         message = await websocket.receive()
         msg_type = message.get("type")
@@ -156,6 +215,7 @@ async def _pump(websocket: WebSocket, client: WsClient, session: TermSession) ->
         data_bytes = message.get("bytes")
         if data_bytes is not None:
             session.write_input(data_bytes)
+            feed_audit(data_bytes)
             continue
         text = message.get("text")
         if not text:
@@ -168,7 +228,9 @@ async def _pump(websocket: WebSocket, client: WsClient, session: TermSession) ->
         if kind == "resize":
             session.resize(int(data.get("cols") or 80), int(data.get("rows") or 24))
         elif kind == "input":
-            session.write_input(str(data.get("data", "")).encode("utf-8"))
+            chunk = str(data.get("data", "")).encode("utf-8")
+            session.write_input(chunk)
+            feed_audit(chunk)
         elif kind == "ping":
             try:
                 client.put({"type": "pong"})
