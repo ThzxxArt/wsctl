@@ -90,6 +90,7 @@ class Settings(BaseSettings):
 
     ssl_cert: Path | None = None
     ssl_key: Path | None = None
+    reuse_port: bool = False
 
     file_root: Path | None = None
     file_max_upload: int = 100 * 1024 * 1024

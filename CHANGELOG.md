@@ -77,6 +77,10 @@ RBAC, auditing, a file panel and observability.
 - Per-session start/stop/download endpoints and `auto_record` / `record_input`
   settings; CLI `session record`, `record-stop` and `recording`.
 
+**Zero-downtime restarts**
+- `reuse_port` / `--reuse-port` binds with `SO_REUSEPORT` so a new instance can
+  take over the port before the old one exits (no connection-refused window).
+
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
 - GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release

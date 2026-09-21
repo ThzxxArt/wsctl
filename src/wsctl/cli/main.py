@@ -98,6 +98,10 @@ def serve(
     backend: Annotated[
         str | None, typer.Option("--backend", help="Default session backend: local or tmux.")
     ] = None,
+    reuse_port: Annotated[
+        bool,
+        typer.Option("--reuse-port", help="Bind with SO_REUSEPORT for zero-downtime restarts."),
+    ] = False,
 ) -> None:
     """Start the wsctl server."""
     overrides: dict[str, object] = {
@@ -106,6 +110,7 @@ def serve(
         "ssl_cert": ssl_cert,
         "ssl_key": ssl_key,
         "default_backend": backend,
+        "reuse_port": reuse_port or None,
     }
     if no_auth:
         overrides["auth_required"] = False
@@ -130,13 +135,34 @@ def serve(
     if not settings.auth_required:
         err_console.print("[bold yellow]warning:[/] authentication is disabled")
 
+    ssl_certfile = str(settings.ssl_cert) if settings.ssl_cert else None
+    ssl_keyfile = str(settings.ssl_key) if settings.ssl_key else None
+
+    if settings.reuse_port:
+        from wsctl.core.net import make_reuse_socket
+
+        uv_config = uvicorn.Config(
+            application,
+            log_level=settings.log_level,
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
+        )
+        server = uvicorn.Server(uv_config)
+        sock = make_reuse_socket(settings.host, settings.port)
+        console.print("[dim]SO_REUSEPORT enabled: a new instance can take over this port[/]")
+        try:
+            server.run(sockets=[sock])
+        finally:
+            sock.close()
+        return
+
     uvicorn.run(
         application,
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level,
-        ssl_certfile=str(settings.ssl_cert) if settings.ssl_cert else None,
-        ssl_keyfile=str(settings.ssl_key) if settings.ssl_key else None,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
     )
 
 

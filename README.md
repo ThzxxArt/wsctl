@@ -156,6 +156,8 @@ record_input = false         # include typed input in recordings
 
 ssl_cert = "/etc/wsctl/cert.pem"
 ssl_key = "/etc/wsctl/key.pem"
+
+reuse_port = false           # SO_REUSEPORT: zero-downtime restarts
 ```
 
 Every key also has an environment variable, e.g. `WSCTL_PORT=9000`,
@@ -195,6 +197,22 @@ location / {
 Set `trust_proxy = true` when running behind a proxy so rate limiting and the
 IP allowlist see real client addresses. Prefer HTTPS/WSS in production and set
 `cookie_secure = true`.
+
+### Zero-downtime restarts
+
+With `reuse_port = true` (or `--reuse-port`) the server binds its listening
+socket with `SO_REUSEPORT`. A new instance can then bind the same port and start
+accepting connections *before* the old one exits, so upgrades have no
+"connection refused" window:
+
+```bash
+wsctl serve --reuse-port &      # running instance
+# deploy the new version, then:
+wsctl serve --reuse-port &      # new instance takes new connections
+kill <old-pid>                  # old instance drains and exits
+```
+
+Combine with the `tmux` backend for sessions that also survive the restart.
 
 ### Sessions that survive a restart
 
