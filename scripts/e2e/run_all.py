@@ -252,6 +252,9 @@ def scenario_tmux() -> None:
             ws.send(b"echo TMUX-MARK\r")
             assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK")
 
+        assert _tmux_has(f"wsctl-{sid}"), (
+            "tmux session missing while the server is running: " + " ".join(_tmux_ls())
+        )
         stop(first)  # graceful: preserves the tmux session
         if not _tmux_has(f"wsctl-{sid}"):
             raise AssertionError(

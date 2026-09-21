@@ -102,7 +102,17 @@ class PosixPty:
         self._write_buf = bytearray()
         self._writer_registered = False
         self._reader_fut: asyncio.Future[bytes] | None = None
+        self._kill_group = True
         self.resize(cols, rows)
+
+    def set_detach_only(self) -> None:
+        """Never signal the process group (used for tmux clients).
+
+        The tmux server is forked by the client and may briefly share its
+        process group before daemonizing; killing the group would take the
+        server (and the preserved session) down with it.
+        """
+        self._kill_group = False
 
     @property
     def pid(self) -> int:
@@ -185,7 +195,10 @@ class PosixPty:
         if self._proc.poll() is not None:
             return
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(os.getpgid(self._proc.pid), sig)
+            if self._kill_group:
+                os.killpg(os.getpgid(self._proc.pid), sig)
+            else:
+                self._proc.send_signal(sig)
 
     def signal_process(self, sig: int) -> None:
         """Signal only the direct child, not its whole process group.

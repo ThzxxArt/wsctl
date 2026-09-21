@@ -114,6 +114,10 @@ class TermSession:
             rows=spec.rows,
             loop=loop,
         )
+        if self._tmux_name is not None:
+            detach_only = getattr(self._pty, "set_detach_only", None)
+            if callable(detach_only):
+                detach_only()
         self._read_task = loop.create_task(self._read_loop())
 
     # -- introspection -------------------------------------------------
