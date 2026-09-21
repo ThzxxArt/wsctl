@@ -45,3 +45,19 @@ jobs:
           playwright install --with-deps chromium
       - name: Browser tests
         run: pytest -m browser -q
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          sudo apt-get update && sudo apt-get install -y tmux
+      - name: Backend end-to-end scenarios
+        run: python scripts/e2e/run_all.py

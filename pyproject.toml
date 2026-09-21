@@ -29,6 +29,7 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115",
+    "starlette>=0.37",
     "uvicorn[standard]>=0.30",
     "typer>=0.12",
     "rich>=13.7",
@@ -71,9 +72,11 @@ packages = ["src/wsctl"]
 include = [
     "src/wsctl",
     "tests",
+    "scripts",
     "DESIGN.md",
     "README.md",
     "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md",
     "LICENSE",
     "CHANGELOG.md",
 ]

@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.0 · 状态：草稿（v1 开发中）
+> 版本：0.1.0 · 状态：已发布（0.1.0）
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -75,7 +75,7 @@ tmux 客户端；真正的 shell 活在 tmux server 内。于是：
   tmux 负责重绘屏幕；
 - 管理员 kill / 空闲回收 / 寿命到期则 `preserve=False`，真正 `tmux kill-session`。
 
-tmux 为可选依赖（`wsctl[persist]`），默认路径不依赖它。
+tmux 为可选的系统依赖（需在主机安装，非 pip 依赖），默认路径不依赖它。
 
 ## 4. WebSocket 协议
 
@@ -142,7 +142,7 @@ wsctl config show|path|edit|set|reload
 wsctl version
 ```
 
-> `config set` 未实现：配置以文件为准，用 `config edit` 修改（避免命令行与文件两套写入口）。
+> `config set` 写入配置文件（校验 TOML），`config reload` 让运行中的服务热加载。
 
 
 ## 7. 目录结构

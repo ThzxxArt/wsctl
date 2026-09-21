@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ThzxxArt/wsctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ThzxxArt/wsctl/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/ThzxxArt/wsctl/blob/main/LICENSE)
 
 > A modern, Python-based web terminal server — a [ttyd](https://github.com/tsl0922/ttyd)
 > superset with **persistent sessions**, **multi-user RBAC**, **auditing** and
@@ -42,7 +42,8 @@ CLI (wsctl connect) ┘             │
 - 🎨 **Themes & shortcuts** — a terminal theme gallery, custom themes and
   configurable keyboard shortcuts
 - 🔔 **Webhooks** — POST every audit event to a URL of your choice
-- ⚙️ **Hot reload** — change config and apply it without restarting
+- ⚙️ **Hot reload** — apply most config changes without restarting (network,
+  TLS, data dir, log level and webhook need a restart)
 - 📁 **Web file panel** — browse, download and upload within a configured root
 - 📝 **Auditing** — logins, sessions, file transfers and admin actions recorded
 - 🛡️ **Security built in** — Argon2, TOTP 2FA, login rate limiting, CIDR IP
@@ -254,7 +255,7 @@ only to trusted users over a trusted network:
 - every sensitive action is written to the audit log
 - TLS via a reverse proxy (recommended) or `ssl_cert` / `ssl_key`
 
-Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
+Report vulnerabilities as described in [SECURITY.md](https://github.com/ThzxxArt/wsctl/blob/main/SECURITY.md).
 
 ## Development
 
@@ -272,8 +273,11 @@ playwright install chromium
 pytest -m browser
 ```
 
-See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
+See [DESIGN.md](https://github.com/ThzxxArt/wsctl/blob/main/DESIGN.md) for the architecture and roadmap.
 
 ## License
 
-[MIT](LICENSE) © 2026 ThzxxArt
+[MIT](https://github.com/ThzxxArt/wsctl/blob/main/LICENSE) © 2026 ThzxxArt
+
+Bundled third-party front-end assets (xterm.js, asciinema-player, zmodem.js) are
+listed in [THIRD_PARTY_NOTICES.md](https://github.com/ThzxxArt/wsctl/blob/main/THIRD_PARTY_NOTICES.md).

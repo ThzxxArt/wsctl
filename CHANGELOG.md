@@ -92,8 +92,11 @@ RBAC, auditing, sharing, a file panel and observability.
 
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
-- GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release
-  workflow using PyPI Trusted Publishing.
+- Third-party front-end assets ship with their license texts
+  (`src/wsctl/static/vendor/THIRD_PARTY_NOTICES.txt`, `THIRD_PARTY_NOTICES.md`).
+- GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13), a dedicated
+  browser-test job and a backend end-to-end job, plus a release workflow using
+  PyPI Trusted Publishing that also creates a GitHub Release.
 
 ### Fixed
 
@@ -139,7 +142,8 @@ RBAC, auditing, sharing, a file panel and observability.
   terminal I/O, multi-tab, hotkeys, file panel, sharing with QR, recording
   replay, theme switching, read-only input blocking and anonymous share links;
   run in CI in a dedicated job.
-- `scripts/e2e/run_all.py` runs five backend end-to-end scenarios: server,
-  CLI, `connect`, tmux restart recovery and SO_REUSEPORT graceful restart.
+- `scripts/e2e/run_all.py` runs five backend end-to-end scenarios (server, CLI,
+  `connect`, tmux restart recovery, SO_REUSEPORT graceful restart); it runs in
+  CI in a dedicated job.
 
 [0.1.0]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.0
