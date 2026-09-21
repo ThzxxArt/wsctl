@@ -1,0 +1,277 @@
+"""Terminal sessions and their manager.
+
+The central design rule: **a session's lifetime is independent of any client
+connection**. Clients attach and detach freely; the underlying PTY keeps
+running and its output is retained in a bounded scrollback so reconnecting
+clients can rebuild their screen.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import secrets
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+from .pty import Pty, create_pty
+from .scrollback import DEFAULT_MAX_BYTES, Scrollback
+
+
+class ClientGone(Exception):
+    """Raised by a client sink that can no longer receive data."""
+
+
+@runtime_checkable
+class Client(Protocol):
+    """A consumer attached to a session (browser tab or CLI client)."""
+
+    def put(self, item: bytes | dict[str, Any]) -> None:
+        """Queue an item for delivery without blocking.
+
+        ``bytes`` are sent as binary terminal data; ``dict`` as a JSON control
+        message. Raises :class:`ClientGone` if the client is no longer usable.
+        """
+        ...
+
+
+@dataclass
+class SessionSpec:
+    """Immutable description of how to create a session."""
+
+    name: str
+    argv: list[str]
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+    cols: int = 80
+    rows: int = 24
+    idle_timeout: float | None = None
+    max_life: float | None = None
+    scrollback_bytes: int = DEFAULT_MAX_BYTES
+
+
+@dataclass
+class _ClientEntry:
+    client: Client
+    joined_at: float = field(default_factory=time.time)
+
+
+class TermSession:
+    """A single PTY-backed terminal session."""
+
+    def __init__(
+        self,
+        sid: str,
+        spec: SessionSpec,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        on_close: Callable[[TermSession], None] | None = None,
+    ) -> None:
+        self.id = sid
+        self.spec = spec
+        self.created_at = time.time()
+        self.last_active = self.created_at
+        self.exit_code: int | None = None
+        self.closed = False
+        self._on_close = on_close
+        self._loop = loop
+        self._scrollback = Scrollback(spec.scrollback_bytes)
+        self._clients: dict[int, _ClientEntry] = {}
+        self._lock = asyncio.Lock()
+        self._pty: Pty = create_pty(
+            spec.argv,
+            cwd=spec.cwd,
+            env=spec.env,
+            cols=spec.cols,
+            rows=spec.rows,
+            loop=loop,
+        )
+        self._read_task = loop.create_task(self._read_loop())
+
+    # -- introspection -------------------------------------------------
+
+    @property
+    def pid(self) -> int:
+        return self._pty.pid
+
+    @property
+    def client_count(self) -> int:
+        return len(self._clients)
+
+    @property
+    def is_alive(self) -> bool:
+        return not self.closed and self._pty.poll() is None
+
+    def scrollback_snapshot(self) -> bytes:
+        return self._scrollback.snapshot()
+
+    # -- client attachment ---------------------------------------------
+
+    async def attach(self, client: Client) -> None:
+        """Attach a client, replaying buffered output first.
+
+        Replay is enqueued and the client registered while holding the same
+        lock used by broadcasting, guaranteeing replay-before-live ordering.
+        """
+        async with self._lock:
+            if self.closed:
+                raise ClientGone("session is closed")
+            replay = self._scrollback.snapshot()
+            self._clients[id(client)] = _ClientEntry(client)
+            if replay:
+                client.put(replay)
+            client.put(
+                {
+                    "type": "attached",
+                    "session": self.id,
+                    "name": self.spec.name,
+                    "cols": self.spec.cols,
+                    "rows": self.spec.rows,
+                }
+            )
+
+    async def detach(self, client: Client) -> None:
+        async with self._lock:
+            self._clients.pop(id(client), None)
+
+    # -- I/O -----------------------------------------------------------
+
+    def write_input(self, data: bytes) -> None:
+        if self.closed:
+            return
+        self.last_active = time.time()
+        self._pty.write(data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        if self.closed:
+            return
+        cols = max(1, cols)
+        rows = max(1, rows)
+        self.spec.cols = cols
+        self.spec.rows = rows
+        self._pty.resize(cols, rows)
+
+    async def _broadcast(self, data: bytes) -> None:
+        async with self._lock:
+            self._scrollback.append(data)
+            dead: list[int] = []
+            for key, entry in self._clients.items():
+                try:
+                    entry.client.put(data)
+                except ClientGone:
+                    dead.append(key)
+            for key in dead:
+                self._clients.pop(key, None)
+
+    async def _notify(self, message: dict[str, Any]) -> None:
+        async with self._lock:
+            dead: list[int] = []
+            for key, entry in self._clients.items():
+                try:
+                    entry.client.put(message)
+                except ClientGone:
+                    dead.append(key)
+            for key in dead:
+                self._clients.pop(key, None)
+
+    async def _read_loop(self) -> None:
+        try:
+            while True:
+                data = await self._pty.read()
+                if not data:
+                    break
+                self.last_active = time.time()
+                await self._broadcast(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._notify({"type": "error", "msg": f"session read failed: {exc}"})
+        finally:
+            await self._finalize()
+
+    async def _finalize(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        code = self._pty.poll()
+        if code is None:
+            try:
+                code = await self._loop.run_in_executor(None, self._pty.wait)
+            except Exception:
+                code = -1
+        self.exit_code = code if code is not None else -1
+        await self._notify({"type": "exit", "code": self.exit_code})
+        self._pty.close()
+        if self._on_close is not None:
+            self._on_close(self)
+
+    # -- lifecycle -----------------------------------------------------
+
+    async def stop(self, *, sig: int | None = None, timeout: float = 3.0) -> None:
+        """Terminate the session and wait for its read loop to finish."""
+        if self.closed:
+            return
+        if sig is None:
+            self._pty.terminate()
+        else:
+            self._pty.terminate(sig)
+        try:
+            await asyncio.wait_for(asyncio.shield(self._read_task), timeout=timeout)
+        except (TimeoutError, asyncio.CancelledError):
+            self._read_task.cancel()
+            await self._finalize()
+
+
+class SessionManager:
+    """Owns the lifecycle of every terminal session on this server."""
+
+    def __init__(self, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
+        # The loop is resolved lazily: managers are often built while a server
+        # factory runs, before the serving event loop exists.
+        self._loop = loop
+        self._sessions: dict[str, TermSession] = {}
+        self._lock = asyncio.Lock()
+
+    def list(self) -> list[TermSession]:
+        self._reap()
+        return list(self._sessions.values())
+
+    def get(self, sid: str) -> TermSession | None:
+        self._reap()
+        return self._sessions.get(sid)
+
+    async def create(self, spec: SessionSpec, *, sid: str | None = None) -> TermSession:
+        loop = self._loop or asyncio.get_running_loop()
+        async with self._lock:
+            sid = sid or self._new_id()
+            if sid in self._sessions:
+                raise ValueError(f"session id already exists: {sid}")
+            session = TermSession(sid, spec, loop=loop, on_close=self._on_session_close)
+            self._sessions[sid] = session
+            return session
+
+    async def remove(self, sid: str, *, sig: int | None = None) -> bool:
+        async with self._lock:
+            session = self._sessions.get(sid)
+        if session is None:
+            return False
+        await session.stop(sig=sig)
+        return True
+
+    async def shutdown(self) -> None:
+        sessions = list(self._sessions.values())
+        await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+        self._sessions.clear()
+
+    def _on_session_close(self, session: TermSession) -> None:
+        # Called from the read loop; the entry is pruned lazily via _reap().
+        self._sessions.pop(session.id, None)
+
+    def _reap(self) -> None:
+        for sid, session in list(self._sessions.items()):
+            if session.closed:
+                del self._sessions[sid]
+
+    def _new_id(self) -> str:
+        return secrets.token_urlsafe(8)

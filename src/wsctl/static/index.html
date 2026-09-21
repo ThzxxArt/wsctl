@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>wsctl</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">wsctl</span>
+    <span id="session-label" class="session-label">no session</span>
+    <span id="status" class="status">idle</span>
+  </header>
+
+  <main id="terminal-wrap">
+    <div id="terminal"></div>
+  </main>
+
+  <div id="login-overlay" class="overlay hidden">
+    <form id="login-form" class="login-card">
+      <h1>wsctl</h1>
+      <p id="login-error" class="error hidden"></p>
+      <label>Username<input id="username" name="username" autocomplete="username" autofocus /></label>
+      <label>Password<input id="password" name="password" type="password" autocomplete="current-password" /></label>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
+  <script src="/static/vendor/addon-web-links.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

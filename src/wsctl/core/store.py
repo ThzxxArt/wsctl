@@ -1,0 +1,267 @@
+"""SQLite-backed persistence for users, auth sessions and audit logs.
+
+Synchronous by design: queries are small and infrequent relative to PTY I/O,
+and ``sqlite3`` with WAL mode is plenty fast for a single-server deployment.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .passwords import hash_password, verify_password
+
+SCHEMA_VERSION = 1
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+    totp_secret   TEXT,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    ip         TEXT,
+    user_agent TEXT,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    last_seen  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS term_sessions (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    owner_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    backend     TEXT NOT NULL DEFAULT 'local',
+    command     TEXT,
+    cwd         TEXT,
+    status      TEXT NOT NULL DEFAULT 'running',
+    created_at  REAL NOT NULL,
+    last_active REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER,
+    term_session_id TEXT,
+    event           TEXT NOT NULL,
+    payload         TEXT,
+    ip              TEXT,
+    ts              REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts);
+"""
+
+
+@dataclass(frozen=True)
+class User:
+    id: int
+    username: str
+    role: str
+    disabled: bool
+    created_at: float
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class Store:
+    """Thin, thread-safe wrapper around a SQLite database."""
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def _init_schema(self) -> None:
+        with self._lock, self._conn:
+            self._conn.executescript(_SCHEMA)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+
+    def _row_to_user(self, row: sqlite3.Row) -> User:
+        return User(
+            id=int(row["id"]),
+            username=str(row["username"]),
+            role=str(row["role"]),
+            disabled=bool(row["disabled"]),
+            created_at=float(row["created_at"]),
+        )
+
+    # -- users ---------------------------------------------------------
+
+    def user_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return int(row["n"])
+
+    def user_create(self, username: str, password: str, role: str = "user") -> User:
+        if role not in ("admin", "user"):
+            raise ValueError(f"invalid role: {role}")
+        now = time.time()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO users(username, password_hash, role, created_at) VALUES(?, ?, ?, ?)",
+                (username, hash_password(password), role, now),
+            )
+            user_id = int(cur.lastrowid or 0)
+        return User(id=user_id, username=username, role=role, disabled=False, created_at=now)
+
+    def user_get(self, username: str) -> User | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def user_get_by_id(self, user_id: int) -> User | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def user_list(self) -> list[User]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM users ORDER BY id").fetchall()
+        return [self._row_to_user(r) for r in rows]
+
+    def user_delete(self, username: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        return cur.rowcount > 0
+
+    def user_set_password(self, username: str, password: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE users SET password_hash = ? WHERE username = ?",
+                (hash_password(password), username),
+            )
+        return cur.rowcount > 0
+
+    def user_set_role(self, username: str, role: str) -> bool:
+        if role not in ("admin", "user"):
+            raise ValueError(f"invalid role: {role}")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE users SET role = ? WHERE username = ?", (role, username)
+            )
+        return cur.rowcount > 0
+
+    def user_authenticate(self, username: str, password: str) -> User | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        if row is None or row["disabled"]:
+            return None
+        if not verify_password(password, str(row["password_hash"])):
+            return None
+        return self._row_to_user(row)
+
+    # -- auth sessions -------------------------------------------------
+
+    def create_auth_session(
+        self,
+        user_id: int,
+        *,
+        ttl: int,
+        ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> str:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO auth_sessions"
+                "(user_id, token_hash, ip, user_agent, created_at, expires_at, last_seen)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (user_id, hash_token(token), ip, user_agent, now, now + ttl, now),
+            )
+        return token
+
+    def resolve_auth_session(self, token: str) -> User | None:
+        now = time.time()
+        token_hash = hash_token(token)
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT user_id, expires_at FROM auth_sessions WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            if float(row["expires_at"]) < now:
+                self._conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+                return None
+            self._conn.execute(
+                "UPDATE auth_sessions SET last_seen = ? WHERE token_hash = ?", (now, token_hash)
+            )
+        return self.user_get_by_id(int(row["user_id"]))
+
+    def delete_auth_session(self, token: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM auth_sessions WHERE token_hash = ?", (hash_token(token),)
+            )
+
+    def purge_expired_sessions(self) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM auth_sessions WHERE expires_at < ?", (time.time(),)
+            )
+        return cur.rowcount
+
+    # -- audit ---------------------------------------------------------
+
+    def log_event(
+        self,
+        event: str,
+        *,
+        user_id: int | None = None,
+        term_session_id: str | None = None,
+        payload: str | None = None,
+        ip: str | None = None,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO audit_logs(user_id, term_session_id, event, payload, ip, ts)"
+                " VALUES(?, ?, ?, ?, ?, ?)",
+                (user_id, term_session_id, event, payload, ip, time.time()),
+            )
+
+    def recent_audit(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]

@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wsctl"
+version = "0.1.0"
+description = "A modern, Python-based web terminal server — a ttyd superset with persistent sessions, multi-user support and auditing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "ThzxxArt" }]
+keywords = ["terminal", "web", "ttyd", "pty", "websocket", "xterm", "shell"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Shells",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "argon2-cffi>=23.1",
+    "python-multipart>=0.0.9",
+    "itsdangerous>=2.2",
+    "pyotp>=2.9",
+]
+
+[project.optional-dependencies]
+win = ["pywinpty>=2.0"]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+    "build>=1.2",
+    "twine>=5.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/ThzxxArt/wsctl"
+Repository = "https://github.com/ThzxxArt/wsctl"
+Issues = "https://github.com/ThzxxArt/wsctl/issues"
+Changelog = "https://github.com/ThzxxArt/wsctl/blob/main/CHANGELOG.md"
+
+[project.scripts]
+wsctl = "wsctl.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wsctl"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/wsctl", "tests", "DESIGN.md", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI dependency injection uses call expressions in defaults by design.
+"src/wsctl/server/app.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/wsctl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra"
