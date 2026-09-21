@@ -39,6 +39,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "itsdangerous>=2.2",
     "pyotp>=2.9",
+    "websockets>=13",
 ]
 
 [project.optional-dependencies]
@@ -66,7 +67,15 @@ wsctl = "wsctl.cli.main:app"
 packages = ["src/wsctl"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/wsctl", "tests", "DESIGN.md", "README.md", "LICENSE", "CHANGELOG.md"]
+include = [
+    "src/wsctl",
+    "tests",
+    "DESIGN.md",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [tool.ruff]
 line-length = 100

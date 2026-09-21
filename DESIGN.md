@@ -181,7 +181,8 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 > RBAC、多标签 UI、空闲/寿命回收、管理员用户 API、CLI `login`/`session`）。
 > M3 已落地（全量审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头）。
 > M4 已落地（Web 文件面板 list/download/upload + 防穿越、`/metrics` Prometheus
-> 指标、JSON 结构化日志）。`connect` 瘦客户端待 M5。
+> 指标、JSON 结构化日志）。M5 已落地（CLI `connect` 瘦客户端、README/SECURITY
+> 文档、Release 工作流 + Trusted Publishing）。v0.1.0 功能完成。
 
 ## 11. Backlog（后续）
 

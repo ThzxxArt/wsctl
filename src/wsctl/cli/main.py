@@ -23,6 +23,7 @@ from wsctl.cli.client import (
 from wsctl.cli.client import (
     login as api_login,
 )
+from wsctl.cli.connect import ConnectError, run_connect
 from wsctl.core import totp
 from wsctl.core.config import Settings, load_settings
 from wsctl.core.logging import configure_logging
@@ -373,10 +374,20 @@ def logout() -> None:
 
 
 @app.command()
-def connect(url: Annotated[str, typer.Argument(help="Server URL, e.g. http://host:7681")]) -> None:
-    """Attach a local terminal to a remote wsctl server."""
-    _ = url
-    err_console.print("[yellow]not implemented yet[/] (planned for M5)")
+def connect(
+    url: Annotated[str | None, typer.Argument(help="Server URL, e.g. http://host:7681")] = None,
+    session: Annotated[
+        str | None, typer.Option("--session", "-s", help="Attach to an existing session id.")
+    ] = None,
+    token: Annotated[
+        str | None, typer.Option("--token", envvar="WSCTL_TOKEN", help="Bearer token.")
+    ] = None,
+) -> None:
+    """Attach this terminal to a remote wsctl server."""
+    try:
+        run_connect(url, session, token)
+    except ConnectError as exc:
+        _fail(str(exc))
 
 
 if __name__ == "__main__":
