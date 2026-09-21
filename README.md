@@ -1,190 +1,371 @@
 # wsctl
 
 [![CI](https://github.com/ThzxxArt/wsctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ThzxxArt/wsctl/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/wsctl.svg)](https://pypi.org/project/wsctl/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/ThzxxArt/wsctl/blob/main/LICENSE)
 
-> A modern, Python-based web terminal server — a [ttyd](https://github.com/tsl0922/ttyd)
-> superset with **persistent sessions**, **multi-user RBAC**, **auditing** and
-> **observability**.
+> 单机部署的 Web 在线终端。一条命令起服务，浏览器或命令行得到完整 shell；
+> 终端**会话与连接解耦**——关掉笔记本不会杀掉 shell，重连即恢复屏幕。
 
-`wsctl` serves terminals over the web from a single process. Start it with one
-command, then reach a full shell from a browser or from the CLI. Terminal
-**sessions are decoupled from connections**: closing your laptop does not kill
-the shell, and reconnecting replays the screen.
+`wsctl` 是 [ttyd](https://github.com/tsl0922/ttyd) 的现代 Python 超集：保留
+「一条命令把终端搬上浏览器」的心智，并补齐**多会话、多用户 RBAC、审计、
+分享、录制、文件面板与可观测性**，且 `pip install` 零编译。
 
 ```
-Browser (xterm.js) ─┐
-                    ├─ WebSocket ─┐
-CLI (wsctl connect) ┘             │
-                        ┌─────────▼──────────┐        ┌──────────────┐
-                        │   SessionManager    │──PTY──▶  bash / ssh   │
-                        │  (asyncio, 1..N)    │        └──────────────┘
-                        │  scrollback replay  │
-                        └─────────────────────┘
+浏览器 (xterm.js) ─┐
+                   ├─ WebSocket ─┐
+CLI (wsctl connect)┘             │
+                       ┌─────────▼──────────┐        ┌──────────────┐
+                       │   SessionManager    │──PTY──▶  bash / ssh   │
+                       │  (asyncio, 1..N)    │        └──────────────┘
+                       │  scrollback replay  │
+                       └─────────────────────┘
 ```
 
-## Features
+## 目录
 
-- 🖥️ **Multi-session** — one server hosts many terminals with a multi-tab UI
-- 🔌 **Connection-independent sessions** — disconnect freely; reconnect replays
-  the scrollback so your screen comes back
-- ♻️ **Restart-safe sessions (optional)** — with the `tmux` backend a session
-  survives a full server restart and is reattached automatically
-- 👥 **Multi-user + RBAC** — admins manage everything, users only their sessions
-- 🔗 **Sharing** — read-only or read-write share links with QR codes; viewers
-  can watch, or type if you allow it
-- 🧑💻 **CLI thin client** — `wsctl connect` bridges your local terminal to a server
-- 🔐 **SSH sessions** — run a session as an `ssh` connection to a remote host
-- ⏺️ **Recording** — capture sessions as asciinema cast files and replay them in
-  the browser
-- 🖼️ **Sixel images** and **opt-in ZMODEM** (`sz`/`rz`) file transfer
-- 🎨 **Themes & shortcuts** — a terminal theme gallery, custom themes and
-  configurable keyboard shortcuts
-- 🔔 **Webhooks** — POST every audit event to a URL of your choice
-- ⚙️ **Hot reload** — apply most config changes without restarting (network,
-  TLS, data dir, log level and webhook need a restart)
-- 📁 **Web file panel** — browse, download and upload within a configured root
-- 📝 **Auditing** — logins, sessions, file transfers and admin actions recorded
-- 🛡️ **Security built in** — Argon2, TOTP 2FA, login rate limiting, CIDR IP
-  allowlist, Origin checks, security headers, optional TLS
-- 📊 **Observability** — `/healthz`, Prometheus `/metrics`, structured JSON logs
-- 📦 **Zero-compile install** — `pip install wsctl`, no build toolchain
+- [特性](#特性)
+- [与 ttyd 的差异](#与-ttyd-的差异)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [使用教程](#使用教程)
+- [配置详解](#配置详解)
+- [CLI 命令参考](#cli-命令参考)
+- [部署](#部署)
+- [安全](#安全)
+- [常见问题与故障排查](#常见问题与故障排查)
+- [开发](#开发)
+- [许可](#许可)
 
-## How it differs from ttyd
+## 特性
 
-| | ttyd | wsctl |
+- **多会话**：一个服务托管多个终端，Web 端多标签切换。
+- **会话与连接解耦**：客户端断开不影响会话；重连时回放 scrollback 重建屏幕。
+- **跨重启恢复（可选 tmux 后端）**：shell 跑在 tmux 里，服务重启后自动重新挂载。
+- **多用户 + RBAC**：admin 管理全部，普通用户仅限自己的会话。
+- **分享**：只读或可写分享链接，带二维码；匿名观看者无需账号。
+- **CLI 瘦客户端**：`wsctl connect` 把本地终端桥接到远程服务。
+- **SSH 会话**：会话直接是到远程主机的 `ssh` 连接。
+- **文件面板**：在可配置根目录内浏览、下载、上传（含拖拽）。
+- **录制与回放**：asciinema cast 录制，浏览器内回放。
+- **终端能力**：Sixel 图像、可选 ZMODEM（`sz`/`rz`）传输。
+- **主题与快捷键**：内置主题库 + 自定义主题；快捷键可编辑。
+- **审计与 Webhook**：登录、会话、文件、管理操作全量审计，可推送到 Webhook。
+- **可观测**：`/healthz`、Prometheus `/metrics`、结构化 JSON 日志。
+- **零停机重启**：`SO_REUSEPORT` 让新实例先接管端口再停旧实例。
+- **配置热更新**：大部分配置改动无需重启。
+
+## 与 ttyd 的差异
+
+| 维度 | ttyd | wsctl |
 |---|---|---|
-| Sessions | one process = one terminal = one port | one server, many sessions |
-| Multi-terminal | multiple processes / tmux | native, multi-tab UI |
-| Users | single basic-auth credential | multi-user with RBAC |
-| Auditing | none | structured audit log |
-| Connection semantics | coupled to the process | decoupled, reconnect replays screen |
-| Config | command-line flags | config file + CLI |
-| Observability | basic logs | `/healthz` · `/metrics` · JSON logs |
-| Language | C | Python |
+| 会话模型 | 一进程 = 一会话 = 一端口 | 单服务托管 N 个会话 |
+| 多终端 | 多进程 / 依赖 tmux | 原生多会话 + 多标签 |
+| 用户体系 | 单一 basic-auth 凭据 | 多用户 + RBAC |
+| 审计 | 无 | 结构化审计日志 + Webhook |
+| 连接语义 | 与进程耦合 | 解耦，重连回放屏幕 |
+| 配置 | 命令行参数 | 配置文件 + CLI + 热更新 |
+| 可观测 | 基础日志 | `/healthz` · `/metrics` · JSON 日志 |
+| 语言 | C | Python |
 
-### Honest performance note
+**性能边界（诚实声明）**：`wsctl` 不在**原始吞吐**上对标 C + libuv 的 ttyd。
+纯 Python 转发在 `cat` 大文件、`yes` 刷屏这类场景打不过 C。`wsctl` 的稳定来自
+**架构**——会话与连接解耦、输出背压、每会话隔离——而非单连接速度。请勿做不公
+平的 benchmark。
 
-wsctl does **not** try to beat ttyd on raw throughput. A pure-Python forwarder
-cannot out-run a C + libuv implementation on pathological output (`cat` of huge
-files, `yes`). wsctl's stability comes from **architecture** — decoupled
-sessions, output backpressure and per-session isolation — not single-connection
-speed. Please do not benchmark the two unfairly.
+## 安装
 
-## Install
+### 环境要求
+
+- Python **3.11 及以上**
+- Linux（推荐）或 macOS；Windows 需额外安装 `pywinpty`
+- 可选：`tmux`（跨重启恢复会话）、`ssh` 客户端（SSH 会话）
+
+### 从 PyPI 安装
 
 ```bash
 pip install wsctl
-# optional: Windows PTY support
+
+# 需要 Windows PTY 支持时
 pip install "wsctl[win]"
 ```
 
-## Quick start
+### 从源码安装
 
 ```bash
-wsctl serve            # http://127.0.0.1:7681
+git clone https://github.com/ThzxxArt/wsctl.git
+cd wsctl
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"     # 含开发工具
 ```
 
-On first run an `admin` account is created and a generated password is printed
-to stderr. Open the URL, sign in, and a shell session starts.
+### 可选依赖（extras）
 
-Attach from your own terminal instead:
+| extra | 内容 | 用途 |
+|---|---|---|
+| `wsctl[win]` | `pywinpty` | Windows 下的 PTY 支持 |
+| `wsctl[e2e]` | `playwright` | 浏览器级端到端测试 |
+| `wsctl[dev]` | ruff / mypy / pytest 等 | 开发与测试 |
+
+## 快速开始
 
 ```bash
-wsctl login http://127.0.0.1:7681
-wsctl connect          # opens a remote shell in this terminal
+wsctl serve
 ```
 
-## CLI reference
+首次运行会在 `~/.local/share/wsctl/wsctl.db` 建库，并创建 `admin` 账号，随机
+密码打印在**标准错误**上（也可用 `--admin-password` 指定）：
 
-```
-wsctl serve                 Start the server
-wsctl serve --new "htop"    Start the server with one session
-wsctl serve --backend tmux  Start with tmux-backed sessions
-wsctl connect [URL]         Attach this terminal to a server
-wsctl login URL             Authenticate and cache a token
-wsctl logout                Forget cached credentials
-wsctl session list          List sessions on a running server
-wsctl session new [-x CMD] [--backend tmux]  Create a session
-wsctl session new --ssh user@host [--ssh-port N] [--ssh-identity FILE]  SSH session
-wsctl session attach ID     Attach this terminal to a session
-wsctl session kill ID       Kill a session
-wsctl session record ID     Start recording (asciinema cast)
-wsctl session record-stop ID
-wsctl session recording ID [-o FILE]  Download a recording
-wsctl user add|list|del|passwd|role|totp
-wsctl audit                 Show the audit log (admin)
-wsctl config show|path|edit Inspect or edit configuration
-wsctl config set KEY VALUE  Set a configuration value
-wsctl config reload         Ask a running server to reload config
-wsctl version
+```bash
+wsctl serve --admin-password '你的密码'
 ```
 
-## Configuration
+浏览器打开 <http://127.0.0.1:7681>，用 `admin` 登录，即得到一个 shell。
 
-Precedence: CLI flags → `WSCTL_*` environment variables → `config.toml`.
+不想用浏览器？用命令行连上去：
 
-`~/.config/wsctl/config.toml`:
+```bash
+wsctl login http://127.0.0.1:7681     # 交互式输入密码，凭据缓存到本地
+wsctl connect                          # 在当前终端打开远程 shell
+```
+
+## 使用教程
+
+### 1. 会话管理（Web 端）
+
+- 顶部 **`+`**：新建会话（新标签）。
+- 点击标签：切换会话。
+- **双击标签**：重命名会话。
+- 标签上的 **`×`**：关闭会话（会终止该 shell）。
+- 断线后前端自动重连，并回放屏幕内容，无需重新登录。
+
+### 2. 从命令行使用
+
+```bash
+# 登录并缓存 token（默认写到 ~/.config/wsctl/credentials.json）
+wsctl login http://host:7681 -u admin
+
+# 在本地终端里直接连远程 shell（Ctrl-D / exit 退出）
+wsctl connect http://host:7681
+wsctl connect -s <session-id>          # 连接到已有会话
+
+# 管理会话
+wsctl session list
+wsctl session new --name build --command "bash -l"
+wsctl session attach <session-id>
+wsctl session kill <session-id>
+
+wsctl logout                           # 清除本地缓存凭据
+```
+
+### 3. 会话后端：local / tmux / ssh
+
+**local（默认）**：shell 是服务的直接子进程，服务退出即结束。
+
+**tmux（跨重启恢复）**：shell 跑在 tmux 会话里，服务重启后自动重新挂载，屏幕
+重绘。
+
+```bash
+wsctl serve --backend tmux
+# 或针对单个会话
+wsctl session new --backend tmux --command "htop"
+```
+
+需要在主机安装 `tmux`。优雅关闭会保留 tmux 会话（`tmux_preserve_on_shutdown`），
+显式 kill / 空闲回收才会真正销毁。
+
+**ssh（跳板）**：会话直接是到远程主机的 ssh 连接。
+
+```bash
+wsctl session new --ssh user@example.com
+wsctl session new --ssh example.com --ssh-user root --ssh-port 2222 \
+  --ssh-identity ~/.ssh/id_ed25519 --ssh-option StrictHostKeyChecking=accept-new
+```
+
+### 4. 文件面板
+
+点击顶部 **files** 打开右侧面板：在配置的 `file_root`（默认当前用户家目录）内
+浏览目录、点击下载、上传（按钮或拖拽）。
+
+> 提醒：能开 shell 的账号本就能访问文件系统，文件面板不额外扩大权限面。
+
+### 5. 分享会话
+
+点击顶部 **share**：
+
+- 默认生成**只读**链接（含二维码），任何人打开即可观看但**不能输入**。
+- 勾选「allow typing」生成**可写**链接。
+- 可设置有效期（TTL），随时 **revoke** 撤销。
+
+分享链接形如 `http://host:7681/?session=<id>&share=<token>`，观看者无需账号。
+
+### 6. 录制与回放
+
+```bash
+wsctl session record <session-id>            # 开始录制（asciinema cast）
+wsctl session record <session-id> --input    # 同时记录输入
+wsctl session record-stop <session-id>
+wsctl session recording <session-id> -o out.cast   # 下载
+```
+
+Web 端点击 **rec** 开始/停止，**replay** 在浏览器内用 asciinema 播放器回放。
+可用 `auto_record = true` 让每个会话自动录制。
+
+### 7. 终端能力：Sixel 与 ZMODEM
+
+- **Sixel**：内嵌 `@xterm/addon-image`，远端输出 Sixel 图像即可直接显示
+  （如 `img2sixel`、`lsix`）。
+- **ZMODEM**：点击 **zmodem** 启用后，远端 `sz 文件` 会在浏览器下载，`rz` 会弹
+  出上传选择框。默认关闭，避免影响常规 I/O。
+
+### 8. 主题、字体与快捷键
+
+点击顶部 **settings**：
+
+- **主题**：内置 10 套终端主题（dracula、solarized、nord、gruvbox、monokai、
+  one-dark、tokyo-night 等），也可粘贴 JSON 自定义。
+- **字体大小**：12–18。
+- **快捷键**（默认，可改）：新建 `Alt+N`、关闭 `Alt+W`、下一个标签
+  `Alt+→`、上一个标签 `Alt+←`、文件 `Alt+F`、设置 `Alt+S`、分享 `Alt+H`。
+
+偏好保存在浏览器本地。
+
+### 9. 用户、权限与二次验证
+
+```bash
+wsctl user add alice                       # 交互式设置密码
+wsctl user list
+wsctl user role alice admin                # 提升为管理员
+wsctl user passwd alice
+wsctl user totp alice                      # 启用 TOTP 双因子（扫码确认）
+wsctl user totp alice --disable
+wsctl user del alice
+```
+
+- `admin`：可查看/管理所有会话与用户。
+- `user`：仅能操作自己的会话。
+
+### 10. 审计与 Webhook
+
+所有敏感操作（登录成功/失败、限速、IP 拒绝、会话创建/连接/断开/终止、文件上传、
+用户管理、配置重载）都会写入审计日志：
+
+```bash
+wsctl audit --limit 50          # 需管理员
+```
+
+也可通过 `webhook_url` 把每条审计事件以 JSON POST 到你的端点。
+
+### 11. 可观测性
+
+```bash
+curl http://127.0.0.1:7681/healthz
+curl http://127.0.0.1:7681/metrics      # Prometheus 文本格式
+```
+
+指标包含：运行状态、当前会话/客户端数、缓冲字节、会话创建数、WebSocket 连接数、
+上传数、登录结果分类。开启 `log_json = true` 输出结构化 JSON 日志。
+
+## 配置详解
+
+优先级：**命令行参数 > `WSCTL_*` 环境变量 > 配置文件**。
+
+配置文件默认位于 `~/.config/wsctl/config.toml`：
 
 ```toml
+# ---- 网络 ----
 host = "127.0.0.1"
 port = 7681
+reuse_port = false            # SO_REUSEPORT：新实例先接管端口再停旧实例
 
-auth_required = true
-session_ttl = 43200          # login session lifetime (seconds)
-cookie_secure = false        # set true when serving over HTTPS
-trust_proxy = false          # honour X-Forwarded-For from a reverse proxy
-allowed_origins = []         # WebSocket Origin allowlist (empty = same host)
+# ---- 认证与安全 ----
+auth_required = true          # 是否强制登录（关闭仅供受信本地使用）
+session_ttl = 43200           # 登录态有效期（秒）
+cookie_secure = false         # 走 HTTPS 时置 true
+trust_proxy = false           # 位于反向代理后时置 true，读取 X-Forwarded-For
+allowed_origins = []          # WebSocket Origin 白名单（空 = 同源）
+allowed_ips = []              # CIDR 白名单（空 = 允许全部）
+security_headers = true       # nosniff / frame-deny / CSP 等响应头
+login_rate_limit = 10         # 登录失败次数阈值
+login_rate_window = 300       # 滑动窗口（秒）
+audit_input = false           # 是否审计提交的命令行
+totp_issuer = "wsctl"         # TOTP 认证器里的发行方名称
 
-allowed_ips = ["10.0.0.0/8"] # CIDR allowlist; empty = allow all
-login_rate_limit = 10        # failed attempts before a key is blocked
-login_rate_window = 300      # sliding window (seconds)
-audit_input = false          # record submitted command lines
-security_headers = true      # send nosniff / frame-deny / CSP headers
-totp_issuer = "wsctl"        # issuer label in TOTP authenticator apps
-
-default_shell = "/bin/bash"  # shell for local sessions (default: $SHELL)
-default_cwd = "/home/me"     # working directory for new sessions
-data_dir = "/var/lib/wsctl"  # database and recordings location
-
-idle_timeout = 3600          # kill sessions idle for this long (optional)
-max_life = 86400             # kill sessions older than this (optional)
+# ---- 会话默认值 ----
+default_shell = "/bin/bash"   # 默认 shell（缺省用 $SHELL 或 /bin/bash）
+default_cwd = "/home/me"      # 新会话工作目录
+default_backend = "local"     # local / tmux
+tmux_preserve_on_shutdown = true
+idle_timeout = 3600           # 空闲多久回收会话（秒，可选）
+max_life = 86400              # 会话最长寿命（秒，可选）
 max_sessions = 64
-session_max_clients = 0      # max clients per session (0 = unlimited)
-session_memory_limit = 67108864   # per-session buffer cap in bytes
-client_max_bytes = 8388608        # per-client backlog cap in bytes
-input_rate_limit = 0         # per-connection input bytes/sec (0 = unlimited)
-input_rate_burst = 0         # token bucket capacity (default: limit)
-scrollback_bytes = 4194304
+session_max_clients = 0       # 单会话最大客户端数（0 = 不限）
+session_memory_limit = 67108864  # 单会话缓冲上限（字节）
+client_max_bytes = 8388608    # 单客户端积压上限（字节）
+input_rate_limit = 0          # 单连接输入速率（字节/秒，0 = 不限）
+input_rate_burst = 0          # 令牌桶容量（默认等于速率）
+scrollback_bytes = 4194304    # 回放缓冲上限（字节）
 
-default_backend = "local"        # "local" or "tmux" (survives server restart)
-tmux_preserve_on_shutdown = true # keep tmux sessions alive across restarts
+# ---- 文件面板 ----
+file_root = "/home/me"        # 面板根目录（默认当前用户家目录）
+file_max_upload = 104857600   # 单文件上传上限（字节）
 
-file_root = "/home/me"       # root for the web file panel (default: home)
-file_max_upload = 104857600
+# ---- 录制 ----
+auto_record = false           # 自动录制每个会话
+record_input = false          # 录制是否包含输入
 
+# ---- 可观测 / 日志 ----
 metrics_enabled = true
 log_level = "info"
 log_json = false
+webhook_url = ""              # 审计事件 POST 目标（可选）
 
-auto_record = false          # record every session to data_dir/recordings
-record_input = false         # include typed input in recordings
-
-webhook_url = "https://example.com/wsctl-hook"  # POST audit events here (optional)
-
+# ---- 数据与 TLS ----
+data_dir = "/var/lib/wsctl"   # 数据库与录制存放目录
 ssl_cert = "/etc/wsctl/cert.pem"
 ssl_key = "/etc/wsctl/key.pem"
-
-reuse_port = false           # SO_REUSEPORT: zero-downtime restarts
 ```
 
-Every key also has an environment variable, e.g. `WSCTL_PORT=9000`,
-`WSCTL_ALLOWED_IPS='["10.0.0.0/8"]'`.
+每个键都有对应环境变量，例如 `WSCTL_PORT=9000`、`WSCTL_ALLOWED_IPS='["10.0.0.0/8"]'`。
 
-## Deployment
+### 修改与热更新
 
-**systemd**
+```bash
+wsctl config show                       # 查看生效配置
+wsctl config path                       # 配置文件路径
+wsctl config edit                       # 用 $EDITOR 编辑（不存在则生成模板）
+wsctl config set port 9000              # 写入配置（值须为合法 TOML）
+wsctl config reload                     # 让运行中的服务重载配置
+```
+
+服务也会监听配置文件修改时间自动重载。可热更新的项包括白名单、限速、会话上限、
+录制、文件根目录、指标开关等；**网络、TLS、数据目录、日志级别、Webhook 需重启**。
+
+## CLI 命令参考
+
+```
+wsctl serve                     启动服务（--host/--port/--backend/--reuse-port/
+                                --new/--ssl-cert/--ssl-key/--admin-password/--log-json）
+wsctl connect [URL] [-s ID]     把本地终端连接到服务
+wsctl login URL                 登录并缓存凭据
+wsctl logout                    清除本地缓存凭据
+wsctl session list              列出会话
+wsctl session new               新建会话（--name/--command/--cwd/--backend/--ssh…）
+wsctl session attach ID         连接到已有会话
+wsctl session kill ID           终止会话
+wsctl session record ID         开始录制（--input）
+wsctl session record-stop ID    停止录制
+wsctl session recording ID      下载录制（-o FILE）
+wsctl user add|list|del|passwd|role|totp
+wsctl audit                     查看审计日志（管理员）
+wsctl config show|path|edit|set|reload
+wsctl version
+```
+
+## 部署
+
+### systemd
 
 ```ini
 [Unit]
@@ -200,7 +381,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-**nginx (TLS termination)**
+### nginx 反向代理（TLS 终止）
 
 ```nginx
 location / {
@@ -213,51 +394,66 @@ location / {
 }
 ```
 
-Set `trust_proxy = true` when running behind a proxy so rate limiting and the
-IP allowlist see real client addresses. Prefer HTTPS/WSS in production and set
-`cookie_secure = true`.
+位于代理后请设 `trust_proxy = true`，让限速与 IP 白名单看到真实客户端 IP；生产
+环境请用 HTTPS/WSS 并设 `cookie_secure = true`。
 
-### Zero-downtime restarts
+### 零停机重启
 
-With `reuse_port = true` (or `--reuse-port`) the server binds its listening
-socket with `SO_REUSEPORT`. A new instance can then bind the same port and start
-accepting connections *before* the old one exits, so upgrades have no
-"connection refused" window:
+`reuse_port = true`（或 `--reuse-port`）让监听 socket 带 `SO_REUSEPORT`，新实例
+可在旧实例退出前绑定同一端口，升级无「连接被拒」窗口：
 
 ```bash
-wsctl serve --reuse-port &      # running instance
-# deploy the new version, then:
-wsctl serve --reuse-port &      # new instance takes new connections
-kill <old-pid>                  # old instance drains and exits
+wsctl serve --reuse-port &      # 运行中的实例
+# 部署新版本后：
+wsctl serve --reuse-port &      # 新实例接管新连接
+kill <旧进程 PID>               # 旧实例排空后退出
 ```
 
-Combine with the `tmux` backend for sessions that also survive the restart.
+配合 **tmux 后端**，连会话本身也能跨重启存活。
 
-### Sessions that survive a restart
+## 安全
 
-By default sessions run as direct children of the server (`default_backend =
-"local"`). Set `default_backend = "tmux"` (or pass `--backend tmux` to
-`wsctl serve` / `wsctl session new`) to run shells inside a tmux session. The
-shell then keeps running when wsctl restarts, and on the next start the session
-is reattached automatically with the same id and a redrawn screen. Requires
-`tmux` on the host; the default backend stays dependency-free.
+Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对待它：
 
-## Security
+- 默认开启认证，密码使用 Argon2 哈希；会话 token 仅存哈希。
+- 可选 TOTP 双因子（`wsctl user totp <用户>`）。
+- 登录失败限速；`allowed_ips` 限制来源网段。
+- WebSocket 握手校验 Origin 白名单（防 CSWSH）。
+- 分享链接不可猜测、可设有效期、可撤销；只读链接拒绝输入。
+- 文件面板防目录穿越（含符号链接），上传有大小限制。
+- 每会话连接数/内存/输入速率上限，防止资源耗尽。
+- 全量审计日志。
+- 请务必使用 HTTPS/WSS，并以最小权限用户运行。
 
-A web terminal is remote code execution by design. wsctl assumes you expose it
-only to trusted users over a trusted network:
+漏洞报告方式见 [SECURITY.md](https://github.com/ThzxxArt/wsctl/blob/main/SECURITY.md)。
 
-- authentication is on by default; passwords use Argon2
-- optional TOTP two-factor auth (`wsctl user totp <user>`)
-- login failures are rate limited; `allowed_ips` restricts source networks
-- WebSocket handshakes are validated against an Origin allowlist (anti-CSWSH)
-- share links are unguessable, read-only, optionally time-limited and revocable
-- every sensitive action is written to the audit log
-- TLS via a reverse proxy (recommended) or `ssl_cert` / `ssl_key`
+## 常见问题与故障排查
 
-Report vulnerabilities as described in [SECURITY.md](https://github.com/ThzxxArt/wsctl/blob/main/SECURITY.md).
+**Q：首次运行没看到密码？**
+密码打印在标准错误。若丢失，可用 `wsctl user passwd admin` 重设，或删除数据库后
+重启重新初始化。
 
-## Development
+**Q：浏览器连不上 / 一直重连？**
+- 检查反向代理是否转发 WebSocket（`Upgrade` / `Connection` 头）。
+- 若被判定未授权（401/4401），重新登录；确认系统时间正确（TOTP 场景）。
+
+**Q：`wsctl connect` 报「no server URL」？**
+先 `wsctl login <url>`，或显式传 URL；token 也可用 `WSCTL_TOKEN` 提供。
+
+**Q：tmux 会话没有跨重启恢复？**
+确认主机安装了 `tmux`，且 `default_backend = "tmux"`（或创建时 `--backend tmux`）。
+无头环境建议保持 `TERM` 可用（wsctl 会为 tmux 会话默认设为 `xterm-256color`）。
+
+**Q：`rz`/`sz` 没反应？**
+需先在 Web 端点击 **zmodem** 启用；远端需装 `lrzsz`。
+
+**Q：如何只在本机使用、不要登录？**
+`wsctl serve --no-auth`（**不安全**，切勿暴露到网络）。
+
+**Q：上传大文件失败？**
+调整 `file_max_upload`；注意反向代理可能也有请求体大小限制。
+
+## 开发
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
@@ -265,7 +461,7 @@ pip install -e ".[dev]"
 ruff check . && mypy src && pytest
 ```
 
-Browser-level tests (Playwright, headless Chromium):
+浏览器级测试（Playwright，无头 Chromium）：
 
 ```bash
 pip install -e ".[e2e]"
@@ -273,11 +469,23 @@ playwright install chromium
 pytest -m browser
 ```
 
-See [DESIGN.md](https://github.com/ThzxxArt/wsctl/blob/main/DESIGN.md) for the architecture and roadmap.
+后端端到端场景（server / CLI / connect / tmux / 零停机重启）：
 
-## License
+```bash
+python scripts/e2e/run_all.py
+```
+
+压测（并发 / 大输出）：
+
+```bash
+pytest -m slow
+```
+
+架构与路线图见 [DESIGN.md](https://github.com/ThzxxArt/wsctl/blob/main/DESIGN.md)。
+
+## 许可
 
 [MIT](https://github.com/ThzxxArt/wsctl/blob/main/LICENSE) © 2026 ThzxxArt
 
-Bundled third-party front-end assets (xterm.js, asciinema-player, zmodem.js) are
-listed in [THIRD_PARTY_NOTICES.md](https://github.com/ThzxxArt/wsctl/blob/main/THIRD_PARTY_NOTICES.md).
+内嵌的第三方前端资源（xterm.js、asciinema-player、zmodem.js）许可证见
+[THIRD_PARTY_NOTICES.md](https://github.com/ThzxxArt/wsctl/blob/main/THIRD_PARTY_NOTICES.md)。
