@@ -60,9 +60,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
           sudo apt-get update && sudo apt-get install -y tmux
-      - name: Backend end-to-end scenarios
-        run: python scripts/e2e/run_all.py
-
       - name: tmux path diagnostic
         run: |
           python - <<'PY'
@@ -81,3 +78,6 @@ jobs:
           print("client alive:", p.poll() is None)
           subprocess.run(["tmux", "kill-server"], check=False)
           PY
+
+      - name: Backend end-to-end scenarios
+        run: python scripts/e2e/run_all.py
