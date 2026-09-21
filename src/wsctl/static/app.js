@@ -34,6 +34,12 @@
     setTheme: document.getElementById("set-theme"),
     setFontsize: document.getElementById("set-fontsize"),
     settingsClose: document.getElementById("settings-close"),
+    recordBtn: document.getElementById("record-btn"),
+    replayBtn: document.getElementById("replay-btn"),
+    replayOverlay: document.getElementById("replay-overlay"),
+    replayHost: document.getElementById("replay-host"),
+    replayNote: document.getElementById("replay-note"),
+    replayClose: document.getElementById("replay-close"),
   };
 
   const params = new URLSearchParams(location.search);
@@ -434,6 +440,68 @@
     } catch (err) {
       showShareNote(String(err.message || err));
     }
+  });
+
+  // -- recording -------------------------------------------------------
+
+  let replayBlobUrl = null;
+
+  els.recordBtn.addEventListener("click", async () => {
+    const s = activeId && sessions.get(activeId);
+    if (!s) {
+      setConnection("no active session", "bad");
+      return;
+    }
+    try {
+      if (s.recording) {
+        await api("POST", `/api/sessions/${s.id}/recording/stop`);
+        s.recording = false;
+        els.recordBtn.classList.remove("rec-on");
+      } else {
+        await api("POST", `/api/sessions/${s.id}/recording/start`, {});
+        s.recording = true;
+        els.recordBtn.classList.add("rec-on");
+      }
+    } catch (err) {
+      setConnection(String(err.message || err), "bad");
+    }
+  });
+
+  els.replayBtn.addEventListener("click", async () => {
+    const s = activeId && sessions.get(activeId);
+    if (!s) return;
+    els.replayHost.innerHTML = "";
+    els.replayNote.classList.add("hidden");
+    els.replayOverlay.classList.remove("hidden");
+    try {
+      const res = await fetch(`/api/sessions/${s.id}/recording`);
+      if (!res.ok) {
+        els.replayNote.textContent = "no recording for this session";
+        els.replayNote.classList.remove("hidden");
+        return;
+      }
+      const text = await res.text();
+      if (replayBlobUrl) URL.revokeObjectURL(replayBlobUrl);
+      replayBlobUrl = URL.createObjectURL(new Blob([text], { type: "application/x-asciicast" }));
+      if (window.AsciinemaPlayer) {
+        AsciinemaPlayer.create(replayBlobUrl, els.replayHost, {
+          autoPlay: true,
+          fit: "width",
+          controls: true,
+        });
+      } else {
+        els.replayNote.textContent = "player not available";
+        els.replayNote.classList.remove("hidden");
+      }
+    } catch (err) {
+      els.replayNote.textContent = String(err.message || err);
+      els.replayNote.classList.remove("hidden");
+    }
+  });
+
+  els.replayClose.addEventListener("click", () => {
+    els.replayOverlay.classList.add("hidden");
+    els.replayHost.innerHTML = "";
   });
 
   // -- preferences -----------------------------------------------------

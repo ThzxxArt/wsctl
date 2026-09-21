@@ -6,6 +6,7 @@
   <meta name="referrer" content="no-referrer" />
   <title>wsctl</title>
   <link rel="stylesheet" href="/static/vendor/xterm.css" />
+  <link rel="stylesheet" href="/static/vendor/asciinema-player.css" />
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
@@ -15,6 +16,8 @@
     <button id="new-tab" class="icon-btn" title="New session">+</button>
     <div class="spacer"></div>
     <span id="connection" class="status">idle</span>
+    <button id="record-btn" class="text-btn" title="Start/stop recording">rec</button>
+    <button id="replay-btn" class="text-btn" title="Replay recording">replay</button>
     <button id="share-btn" class="text-btn" title="Share session">share</button>
     <button id="settings-btn" class="text-btn" title="Settings">settings</button>
     <button id="files-toggle" class="text-btn" title="Files">files</button>
@@ -88,9 +91,23 @@
     </div>
   </div>
 
+  <div id="replay-overlay" class="overlay hidden">
+    <div class="replay-card">
+      <div class="replay-head">
+        <span>Session recording</span>
+        <button id="replay-close" class="text-btn" title="Close">&times;</button>
+      </div>
+      <p id="replay-note" class="error hidden"></p>
+      <div id="replay-host" class="replay-host"></div>
+    </div>
+  </div>
+
   <script src="/static/vendor/xterm.js"></script>
   <script src="/static/vendor/addon-fit.js"></script>
   <script src="/static/vendor/addon-web-links.js"></script>
+  <script src="/static/vendor/addon-image.js"></script>
+  <script src="/static/vendor/zmodem.js"></script>
+  <script src="/static/vendor/asciinema-player.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -18,8 +18,9 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": (
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self' ws: wss:"
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self' ws: wss:; worker-src 'self' blob:"
     ),
 }
 

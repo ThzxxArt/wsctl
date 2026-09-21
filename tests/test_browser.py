@@ -136,6 +136,27 @@ def test_browser_flow(tmp_path: Path) -> None:
             assert page.get_attribute("html", "data-theme") == "light"
             page.click("#settings-close")
 
+            # record the session, then replay it in the asciinema player
+            page.click("#record-btn")
+            page.click(".xterm-screen")
+            page.keyboard.type("echo REPLAY-OK")
+            page.keyboard.press("Enter")
+            page.wait_for_function(
+                "() => document.querySelector('.xterm-rows')"
+                " && document.querySelector('.xterm-rows').innerText.includes('REPLAY-OK')",
+                timeout=15000,
+            )
+            page.click("#record-btn")  # stop
+            page.wait_for_timeout(400)
+            page.click("#replay-btn")
+            page.wait_for_selector("#replay-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_function(
+                "() => document.getElementById('replay-host').children.length > 0",
+                timeout=15000,
+            )
+            page.evaluate("() => document.getElementById('replay-close').click()")
+            page.wait_for_selector("#replay-overlay.hidden", state="attached", timeout=5000)
+
             # open the share link in a fresh context: read-only, no login
             viewer = browser.new_context(viewport={"width": 1280, "height": 800})
             vpage = viewer.new_page()

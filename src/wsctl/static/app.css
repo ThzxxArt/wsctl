@@ -197,7 +197,30 @@ body.shared #new-tab,
 body.shared #files-toggle,
 body.shared #share-btn,
 body.shared #settings-btn,
+body.shared #record-btn,
+body.shared #replay-btn,
 body.shared #logout { display: none; }
+
+.replay-card {
+  width: min(960px, 92vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.replay-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.replay-host { min-height: 320px; }
+.replay-host .ap-player { width: 100%; }
 .readonly-badge {
   color: #e0a24f;
   border: 1px solid #e0a24f;
@@ -205,6 +228,8 @@ body.shared #logout { display: none; }
   padding: 1px 6px;
   font-size: 11px;
 }
+
+.text-btn.rec-on { color: var(--danger); border-color: var(--danger); }
 
 html[data-theme="light"] {
   --bg: #f6f7f9;
