@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from . import tmux
 from .pty import Pty, create_pty
 from .scrollback import DEFAULT_MAX_BYTES, Scrollback
 
@@ -44,6 +45,7 @@ class SessionSpec:
     argv: list[str]
     cwd: str | None = None
     env: dict[str, str] | None = None
+    backend: str = "local"
     cols: int = 80
     rows: int = 24
     idle_timeout: float | None = None
@@ -82,8 +84,13 @@ class TermSession:
         self._scrollback = Scrollback(spec.scrollback_bytes)
         self._clients: dict[int, _ClientEntry] = {}
         self._lock = asyncio.Lock()
+        self._tmux_name: str | None = None
+        argv = spec.argv
+        if spec.backend == "tmux":
+            self._tmux_name = tmux.session_name(sid)
+            argv = tmux.wrap_argv(self._tmux_name, spec.argv)
         self._pty: Pty = create_pty(
-            spec.argv,
+            argv,
             cwd=spec.cwd,
             env=spec.env,
             cols=spec.cols,
@@ -229,10 +236,19 @@ class TermSession:
 
     # -- lifecycle -----------------------------------------------------
 
-    async def stop(self, *, sig: int | None = None, timeout: float = 3.0) -> None:
-        """Terminate the session and wait for its read loop to finish."""
+    async def stop(
+        self, *, sig: int | None = None, timeout: float = 3.0, preserve: bool = False
+    ) -> None:
+        """Terminate the session and wait for its read loop to finish.
+
+        With ``preserve=True`` a tmux-backed session's shell is left running so
+        it can be reattached after a server restart; only the local attach
+        client is closed.
+        """
         if self.closed:
             return
+        if self._tmux_name is not None and not preserve:
+            tmux.kill_session(self._tmux_name)
         if sig is None:
             self._pty.terminate()
         else:
@@ -242,6 +258,10 @@ class TermSession:
         except (TimeoutError, asyncio.CancelledError):
             self._read_task.cancel()
             await self._finalize()
+
+    @property
+    def backend(self) -> str:
+        return self.spec.backend
 
 
 class SessionManager:
@@ -295,9 +315,12 @@ class SessionManager:
         await session.stop(sig=sig)
         return True
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, preserve: bool = False) -> None:
+        """Stop every session. ``preserve`` keeps tmux sessions alive."""
         sessions = list(self._sessions.values())
-        await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+        await asyncio.gather(
+            *(s.stop(preserve=preserve) for s in sessions), return_exceptions=True
+        )
         self._sessions.clear()
 
     def _on_session_close(self, session: TermSession) -> None:

@@ -73,6 +73,8 @@ class Settings(BaseSettings):
 
     default_shell: str | None = None
     default_cwd: str | None = None
+    default_backend: str = "local"
+    tmux_preserve_on_shutdown: bool = True
     allowed_origins: list[str] = Field(default_factory=list)
 
     idle_timeout: float | None = None

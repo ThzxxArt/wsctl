@@ -30,7 +30,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 
 from wsctl import __version__
 from wsctl.core import fs as fs_mod
-from wsctl.core import totp
+from wsctl.core import tmux, totp
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
 from wsctl.core.ratelimit import RateLimiter
@@ -62,6 +62,7 @@ class SessionCreate(BaseModel):
     name: str | None = None
     command: str | None = None
     cwd: str | None = None
+    backend: str | None = None
     cols: int = 80
     rows: int = 24
 
@@ -107,6 +108,38 @@ def require_admin(user: User = Depends(current_user)) -> User:
     return user
 
 
+async def _restore_tmux_sessions(app: FastAPI) -> None:
+    """Reattach to tmux-backed sessions that outlived a previous server run."""
+    settings: Settings = app.state.settings
+    store: Store = app.state.store
+    manager: SessionManager = app.state.manager
+    if not tmux.is_available():
+        return
+    for row in store.term_session_list():
+        if row.get("backend") != "tmux" or row.get("status") not in ("running", "interrupted"):
+            continue
+        sid = str(row["id"])
+        if not tmux.has_session(tmux.session_name(sid)):
+            store.term_session_set_status(sid, "stopped")
+            continue
+        spec = SessionSpec(
+            name=str(row["name"]),
+            argv=[settings.shell],
+            cwd=row.get("cwd") or settings.default_cwd,
+            backend="tmux",
+            idle_timeout=settings.idle_timeout,
+            max_life=settings.max_life,
+            max_clients=settings.session_max_clients,
+            scrollback_bytes=settings.scrollback_bytes,
+        )
+        try:
+            await manager.create(spec, sid=sid, owner_id=row.get("owner_id"))
+        except ValueError:
+            continue
+        store.term_session_set_status(sid, "running")
+        log.info("restored tmux session %s", sid)
+
+
 def create_app(
     settings: Settings,
     *,
@@ -132,19 +165,23 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("wsctl %s listening on %s:%s", __version__, settings.host, settings.port)
         maint = asyncio.create_task(_maintenance())
+        await _restore_tmux_sessions(app)
         if startup_command:
             argv = shlex.split(startup_command)
             spec = SessionSpec(
                 name=Path(argv[0]).name if argv else "shell",
                 argv=argv,
                 cwd=settings.default_cwd,
+                backend=settings.default_backend,
                 idle_timeout=settings.idle_timeout,
                 max_life=settings.max_life,
                 max_clients=settings.session_max_clients,
                 scrollback_bytes=settings.scrollback_bytes,
             )
             session = await app.state.manager.create(spec)
-            app.state.store.term_session_upsert(session.id, name=spec.name, owner_id=None)
+            app.state.store.term_session_upsert(
+                session.id, name=spec.name, owner_id=None, backend=spec.backend
+            )
             log.info("startup session %s: %s", session.id, startup_command)
         try:
             yield
@@ -152,7 +189,7 @@ def create_app(
             maint.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await maint
-            await app.state.manager.shutdown()
+            await app.state.manager.shutdown(preserve=settings.tmux_preserve_on_shutdown)
             app.state.store.close()
 
     app = FastAPI(
@@ -292,6 +329,7 @@ def create_app(
             "name": session.spec.name,
             "pid": session.pid,
             "owner_id": session.owner_id,
+            "backend": session.backend,
             "clients": session.client_count,
             "alive": session.is_alive,
             "created_at": session.created_at,
@@ -312,12 +350,22 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="session limit"
             )
+        backend = body.backend or settings.default_backend
+        if backend not in ("local", "tmux"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"unknown backend: {backend}"
+            )
+        if backend == "tmux" and not tmux.is_available():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="tmux is not installed"
+            )
         argv = shlex.split(body.command) if body.command else [settings.shell]
         name = body.name or (Path(argv[0]).name if argv else "shell")
         spec = SessionSpec(
             name=name,
             argv=argv,
             cwd=body.cwd or settings.default_cwd,
+            backend=backend,
             cols=body.cols,
             rows=body.rows,
             idle_timeout=settings.idle_timeout,
@@ -330,6 +378,7 @@ def create_app(
             session.id,
             name=name,
             owner_id=user.id,
+            backend=backend,
             command=body.command,
             cwd=spec.cwd,
         )

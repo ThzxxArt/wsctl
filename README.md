@@ -29,6 +29,8 @@ CLI (wsctl connect) ┘             │
 - 🖥️ **Multi-session** — one server hosts many terminals with a multi-tab UI
 - 🔌 **Connection-independent sessions** — disconnect freely; reconnect replays
   the scrollback so your screen comes back
+- ♻️ **Restart-safe sessions (optional)** — with the `tmux` backend a session
+  survives a full server restart and is reattached automatically
 - 👥 **Multi-user + RBAC** — admins manage everything, users only their sessions
 - 🧑💻 **CLI thin client** — `wsctl connect` bridges your local terminal to a server
 - 📁 **Web file panel** — browse, download and upload within a configured root
@@ -88,11 +90,12 @@ wsctl connect          # opens a remote shell in this terminal
 ```
 wsctl serve                 Start the server
 wsctl serve --new "htop"    Start the server with one session
+wsctl serve --backend tmux  Start with tmux-backed sessions
 wsctl connect [URL]         Attach this terminal to a server
 wsctl login URL             Authenticate and cache a token
 wsctl logout                Forget cached credentials
 wsctl session list          List sessions on a running server
-wsctl session new [-x CMD]  Create a session
+wsctl session new [-x CMD] [--backend tmux]  Create a session
 wsctl session attach ID     Attach this terminal to a session
 wsctl session kill ID       Kill a session
 wsctl user add|list|del|passwd|role|totp
@@ -128,6 +131,9 @@ session_max_clients = 0      # max clients per session (0 = unlimited)
 input_rate_limit = 0         # per-connection input bytes/sec (0 = unlimited)
 input_rate_burst = 0         # token bucket capacity (default: limit)
 scrollback_bytes = 4194304
+
+default_backend = "local"        # "local" or "tmux" (survives server restart)
+tmux_preserve_on_shutdown = true # keep tmux sessions alive across restarts
 
 file_root = "/home/me"       # root for the web file panel (default: home)
 file_max_upload = 104857600
@@ -177,6 +183,15 @@ location / {
 Set `trust_proxy = true` when running behind a proxy so rate limiting and the
 IP allowlist see real client addresses. Prefer HTTPS/WSS in production and set
 `cookie_secure = true`.
+
+### Sessions that survive a restart
+
+By default sessions run as direct children of the server (`default_backend =
+"local"`). Set `default_backend = "tmux"` (or pass `--backend tmux` to
+`wsctl serve` / `wsctl session new`) to run shells inside a tmux session. The
+shell then keeps running when wsctl restarts, and on the next start the session
+is reattached automatically with the same id and a redrawn screen. Requires
+`tmux` on the host; the default backend stays dependency-free.
 
 ## Security
 

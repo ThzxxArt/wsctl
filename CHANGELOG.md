@@ -51,6 +51,13 @@ RBAC, auditing, a file panel and observability.
 - Session renaming (`PATCH /api/sessions/{id}`, double-click a tab in the UI).
 - Concurrency and large-output load tests (`pytest -m slow` for the heavy one).
 
+**Restart-safe sessions**
+- Optional `tmux` backend (`default_backend`, `--backend tmux`): the shell runs
+  inside a tmux session and survives a full wsctl restart, then is reattached
+  automatically with the same id and a redrawn screen.
+- Graceful shutdown preserves tmux sessions (`tmux_preserve_on_shutdown`); an
+  explicit kill still tears them down.
+
 **Packaging & CI**
 - Hatchling packaging (PyPI: `wsctl`), MIT license, `py.typed`.
 - GitHub Actions CI (ruff, mypy, pytest on Python 3.11–3.13) and a release

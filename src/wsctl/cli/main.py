@@ -94,6 +94,9 @@ def serve(
     new: Annotated[
         str | None, typer.Option("--new", help="Create a session running this command at startup.")
     ] = None,
+    backend: Annotated[
+        str | None, typer.Option("--backend", help="Default session backend: local or tmux.")
+    ] = None,
 ) -> None:
     """Start the wsctl server."""
     overrides: dict[str, object] = {
@@ -101,6 +104,7 @@ def serve(
         "port": port,
         "ssl_cert": ssl_cert,
         "ssl_key": ssl_key,
+        "default_backend": backend,
     }
     if no_auth:
         overrides["auth_required"] = False
@@ -407,13 +411,21 @@ def session_new(
         str | None, typer.Option("--command", "-x", help="Command to run instead of a shell.")
     ] = None,
     cwd: Annotated[str | None, typer.Option("--cwd", help="Working directory.")] = None,
+    backend: Annotated[
+        str | None, typer.Option("--backend", help="Backend: local or tmux.")
+    ] = None,
     url: Annotated[str | None, typer.Option("--url", help="Server URL.")] = None,
 ) -> None:
     """Create a session on a running server."""
     client = _api_client(url)
     body = {
         key: value
-        for key, value in {"name": name, "command": command, "cwd": cwd}.items()
+        for key, value in {
+            "name": name,
+            "command": command,
+            "cwd": cwd,
+            "backend": backend,
+        }.items()
         if value is not None
     }
     try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pyotp
@@ -8,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from wsctl.core import tmux
 from wsctl.core.config import load_settings
 from wsctl.core.session import SessionManager
 from wsctl.core.store import Store
@@ -332,3 +334,39 @@ def test_startup_command_creates_session(tmp_path: Path) -> None:
         sessions = client.get("/api/sessions").json()
         assert sessions
         assert sessions[0]["name"] == "sleep"
+
+
+def test_invalid_backend_rejected(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.post("/api/sessions", json={"backend": "nope"}).status_code == 400
+
+
+@pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
+def test_create_and_kill_tmux_session(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        r = client.post("/api/sessions", json={"backend": "tmux", "name": "tmuxed"})
+        assert r.status_code == 201, r.text
+        sid = r.json()["id"]
+        assert r.json()["backend"] == "tmux"
+        assert client.delete(f"/api/sessions/{sid}").status_code == 200
+
+
+@pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
+def test_startup_restores_tmux_session(tmp_path: Path) -> None:
+    sid = "restore-test"
+    name = tmux.session_name(sid)
+    subprocess.run(["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True)
+    try:
+        settings = load_settings(data_dir=tmp_path, auth_required=True, default_shell="/bin/sh")
+        store = Store(tmp_path / "test.db")
+        store.user_create("admin", "adminpw", role="admin")
+        store.term_session_upsert(sid, name="restored", owner_id=None, backend="tmux")
+        app = create_app(settings, store=store, manager=SessionManager())
+        with TestClient(app) as client:
+            login(client, ADMIN)
+            sessions = client.get("/api/sessions").json()
+            assert any(s["id"] == sid and s["backend"] == "tmux" for s in sessions)
+    finally:
+        tmux.kill_session(name)

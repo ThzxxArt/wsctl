@@ -19,6 +19,7 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
+from wsctl.core import tmux
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
 from wsctl.core.ratelimit import TokenBucket
@@ -49,10 +50,14 @@ def _resolve_user(websocket: WebSocket, store: Store, auth_required: bool) -> Us
 
 def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
     shell = settings.shell
+    backend = settings.default_backend
+    if backend == "tmux" and not tmux.is_available():
+        backend = "local"
     return SessionSpec(
         name=Path(shell).name or "shell",
         argv=[shell],
         cwd=settings.default_cwd,
+        backend=backend,
         cols=cols,
         rows=rows,
         idle_timeout=settings.idle_timeout,
@@ -162,7 +167,12 @@ async def _handshake(
         websocket.app.state.metrics.inc("wsctl_sessions_created_total")
         store: Store = websocket.app.state.store
         store.term_session_upsert(
-            session.id, name=spec.name, owner_id=user.id, command=None, cwd=spec.cwd
+            session.id,
+            name=spec.name,
+            owner_id=user.id,
+            backend=spec.backend,
+            command=None,
+            cwd=spec.cwd,
         )
         store.log_event(
             "session_create",

@@ -61,7 +61,21 @@ wsctl **不在原始吞吐上对标 ttyd**。纯 Python 无法在 `cat` 大文�
 - **背压**：每个客户端维护有界发送队列；慢消费者达到上限时丢弃旧帧或断开，
   防止大输出导致服务端内存暴涨。
 - **回收策略**：空闲超时 / 最大生命周期 / 管理员显式 kill，三者之一触发回收。
-- **进程治理**：统一处理 `SIGCHLD`，杜绝僵尸 / 孤儿进程。
+- **进程治理**：`start_new_session` + `killpg`，并在会话结束时 `wait()` 回收；未安装
+  全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）。已跟踪会话不残留僵尸进程。
+
+### 3.1 可选 tmux 后端（跨重启恢复）
+
+`backend="local"`（默认）时 shell 是服务进程的直接子进程，服务退出即随之结束。
+`backend="tmux"` 时，PTY 里跑的是 `tmux new-session -A -s wsctl-<sid> <cmd>`，即一个
+tmux 客户端；真正的 shell 活在 tmux server 内。于是：
+
+- 服务关闭时以 `preserve=True` 停止会话——只断开 tmux 客户端，shell 继续运行；
+- 下次启动读取 `term_sessions` 中 `backend='tmux'` 的行，用相同 id 重新 attach，
+  tmux 负责重绘屏幕；
+- 管理员 kill / 空闲回收 / 寿命到期则 `preserve=False`，真正 `tmux kill-session`。
+
+tmux 为可选依赖（`wsctl[persist]`），默认路径不依赖它。
 
 ## 4. WebSocket 协议
 
@@ -116,7 +130,8 @@ settings(key, value)
 ```
 wsctl serve                     # 起控制面，默认配置开箱即用
 wsctl serve --new "bash"        # 启动时顺带开一个会话
-wsctl session list|new|kill|attach
+wsctl serve --backend tmux      # 默认使用 tmux 后端（跨重启恢复）
+wsctl session list|new|kill|attach   # new 支持 --backend local|tmux
 wsctl connect [url] [-s id]     # 瘦客户端：本地 raw 终端直连
 wsctl login|logout              # 缓存/清除服务端凭据
 wsctl user add|list|del|passwd|role|totp
@@ -159,6 +174,8 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 [dev] → ruff mypy pytest pytest-asyncio httpx build twine
 ```
 
+> tmux 后端需要系统安装 `tmux`（非 pip 依赖），未安装时自动回退 local。
+
 ## 9. 安全清单（内建，非可选）
 
 1. 默认强制认证，`argon2` 哈希
@@ -181,25 +198,28 @@ pydantic-settings  argon2-cffi  python-multipart  itsdangerous  pyotp
 | **M4** | Web 文件面板 + 可观测（/healthz · /metrics · JSON 日志）|
 | **M5** | CLI `connect` 瘦客户端 + 文档 + PyPI Trusted Publishing |
 | **M6** | 缺口补齐：`session new/attach`、`serve --new`、`config edit`、会话重命名、每会话连接上限、输入速率限制、并发压测 |
+| **M7** | 可选 tmux 后端：会话跨服务重启恢复；优雅关闭时保留 tmux 会话；启动自动 reattach |
 
 ## 10.1 实现状态（截至 0.1.0）
 
-**已实现**：M0–M6 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
+**已实现**：M0–M7 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
 文件面板（防穿越 + 上传限流）、`/metrics`、JSON 日志、`connect` 瘦客户端、
-会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测。
+会话重命名、每会话连接上限、输入令牌桶限速、并发/大输出压测、**可选 tmux 后端
+（会话跨服务重启恢复）**。
 
-**尚未实现（见 §11 Backlog）**：会话级读写/分享三级权限、服务重启恢复会话、
-优雅重启、独立 SIGCHLD 回收、`settings` 表与 `term_sessions` 完整字段、
-主题/字体/快捷键可配、移动端专项适配、`config set`。
+**尚未实现（见 §11 Backlog）**：会话级读写/分享三级权限、优雅重启（监听无缝
+交接）、`settings` 表与 `term_sessions` 完整字段、主题/字体/快捷键可配、
+移动端专项适配、`config set`。
 
-> 说明：进程回收目前依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
-> `wait()`，未安装全局 SIGCHLD handler；已跟踪会话不会残留僵尸进程。
+> 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
+> `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
+> 会话不会残留僵尸进程。
 
 ## 11. Backlog（后续）
 
 ZMODEM/lrzsz · Sixel · SSH 跳板 · asciinema 录制回放 · Webhook · 分享链接/二维码 ·
-主题市场 · 会话读写/分享三级权限 · 服务重启恢复会话 · 优雅重启 · 独立 SIGCHLD 回收 ·
+主题市场 · 会话读写/分享三级权限 · 优雅重启（SO_REUSEPORT / socket 交接）·
 `settings` 表与 `term_sessions` 完整字段 · 主题/字体/快捷键可配 · 移动端专项适配 ·
 `config set`
 
