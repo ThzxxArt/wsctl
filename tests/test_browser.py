@@ -88,12 +88,12 @@ def test_browser_flow(tmp_path: Path) -> None:
             assert page.locator(".tab").count() == 1
 
             # type into the terminal and see the echoed output
-            page.click(".xterm-screen")
+            page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo BROWSER-OK")
             page.keyboard.press("Enter")
             page.wait_for_function(
-                "() => document.querySelector('.xterm-rows')"
-                " && document.querySelector('.xterm-rows').innerText.includes('BROWSER-OK')",
+                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
+                " return r && r.innerText.includes('BROWSER-OK'); }",
                 timeout=15000,
             )
 
@@ -105,6 +105,13 @@ def test_browser_flow(tmp_path: Path) -> None:
             assert page.locator(".tab").count() == 2
             page.locator(".tab").first.click()
             assert "active" in (page.locator(".tab").first.get_attribute("class") or "")
+
+            # hotkey: Alt+N creates another session
+            page.click(".term-pane.active .xterm-screen")
+            page.keyboard.press("Alt+n")
+            page.wait_for_function(
+                "() => document.querySelectorAll('.tab').length === 3", timeout=15000
+            )
 
             # file panel lists the seed file
             page.click("#files-toggle")
@@ -138,12 +145,12 @@ def test_browser_flow(tmp_path: Path) -> None:
 
             # record the session, then replay it in the asciinema player
             page.click("#record-btn")
-            page.click(".xterm-screen")
+            page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo REPLAY-OK")
             page.keyboard.press("Enter")
             page.wait_for_function(
-                "() => document.querySelector('.xterm-rows')"
-                " && document.querySelector('.xterm-rows').innerText.includes('REPLAY-OK')",
+                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
+                " return r && r.innerText.includes('REPLAY-OK'); }",
                 timeout=15000,
             )
             page.click("#record-btn")  # stop

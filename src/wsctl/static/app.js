@@ -40,6 +40,18 @@
     replayHost: document.getElementById("replay-host"),
     replayNote: document.getElementById("replay-note"),
     replayClose: document.getElementById("replay-close"),
+    hotkeyList: document.getElementById("hotkey-list"),
+    hotkeysReset: document.getElementById("hotkeys-reset"),
+  };
+
+  const DEFAULT_KEYS = {
+    new_session: "alt+n",
+    close_session: "alt+w",
+    next_tab: "alt+ArrowRight",
+    prev_tab: "alt+ArrowLeft",
+    toggle_files: "alt+f",
+    toggle_settings: "alt+s",
+    toggle_share: "alt+h",
   };
 
   const params = new URLSearchParams(location.search);
@@ -66,9 +78,10 @@
   };
 
   const prefs = Object.assign(
-    { theme: "dark", fontSize: 14 },
+    { theme: "dark", fontSize: 14, keybindings: {} },
     JSON.parse(localStorage.getItem("wsctl-prefs") || "{}"),
   );
+  prefs.keybindings = Object.assign({}, DEFAULT_KEYS, prefs.keybindings);
 
   function applyPrefs() {
     document.documentElement.dataset.theme = prefs.theme;
@@ -505,6 +518,105 @@
   });
 
   // -- preferences -----------------------------------------------------
+
+  function runAction(action) {
+    switch (action) {
+      case "new_session":
+        newSession().catch(() => {});
+        break;
+      case "close_session":
+        if (activeId) closeTab(activeId);
+        break;
+      case "next_tab":
+      case "prev_tab": {
+        const ids = Array.from(sessions.keys());
+        if (!ids.length) break;
+        const idx = Math.max(0, ids.indexOf(activeId));
+        const step = action === "next_tab" ? 1 : -1;
+        activateTab(ids[(idx + step + ids.length) % ids.length]);
+        break;
+      }
+      case "toggle_files": {
+        const hidden = els.filePanel.classList.toggle("hidden");
+        if (!hidden) loadFiles(filePath);
+        break;
+      }
+      case "toggle_settings":
+        els.settingsOverlay.classList.toggle("hidden");
+        break;
+      case "toggle_share":
+        openShare();
+        break;
+      default:
+        break;
+    }
+  }
+
+  function comboOf(event) {
+    const keys = [];
+    if (event.ctrlKey) keys.push("ctrl");
+    if (event.altKey) keys.push("alt");
+    if (event.shiftKey) keys.push("shift");
+    if (event.metaKey) keys.push("meta");
+    if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) return null;
+    let key = event.key;
+    if (key.length === 1) key = key.toLowerCase();
+    keys.push(key);
+    return keys.join("+");
+  }
+
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      const combo = comboOf(event);
+      if (!combo) return;
+      for (const [action, binding] of Object.entries(prefs.keybindings)) {
+        if (binding && binding.toLowerCase() === combo.toLowerCase()) {
+          event.preventDefault();
+          event.stopPropagation();
+          runAction(action);
+          return;
+        }
+      }
+    },
+    true,
+  );
+
+  const HOTKEY_LABELS = {
+    new_session: "new session",
+    close_session: "close session",
+    next_tab: "next tab",
+    prev_tab: "previous tab",
+    toggle_files: "toggle files",
+    toggle_settings: "toggle settings",
+    toggle_share: "share session",
+  };
+
+  function renderHotkeys() {
+    els.hotkeyList.innerHTML = "";
+    for (const action of Object.keys(DEFAULT_KEYS)) {
+      const row = document.createElement("div");
+      row.className = "hotkey-row";
+      const label = document.createElement("span");
+      label.textContent = HOTKEY_LABELS[action] || action;
+      const input = document.createElement("input");
+      input.value = prefs.keybindings[action] || "";
+      input.addEventListener("change", () => {
+        prefs.keybindings[action] = input.value.trim();
+        applyPrefs();
+      });
+      row.appendChild(label);
+      row.appendChild(input);
+      els.hotkeyList.appendChild(row);
+    }
+  }
+
+  els.hotkeysReset.addEventListener("click", () => {
+    prefs.keybindings = Object.assign({}, DEFAULT_KEYS);
+    renderHotkeys();
+    applyPrefs();
+  });
+  renderHotkeys();
 
   els.setTheme.value = prefs.theme;
   els.setFontsize.value = String(prefs.fontSize);
