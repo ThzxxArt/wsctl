@@ -20,6 +20,7 @@ from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
 from wsctl.core.config import Settings
+from wsctl.core.metrics import Metrics
 from wsctl.core.session import ClientGone, SessionManager, SessionSpec, TermSession
 from wsctl.core.store import Store, User
 
@@ -64,6 +65,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     settings = app.state.settings
     store: Store = app.state.store
     manager = app.state.manager
+    metrics: Metrics = app.state.metrics
 
     ip = client_ip(websocket, settings)
     if not ip_allowed(ip, settings.allowed_ips):
@@ -85,6 +87,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+    metrics.inc("wsctl_ws_connections_total")
 
     client = WsClient(websocket)
     writer = asyncio.create_task(client.run())
@@ -153,6 +156,7 @@ async def _handshake(
             return None
         spec = _default_spec(settings, cols, rows)
         session = await manager.create(spec, owner_id=user.id)
+        websocket.app.state.metrics.inc("wsctl_sessions_created_total")
         store: Store = websocket.app.state.store
         store.term_session_upsert(
             session.id, name=spec.name, owner_id=user.id, command=None, cwd=spec.cwd

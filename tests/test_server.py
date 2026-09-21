@@ -204,3 +204,69 @@ def test_audit_endpoint_admin_only(tmp_path: Path) -> None:
         login(client, ADMIN)
         events = {e["event"] for e in client.get("/api/audit").json()}
         assert "login" in events
+
+
+# -- M4: file panel & observability -----------------------------------
+
+
+def test_files_list_download_upload(tmp_path: Path) -> None:
+    app = build_app(tmp_path, file_root=tmp_path)
+    (tmp_path / "hello.txt").write_text("hi")
+    with TestClient(app) as client:
+        login(client, ADMIN)
+
+        names = {e["name"] for e in client.get("/api/files").json()["entries"]}
+        assert "hello.txt" in names
+
+        download = client.get("/api/files/download", params={"path": "hello.txt"})
+        assert download.status_code == 200
+        assert download.content == b"hi"
+
+        upload = client.post(
+            "/api/files/upload",
+            data={"path": ""},
+            files={"file": ("up.txt", b"payload")},
+        )
+        assert upload.status_code == 201
+        assert (tmp_path / "up.txt").read_bytes() == b"payload"
+
+
+def test_files_reject_traversal(tmp_path: Path) -> None:
+    app = build_app(tmp_path, file_root=tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert client.get("/api/files", params={"path": "../../etc"}).status_code == 400
+        assert client.get("/api/files/download", params={"path": "../x"}).status_code == 400
+
+
+def test_files_reject_oversized_upload(tmp_path: Path) -> None:
+    app = build_app(tmp_path, file_root=tmp_path, file_max_upload=4)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        upload = client.post(
+            "/api/files/upload",
+            data={"path": ""},
+            files={"file": ("big.bin", b"more than four bytes")},
+        )
+        assert upload.status_code == 413
+
+
+def test_files_require_auth(tmp_path: Path) -> None:
+    app = build_app(tmp_path, file_root=tmp_path)
+    with TestClient(app) as client:
+        assert client.get("/api/files").status_code == 401
+
+
+def test_metrics_endpoint(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        text = client.get("/metrics").text
+        assert "wsctl_up 1.0" in text
+        login(client, ADMIN)
+        text = client.get("/metrics").text
+        assert 'wsctl_logins_total{result="ok"} 1.0' in text
+
+
+def test_metrics_can_be_disabled(tmp_path: Path) -> None:
+    app = build_app(tmp_path, metrics_enabled=False)
+    with TestClient(app) as client:
+        assert client.get("/metrics").status_code == 404

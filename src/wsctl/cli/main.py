@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import logging
 import secrets
 import time
 from pathlib import Path
@@ -26,6 +25,7 @@ from wsctl.cli.client import (
 )
 from wsctl.core import totp
 from wsctl.core.config import Settings, load_settings
+from wsctl.core.logging import configure_logging
 from wsctl.core.store import Store
 
 app = typer.Typer(
@@ -87,6 +87,7 @@ def serve(
     ssl_cert: Annotated[Path | None, typer.Option(help="TLS certificate file.")] = None,
     ssl_key: Annotated[Path | None, typer.Option(help="TLS key file.")] = None,
     log_level: Annotated[str | None, typer.Option(help="Log level.")] = None,
+    log_json: Annotated[bool, typer.Option("--log-json", help="Emit JSON logs.")] = False,
 ) -> None:
     """Start the wsctl server."""
     overrides: dict[str, object] = {
@@ -97,14 +98,13 @@ def serve(
     }
     if no_auth:
         overrides["auth_required"] = False
+    if log_json:
+        overrides["log_json"] = True
     settings = _settings_from(config, **overrides)
     if log_level:
         settings.log_level = log_level
 
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(settings.log_level, json_output=settings.log_json)
 
     from wsctl.server.app import create_app
 

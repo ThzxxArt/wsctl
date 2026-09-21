@@ -118,3 +118,54 @@ body { display: flex; flex-direction: column; }
 }
 .login-card button:hover { filter: brightness(1.08); }
 .error { color: var(--danger); font-size: 12px; margin: 0; }
+
+.file-panel {
+  position: fixed;
+  top: 40px;
+  right: 0;
+  bottom: 0;
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-2);
+  border-left: 1px solid var(--border);
+  font-size: 13px;
+  z-index: 5;
+}
+.file-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.crumbs { flex: 1; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crumbs button {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+}
+.file-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.file-status { margin-left: auto; color: var(--muted); font-size: 11px; }
+.file-list { list-style: none; margin: 0; padding: 4px 0; overflow-y: auto; flex: 1; }
+.file-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.file-list li:hover { background: var(--bg-3); }
+.file-list .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-list .fmeta { color: var(--muted); font-size: 11px; }
+.file-list.dragover { outline: 2px dashed var(--accent); outline-offset: -6px; }
+

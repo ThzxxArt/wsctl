@@ -11,6 +11,15 @@
     overlay: document.getElementById("login-overlay"),
     loginForm: document.getElementById("login-form"),
     loginError: document.getElementById("login-error"),
+    filesToggle: document.getElementById("files-toggle"),
+    filePanel: document.getElementById("file-panel"),
+    fileCrumbs: document.getElementById("file-crumbs"),
+    fileClose: document.getElementById("file-close"),
+    fileList: document.getElementById("file-list"),
+    fileUploadBtn: document.getElementById("file-upload-btn"),
+    fileRefresh: document.getElementById("file-refresh"),
+    fileInput: document.getElementById("file-input"),
+    fileStatus: document.getElementById("file-status"),
   };
 
   const encoder = new TextEncoder();
@@ -295,6 +304,111 @@
       setConnection(String(err.message || err), "bad");
     }
   }
+
+  // -- file panel ------------------------------------------------------
+
+  let filePath = "";
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[c]);
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = bytes / 1024;
+    let i = 0;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+    return `${value.toFixed(1)} ${units[i]}`;
+  }
+
+  function renderCrumbs(path) {
+    const parts = path ? path.split("/") : [];
+    let acc = "";
+    let html = '<button data-path="">root</button>';
+    for (const part of parts) {
+      acc = acc ? `${acc}/${part}` : part;
+      html += ` / <button data-path="${escapeHtml(acc)}">${escapeHtml(part)}</button>`;
+    }
+    els.fileCrumbs.innerHTML = html;
+    els.fileCrumbs.querySelectorAll("button").forEach((btn) => {
+      btn.addEventListener("click", () => loadFiles(btn.dataset.path));
+    });
+  }
+
+  async function loadFiles(path) {
+    filePath = path || "";
+    els.fileStatus.textContent = "loading...";
+    try {
+      const data = await api("GET", `/api/files?path=${encodeURIComponent(filePath)}`);
+      renderCrumbs(filePath);
+      els.fileList.innerHTML = "";
+      if (!data.entries.length) {
+        els.fileList.innerHTML = '<li class="fmeta">empty</li>';
+      }
+      for (const entry of data.entries) {
+        const li = document.createElement("li");
+        const icon = entry.type === "dir" ? "📁" : "📄";
+        const meta = entry.type === "dir" ? "" : formatSize(entry.size);
+        li.innerHTML =
+          `<span class="ficon">${icon}</span>` +
+          `<span class="fname">${escapeHtml(entry.name)}</span>` +
+          `<span class="fmeta">${meta}</span>`;
+        li.addEventListener("click", () => {
+          const child = filePath ? `${filePath}/${entry.name}` : entry.name;
+          if (entry.type === "dir") loadFiles(child);
+          else window.location.href = `/api/files/download?path=${encodeURIComponent(child)}`;
+        });
+        els.fileList.appendChild(li);
+      }
+      els.fileStatus.textContent = `${data.entries.length} items`;
+    } catch (err) {
+      els.fileStatus.textContent = String(err.message || err);
+    }
+  }
+
+  async function uploadFiles(files) {
+    if (!files || !files.length) return;
+    for (const file of files) {
+      const form = new FormData();
+      form.append("path", filePath);
+      form.append("file", file);
+      els.fileStatus.textContent = `uploading ${file.name}...`;
+      const res = await fetch("/api/files/upload", { method: "POST", body: form });
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
+        els.fileStatus.textContent = `failed: ${detail}`;
+        return;
+      }
+    }
+    els.fileStatus.textContent = "upload complete";
+    await loadFiles(filePath);
+  }
+
+  els.filesToggle.addEventListener("click", () => {
+    const hidden = els.filePanel.classList.toggle("hidden");
+    if (!hidden) loadFiles(filePath);
+  });
+  els.fileClose.addEventListener("click", () => els.filePanel.classList.add("hidden"));
+  els.fileRefresh.addEventListener("click", () => loadFiles(filePath));
+  els.fileUploadBtn.addEventListener("click", () => els.fileInput.click());
+  els.fileInput.addEventListener("change", () => {
+    uploadFiles(els.fileInput.files);
+    els.fileInput.value = "";
+  });
+  els.fileList.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    els.fileList.classList.add("dragover");
+  });
+  els.fileList.addEventListener("dragleave", () => els.fileList.classList.remove("dragover"));
+  els.fileList.addEventListener("drop", (e) => {
+    e.preventDefault();
+    els.fileList.classList.remove("dragover");
+    uploadFiles(e.dataTransfer.files);
+  });
 
   bootstrap();
 })();

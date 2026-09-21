@@ -1,0 +1,58 @@
+"""Traversal-proof filesystem helpers for the web file panel."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+
+class FsError(Exception):
+    """Raised for invalid paths or filesystem operations."""
+
+
+def safe_resolve(root: Path, rel: str | None) -> Path:
+    """Resolve ``rel`` under ``root``, rejecting anything that escapes it.
+
+    Symlinks are followed before the containment check, so links that point
+    outside the root are rejected too.
+    """
+    root_resolved = root.resolve()
+    rel = (rel or "").strip()
+    if rel in ("", ".", "/"):
+        return root_resolved
+    if rel.startswith("/") or (len(rel) > 1 and rel[1] == ":"):
+        raise FsError("absolute paths are not allowed")
+    candidate = (root_resolved / rel).resolve()
+    if candidate != root_resolved and root_resolved not in candidate.parents:
+        raise FsError("path escapes the configured root")
+    return candidate
+
+
+def list_dir(root: Path, rel: str | None) -> list[dict[str, Any]]:
+    target = safe_resolve(root, rel)
+    if not target.is_dir():
+        raise FsError("not a directory")
+    entries: list[dict[str, Any]] = []
+    for child in target.iterdir():
+        try:
+            stat = child.stat()
+            is_dir = child.is_dir()
+        except OSError:
+            continue
+        entries.append(
+            {
+                "name": child.name,
+                "type": "dir" if is_dir else "file",
+                "size": int(stat.st_size),
+                "mtime": float(stat.st_mtime),
+            }
+        )
+    entries.sort(key=lambda e: (e["type"] != "dir", str(e["name"]).lower()))
+    return entries
+
+
+def relative_to(root: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return ""

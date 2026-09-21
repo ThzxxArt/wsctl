@@ -86,11 +86,21 @@ class Settings(BaseSettings):
     ssl_cert: Path | None = None
     ssl_key: Path | None = None
 
+    file_root: Path | None = None
+    file_max_upload: int = 100 * 1024 * 1024
+
+    metrics_enabled: bool = True
     log_level: str = "info"
+    log_json: bool = False
 
     @property
     def db_path(self) -> Path:
         return self.data_dir / "wsctl.db"
+
+    @property
+    def files_root(self) -> Path:
+        """Root directory exposed by the web file panel."""
+        return (self.file_root or Path.home()).expanduser().resolve()
 
     @property
     def shell(self) -> str:

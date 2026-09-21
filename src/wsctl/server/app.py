@@ -11,15 +11,28 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    status,
+)
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import RequestResponseEndpoint
 
 from wsctl import __version__
+from wsctl.core import fs as fs_mod
 from wsctl.core import totp
 from wsctl.core.config import Settings
+from wsctl.core.metrics import Metrics
 from wsctl.core.ratelimit import RateLimiter
 from wsctl.core.session import SessionManager, SessionSpec, TermSession
 from wsctl.core.store import Store, User
@@ -130,6 +143,20 @@ def create_app(
     app.state.store = store or Store(settings.db_path)
     app.state.manager = manager or SessionManager()
 
+    metrics = Metrics()
+    app.state.metrics = metrics
+    metrics.collect("wsctl_up", "1 when the server is serving", lambda: 1.0)
+    metrics.collect(
+        "wsctl_sessions",
+        "Current number of terminal sessions",
+        lambda: float(len(app.state.manager.list_sessions())),
+    )
+    metrics.collect(
+        "wsctl_clients",
+        "Current number of attached terminal clients",
+        lambda: float(sum(s.client_count for s in app.state.manager.list_sessions())),
+    )
+
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
 
     @app.middleware("http")
@@ -158,6 +185,12 @@ def create_app(
             "sessions": len(app.state.manager.list_sessions()),
         }
 
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint() -> PlainTextResponse:
+        if not settings.metrics_enabled:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="metrics disabled")
+        return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
+
     # -- auth ----------------------------------------------------------
 
     @app.post("/api/login")
@@ -168,6 +201,7 @@ def create_app(
 
         if limiter.is_blocked(key):
             retry_after = int(limiter.retry_after(key)) + 1
+            metrics.inc("wsctl_logins_total", result="blocked")
             store_.log_event("login_blocked", ip=ip, payload=body.username)
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -178,6 +212,7 @@ def create_app(
         user = store_.user_authenticate(body.username, body.password)
         if user is None:
             limiter.record_failure(key)
+            metrics.inc("wsctl_logins_total", result="failed")
             store_.log_event("login_failed", ip=ip, payload=body.username)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid credentials"
@@ -186,12 +221,14 @@ def create_app(
         secret = store_.user_totp_secret(body.username)
         if secret is not None and not totp.verify(secret, body.totp or ""):
             limiter.record_failure(key)
+            metrics.inc("wsctl_logins_total", result="totp_failed")
             store_.log_event("login_totp_failed", user_id=user.id, ip=ip, payload=body.username)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid one-time code"
             )
 
         limiter.reset(key)
+        metrics.inc("wsctl_logins_total", result="ok")
         token = store_.create_auth_session(
             user.id,
             ttl=settings.session_ttl,
@@ -279,6 +316,7 @@ def create_app(
         app.state.store.log_event(
             "session_create", user_id=user.id, term_session_id=session.id, payload=name
         )
+        metrics.inc("wsctl_sessions_created_total")
         return _serialize(session)
 
     @app.delete("/api/sessions/{sid}")
@@ -340,6 +378,72 @@ def create_app(
     ) -> list[dict[str, Any]]:
         store_: Store = app.state.store
         return store_.recent_audit(limit=min(max(limit, 1), 1000))
+
+    # -- files (rooted at settings.files_root) -------------------------
+
+    @app.get("/api/files")
+    async def list_files(
+        user: User = Depends(current_user), path: str = ""
+    ) -> dict[str, Any]:
+        root = settings.files_root
+        try:
+            entries = fs_mod.list_dir(root, path)
+        except fs_mod.FsError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return {"path": path.strip().lstrip("/"), "root": str(root), "entries": entries}
+
+    @app.get("/api/files/download")
+    async def download_file(user: User = Depends(current_user), path: str = "") -> FileResponse:
+        root = settings.files_root
+        try:
+            target = fs_mod.safe_resolve(root, path)
+        except fs_mod.FsError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if not target.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not a file")
+        return FileResponse(target, filename=target.name)
+
+    @app.post("/api/files/upload", status_code=status.HTTP_201_CREATED)
+    async def upload_file(
+        user: User = Depends(current_user),
+        file: UploadFile = File(...),
+        path: str = Form(""),
+    ) -> dict[str, Any]:
+        root = settings.files_root
+        name = Path(file.filename or "").name
+        if not name or name in (".", ".."):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid filename")
+        try:
+            directory = fs_mod.safe_resolve(root, path)
+        except fs_mod.FsError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if not directory.is_dir():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not a directory")
+
+        dest = directory / name
+        size = 0
+        try:
+            with dest.open("wb") as handle:
+                while chunk := await file.read(1 << 20):
+                    size += len(chunk)
+                    if size > settings.file_max_upload:
+                        handle.close()
+                        dest.unlink(missing_ok=True)
+                        raise HTTPException(
+                            status_code=413,
+                            detail="file too large",
+                        )
+                    handle.write(chunk)
+        finally:
+            await file.close()
+
+        metrics.inc("wsctl_uploads_total")
+        app.state.store.log_event(
+            "file_upload",
+            user_id=user.id,
+            payload=fs_mod.relative_to(root, dest)[:256],
+        )
+        return {"name": name, "size": size}
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (M4 — file panel & observability)
+
+- Web file panel: browse, download and upload (incl. drag-and-drop) within a
+  configurable `file_root`, with traversal-proof path resolution and an upload
+  size limit.
+- Prometheus metrics at `/metrics`: uptime, live sessions/clients, sessions
+  created, WebSocket connections, uploads and logins by result; toggleable via
+  `metrics_enabled`.
+- Structured JSON logging via `--log-json` / `log_json`.
+
 ### Added (M3 — audit & hardening)
 
 - Full audit trail: login success/failure/TOTP failure/rate-limit, logout, IP

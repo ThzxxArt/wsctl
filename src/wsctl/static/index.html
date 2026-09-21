@@ -15,11 +15,26 @@
     <button id="new-tab" class="icon-btn" title="New session">+</button>
     <div class="spacer"></div>
     <span id="connection" class="status">idle</span>
+    <button id="files-toggle" class="text-btn" title="Files">files</button>
     <span id="whoami" class="whoami"></span>
     <button id="logout" class="text-btn" title="Sign out">sign out</button>
   </header>
 
   <main id="terminal-wrap"></main>
+
+  <aside id="file-panel" class="file-panel hidden">
+    <header class="file-head">
+      <span id="file-crumbs" class="crumbs"></span>
+      <button id="file-close" class="text-btn" title="Close">&times;</button>
+    </header>
+    <div class="file-toolbar">
+      <button id="file-upload-btn" class="text-btn">upload</button>
+      <button id="file-refresh" class="text-btn">refresh</button>
+      <span id="file-status" class="file-status"></span>
+      <input id="file-input" type="file" multiple hidden />
+    </div>
+    <ul id="file-list" class="file-list"></ul>
+  </aside>
 
   <div id="login-overlay" class="overlay hidden">
     <form id="login-form" class="login-card">
