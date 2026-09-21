@@ -187,6 +187,17 @@ class PosixPty:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(os.getpgid(self._proc.pid), sig)
 
+    def signal_process(self, sig: int) -> None:
+        """Signal only the direct child, not its whole process group.
+
+        Used to detach a tmux client without risking the tmux server that the
+        client may have just forked (and which may not be daemonized yet).
+        """
+        if self._proc.poll() is not None:
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            self._proc.send_signal(sig)
+
     def kill(self) -> None:
         self.terminate(signal.SIGKILL)
 

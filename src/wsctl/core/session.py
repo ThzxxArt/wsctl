@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import signal
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -363,7 +364,15 @@ class TermSession:
         if self._tmux_name is not None and not preserve:
             tmux.kill_session(self._tmux_name)
         if sig is None:
-            self._pty.terminate()
+            sig = signal.SIGHUP
+        if self._tmux_name is not None and preserve:
+            # Detach the client without signalling its process group, so a
+            # freshly forked tmux server is not caught by the signal.
+            signaler = getattr(self._pty, "signal_process", None)
+            if callable(signaler):
+                signaler(sig)
+            else:
+                self._pty.terminate(sig)
         else:
             self._pty.terminate(sig)
         try:

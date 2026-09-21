@@ -120,6 +120,21 @@ def ws_recv_until(ws: object, marker: bytes, timeout: float = 10.0) -> bytes:
     return out
 
 
+def _tmux_has(name: str) -> bool:
+    return subprocess.run(
+        ["tmux", "has-session", "-t", name], check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def _tmux_ls() -> list[str]:
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True, text=True, check=False,
+    )
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
 # -- scenarios --------------------------------------------------------
 
 
@@ -238,6 +253,10 @@ def scenario_tmux() -> None:
             assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK")
 
         stop(first)  # graceful: preserves the tmux session
+        if not _tmux_has(f"wsctl-{sid}"):
+            raise AssertionError(
+                "tmux session lost after server stop: " + " ".join(_tmux_ls())
+            )
         second = spawn(port, data, extra_env=env)
         wait_health(base, second)
 
