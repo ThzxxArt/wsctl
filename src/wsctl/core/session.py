@@ -41,7 +41,11 @@ class Client(Protocol):
 
 @dataclass
 class SessionSpec:
-    """Immutable description of how to create a session."""
+    """Description of how to create a session.
+
+    ``name``/``cols``/``rows`` are updated as the session is renamed or
+    resized; the rest is fixed at creation time.
+    """
 
     name: str
     argv: list[str]

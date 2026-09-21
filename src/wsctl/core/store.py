@@ -20,6 +20,10 @@ from .passwords import hash_password, verify_password
 
 SCHEMA_VERSION = 2
 
+# Verified against when a username does not exist, so login timing does not
+# reveal whether an account is present.
+_DUMMY_HASH = hash_password("wsctl-timing-equalizer")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -253,7 +257,11 @@ class Store:
             row = self._conn.execute(
                 "SELECT * FROM users WHERE username = ?", (username,)
             ).fetchone()
-        if row is None or row["disabled"]:
+        if row is None:
+            verify_password(password, _DUMMY_HASH)  # equalize timing
+            return None
+        if row["disabled"]:
+            verify_password(password, str(row["password_hash"]))
             return None
         if not verify_password(password, str(row["password_hash"])):
             return None
