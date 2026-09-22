@@ -572,3 +572,31 @@ def test_doctor_accepts_host_and_port(tmp_path, monkeypatch) -> None:
     _missing_config(tmp_path, monkeypatch)
     result = runner.invoke(app, ["doctor", "--port", "18111"])
     assert result.exit_code != 2, result.output  # 2 = usage error
+
+
+def test_settings_from_does_not_leak_wsctl_config(tmp_path) -> None:
+    """`--config X` must not become ambient state for the next call.
+
+    `_settings_from` used to assign `os.environ["WSCTL_CONFIG"]` permanently,
+    so a later call without `--config` in the same process silently kept
+    reading the previous file. That is process-wide hidden state -- the same
+    shape as the environment leaks this suite keeps getting bitten by.
+    """
+    import os
+
+    from wsctl.cli.main import _settings_from
+
+    first = tmp_path / "first.toml"
+    second = tmp_path / "second.toml"
+    first.write_text("max_sessions = 5\n", encoding="utf-8")
+    second.write_text("max_sessions = 9\n", encoding="utf-8")
+
+    assert os.environ.get("WSCTL_CONFIG") != str(first)
+    assert _settings_from(first).max_sessions == 5
+    assert "WSCTL_CONFIG" not in os.environ or os.environ["WSCTL_CONFIG"] != str(first), (
+        "--config leaked into the process environment"
+    )
+
+    # A later call with no --config must not keep reading `first`.
+    assert _settings_from(second).max_sessions == 9
+    assert _settings_from(None).max_sessions != 5

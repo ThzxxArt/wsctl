@@ -18,6 +18,14 @@ features, no schema change.
   "No such option: --port" on the exact invocation a user reaches for when two
   instances are running. It resolves the target with the same narrowing
   semantics as `status`/`logs`/`stop`.
+- **`--config` no longer becomes ambient process state.** `_settings_from`
+  assigned `os.environ["WSCTL_CONFIG"]` permanently, so a later call without
+  `--config` in the same process silently kept reading the previous file. The
+  override is now scoped to the call and restored afterwards.
+- `doctor` loads its settings once, with the target the user named. It used to
+  load them twice just to pick up `--host`/`--port`, which repeated the
+  `os.environ` side effect above and left the early checks reporting the wrong
+  address.
 - **The 服务器 row probes the instance you are running.** It used to probe the
   URL cached by an old `wsctl login`, so a healthy instance on 7682 reported
   `cannot reach http://127.0.0.1:7720: timed out` and the box looked dead. The
@@ -32,7 +40,16 @@ features, no schema change.
   wrong-green three times (a `credentials.json` in 0.1.5, default-value
   assertions in 0.1.6, and the four new doctor cases here), so it is fixed at
   the root: an autouse fixture gives every test a private config and data
-  directory. Verified both ways -- with the fixture disabled a canary test
+  directory.
+
+  The canary was the first thing this review checked, and it was hollow:
+  `assert json.dumps(creds) != "{}" or creds == {}` is a tautology that cannot
+  fail whatever leaks, its neighbour only looked for a `ghp_` prefix so any
+  other credential slipped through, and its docstring claimed to plant a marker
+  it never planted. All three are corrected: the sandbox must live outside the
+  caller's home and must start completely empty. A negative control with a
+  deliberately ordinary, non-`ghp_` token is now caught.
+  Verified both ways -- with the fixture disabled a canary test
   reads the real cached login and fails; with it enabled the same test passes.
   A canary suite (`tests/test_isolation.py`) now fails if the fixture is ever
   weakened.

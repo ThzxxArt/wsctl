@@ -16,7 +16,7 @@ import sys
 import time
 import tomllib
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, NoReturn, cast
 
@@ -162,12 +162,33 @@ def _api_client(url: str | None) -> ApiClient:
     return cast("ApiClient", client_mod.ApiClient(base, token))
 
 
-def _settings_from(config: Path | None, **overrides: object) -> Settings:
-    if config is not None:
-        import os
+@contextlib.contextmanager
+def _config_env(path: Path | None) -> Iterator[None]:
+    """Point ``WSCTL_CONFIG`` at ``path`` for one call, then put it back.
 
-        os.environ["WSCTL_CONFIG"] = str(config)
-    return cast("Settings", config_mod.load_settings(**overrides))
+    Assigning ``os.environ["WSCTL_CONFIG"]`` permanently is process-wide hidden
+    state: a later ``_settings_from(None)`` in the same process would silently
+    keep reading the previous ``--config``. That is exactly the shape of bug
+    that made the suite pass against the developer's own environment three
+    times. Restore what was there, including "absent".
+    """
+    if path is None:
+        yield
+        return
+    previous = os.environ.get("WSCTL_CONFIG")
+    os.environ["WSCTL_CONFIG"] = str(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("WSCTL_CONFIG", None)
+        else:
+            os.environ["WSCTL_CONFIG"] = previous
+
+
+def _settings_from(config: Path | None, **overrides: object) -> Settings:
+    with _config_env(config):
+        return cast("Settings", config_mod.load_settings(**overrides))
 
 
 def _print_json(payload: object) -> None:
