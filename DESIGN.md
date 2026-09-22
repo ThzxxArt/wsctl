@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.6 · 状态：0.1.0–0.1.6 已发布
+> 版本：0.1.7 · 状态：0.1.0–0.1.7 已发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -284,9 +284,11 @@ pyotp  segno  websockets
 | **M39** | 0.1.4 测试与文档：新增密码策略/认证缓存/日志轮转/录制失败/UTF-8/metrics 转义六个套件，扩展分享持久化、有界 `Pty.wait`、PTY 丢输入、上传覆盖、配置端点与重载报错、TOTP/`--json`/注释保留/补全；浏览器覆盖建会话对话框、配置页签、上传覆盖提示、连接预算、**ZMODEM `sz`/`rz` 字节级真机往返**；e2e 断言分享跨重启存活；README/DESIGN/CHANGELOG/SECURITY 同步 |
 | **M40** | 0.1.5 Windows 可用性与跨平台收敛：`signal.SIGHUP` 默认参数不再在定义期求值（此前 Windows 一 import 就炸，`DEFAULT_TERM_SIGNAL` 回落 `SIGTERM`）、CLI 启动时把 stdio 切到 UTF-8 + `errors="replace"`（此前 cp1252 控制台编不了中文，`wsctl doctor` 直接崩）、`fs.relative_to` 恒用 POSIX 分隔符（审计/分享路径跨平台可对齐）；测试改为封闭与确定性：CLI 用例不依赖开发者本机 `credentials.json`、PTY 丢输入用例 stub 掉内核缓冲而非假设其尺寸、浏览器断言改为结果导向并做空值守卫；CI 的 Windows job 装齐 `dev` extras 并用 `python -m pytest` |
 | **M41** | 0.1.6 运维可用性：生命周期命令**自动跟随正在运行的实例**（未指定 `--port` 时实例优先于默认端口，多实例则列出待选；`restart` 把实际 host:port 注入子进程 argv）、`--admin-password` 不再静默忽略（终端告警 + 无启用管理员时用该值救场 + `user passwd -p` 一条命令自救）、**回环地址不走 `http_proxy`**（`core/net.opener_for`，否则本地实例被代理回 502 且拖累全部 ApiClient 命令）、`doctor` 报真实监听地址并列出发现的其他实例 |
+| **M42** | 0.1.7 `doctor` 补齐实例语义：`--host`/`--port` 收窄选实例（与 status/logs/stop 同源），「服务器」项改为**探测本机实例**而非 `wsctl login` 的陈旧缓存地址（此前把健康机器报成失败），回退到缓存地址时标明来源与 `wsctl logout` 清理方式；**测试封闭性结构性根治**——autouse fixture 默认隔离 `WSCTL_*` 与 `XDG_CONFIG_HOME`，杜绝同类第三次复发（含 `tests/test_isolation.py` 金丝雀：关闭隔离则红、开启则绿）|
 
 
-## 10.1 实现状态（截至 0.1.6）
+
+## 10.1 实现状态（截至 0.1.7）
 
 **已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
@@ -302,6 +304,8 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 重载）、声明式参数互斥/依赖强校验、CLI 与 API 同源的用户管理不变量、一致性
 备份/恢复（SQLite 在线备份）、WS 关闭码语义化、`connect` 自动重连、事件循环
 解阻（argon2/录制/保留/审计容错）。
+
+**0.1.7 新增**：`doctor` 补齐实例语义，并把**测试封闭性**从逐个打补丁改为结构性隔离（autouse fixture）。同类缺陷此前已造成三次「假绿」，根治比再补一次更划算。
 
 **0.1.6 新增**：运维可用性。一条 bug 报告背后是四个独立缺陷——生命周期命令盯着默认端口而无视正在运行的实例、`--admin-password` 在库已有用户时被静默吞掉（表现为「用户名或密码错误」）、本地请求被 `http_proxy` 劫持返回 502、`doctor` 报默认地址。修复遵循同一原则：**命令应当作用于用户正在用的那个东西，并且拒绝时必须说清原因**。
 

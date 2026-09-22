@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-09-22
+
+Follow-up to 0.1.6 for `wsctl doctor`, the one lifecycle command that had no
+way to say *which* instance it meant and no idea which one to talk to. No new
+features, no schema change.
+
+### Fixed
+
+- **`wsctl doctor` gained `--host`/`--port`.** Every other lifecycle command
+  takes them; doctor did not, so `wsctl doctor --port 7682` died with
+  "No such option: --port" on the exact invocation a user reaches for when two
+  instances are running. It resolves the target with the same narrowing
+  semantics as `status`/`logs`/`stop`.
+- **The 服务器 row probes the instance you are running.** It used to probe the
+  URL cached by an old `wsctl login`, so a healthy instance on 7682 reported
+  `cannot reach http://127.0.0.1:7720: timed out` and the box looked dead. The
+  order is now: an explicit `--url` wins, then the running instance's
+  `/healthz`, and only then the cached login URL — which is labelled with where
+  the address came from and how to clear it (`wsctl logout`).
+
+### Testing
+
+- The suite can no longer read the developer's own `~/.config/wsctl/` or their
+  exported `WSCTL_*` variables. This class of defect has now caused a
+  wrong-green three times (a `credentials.json` in 0.1.5, default-value
+  assertions in 0.1.6, and the four new doctor cases here), so it is fixed at
+  the root: an autouse fixture gives every test a private config and data
+  directory. Verified both ways -- with the fixture disabled a canary test
+  reads the real cached login and fails; with it enabled the same test passes.
+  A canary suite (`tests/test_isolation.py`) now fails if the fixture is ever
+  weakened.
+
+  Tests that write to a specific path still say so explicitly (and the browser
+  suite must, since a spawned server is a subprocess and fixtures do not reach
+  it); what is gone is the need to *defend* against the developer's shell.
+
+[0.1.7]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.7
+
 ## [0.1.6] - 2026-09-22
 
 Operational-usability release. Four bugs behind one bug report — "you hardcoded

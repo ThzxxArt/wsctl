@@ -16,6 +16,7 @@ import sys
 import time
 import tomllib
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, NoReturn, cast
 
@@ -255,7 +256,7 @@ def _which(name: str) -> str:
 
 
 def _add_server_check(
-    add: Any, ok: str, bad: str, url: str, *, origin: str
+    add: Callable[[str, str, str], None], ok: str, bad: str, url: str, *, origin: str
 ) -> None:
     """Probe ``url``'s ``/healthz``, naming where the address came from."""
     try:
@@ -303,7 +304,10 @@ def doctor(
         ok if py >= (3, 11) else bad,
     )
 
-    settings = _settings_from(config)
+    # Loaded once, with the target the user named (if any): loading it again
+    # later just to pick up `--host`/`--port` repeated `_settings_from`'s
+    # os.environ side effect and left the early checks on the wrong address.
+    settings = _settings_from(config, host=host, port=port)
 
     try:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -352,8 +356,6 @@ def doctor(
         ok if daemon_ok else warn,
     )
 
-    if host is not None or port is not None:
-        settings = _settings_from(config, host=host, port=port)
     resolved = daemon_mod.resolve_instance(
         settings, port_explicit=port is not None, host_explicit=host is not None
     )
