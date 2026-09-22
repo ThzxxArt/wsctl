@@ -180,6 +180,8 @@ wsctl doctor                # 环境/配置/运行状态自检（--json 便于�
 `doctor` 会检查 Python 版本、数据目录可写、数据库、配置文件、默认 shell、
 `tmux`/`ssh`/`lrzsz`、`SO_REUSEPORT`、监听端口占用以及后台启动能力。
 
+> 想让 `wsctl <Tab>` 自动补全子命令与选项？见 [shell 补全](#shell-补全)。
+
 ### 可选依赖（extras）
 
 | extra | 内容 | 用途 |
@@ -618,6 +620,39 @@ wsctl version
 >
 > 互斥或互相依赖的参数（如 `--daemon` 与 `--reuse-port`、`--ssl-cert` 与
 > `--ssl-key`、`session new --ssh` 与 `--backend`）会以退出码 2 明确报错。
+
+### shell 补全
+
+`wsctl` 基于 Typer/Click，支持命令与选项的 Tab 补全。**bash** 下一键安装：
+
+```bash
+wsctl --install-completion        # 写入 ~/.bash_completions/wsctl.sh，并在 ~/.bashrc 追加 source
+exec "$SHELL" -l                  # 或重开终端使其生效
+```
+
+查看补全脚本（可自行保存到任意位置 source）：
+
+```bash
+wsctl --show-completion
+```
+
+**zsh**：当前版本未单独生成 zsh 脚本，可借助 `bashcompinit` 复用同一份脚本：
+
+```bash
+# 追加到 ~/.zshrc
+autoload -U +X bashcompinit && bashcompinit
+source <(wsctl --show-completion)
+```
+
+**fish / PowerShell**：当前集成未内建生成对应脚本（`--install-completion` 只会安装 bash
+版），fish 用户可自行编写补全文件，或改用 bash/zsh。
+
+生效后输入 `wsctl <Tab>` 即可补全子命令（`session`、`user`、`config`…）与选项：
+
+```console
+$ wsctl ser<Tab>        →  serve
+$ wsctl session <Tab>   →  list  new  rename  kill  attach  record  record-stop  recording
+```
 
 ## 部署
 
