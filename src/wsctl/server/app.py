@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import shlex
+import signal
 import socket
 import sqlite3
 import sys
@@ -39,7 +40,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from wsctl import __version__
 from wsctl.core import fs as fs_mod
 from wsctl.core import recording as recording_mod
-from wsctl.core import ssh, tmux, totp
+from wsctl.core import ssh, tmux, totp, user_admin
 from wsctl.core.audit import AuditWriter
 from wsctl.core.config import Settings, reload_settings_file
 from wsctl.core.metrics import Metrics
@@ -88,6 +89,32 @@ def _copy_upload(src: Any, fd: int, limit: int, chunk_size: int = 1 << 20) -> in
         return size
     finally:
         out.close()
+
+
+def _scan_recordings(directory: Path) -> list[dict[str, Any]]:
+    """List ``*.cast`` files (blocking; call via ``asyncio.to_thread``)."""
+    if not directory.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for entry in sorted(directory.glob("*.cast")):
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        items.append({"name": entry.name, "size": stat.st_size, "mtime": stat.st_mtime})
+    return items
+
+
+def _prune_recordings(directory: Path, cutoff: float, active: set[str]) -> None:
+    """Delete recordings older than ``cutoff`` (blocking; runs in a thread)."""
+    for entry in directory.glob("*.cast"):
+        if str(entry) in active:
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 class LoginRequest(BaseModel):
@@ -179,6 +206,20 @@ def _config_mtime(settings: Settings) -> float:
         return settings.config_path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def _request_reload(app: FastAPI) -> None:
+    """Signal handler: defer the reload to the maintenance loop."""
+    app.state.reload_requested = True
+
+
+def _install_sighup(app: FastAPI) -> None:
+    """Reload config on ``SIGHUP`` (what ``wsctl reload`` sends)."""
+    if sys.platform == "win32":  # pragma: no cover - platform specific
+        return
+    loop = asyncio.get_running_loop()
+    with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+        loop.add_signal_handler(signal.SIGHUP, _request_reload, app)
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -300,30 +341,35 @@ def create_app(
             log.info("config reloaded: %s", ", ".join(changed))
         return changed
 
-    def _purge_retention() -> None:
-        """Bound on-disk growth: audit log, finished session rows, old casts."""
+    async def _purge_retention() -> None:
+        """Bound on-disk growth: audit log, finished session rows, old casts.
+
+        The database purges and the directory scan are blocking, so they run on
+        a worker thread rather than stalling the event loop every 5 seconds.
+        """
         now = time.time()
+        store_ = app.state.store
         if settings.audit_retention_days > 0:
-            app.state.store.purge_audit(now - settings.audit_retention_days * 86400)
+            await asyncio.to_thread(
+                store_.purge_audit, now - settings.audit_retention_days * 86400
+            )
         if settings.term_session_retention_days > 0:
-            app.state.store.purge_term_sessions(
-                now - settings.term_session_retention_days * 86400
+            await asyncio.to_thread(
+                store_.purge_term_sessions,
+                now - settings.term_session_retention_days * 86400,
             )
         if settings.recordings_retention_days > 0:
             cutoff = now - settings.recordings_retention_days * 86400
+            # Read the live set on the loop (touching the manager from a thread
+            # would race with session creation/removal).
             active = {
                 str(s.recording_path)
                 for s in app.state.manager.list_sessions()
                 if s.recording_path is not None
             }
-            for entry in settings.recordings_dir.glob("*.cast"):
-                if str(entry) in active:
-                    continue
-                try:
-                    if entry.stat().st_mtime < cutoff:
-                        entry.unlink(missing_ok=True)
-                except OSError:
-                    continue
+            await asyncio.to_thread(
+                _prune_recordings, settings.recordings_dir, cutoff, active
+            )
 
     async def _maintenance() -> None:
         while True:
@@ -346,11 +392,15 @@ def create_app(
                     if dead != instance_id:
                         app.state.store.instance_remove(dead)
                 await _reconcile_instances(app)
-                _purge_retention()
+                await _purge_retention()
+                if app.state.reload_requested:
+                    app.state.reload_requested = False
+                    _reload_config()
                 mtime = _config_mtime(settings)
                 if mtime != config_clock["mtime"]:
                     config_clock["mtime"] = mtime
                     _reload_config()
+                app.state.maintenance_last = time.monotonic()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -364,6 +414,7 @@ def create_app(
             instance_id, pid=os.getpid(), host=socket.gethostname()
         )
         maint = asyncio.create_task(_maintenance())
+        _install_sighup(app)
         audit.start()
         if webhook is not None:
             webhook.start()
@@ -419,6 +470,10 @@ def create_app(
     app.state.store.sliding_ttl = settings.session_sliding_ttl
     app.state.manager = manager or SessionManager()
 
+    app.state.reload_requested = False
+    app.state.maintenance_last = time.monotonic()
+    app.state.reload_config = _reload_config
+
     audit = AuditWriter(app.state.store)
     app.state.audit = audit
 
@@ -448,6 +503,18 @@ def create_app(
         "wsctl_audit_dropped_total",
         "Audit events dropped because the async queue was saturated",
         lambda: float(audit.dropped),
+    )
+    metrics.collect(
+        "wsctl_audit_write_errors_total",
+        "Audit batches that failed to persist (logged, then dropped)",
+        lambda: float(audit.errors),
+    )
+    metrics.collect(
+        "wsctl_maintenance_lag_seconds",
+        "How far behind the maintenance loop is (0 when healthy)",
+        lambda: max(
+            0.0, time.monotonic() - app.state.maintenance_last - MAINTENANCE_INTERVAL
+        ),
     )
 
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
@@ -504,7 +571,9 @@ def create_app(
                 headers={"Retry-After": str(retry_after)},
             )
 
-        user = store_.user_authenticate(body.username, body.password)
+        # Argon2 verification is CPU-bound (~tens of ms): keep it off the event
+        # loop so a login storm cannot stall every terminal.
+        user = await asyncio.to_thread(store_.user_authenticate, body.username, body.password)
         if user is None:
             limiter.record_failure(key)
             metrics.inc("wsctl_logins_total", result="failed")
@@ -662,10 +731,12 @@ def create_app(
                 detail=f"无法启动命令：{exc}",
             ) from exc
         try:
-            if settings.auto_record and recording_mod.has_room(
-                settings.recordings_dir, settings.recordings_max_bytes
+            if settings.auto_record and await asyncio.to_thread(
+                recording_mod.has_room,
+                settings.recordings_dir,
+                settings.recordings_max_bytes,
             ):
-                session.start_recording(
+                await session.start_recording(
                     settings.recordings_dir / f"{session.id}.cast",
                     record_input=settings.record_input,
                 )
@@ -793,7 +864,7 @@ def create_app(
         session = _owned(sid, user)
         if session.is_recording:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="已在录制中")
-        path = session.start_recording(
+        path = await session.start_recording(
             settings.recordings_dir / f"{sid}.cast", record_input=body.record_input
         )
         app.state.audit.enqueue("recording_start", user_id=user.id, term_session_id=sid)
@@ -802,7 +873,7 @@ def create_app(
     @app.post("/api/sessions/{sid}/recording/stop")
     async def stop_recording(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
         session = _owned(sid, user)
-        session.stop_recording()
+        await session.stop_recording()
         app.state.audit.enqueue("recording_stop", user_id=user.id, term_session_id=sid)
         return {"ok": True}
 
@@ -818,19 +889,7 @@ def create_app(
 
     @app.get("/api/recordings")
     async def list_recordings(_: User = Depends(require_admin)) -> list[dict[str, Any]]:
-        directory = settings.recordings_dir
-        if not directory.is_dir():
-            return []
-        items = []
-        for entry in sorted(directory.glob("*.cast")):
-            try:
-                stat = entry.stat()
-            except OSError:
-                continue
-            items.append(
-                {"name": entry.name, "size": stat.st_size, "mtime": stat.st_mtime}
-            )
-        return items
+        return await asyncio.to_thread(_scan_recordings, settings.recordings_dir)
 
     def _recording_path(name: str) -> Path:
         safe = Path(name).name
@@ -875,12 +934,16 @@ def create_app(
 
     @app.post("/api/users", status_code=status.HTTP_201_CREATED)
     async def create_user(body: UserCreate, actor: User = Depends(require_admin)) -> dict[str, Any]:
-        if body.role not in ("admin", "user"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="角色无效")
-        if app.state.store.user_get(body.username) is not None:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户已存在")
         try:
-            user = app.state.store.user_create(body.username, body.password, role=body.role)
+            user = await asyncio.to_thread(
+                user_admin.create,
+                app.state.store,
+                body.username,
+                body.password,
+                body.role,
+            )
+        except user_admin.UserAdminError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
         except sqlite3.IntegrityError as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="用户已存在"
@@ -894,16 +957,12 @@ def create_app(
     async def delete_user(
         username: str, actor: User = Depends(require_admin)
     ) -> dict[str, bool]:
-        target = app.state.store.user_get(username)
-        if target is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-        if username == actor.username:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不能删除自己")
-        if target.role == "admin" and app.state.store.admin_count() <= 1:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="至少保留一个管理员"
+        try:
+            await asyncio.to_thread(
+                user_admin.delete, app.state.store, username, actor=actor
             )
-        app.state.store.user_delete(username)
+        except user_admin.UserAdminError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
         audit.enqueue("user_delete", user_id=actor.id, payload=username)
         return {"ok": True}
 
@@ -915,33 +974,27 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="没有需要更新的字段"
             )
-        if body.role is not None and body.role not in ("admin", "user"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="角色无效")
-        target = app.state.store.user_get(username)
-        if target is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-        if body.disabled and username == actor.username:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不能禁用自己")
-        demoting = body.role == "user" and target.role == "admin"
-        disabling = body.disabled is True and target.role == "admin"
-        if (demoting or disabling) and app.state.store.admin_count() <= 1:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="至少保留一个管理员"
-            )
+        store_ = app.state.store
         changed: list[str] = []
-        if body.role is not None:
-            app.state.store.user_set_role(username, body.role)
-            changed.append(f"role={body.role}")
-        if body.disabled is not None:
-            app.state.store.user_set_disabled(username, body.disabled)
-            changed.append(f"disabled={body.disabled}")
-            if body.disabled:
-                app.state.store.delete_user_sessions(target.id)
-        if body.password is not None:
-            app.state.store.user_set_password(username, body.password)
-            # A password change revokes existing logins for that user.
-            app.state.store.delete_user_sessions(target.id)
-            changed.append("password")
+        try:
+            if body.role is not None:
+                await asyncio.to_thread(
+                    user_admin.set_role, store_, username, body.role, actor=actor
+                )
+                changed.append(f"role={body.role}")
+            if body.disabled is not None:
+                await asyncio.to_thread(
+                    user_admin.set_disabled, store_, username, body.disabled, actor=actor
+                )
+                changed.append(f"disabled={body.disabled}")
+            if body.password is not None:
+                # Password hashing is CPU-bound; revokes existing logins.
+                await asyncio.to_thread(
+                    user_admin.set_password, store_, username, body.password, actor=actor
+                )
+                changed.append("password")
+        except user_admin.UserAdminError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
         audit.enqueue("user_update", user_id=actor.id, payload=f"{username}:{','.join(changed)}")
         return {"ok": True}
 
@@ -1002,7 +1055,7 @@ def create_app(
     ) -> dict[str, Any]:
         root = settings.files_root
         try:
-            entries = fs_mod.list_dir(root, path)
+            entries = await asyncio.to_thread(fs_mod.list_dir, root, path)
         except fs_mod.FsError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return {"path": path.strip().lstrip("/"), "root": str(root), "entries": entries}

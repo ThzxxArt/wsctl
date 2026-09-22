@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Backend end-to-end scenarios for wsctl.
 
-Runs five scenarios, each against a freshly started server on its own port and
+Runs eight scenarios, each against a freshly started server on its own port and
 data directory:
 
-1. server   — health, login, WebSocket attach/exec, reconnect replay, metrics,
-              file panel (list/upload/download), traversal guard, auth guard
-2. cli      — wsctl login / session new|list|kill
-3. connect  — the CLI thin client over a real pseudo-terminal
-4. tmux     — a tmux-backed session survives a full server restart
-5. restart  — two instances share a port via SO_REUSEPORT (zero downtime)
+1. server    — health, login, WebSocket attach/exec, reconnect replay, metrics,
+               file panel (list/upload/download), traversal guard, auth guard
+2. cli       — wsctl login / session new|list|kill
+3. connect   — the CLI thin client over a real pseudo-terminal
+4. tmux      — a tmux-backed session survives a full server restart
+5. crash     — a SIGKILLed instance's tmux session is adopted by a new one
+6. multiplex — two instances share one data directory without interfering
+7. daemon    — background lifecycle (start/status/logs/reload/restart/stop)
+8. restart   — two instances share a port via SO_REUSEPORT (zero downtime)
 
 Usage:
     pip install -e ".[dev]"
@@ -393,6 +396,89 @@ def scenario_multiplex() -> None:
     print("  multiplex: ok")
 
 
+def _health_ok(base: str) -> bool:
+    try:
+        return httpx.get(f"{base}/healthz", timeout=1).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def scenario_daemon() -> None:
+    """Non-systemd background lifecycle: start/status/logs/reload/restart/stop."""
+    if sys.platform == "win32":
+        print("  daemon: skipped (POSIX only)")
+        return
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    data = Path(tempfile.mkdtemp(prefix="wsctl-daemon-"))
+    config = data / "config.toml"
+    config.write_text(
+        f'port = {port}\ndata_dir = "{data}"\nmax_sessions = 5\n', encoding="utf-8"
+    )
+    env = {**os.environ, "WSCTL_CONFIG": str(config)}
+
+    def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            [PY, "-m", "wsctl", *args, "--config", str(config)],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if check:
+            assert result.returncode == 0, f"{args}: {result.stdout}\n{result.stderr}"
+        return result
+
+    try:
+        run("start", "--admin-password", PASSWORD)
+        wait_health(base)
+
+        payload = json.loads(run("status", "--json").stdout)
+        assert payload["running"] is True and payload["port"] == port, payload
+
+        # A second start must be refused rather than silently duplicated.
+        assert run("start", "--admin-password", PASSWORD, check=False).returncode != 0
+
+        # SIGHUP reload picks up a config change.
+        config.write_text(
+            f'port = {port}\ndata_dir = "{data}"\nmax_sessions = 9\n', encoding="utf-8"
+        )
+        run("reload")
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            if "config reloaded" in run("logs", "-n", "60").stdout:
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError("SIGHUP did not trigger a config reload")
+
+        # restart keeps the instance reachable
+        run("restart", "--admin-password", PASSWORD)
+        wait_health(base)
+
+        # A SIGKILLed instance leaves a stale pid file that status prunes.
+        pidfile = data / "run" / f"wsctl-{port}.pid"
+        pid = int(json.loads(pidfile.read_text())["pid"])
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        assert run("status", check=False).returncode != 0, "stale pid file not pruned"
+
+        run("start", "--admin-password", PASSWORD)
+        wait_health(base)
+        run("stop")
+        assert not _health_ok(base), "server still answering after stop"
+    finally:
+        subprocess.run(
+            [PY, "-m", "wsctl", "stop", "--config", str(config)],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+        )
+        shutil.rmtree(data, ignore_errors=True)
+    print("  daemon: ok")
+
+
 def scenario_restart() -> None:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -428,6 +514,7 @@ SCENARIOS = {
     "tmux": scenario_tmux,
     "crash": scenario_crash,
     "multiplex": scenario_multiplex,
+    "daemon": scenario_daemon,
     "restart": scenario_restart,
 }
 

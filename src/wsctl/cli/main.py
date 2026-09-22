@@ -8,10 +8,10 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
-import tarfile
 import time
 import tomllib
 from pathlib import Path
@@ -22,6 +22,8 @@ from rich.console import Console
 from rich.table import Table
 
 from wsctl import __version__
+from wsctl.cli import daemon as daemon_mod
+from wsctl.cli import validate as vmod
 from wsctl.cli.client import (
     ApiClient,
     ApiError,
@@ -33,7 +35,8 @@ from wsctl.cli.client import (
     login as api_login,
 )
 from wsctl.cli.connect import ConnectError, run_connect
-from wsctl.core import totp
+from wsctl.core import backup as backup_mod
+from wsctl.core import totp, user_admin
 from wsctl.core.config import Settings, load_settings
 from wsctl.core.logging import configure_logging
 from wsctl.core.store import Store
@@ -69,6 +72,36 @@ def _root(
 def _fail(message: str) -> NoReturn:
     err_console.print(f"[red]{message}[/]")
     raise typer.Exit(code=1)
+
+
+def _usage_fail(error: vmod.CliUsageError) -> NoReturn:
+    """Report a contradictory command line (exit code 2, like a usage error)."""
+    err_console.print(f"[red]参数错误：[/]{error.message}")
+    if error.hint:
+        err_console.print(f"[dim]{error.hint}[/]")
+    raise typer.Exit(code=2)
+
+
+def _port_free(host: str, port: int) -> bool:
+    """Whether nothing is listening on ``host:port`` right now."""
+    probe = "127.0.0.1" if host in ("", "0.0.0.0", "::", "[::]") else host
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((probe, port)) != 0
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(max(0.0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}天{hours}时{minutes}分"
+    if hours:
+        return f"{hours}时{minutes}分"
+    if minutes:
+        return f"{minutes}分{secs}秒"
+    return f"{secs}秒"
 
 
 def _api_client(url: str | None) -> ApiClient:
@@ -164,6 +197,34 @@ def doctor(
     lrzsz = _which("sz") or _which("rz")
     add("lrzsz（ZMODEM）", lrzsz or "未安装", ok if lrzsz else warn)
 
+    daemon_ok = sys.platform != "win32"
+    add(
+        "后台启动（wsctl start）",
+        "支持" if daemon_ok else "不支持（Windows，请用 NSSM 或计划任务）",
+        ok if daemon_ok else warn,
+    )
+
+    instance = daemon_mod.read_instance(settings)
+    if instance is not None:
+        add("运行状态", f"运行中（pid {instance.pid}，{instance.host}:{instance.port}）", ok)
+    else:
+        add("运行状态", "未运行", "[dim]-[/]")
+
+    reuse_ok = hasattr(socket, "SO_REUSEPORT")
+    add(
+        "SO_REUSEPORT（零停机重启）",
+        "支持" if reuse_ok else "不支持",
+        ok if reuse_ok else warn,
+    )
+
+    if not settings.reuse_port:
+        free = _port_free(settings.host, settings.port)
+        add(
+            "监听端口",
+            f"{settings.host}:{settings.port}（{'可用' if free else '被占用'}）",
+            ok if free else warn,
+        )
+
     if url or load_credentials().get("url"):
         try:
             client = _api_client(url)
@@ -195,17 +256,224 @@ def doctor(
 def backup(
     output: Annotated[Path, typer.Argument(help="输出的 tar.gz 路径。")],
     config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
+    include_config: Annotated[
+        bool, typer.Option("--include-config", help="同时备份配置文件。")
+    ] = False,
 ) -> None:
-    """把数据库与录制打包备份到 tar.gz。"""
+    """一致性备份数据库与录制到 tar.gz（SQLite 在线备份）。"""
     settings = _settings_from(config)
-    output = output.expanduser()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(output, "w:gz") as tar:
-        if settings.db_path.is_file():
-            tar.add(settings.db_path, arcname="wsctl.db")
-        if settings.recordings_dir.is_dir():
-            tar.add(settings.recordings_dir, arcname="recordings")
-    console.print(f"[green]已备份到[/] {output}")
+    try:
+        path = backup_mod.create_backup(
+            settings.db_path,
+            settings.recordings_dir,
+            output,
+            config_path=settings.config_path,
+            include_config=include_config,
+            version=__version__,
+        )
+    except backup_mod.BackupError as exc:
+        _fail(str(exc))
+    console.print(f"[green]已备份到[/] {path}")
+
+
+@app.command()
+def restore(
+    archive: Annotated[Path, typer.Argument(help="备份的 tar.gz 路径。")],
+    config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="覆盖现有数据库（原库保存为 .bak）。")
+    ] = False,
+    with_config: Annotated[
+        bool, typer.Option("--with-config", help="同时恢复配置文件。")
+    ] = False,
+) -> None:
+    """从备份恢复数据库与录制。"""
+    settings = _settings_from(config)
+    try:
+        manifest = backup_mod.restore_backup(
+            archive,
+            settings.db_path,
+            settings.recordings_dir,
+            config_path=settings.config_path,
+            restore_config=with_config,
+            force=force,
+        )
+    except backup_mod.BackupError as exc:
+        _fail(str(exc))
+    created = manifest.get("created_at")
+    when = (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(created)))
+        if isinstance(created, (int, float))
+        else "未知时间"
+    )
+    console.print(f"[green]已从备份恢复[/] {archive}（备份于 {when}）")
+
+
+# Rules shared by ``serve`` and ``start``: they describe which options cannot be
+# combined, so a contradictory command line fails before any process is spawned.
+SERVE_RULES = [
+    vmod.exclusive("daemon", "foreground"),
+    vmod.exclusive(
+        "daemon",
+        "reuse_port",
+        message="--daemon 与 --reuse-port 不兼容：多实例热切换请用 --foreground（或 systemd）管理",
+    ),
+    vmod.exclusive(
+        "no_auth",
+        "admin_password",
+        message="--no-auth 已关闭认证，--admin-password 无意义",
+    ),
+    vmod.requires("ssl_cert", "ssl_key", message="--ssl-cert 需要同时提供 --ssl-key"),
+    vmod.requires("ssl_key", "ssl_cert", message="--ssl-key 需要同时提供 --ssl-cert"),
+    vmod.choices(
+        "backend",
+        ("local", "tmux"),
+        message="--backend 只能是 local 或 tmux（ssh 仅用于单个会话：wsctl session new --ssh）",
+    ),
+]
+
+_SERVE_FLAG_MAP = {
+    "host": "--host",
+    "port": "--port",
+    "config": "--config",
+    "admin_password": "--admin-password",
+    "ssl_cert": "--ssl-cert",
+    "ssl_key": "--ssl-key",
+    "log_level": "--log-level",
+    "new": "--new",
+    "backend": "--backend",
+}
+
+
+def _serve_child_argv(options: vmod.Options) -> list[str]:
+    """The argv a detached child should run to reproduce this invocation."""
+    argv = [sys.executable, "-m", "wsctl", "serve", "--foreground"]
+    for key, flag in _SERVE_FLAG_MAP.items():
+        if options.has(key):
+            argv += [flag, str(options.get(key))]
+    if options.has("no_auth"):
+        argv.append("--no-auth")
+    if options.has("log_json"):
+        argv.append("--log-json")
+    return argv
+
+
+def _serve_settings(
+    config: Path | None,
+    *,
+    host: str | None,
+    port: int | None,
+    ssl_cert: Path | None,
+    ssl_key: Path | None,
+    backend: str | None,
+    reuse_port: bool,
+    no_auth: bool,
+    log_json: bool,
+    log_level: str | None,
+) -> Settings:
+    overrides: dict[str, object] = {
+        "host": host,
+        "port": port,
+        "ssl_cert": ssl_cert,
+        "ssl_key": ssl_key,
+        "default_backend": backend,
+        "reuse_port": reuse_port or None,
+    }
+    if no_auth:
+        overrides["auth_required"] = False
+    if log_json:
+        overrides["log_json"] = True
+    settings = _settings_from(config, **overrides)
+    if log_level:
+        settings.log_level = log_level
+    return settings
+
+
+def _start_background(settings: Settings, argv: list[str], *, timeout: float) -> None:
+    try:
+        instance = daemon_mod.start(settings, argv, timeout=timeout)
+    except daemon_mod.DaemonError as exc:
+        _fail(str(exc))
+    console.print(
+        f"[green]已在后台启动[/] pid {instance.pid}  "
+        f"[cyan]{instance.host}:{instance.port}[/]"
+    )
+    console.print(f"[dim]日志：{daemon_mod.logfile_path(settings)}（wsctl logs -f 可跟踪）[/]")
+    console.print("[dim]若为首次启动，admin 随机密码打印在日志中。[/]")
+
+
+def _serve_foreground(
+    settings: Settings, *, admin_password: str | None, startup_command: str | None
+) -> None:
+    configure_logging(settings.log_level, json_output=settings.log_json)
+
+    from wsctl.server.app import create_app
+
+    try:
+        store = Store(settings.db_path)
+    except (OSError, sqlite3.Error) as exc:
+        _fail(f"无法打开数据库 {settings.db_path}：{exc}")
+    _ensure_admin(store, settings, admin_password)
+    application = create_app(settings, store=store, startup_command=startup_command)
+
+    if settings.reuse_port and not hasattr(socket, "SO_REUSEPORT"):
+        _fail("当前平台不支持 SO_REUSEPORT，无法使用 --reuse-port")
+
+    instance: daemon_mod.Instance | None = None
+    if settings.reuse_port:
+        console.print("[dim]SO_REUSEPORT：多实例共享端口，后台生命周期命令不可用[/]")
+    else:
+        try:
+            instance = daemon_mod.claim_pidfile(settings)
+        except daemon_mod.DaemonError as exc:
+            _fail(str(exc))
+
+    import uvicorn
+
+    scheme = "https" if settings.ssl_cert else "http"
+    console.print(
+        f"[bold green]wsctl {__version__}[/] serving on "
+        f"[cyan]{scheme}://{settings.host}:{settings.port}[/]"
+    )
+    if not settings.auth_required:
+        err_console.print("[bold yellow]warning:[/] authentication is disabled")
+
+    ssl_certfile = str(settings.ssl_cert) if settings.ssl_cert else None
+    ssl_keyfile = str(settings.ssl_key) if settings.ssl_key else None
+
+    try:
+        if settings.reuse_port:
+            from wsctl.core.net import make_reuse_socket
+
+            uv_config = uvicorn.Config(
+                application,
+                log_level=settings.log_level,
+                ssl_certfile=ssl_certfile,
+                ssl_keyfile=ssl_keyfile,
+            )
+            server = uvicorn.Server(uv_config)
+            try:
+                sock = make_reuse_socket(settings.host, settings.port)
+            except OSError as exc:
+                _fail(f"无法以 SO_REUSEPORT 绑定 {settings.host}:{settings.port}：{exc}")
+            console.print("[dim]SO_REUSEPORT enabled: a new instance can take over this port[/]")
+            try:
+                server.run(sockets=[sock])
+            finally:
+                sock.close()
+            return
+
+        uvicorn.run(
+            application,
+            host=settings.host,
+            port=settings.port,
+            log_level=settings.log_level,
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
+        )
+    finally:
+        if instance is not None:
+            daemon_mod.release_pidfile(settings, instance)
 
 
 @app.command()
@@ -233,68 +501,266 @@ def serve(
         bool,
         typer.Option("--reuse-port", help="以 SO_REUSEPORT 绑定，实现零停机重启。"),
     ] = False,
+    daemon: Annotated[
+        bool, typer.Option("--daemon", help="后台运行（等价于 wsctl start）。")
+    ] = False,
+    foreground: Annotated[
+        bool, typer.Option("--foreground", help="前台运行（默认）。")
+    ] = False,
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="后台启动时等待就绪的秒数。")
+    ] = 20.0,
 ) -> None:
-    """启动 wsctl 服务。"""
-    overrides: dict[str, object] = {
-        "host": host,
-        "port": port,
-        "ssl_cert": ssl_cert,
-        "ssl_key": ssl_key,
-        "default_backend": backend,
-        "reuse_port": reuse_port or None,
-    }
-    if no_auth:
-        overrides["auth_required"] = False
-    if log_json:
-        overrides["log_json"] = True
-    settings = _settings_from(config, **overrides)
-    if log_level:
-        settings.log_level = log_level
-
-    configure_logging(settings.log_level, json_output=settings.log_json)
-
-    from wsctl.server.app import create_app
-
-    store = Store(settings.db_path)
-    _ensure_admin(store, settings, admin_password)
-    application = create_app(settings, store=store, startup_command=new)
-
-    import uvicorn
-
-    scheme = "https" if settings.ssl_cert else "http"
-    console.print(f"[bold green]wsctl {__version__}[/] serving on [cyan]{scheme}://{settings.host}:{settings.port}[/]")
-    if not settings.auth_required:
-        err_console.print("[bold yellow]warning:[/] authentication is disabled")
-
-    ssl_certfile = str(settings.ssl_cert) if settings.ssl_cert else None
-    ssl_keyfile = str(settings.ssl_key) if settings.ssl_key else None
-
-    if settings.reuse_port:
-        from wsctl.core.net import make_reuse_socket
-
-        uv_config = uvicorn.Config(
-            application,
-            log_level=settings.log_level,
-            ssl_certfile=ssl_certfile,
-            ssl_keyfile=ssl_keyfile,
-        )
-        server = uvicorn.Server(uv_config)
-        sock = make_reuse_socket(settings.host, settings.port)
-        console.print("[dim]SO_REUSEPORT enabled: a new instance can take over this port[/]")
-        try:
-            server.run(sockets=[sock])
-        finally:
-            sock.close()
-        return
-
-    uvicorn.run(
-        application,
-        host=settings.host,
-        port=settings.port,
-        log_level=settings.log_level,
-        ssl_certfile=ssl_certfile,
-        ssl_keyfile=ssl_keyfile,
+    """启动 wsctl 服务（前台；加 --daemon 转后台）。"""
+    options = vmod.Options(
+        {
+            "host": host,
+            "port": port,
+            "config": config,
+            "no_auth": no_auth,
+            "admin_password": admin_password,
+            "ssl_cert": ssl_cert,
+            "ssl_key": ssl_key,
+            "log_level": log_level,
+            "log_json": log_json,
+            "new": new,
+            "backend": backend,
+            "reuse_port": reuse_port,
+            "daemon": daemon,
+            "foreground": foreground,
+        }
     )
+    try:
+        vmod.validate(options, SERVE_RULES)
+    except vmod.CliUsageError as exc:
+        _usage_fail(exc)
+
+    settings = _serve_settings(
+        config,
+        host=host,
+        port=port,
+        ssl_cert=ssl_cert,
+        ssl_key=ssl_key,
+        backend=backend,
+        reuse_port=reuse_port,
+        no_auth=no_auth,
+        log_json=log_json,
+        log_level=log_level,
+    )
+    if daemon:
+        _start_background(settings, _serve_child_argv(options), timeout=timeout)
+        return
+    _serve_foreground(settings, admin_password=admin_password, startup_command=new)
+
+
+@app.command()
+def start(
+    host: Annotated[str | None, typer.Option(help="监听地址。")] = None,
+    port: Annotated[int | None, typer.Option(help="监听端口。")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
+    no_auth: Annotated[
+        bool, typer.Option("--no-auth", help="关闭认证（不安全）。")
+    ] = False,
+    admin_password: Annotated[
+        str | None, typer.Option("--admin-password", help="初始管理员密码。")
+    ] = None,
+    ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
+    ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
+    log_level: Annotated[str | None, typer.Option(help="日志级别。")] = None,
+    log_json: Annotated[bool, typer.Option("--log-json", help="输出 JSON 日志。")] = False,
+    new: Annotated[
+        str | None, typer.Option("--new", help="启动时创建并运行此命令的会话。")
+    ] = None,
+    backend: Annotated[
+        str | None, typer.Option("--backend", help="默认会话后端：local 或 tmux。")
+    ] = None,
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="等待服务就绪的秒数。")
+    ] = 20.0,
+    force: Annotated[
+        bool, typer.Option("--force", help="已在运行时先停止再启动。")
+    ] = False,
+) -> None:
+    """在后台启动 wsctl（非 systemd；配合 stop/status/logs/restart）。"""
+    options = vmod.Options(
+        {
+            "host": host,
+            "port": port,
+            "config": config,
+            "no_auth": no_auth,
+            "admin_password": admin_password,
+            "ssl_cert": ssl_cert,
+            "ssl_key": ssl_key,
+            "log_level": log_level,
+            "log_json": log_json,
+            "new": new,
+            "backend": backend,
+        }
+    )
+    try:
+        vmod.validate(options, SERVE_RULES)
+    except vmod.CliUsageError as exc:
+        _usage_fail(exc)
+
+    settings = _serve_settings(
+        config,
+        host=host,
+        port=port,
+        ssl_cert=ssl_cert,
+        ssl_key=ssl_key,
+        backend=backend,
+        reuse_port=False,
+        no_auth=no_auth,
+        log_json=log_json,
+        log_level=log_level,
+    )
+    if force and daemon_mod.read_instance(settings) is not None:
+        try:
+            daemon_mod.stop(settings, timeout=timeout)
+        except daemon_mod.DaemonError as exc:
+            _fail(str(exc))
+    _start_background(settings, _serve_child_argv(options), timeout=timeout)
+
+
+@app.command()
+def stop(
+    host: Annotated[str | None, typer.Option(help="监听地址（与启动时一致）。")] = None,
+    port: Annotated[int | None, typer.Option(help="监听端口（与启动时一致）。")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    timeout: Annotated[float, typer.Option("--timeout", help="优雅退出的等待秒数。")] = 15.0,
+    force: Annotated[bool, typer.Option("--force", help="超时后强制 SIGKILL。")] = False,
+) -> None:
+    """停止后台运行的 wsctl。"""
+    settings = _settings_from(config, host=host, port=port)
+    try:
+        instance = daemon_mod.stop(settings, timeout=timeout, force=force)
+    except daemon_mod.DaemonError as exc:
+        _fail(str(exc))
+    console.print(f"[green]已停止[/] pid {instance.pid}")
+
+
+@app.command()
+def restart(
+    host: Annotated[str | None, typer.Option(help="监听地址。")] = None,
+    port: Annotated[int | None, typer.Option(help="监听端口。")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
+    no_auth: Annotated[bool, typer.Option("--no-auth", help="关闭认证。")] = False,
+    admin_password: Annotated[str | None, typer.Option("--admin-password")] = None,
+    ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
+    ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
+    log_level: Annotated[str | None, typer.Option(help="日志级别。")] = None,
+    log_json: Annotated[bool, typer.Option("--log-json")] = False,
+    new: Annotated[str | None, typer.Option("--new")] = None,
+    backend: Annotated[str | None, typer.Option("--backend")] = None,
+    timeout: Annotated[float, typer.Option("--timeout", help="等待就绪的秒数。")] = 20.0,
+) -> None:
+    """重启后台运行的 wsctl。"""
+    options = vmod.Options(
+        {
+            "host": host,
+            "port": port,
+            "config": config,
+            "no_auth": no_auth,
+            "admin_password": admin_password,
+            "ssl_cert": ssl_cert,
+            "ssl_key": ssl_key,
+            "log_level": log_level,
+            "log_json": log_json,
+            "new": new,
+            "backend": backend,
+        }
+    )
+    try:
+        vmod.validate(options, SERVE_RULES)
+    except vmod.CliUsageError as exc:
+        _usage_fail(exc)
+    settings = _serve_settings(
+        config,
+        host=host,
+        port=port,
+        ssl_cert=ssl_cert,
+        ssl_key=ssl_key,
+        backend=backend,
+        reuse_port=False,
+        no_auth=no_auth,
+        log_json=log_json,
+        log_level=log_level,
+    )
+    try:
+        instance = daemon_mod.restart(settings, _serve_child_argv(options), timeout=timeout)
+    except daemon_mod.DaemonError as exc:
+        _fail(str(exc))
+    console.print(f"[green]已重启[/] pid {instance.pid}  [cyan]{instance.host}:{instance.port}[/]")
+
+
+@app.command()
+def status(
+    host: Annotated[str | None, typer.Option(help="监听地址（与启动时一致）。")] = None,
+    port: Annotated[int | None, typer.Option(help="监听端口（与启动时一致）。")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
+) -> None:
+    """查看后台 wsctl 的运行状态。"""
+    settings = _settings_from(config, host=host, port=port)
+    instance = daemon_mod.read_instance(settings)
+    if instance is None:
+        others = daemon_mod.discover(settings)
+        if json_output:
+            missing = {"running": False, "others": [o.to_dict() for o in others]}
+            sys.stdout.write(json.dumps(missing, ensure_ascii=False, indent=2) + "\n")
+        else:
+            console.print("[yellow]未在运行[/]")
+            for other in others:
+                console.print(
+                    f"[dim]发现其他实例：pid {other.pid} {other.host}:{other.port}[/]"
+                )
+        raise typer.Exit(code=1)
+
+    info = daemon_mod.health_info(settings)
+    payload: dict[str, object] = {"running": True, **instance.to_dict(), "health": info}
+    if json_output:
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        return
+    table = Table("项", "值")
+    table.add_row("状态", "[green]运行中[/]")
+    table.add_row("PID", str(instance.pid))
+    table.add_row("地址", f"{instance.host}:{instance.port}")
+    table.add_row("版本", instance.version)
+    table.add_row("运行时长", _fmt_duration(instance.uptime))
+    if info is not None:
+        table.add_row("会话数", str(info.get("sessions", "?")))
+    console.print(table)
+
+
+@app.command()
+def logs(
+    host: Annotated[str | None, typer.Option(help="监听地址（与启动时一致）。")] = None,
+    port: Annotated[int | None, typer.Option(help="监听端口（与启动时一致）。")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    follow: Annotated[bool, typer.Option("--follow", "-f", help="持续跟踪。")] = False,
+    lines: Annotated[int, typer.Option("--lines", "-n", help="显示末尾行数。")] = 100,
+) -> None:
+    """查看后台 wsctl 的日志。"""
+    settings = _settings_from(config, host=host, port=port)
+    try:
+        daemon_mod.tail_log(settings, lines=max(lines, 0), follow=follow)
+    except daemon_mod.DaemonError as exc:
+        _fail(str(exc))
+
+
+@app.command()
+def reload(
+    host: Annotated[str | None, typer.Option(help="监听地址（与启动时一致）。")] = None,
+    port: Annotated[int | None, typer.Option(help="监听端口（与启动时一致）。")] = None,
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+) -> None:
+    """请求运行中的 wsctl 重载配置（发送 SIGHUP）。"""
+    settings = _settings_from(config, host=host, port=port)
+    try:
+        instance = daemon_mod.reload_(settings)
+    except daemon_mod.DaemonError as exc:
+        _fail(str(exc))
+    console.print(f"[green]已请求重载配置[/]（pid {instance.pid}）")
 
 
 def _ensure_admin(store: Store, settings: Settings, password: str | None) -> None:
@@ -331,15 +797,18 @@ def user_add(
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
     """创建一个用户。"""
+    try:
+        vmod.validate(vmod.Options({"role": role}), [vmod.choices("role", ("admin", "user"))])
+    except vmod.CliUsageError as exc:
+        _usage_fail(exc)
     settings = _settings_from(config)
     if password is None:
         password = typer.prompt("密码", hide_input=True, confirmation_prompt=True)
     store = Store(settings.db_path)
     try:
-        if store.user_get(username) is not None:
-            err_console.print(f"[red]用户已存在：{username}[/]")
-            raise typer.Exit(code=1)
-        store.user_create(username, password, role=role)
+        user_admin.create(store, username, password, role=role)
+    except user_admin.UserAdminError as exc:
+        _fail(exc.message)
     finally:
         store.close()
     console.print(f"[green]已创建用户[/] {username}（[cyan]{role}[/]）")
@@ -365,13 +834,13 @@ def user_del(
     username: Annotated[str, typer.Argument(help="用户名。")],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """删除一个用户。"""
+    """删除一个用户（不会删除最后一个管理员）。"""
     settings = _settings_from(config)
     store = Store(settings.db_path)
     try:
-        if not store.user_delete(username):
-            err_console.print(f"[red]没有此用户：{username}[/]")
-            raise typer.Exit(code=1)
+        user_admin.delete(store, username)
+    except user_admin.UserAdminError as exc:
+        _fail(exc.message)
     finally:
         store.close()
     console.print(f"[green]已删除用户[/] {username}")
@@ -382,17 +851,17 @@ def user_passwd(
     username: Annotated[str, typer.Argument(help="用户名。")],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """修改用户密码。"""
+    """修改用户密码（并吊销该用户已有的登录态）。"""
     settings = _settings_from(config)
     password = typer.prompt("新密码", hide_input=True, confirmation_prompt=True)
     store = Store(settings.db_path)
     try:
-        if not store.user_set_password(username, password):
-            err_console.print(f"[red]没有此用户：{username}[/]")
-            raise typer.Exit(code=1)
+        user_admin.set_password(store, username, password)
+    except user_admin.UserAdminError as exc:
+        _fail(exc.message)
     finally:
         store.close()
-    console.print(f"[green]已更新密码：[/] {username}")
+    console.print(f"[green]已更新密码并吊销旧登录态：[/] {username}")
 
 
 @user_app.command("role")
@@ -401,13 +870,17 @@ def user_role(
     role: Annotated[str, typer.Argument(help="角色：admin 或 user。")],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """设置用户角色。"""
+    """设置用户角色（不会降级最后一个管理员）。"""
+    try:
+        vmod.validate(vmod.Options({"role": role}), [vmod.choices("role", ("admin", "user"))])
+    except vmod.CliUsageError as exc:
+        _usage_fail(exc)
     settings = _settings_from(config)
     store = Store(settings.db_path)
     try:
-        if not store.user_set_role(username, role):
-            err_console.print(f"[red]没有此用户：{username}[/]")
-            raise typer.Exit(code=1)
+        user_admin.set_role(store, username, role)
+    except user_admin.UserAdminError as exc:
+        _fail(exc.message)
     finally:
         store.close()
     console.print(f"[green]{username}[/] 现在是 [cyan]{role}[/]")
@@ -455,12 +928,13 @@ def user_disable(
     username: Annotated[str, typer.Argument(help="用户名。")],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """禁用一个用户（其登录态立即失效）。"""
+    """禁用一个用户（其登录态立即失效；不能禁用最后一个管理员）。"""
     settings = _settings_from(config)
     store = Store(settings.db_path)
     try:
-        if not store.user_set_disabled(username, True):
-            _fail(f"没有此用户：{username}")
+        user_admin.set_disabled(store, username, True)
+    except user_admin.UserAdminError as exc:
+        _fail(exc.message)
     finally:
         store.close()
     console.print(f"[green]已禁用[/] {username}")
@@ -475,8 +949,9 @@ def user_enable(
     settings = _settings_from(config)
     store = Store(settings.db_path)
     try:
-        if not store.user_set_disabled(username, False):
-            _fail(f"没有此用户：{username}")
+        user_admin.set_disabled(store, username, False)
+    except user_admin.UserAdminError as exc:
+        _fail(exc.message)
     finally:
         store.close()
     console.print(f"[green]已启用[/] {username}")
@@ -653,12 +1128,20 @@ def config_set(
         hint = f"，是否想用 “{suggestion[0]}”？" if suggestion else ""
         _fail(f"未知的配置项：{key}{hint}")
     try:
-        tomllib.loads(f"__value__ = {value}")
+        parsed = tomllib.loads(f"__value__ = {value}")["__value__"]
     except tomllib.TOMLDecodeError:
         _fail('值必须是合法 TOML，例如 8080、"文本"、true、["a", "b"]')
 
+    # Type-check the single value against the settings model before touching the
+    # file, so `port = "abc"` is rejected here rather than at the next start.
+    try:
+        Settings(**{key: parsed})
+    except Exception as exc:
+        _fail(f"配置项 {key} 的值无效：{exc}")
+
     path = settings.config_path
-    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    original = path.read_text(encoding="utf-8") if path.is_file() else None
+    lines = original.splitlines() if original is not None else []
     replaced = False
     for index, line in enumerate(lines):
         stripped = line.strip()
@@ -668,9 +1151,18 @@ def config_set(
             break
     if not replaced:
         lines.append(f"{key} = {value}")
+    new_text = "\n".join(lines).rstrip("\n") + "\n"
+
+    # Validate the whole file (duplicate keys, conflicting values) and roll back
+    # on failure so a bad edit never leaves the server unable to start.
+    try:
+        data = tomllib.loads(new_text)
+        Settings(**data)
+    except Exception as exc:
+        _fail(f"写入后配置无效，已放弃修改：{exc}")
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    path.write_text(new_text, encoding="utf-8")
     console.print(f"[green]已设置[/] {key} = {value}  [dim]（{path}）[/]")
 
 
@@ -744,6 +1236,47 @@ def session_new(
     url: Annotated[str | None, typer.Option("--url", help="服务器地址。")] = None,
 ) -> None:
     """在运行中的服务上创建会话。"""
+    options = vmod.Options(
+        {
+            "backend": backend,
+            "ssh": ssh_host,
+            "ssh_user": ssh_user,
+            "ssh_port": ssh_port,
+            "ssh_identity": ssh_identity,
+            "ssh_option": ssh_option,
+        }
+    )
+
+    def _ssh_backend_conflict(o: vmod.Options) -> str | None:
+        if o.has("ssh") and o.has("backend") and o.get("backend") != "ssh":
+            return "--ssh 隐含 --backend ssh，不能与 --backend local/tmux 同时使用"
+        return None
+
+    try:
+        vmod.validate(
+            options,
+            [
+                vmod.choices("backend", ("local", "tmux", "ssh")),
+                vmod.requires("ssh_user", "ssh", message="--ssh-user 需要配合 --ssh 使用"),
+                vmod.requires("ssh_port", "ssh", message="--ssh-port 需要配合 --ssh 使用"),
+                vmod.requires(
+                    "ssh_identity", "ssh", message="--ssh-identity 需要配合 --ssh 使用"
+                ),
+                vmod.requires(
+                    "ssh_option", "ssh", message="--ssh-option 需要配合 --ssh 使用"
+                ),
+                vmod.requires_if(
+                    "backend",
+                    "ssh",
+                    "ssh",
+                    message="--backend ssh 需要提供 --ssh <host>",
+                ),
+                vmod.custom(_ssh_backend_conflict),
+            ],
+        )
+    except vmod.CliUsageError as exc:
+        _usage_fail(exc)
+
     client = _api_client(url)
     ssh_body: dict[str, object] | None = None
     if ssh_host:
@@ -799,10 +1332,13 @@ def session_attach(
     token: Annotated[
         str | None, typer.Option("--token", envvar="WSCTL_TOKEN", help="Bearer 令牌。")
     ] = None,
+    no_reconnect: Annotated[
+        bool, typer.Option("--no-reconnect", help="断线后不自动重连。")
+    ] = False,
 ) -> None:
     """把当前终端连接到已有会话。"""
     try:
-        run_connect(url, sid, token)
+        run_connect(url, sid, token, reconnect=not no_reconnect)
     except ConnectError as exc:
         _fail(str(exc))
 
@@ -898,10 +1434,13 @@ def connect(
     token: Annotated[
         str | None, typer.Option("--token", envvar="WSCTL_TOKEN", help="Bearer 令牌。")
     ] = None,
+    no_reconnect: Annotated[
+        bool, typer.Option("--no-reconnect", help="断线后不自动重连。")
+    ] = False,
 ) -> None:
     """把当前终端连接到远程 wsctl 服务。"""
     try:
-        run_connect(url, session, token)
+        run_connect(url, session, token, reconnect=not no_reconnect)
     except ConnectError as exc:
         _fail(str(exc))
 

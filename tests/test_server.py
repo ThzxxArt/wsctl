@@ -647,7 +647,8 @@ def test_revoked_writable_share_blocks_input(tmp_path: Path) -> None:
             app.state.manager.get(sid).revoke_share()  # type: ignore[attr-defined]
             ws.send_text(json.dumps({"type": "input", "data": "echo X\r"}))
             close = _recv_until_close(ws)
-            assert close["code"] == 4401
+            # A revoked share is a permission failure, not an auth failure.
+            assert close["code"] == 4403
 
 
 def test_readonly_attach_does_not_resize(tmp_path: Path) -> None:
@@ -899,6 +900,85 @@ def test_cannot_remove_last_admin(tmp_path: Path) -> None:
         # with a second admin, demotion is allowed
         assert client.patch("/api/users/bob", json={"role": "admin"}).status_code == 200
         assert client.patch("/api/users/admin", json={"role": "user"}).status_code == 200
+
+
+# -- M31: WebSocket close-code semantics ------------------------------
+
+
+def test_ws_missing_session_closes_4404(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(
+                json.dumps({"type": "attach", "session": "does-not-exist", "cols": 80, "rows": 24})
+            )
+            err = _recv_control(ws, {"error"})
+            assert err is not None and "会话不存在" in str(err["msg"])
+            assert _recv_until_close(ws)["code"] == 4404
+
+
+def test_ws_forbidden_session_closes_4403(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        client.post("/api/logout")
+        login(client, BOB)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_until_close(ws)["code"] == 4403
+
+
+def test_ws_session_limit_closes_4409(tmp_path: Path) -> None:
+    app = build_app(tmp_path, max_sessions=1)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert client.post("/api/sessions", json={}).status_code == 201
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "cols": 80, "rows": 24}))
+            err = _recv_control(ws, {"error"})
+            assert err is not None and "上限" in str(err["msg"])
+            assert _recv_until_close(ws)["code"] == 4409
+
+
+def test_ws_bad_first_message_closes_4400(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "ping"}))
+            assert _recv_until_close(ws)["code"] == 4400
+
+
+def test_ws_idle_connection_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wsctl.server import ws as ws_mod
+
+    monkeypatch.setattr(ws_mod, "ACCESS_RECHECK", 0.1)
+    monkeypatch.setattr(ws_mod, "IDLE_TIMEOUT", 0.3)
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            # Sends nothing: a half-open peer must be closed, not held forever.
+            assert _recv_until_close(ws, timeout=5)["code"] == 4408
+
+
+def test_ws_malformed_json_closes_4400(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text("not json at all")
+            assert _recv_until_close(ws)["code"] == 4400
+
+
+def test_ws_bad_dimensions_closes_4400(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "cols": "wide", "rows": 24}))
+            assert _recv_until_close(ws)["code"] == 4400
 
 
 def test_password_change_revokes_other_sessions(tmp_path: Path) -> None:

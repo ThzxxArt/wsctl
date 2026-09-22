@@ -25,6 +25,14 @@ session can run commands as the server's user. Treat it like SSH:
 - Optional authentication on `/metrics` (`metrics_require_auth`)
 - Multi-instance leases so a peer sharing the data directory can never reconcile
   or reap another instance's sessions
+- The CLI enforces the same user-management invariants as the API (the last
+  admin cannot be demoted/disabled/deleted, and a password change revokes that
+  user's logins), so local administration cannot lock the instance out
+- Consistent backups via SQLite's online backup API; restoring refuses to
+  overwrite an existing database without `--force` and rejects archive members
+  that try to escape the data directory
+- The background lifecycle verifies a process-identity fingerprint before
+  signalling a PID, so it never kills an unrelated process that reused the PID
 
 ## Supported versions
 

@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-09-22
+
+Operations and correctness release: a background lifecycle that needs no
+systemd, strict validation of mutually exclusive options, and the last blocking
+paths on the event loop removed. No new terminal protocols.
+
+### Added
+
+- **Background lifecycle without systemd**: `wsctl start` / `stop` / `restart` /
+  `status` / `logs` / `reload`, plus `wsctl serve --daemon`. The child is
+  detached (`start_new_session`), its output goes to a per-port log file, and a
+  pid file carries a **process-identity fingerprint** (Linux start time, `ps`
+  elsewhere) so a recycled PID is never signalled. `start` refuses to clobber a
+  live instance (`start --force` replaces a running one); `status --json` is
+  machine-readable; `reload` sends `SIGHUP`, which the server now handles (in
+  addition to the mtime watcher).
+- **Half-open connection detection**: a WebSocket that has sent nothing for
+  `IDLE_TIMEOUT` (120s) is closed with code `4408`. Both clients ping every 25s,
+  so a peer that vanished without a FIN is reclaimed instead of lingering.
+- **Declarative CLI validation** (`wsctl/cli/validate.py`): options that cannot
+  be combined or that depend on each other now fail fast with exit code 2 and an
+  actionable message — `--daemon` vs `--reuse-port`, `--ssl-cert`/`--ssl-key`,
+  `serve --backend ssh`, `session new --ssh` vs `--backend`, `--ssh-*` without
+  `--ssh`, unknown roles, and more. `config set` now type-checks the value
+  against the settings model and validates the whole file before writing.
+- **One set of user invariants for both surfaces** (`wsctl/core/user_admin.py`):
+  the CLI can no longer disable, demote or delete the last admin (which could
+  lock the instance out), and `wsctl user passwd` now revokes that user's
+  existing logins just like the API does.
+- **Consistent backups and restores**: `backup` uses SQLite's online backup API
+  (a WAL-mode database copied as a plain file could miss recent commits), and
+  `restore` validates the archive, refuses to overwrite without `--force`
+  (keeping a `.bak`), and rejects path-traversal members.
+- `wsctl connect` reconnects automatically with exponential backoff and
+  re-attaches to the same session (server-side replay restores the screen);
+  `--no-reconnect` opts out.
+- `doctor` now reports the running instance, port availability, `SO_REUSEPORT`
+  support and background-start capability.
+- Metrics `wsctl_audit_write_errors_total` and `wsctl_maintenance_lag_seconds`.
+
+### Changed
+
+- **WebSocket close codes are now meaningful**: `4400` bad request, `4401`
+  unauthenticated, `4403` forbidden, `4404` session not found, `4409` limit
+  reached, `4500` server error. The web client stops reconnecting on a permanent
+  failure instead of looping, and a missing session no longer pops the login
+  dialog at an already-authenticated user.
+- Session ids are hex (`token_hex`) so they can never start with `-` and be
+  mistaken for a CLI option.
+- `--reuse-port` now fails loudly when `SO_REUSEPORT` is unavailable instead of
+  silently binding without it (a silent downgrade would defeat zero-downtime
+  handovers).
+
+### Fixed
+
+- **Argon2 verification and hashing no longer run on the event loop**: login,
+  user creation and password changes run on a worker thread, so a login storm
+  cannot stall every terminal.
+- `Recorder.close()` (which joins its writer thread) no longer blocks the event
+  loop; retention purging, recording-capacity checks and directory listings run
+  on worker threads.
+- The audit writer survives a failing database write (it logs, counts and keeps
+  going instead of dying silently), and concurrent `flush()` calls can no longer
+  reorder events.
+- `serve --new` with a `tmux` backend that is not installed no longer crashes the
+  server at startup.
+- The web UI's Esc key closes the topmost modal (previously it could close the
+  admin panel behind the QR dialog), the QR dialog is a normal, focus-trapped
+  modal, password reset uses a masked input, and assigning a hotkey that is
+  already taken is rejected with a warning.
+
+### Testing
+
+- New suites for the validation layer, the pid-file lifecycle, consistent
+  backups/restores, and the shared user-admin invariants; WebSocket close-code
+  tests; audit-writer failure and ordering tests; a `daemon` end-to-end scenario;
+  and browser coverage for the 2FA QR modal.
+
+[0.1.3]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.3
+
 ## [0.1.2] - 2026-09-22
 
 Polish and robustness release: disk/DB I/O is moved off the event loop, the web

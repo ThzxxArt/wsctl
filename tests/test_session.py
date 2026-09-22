@@ -222,13 +222,13 @@ async def test_recording_captures_output(tmp_path: Path) -> None:
     path = tmp_path / "s.cast"
     client = FakeClient()
     try:
-        session.start_recording(path, record_input=True)
+        await session.start_recording(path, record_input=True)
         assert session.is_recording
         await session.attach(client)
         session.write_input(b"echo REC-MARK\n")
         assert await wait_for(lambda: b"REC-MARK" in client.output())
     finally:
-        session.stop_recording()
+        await session.stop_recording()
         await manager.shutdown()
     text = path.read_text()
     assert '"o"' in text and "REC-MARK" in text

@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -43,6 +44,22 @@ log = logging.getLogger("wsctl.ws")
 MAX_AUDIT_LINE = 512
 MAX_AUDIT_BUFFER = 8192
 ACCESS_RECHECK = 5.0
+
+# WebSocket close codes (4000-4999 is the application-defined range). They are
+# distinct so the client can tell "log in again" apart from "this session is
+# gone" and stop reconnecting on a permanent failure.
+CLOSE_BAD_REQUEST = 4400
+CLOSE_UNAUTHORIZED = 4401
+CLOSE_FORBIDDEN = 4403
+CLOSE_NOT_FOUND = 4404
+CLOSE_LIMIT = 4409
+CLOSE_SERVER_ERROR = 4500
+CLOSE_TIMEOUT = 4408
+
+# Close a connection that has sent nothing for this long. Both clients send a
+# `ping` every 25s, so this detects a half-open TCP connection (a peer that
+# vanished without a FIN) without ever tripping on a genuinely idle session.
+IDLE_TIMEOUT = 120.0
 
 
 def _auth_token(websocket: WebSocket) -> str | None:
@@ -84,7 +101,7 @@ def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
 class _Denied(Exception):
     """Handshake denial: the client is told and the socket closed with a code."""
 
-    def __init__(self, message: str, code: int = 4401) -> None:
+    def __init__(self, message: str, code: int = CLOSE_UNAUTHORIZED) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
@@ -110,7 +127,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
 
     if not ip_allowed(ip, settings.allowed_ips):
         audit.enqueue("ip_rejected", ip=ip, payload="ws")
-        await websocket.close(code=4403)
+        await websocket.close(code=CLOSE_FORBIDDEN)
         return
 
     if not is_origin_allowed(
@@ -118,13 +135,13 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         websocket.headers.get("host"),
         settings.allowed_origins,
     ):
-        await websocket.close(code=4403)
+        await websocket.close(code=CLOSE_FORBIDDEN)
         return
 
     # An unauthenticated connection is only allowed when it presents a share
     # token (validated during the handshake).
     if user is None and not share_param:
-        await websocket.close(code=4401)
+        await websocket.close(code=CLOSE_UNAUTHORIZED)
         return
 
     client = WsClient(websocket, max_bytes=settings.client_max_bytes)
@@ -202,14 +219,19 @@ async def _handshake(
     user: User | None,
     share_param: str | None = None,
 ) -> tuple[TermSession, bool, str | None] | None:
-    raw = await websocket.receive_text()
-    msg = json.loads(raw)
-    if msg.get("type") != "attach":
-        client.put({"type": "error", "msg": "首条消息必须是 attach"})
-        return None
+    try:
+        raw = await websocket.receive_text()
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        raise _Denied("首条消息必须是 JSON 格式的 attach", CLOSE_BAD_REQUEST) from None
+    if not isinstance(msg, dict) or msg.get("type") != "attach":
+        raise _Denied("首条消息必须是 attach", CLOSE_BAD_REQUEST)
 
-    cols = int(msg.get("cols") or 80)
-    rows = int(msg.get("rows") or 24)
+    try:
+        cols = int(msg.get("cols") or 80)
+        rows = int(msg.get("rows") or 24)
+    except (TypeError, ValueError):
+        raise _Denied("cols/rows 必须是整数", CLOSE_BAD_REQUEST) from None
     sid = msg.get("session")
     share = msg.get("share") or share_param
 
@@ -219,32 +241,31 @@ async def _handshake(
     if sid:
         session = manager.get(str(sid))
         if session is None:
-            raise _Denied(f"会话不存在：{sid}")
+            raise _Denied(f"会话不存在：{sid}", CLOSE_NOT_FOUND)
         access = _access(user, session, share)
         if access is None:
-            raise _Denied("无权访问该会话")
+            raise _Denied("无权访问该会话", CLOSE_FORBIDDEN)
         writable = access == "write"
     else:
         if user is None:
-            raise _Denied("创建会话需要登录")
+            raise _Denied("创建会话需要登录", CLOSE_UNAUTHORIZED)
         if len(manager.list_sessions()) >= settings.max_sessions:
-            client.put({"type": "error", "msg": "会话数量已达上限"})
-            return None
+            raise _Denied("会话数量已达上限", CLOSE_LIMIT)
         if not within_user_quota(manager, settings.max_sessions_per_user, user.id):
-            client.put({"type": "error", "msg": "该用户的会话数量已达上限"})
-            return None
+            raise _Denied("该用户的会话数量已达上限", CLOSE_LIMIT)
         spec = _default_spec(settings, cols, rows)
         try:
             session = await manager.create(spec, owner_id=user.id)
         except (OSError, PtyError) as exc:
-            client.put({"type": "error", "msg": f"无法启动命令：{exc}"})
-            return None
+            raise _Denied(f"无法启动命令：{exc}", CLOSE_BAD_REQUEST) from exc
         created = True
         try:
-            if settings.auto_record and recordings_have_room(
-                settings.recordings_dir, settings.recordings_max_bytes
+            if settings.auto_record and await asyncio.to_thread(
+                recordings_have_room,
+                settings.recordings_dir,
+                settings.recordings_max_bytes,
             ):
-                session.start_recording(
+                await session.start_recording(
                     settings.recordings_dir / f"{session.id}.cast",
                     record_input=settings.record_input,
                 )
@@ -272,8 +293,7 @@ async def _handshake(
         except Exception:
             # Do not leave a live process/fd behind if post-create setup fails.
             await manager.remove(session.id)
-            client.put({"type": "error", "msg": "创建会话失败"})
-            return None
+            raise _Denied("创建会话失败", CLOSE_SERVER_ERROR) from None
 
     # Only writers may set the shared terminal size; a read-only viewer must not
     # be able to shrink the owner's window at attach time.
@@ -285,8 +305,7 @@ async def _handshake(
         # A session we just created has no other owner and must not be leaked.
         if created:
             await manager.remove(session.id)
-        client.put({"type": "error", "msg": str(exc)})
-        return None
+        raise _Denied(str(exc), CLOSE_LIMIT) from exc
     return session, writable, share
 
 
@@ -328,15 +347,16 @@ async def _pump(
 ) -> None:
     line_buffer = bytearray()
     read_only_notice = False
+    last_rx = time.monotonic()
 
     def share_revoked() -> bool:
         return share is not None and not session.share_valid(share)
 
-    async def deny(message: str) -> None:
+    async def deny(message: str, code: int = CLOSE_UNAUTHORIZED) -> None:
         with contextlib.suppress(ClientGone):
             client.put({"type": "error", "msg": message})
         with contextlib.suppress(Exception):
-            await websocket.close(code=4401)
+            await websocket.close(code=code)
 
     def over_limit(size: int) -> bool:
         return bucket is not None and not bucket.allow(size)
@@ -379,13 +399,18 @@ async def _pump(
                 # The session dropped this client (e.g. memory backpressure);
                 # close the socket rather than lingering here.
                 return
+            if time.monotonic() - last_rx > IDLE_TIMEOUT:
+                # No ping/input for a long time: the peer is gone (half-open).
+                await deny("连接空闲超时，请重新连接", CLOSE_TIMEOUT)
+                return
             if share_revoked():
-                await deny("分享已撤销或过期")
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
                 return
             if recheck is not None and not recheck():
-                await deny("登录已失效，请重新登录")
+                await deny("登录已失效，请重新登录", CLOSE_UNAUTHORIZED)
                 return
             continue
+        last_rx = time.monotonic()
         if client.closed:
             # The session dropped this client (e.g. memory backpressure); stop
             # accepting further input from it.
@@ -396,7 +421,7 @@ async def _pump(
         data_bytes = message.get("bytes")
         if data_bytes is not None:
             if share_revoked():
-                await deny("分享已撤销或过期")
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
                 return
             if not writable:
                 reject_readonly()
@@ -417,7 +442,12 @@ async def _pump(
         kind = data.get("type")
         if kind == "resize":
             if writable:
-                session.resize(int(data.get("cols") or 80), int(data.get("rows") or 24))
+                try:
+                    session.resize(
+                        int(data.get("cols") or 80), int(data.get("rows") or 24)
+                    )
+                except (TypeError, ValueError):
+                    continue  # ignore a malformed resize rather than dropping the link
         elif kind == "input":
             if not writable:
                 reject_readonly()

@@ -264,9 +264,9 @@ class TermSession:
 
     # -- recording -----------------------------------------------------
 
-    def start_recording(self, path: Path | str, *, record_input: bool = False) -> Path:
+    async def start_recording(self, path: Path | str, *, record_input: bool = False) -> Path:
         """Begin recording this session to an asciinema cast file."""
-        self.stop_recording()
+        await self.stop_recording()
         self._recorder = Recorder(
             Path(path), width=self.spec.cols, height=self.spec.rows
         )
@@ -274,10 +274,16 @@ class TermSession:
         self.recording_path = Path(path)
         return self.recording_path
 
-    def stop_recording(self) -> None:
-        if self._recorder is not None:
-            self._recorder.close()
-            self._recorder = None
+    async def stop_recording(self) -> None:
+        """Stop recording.
+
+        The recorder joins its writer thread, so the blocking part runs on a
+        worker thread instead of stalling the event loop.
+        """
+        recorder = self._recorder
+        self._recorder = None
+        if recorder is not None:
+            await asyncio.to_thread(recorder.close)
 
     @property
     def is_recording(self) -> bool:
@@ -350,7 +356,7 @@ class TermSession:
         if self.closed:
             return
         self.closed = True
-        self.stop_recording()
+        await self.stop_recording()
         code = self._pty.poll()
         if code is None:
             try:
@@ -472,7 +478,9 @@ class SessionManager:
                 del self._sessions[sid]
 
     def _new_id(self) -> str:
-        return secrets.token_urlsafe(8)
+        # Hex, not url-safe base64: an id must never start with "-", which the
+        # CLI would parse as an option (e.g. `wsctl session kill -6dM4...`).
+        return secrets.token_hex(8)
 
 
 def within_user_quota(manager: SessionManager, limit: int, user_id: int | None) -> bool:

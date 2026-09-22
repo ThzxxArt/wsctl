@@ -229,6 +229,21 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.wait_for_selector("#admin-body .admin-table", timeout=10000)
             page.click(".tab2[data-tab='recordings']")
             page.wait_for_timeout(300)
+            # enabling 2FA opens the shared modal with a QR code; Esc closes the
+            # topmost modal (not the admin panel underneath it)
+            page.click(".tab2[data-tab='users']")
+            page.wait_for_function(
+                "() => document.querySelectorAll('#admin-body .admin-table tbody tr').length >= 1",
+                timeout=10000,
+            )
+            page.locator(
+                "#admin-body .admin-table tbody tr"
+            ).first.locator("button:has-text('启用 2FA')").click()
+            page.wait_for_selector("#qr-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#qr-image svg", timeout=10000)
+            page.keyboard.press("Escape")
+            page.wait_for_selector("#qr-overlay.hidden", state="attached", timeout=5000)
+            assert page.locator("#admin-overlay").is_visible()
             page.click("#admin-close")
             page.wait_for_selector("#admin-overlay.hidden", state="attached", timeout=5000)
 
@@ -247,7 +262,12 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.dblclick(".tab.active .label")
             page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=5000)
             page.fill("#rename-input", "重命名标签")
-            page.click("#rename-form button[type=submit]")
+            with page.expect_response(
+                lambda r: r.request.method == "PATCH" and "/api/sessions/" in r.url,
+                timeout=10000,
+            ) as rename_response:
+                page.click("#rename-form button[type=submit]")
+            assert rename_response.value.status == 200, rename_response.value.status
             page.wait_for_selector("#rename-overlay.hidden", state="attached", timeout=5000)
             page.wait_for_function(
                 "() => document.querySelector('.tab.active .label').textContent === '重命名标签'",

@@ -30,7 +30,9 @@ class AuditWriter:
         self._store = store
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
+        self._write_lock = asyncio.Lock()
         self.dropped = 0
+        self.errors = 0
 
     def start(self) -> None:
         if self._task is None:
@@ -81,22 +83,43 @@ class AuditWriter:
 
     async def _run(self) -> None:
         while True:
-            batch = [await self._queue.get()]
-            batch.extend(self._drain_batch())
-            await self._write(batch)
+            first = await self._queue.get()
+            # Drain and write under the same lock as ``flush`` so events keep
+            # their order and a concurrent flush never strands a batch.
+            async with self._write_lock:
+                batch = [first]
+                batch.extend(self._drain_batch())
+                await self._write_locked(batch)
 
-    async def _write(self, batch: list[dict[str, Any]]) -> None:
+    async def _write_locked(self, batch: list[dict[str, Any]]) -> None:
+        """Persist one batch; never raises, so the writer task cannot die.
+
+        A failing DB write (disk full, locked database) would otherwise kill the
+        background task and silently stop all auditing.
+        """
         if not batch:
             return
-        # DB write on a worker thread; webhook dispatch back on the loop.
-        await asyncio.to_thread(self._store.write_events, batch)
-        self._store.dispatch_events(batch)
+        try:
+            # DB write on a worker thread; webhook dispatch back on the loop.
+            await asyncio.to_thread(self._store.write_events, batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.errors += 1
+            log.exception("audit write failed; %d event(s) dropped", len(batch))
+        try:
+            self._store.dispatch_events(batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("audit sink dispatch failed")
 
     async def flush(self) -> None:
         """Write everything currently queued (used before shutdown and by the
         audit API so reads see recent events)."""
         while True:
-            batch = self._drain_batch()
-            if not batch:
-                return
-            await self._write(batch)
+            async with self._write_lock:
+                batch = self._drain_batch()
+                if not batch:
+                    return
+                await self._write_locked(batch)

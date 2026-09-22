@@ -33,6 +33,8 @@
     renameTitle: $("rename-title"), renameCancel: $("rename-cancel"),
     confirmOverlay: $("confirm-overlay"), confirmTitle: $("confirm-title"),
     confirmMessage: $("confirm-message"), confirmOk: $("confirm-ok"), confirmCancel: $("confirm-cancel"),
+    qrOverlay: $("qr-overlay"), qrTitle: $("qr-title"), qrSecret: $("qr-secret"),
+    qrImage: $("qr-image"), qrDone: $("qr-done"), qrClose: $("qr-close"),
     toasts: $("toasts"),
   };
 
@@ -47,6 +49,10 @@
   const sharedSession = params.get("session");
   const shareToken = params.get("share");
   const sharedMode = Boolean(sharedSession && shareToken);
+
+  // Application close codes that mean "do not reconnect": the failure is
+  // permanent and the reason was already delivered as a control message.
+  const FATAL_CLOSE_CODES = new Set([4400, 4403, 4404, 4409, 4500]);
 
   const encoder = new TextEncoder();
   const sessions = new Map();
@@ -202,9 +208,11 @@
     });
   }
 
-  function promptDialog(title, value) {
+  function promptDialog(title, value, opts) {
+    const masked = Boolean(opts && opts.masked);
     return new Promise((resolve) => {
       els.renameTitle.textContent = title || "重命名";
+      els.renameInput.type = masked ? "password" : "text";
       els.renameInput.value = value || "";
       els.renameOverlay.classList.remove("hidden");
       els.renameInput.focus();
@@ -232,14 +240,16 @@
     "replay-overlay": () => els.replayClose.click(),
     "rename-overlay": () => els.renameCancel.click(),
     "confirm-overlay": () => els.confirmCancel.click(),
+    "qr-overlay": () => closeQrDialog(true),
   };
+  // Esc closes the *topmost* visible modal (they can be nested, e.g. the QR
+  // dialog opened from the admin panel).
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    for (const [id, close] of Object.entries(OVERLAY_CLOSERS)) {
-      if (!close) continue;
-      const el = $(id);
-      if (el && !el.classList.contains("hidden")) { close(); return; }
-    }
+    const open = [...document.querySelectorAll(".overlay:not(.hidden)")];
+    if (!open.length) return;
+    const close = OVERLAY_CLOSERS[open[open.length - 1].id];
+    if (close) close();
   });
   for (const [id, close] of Object.entries(OVERLAY_CLOSERS)) {
     if (!close) continue;
@@ -343,9 +353,23 @@
 
     ws.onclose = (event) => {
       if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
-      if (event.code === 4401 || event.code === 4403) {
+      if (event.code === 4401) {
         setConnection("未授权", "bad");
         if (!sharedMode) showLogin("请先登录");
+        return;
+      }
+      if (FATAL_CLOSE_CODES.has(event.code)) {
+        // Permanent failure (session gone, forbidden, limit): the server already
+        // explained it over the control channel — do not reconnect in a loop.
+        s.exited = true;
+        markTab(s, "exited");
+        setConnection("已结束", "bad");
+        if (event.code === 4404) {
+          toast("会话不存在或已结束", "error");
+          if (sessions.has(s.id)) detachTab(s.id);
+        } else if (event.code === 4403) {
+          toast("无权访问该会话", "error");
+        }
         return;
       }
       setConnection(s.intentional ? "空闲" : "已断开", s.intentional ? "" : "bad");
@@ -847,9 +871,9 @@
         catch (err) { adminNote(String(err.message || err), true); }
       });
       mk("重置密码", async () => {
-        const pw = await promptDialog(`为 ${u.username} 设置新密码`, "");
+        const pw = await promptDialog(`为 ${u.username} 设置新密码`, "", { masked: true });
         if (!pw) return;
-        try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { password: pw }); adminNote("密码已更新", false); }
+        try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { password: pw }); adminNote("密码已更新（该用户登录态已失效）", false); }
         catch (err) { adminNote(String(err.message || err), true); }
       });
       mk(u.totp ? "关闭 2FA" : "启用 2FA", async () => {
@@ -873,16 +897,22 @@
     els.adminBody.appendChild(table);
   }
 
-  function showQrDialog(username, info) {
-    const wrap = document.createElement("div");
-    wrap.className = "overlay";
-    wrap.innerHTML = `<div class="modal-card narrow"><div class="modal-head"><h2>为 ${esc(username)} 启用 2FA</h2></div>` +
-      `<p class="hint">用认证器扫描二维码，密钥：<b>${esc(info.secret)}</b></p>` +
-      `<div style="align-self:center;background:#fff;border-radius:9px;padding:8px;width:200px;height:200px">${info.qr_svg}</div>` +
-      `<div class="modal-actions"><button type="button" class="primary">完成</button></div></div>`;
-    document.body.appendChild(wrap);
-    wrap.querySelector("button").addEventListener("click", () => { wrap.remove(); renderAdmin(); });
+  function closeQrDialog(refresh) {
+    els.qrOverlay.classList.add("hidden");
+    els.qrImage.innerHTML = "";
+    if (refresh) renderAdmin();
   }
+
+  function showQrDialog(username, info) {
+    els.qrTitle.textContent = `为 ${username} 启用 2FA`;
+    els.qrSecret.textContent = info.secret;
+    els.qrImage.innerHTML = info.qr_svg;
+    els.qrOverlay.classList.remove("hidden");
+    els.qrDone.focus();
+  }
+
+  els.qrDone.addEventListener("click", () => closeQrDialog(true));
+  els.qrClose.addEventListener("click", () => closeQrDialog(true));
 
   async function renderAudit() {
     const bar = document.createElement("div");
@@ -1209,7 +1239,19 @@
       label.textContent = HOTKEY_LABELS[action] || action;
       const input = document.createElement("input");
       input.value = prefs.keybindings[action] || "";
-      input.addEventListener("change", () => { prefs.keybindings[action] = input.value.trim(); applyPrefs(); });
+      input.addEventListener("change", () => {
+        const value = input.value.trim();
+        const clash = Object.entries(prefs.keybindings).find(
+          ([other, binding]) => other !== action && binding && value
+            && binding.toLowerCase() === value.toLowerCase());
+        if (clash) {
+          toast(`快捷键与「${HOTKEY_LABELS[clash[0]] || clash[0]}」冲突`, "error");
+          input.value = prefs.keybindings[action] || "";
+          return;
+        }
+        prefs.keybindings[action] = value;
+        applyPrefs();
+      });
       row.append(label, input);
       els.hotkeyList.appendChild(row);
     }

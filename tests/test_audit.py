@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from wsctl.core.audit import AuditWriter
@@ -41,5 +42,47 @@ async def test_drops_when_queue_is_full(tmp_path: Path) -> None:
         for _ in range(10):
             writer.enqueue("spam")
         assert writer.dropped >= 8
+    finally:
+        store.close()
+
+
+class _BrokenStore:
+    """A store whose write path always fails, to prove the writer survives."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[dict[str, object]]] = []
+
+    def write_events(self, batch: list[dict[str, object]]) -> None:
+        raise RuntimeError("disk full")
+
+    def dispatch_events(self, batch: list[dict[str, object]]) -> None:
+        self.batches.append(batch)
+
+
+async def test_writer_survives_write_failure() -> None:
+    store = _BrokenStore()
+    writer = AuditWriter(store)  # type: ignore[arg-type]
+    writer.enqueue("one")
+    await writer.flush()
+    assert writer.errors == 1
+    # The task must still be usable for subsequent events.
+    writer.enqueue("two")
+    await writer.flush()
+    assert writer.errors == 2
+    assert len(store.batches) == 2  # sink still notified
+
+
+async def test_concurrent_flush_preserves_order(tmp_path: Path) -> None:
+    store = Store(tmp_path / "audit4.db")
+    try:
+        writer = AuditWriter(store)
+        writer.start()
+        for index in range(50):
+            writer.enqueue("event", payload=str(index))
+        await asyncio.gather(writer.flush(), writer.flush())
+        await writer.stop()
+        rows = store.recent_audit(limit=100)
+        payloads = [r["payload"] for r in rows]
+        assert payloads == [str(i) for i in range(49, -1, -1)]
     finally:
         store.close()

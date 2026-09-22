@@ -43,6 +43,8 @@ CLI (wsctl connect)┘             │
 - **多会话**：一个服务托管多个终端，Web 端多标签切换。
 - **会话与连接解耦**：客户端断开不影响会话；重连时回放 scrollback 重建屏幕。
   关闭标签默认只**断开连接**，会话仍在服务器上运行。
+- **连接自愈**：前端与 `wsctl connect` 断线后都会自动重连并回放屏幕；服务端对
+  长时间无心跳的半开连接主动回收（关闭码 4408）。
 - **跨重启恢复（可选 tmux 后端）**：shell 跑在 tmux 里，服务重启后自动重新挂载。
 - **多实例安全**：共享同一 `data_dir` 的多个实例通过租约互不干扰；`--reuse-port`
   升级时另一实例的活跃会话不会被误标或误杀。
@@ -60,7 +62,10 @@ CLI (wsctl connect)┘             │
 - **资源有界**：审计日志、已结束会话与录制文件支持保留策略清理；支持每用户会话
   配额、每会话内存硬上限与背压。
 - **零停机重启**：`SO_REUSEPORT` 让新实例先接管端口再停旧实例。
-- **配置热更新**：大部分配置改动无需重启。
+- **后台运行（无需 systemd）**：`wsctl start / stop / restart / status / logs /
+  reload`，带 pid 文件（进程身份校验）与日志文件。
+- **参数强校验**：互斥或互相依赖的参数在启动前报错（退出码 2），不会静默忽略其一。
+- **配置热更新**：大部分配置改动无需重启；`wsctl reload`（SIGHUP）可主动触发。
 - **Web 管理面**：管理员可在浏览器内管理用户（含 TOTP 二维码）、查看审计日志、
   管理录制文件。
 - **终端搜索**：`Ctrl+Shift+F` 在回滚缓冲中查找。
@@ -428,12 +433,14 @@ wsctl config reload                     # 让运行中的服务重载配置
 ## CLI 命令参考
 
 ```
-wsctl serve                     启动服务（--host/--port/--backend/--reuse-port/
-                                --new/--ssl-cert/--ssl-key/--admin-password/--log-json）
-wsctl doctor                    环境与配置自检（--json 输出 JSON）
-wsctl backup FILE.tar.gz        备份数据库与录制
+wsctl serve                     启动服务（前台；--daemon 转后台）
+wsctl start|stop|restart|status|logs|reload
+                                后台生命周期（非 systemd；status 支持 --json）
+wsctl doctor                    环境/配置/运行状态自检（--json 输出 JSON）
+wsctl backup FILE.tar.gz        一致性备份数据库与录制（--include-config）
+wsctl restore FILE.tar.gz       从备份恢复（--force 覆盖，原库存为 .bak）
 wsctl --version                 显示版本
-wsctl connect [URL] [-s ID]     把本地终端连接到服务
+wsctl connect [URL] [-s ID]     把本地终端连接到服务（断线自动重连；--no-reconnect）
 wsctl login URL                 登录并缓存凭据
 wsctl logout                    清除本地缓存凭据
 wsctl session list              列出会话
@@ -450,9 +457,36 @@ wsctl config show|get|path|edit|set|validate|reload
 wsctl version
 ```
 
-> `wsctl config set` 会校验配置项名称，未知项会报错并给出最接近的候选。
+> `wsctl config set` 会校验配置项名称与**值的类型**，并在写入前校验整个文件；
+> 非法值会被拒绝且不落盘。未知项会报错并给出最接近的候选。
+>
+> 互斥或互相依赖的参数（如 `--daemon` 与 `--reuse-port`、`--ssl-cert` 与
+> `--ssl-key`、`session new --ssh` 与 `--backend`）会以退出码 2 明确报错。
 
 ## 部署
+
+### 后台运行（非 systemd）
+
+不想用 systemd，也不想占用终端时，用内置的后台生命周期：
+
+```bash
+wsctl start                       # 后台启动（子进程脱离终端）
+wsctl status                      # 查看状态（--json 便于脚本消费）
+wsctl logs -f                     # 跟踪日志（首次启动的 admin 密码也在其中）
+wsctl restart                     # 重启
+wsctl reload                      # 让运行中的实例重载配置（SIGHUP）
+wsctl stop                        # 优雅停止（超时后 --force 强制结束）
+```
+
+- pid 文件位于 `<data_dir>/run/wsctl-<port>.pid`，日志位于
+  `<data_dir>/run/wsctl-<port>.log`；`stop/status` 在发信号前会核对**进程身份**，
+  因此不会误杀复用了同一 PID 的其他进程，崩溃留下的陈旧 pid 文件会被自动清理。
+- 已在运行时 `start` 会被拒绝，请用 `restart`、`start --force`（先停再启）或先 `stop`。
+- 需要指定不同端口/配置时，`start` 与 `serve` 接受同样的参数（`--port`、`--config`、
+  `--backend` 等）；`stop/status/logs/reload` 用相同参数找到对应实例。
+- `--daemon` 与 `--reuse-port` 互斥：多实例热切换请用 `--foreground` 或 systemd。
+- 后台启动仅支持 Linux/macOS；Windows 请用 NSSM 或计划任务运行
+  `wsctl serve --foreground`。
 
 ### Docker
 
@@ -565,6 +599,18 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 
 **Q：如何只在本机使用、不要登录？**
 `wsctl serve --no-auth`（**不安全**，切勿暴露到网络）。
+
+**Q：不用 systemd，怎么让它后台常驻？**
+用内置生命周期：`wsctl start` 启动，`wsctl status` 查看，`wsctl logs -f` 看日志，
+`wsctl stop` 停止。详见[后台运行（非 systemd）](#后台运行非-systemd)。
+
+**Q：`wsctl start` 说「已在运行」？**
+说明同端口已有托管实例。用 `wsctl restart`，或先 `wsctl stop`。若是崩溃残留的
+陈旧 pid 文件，`status` 会自动识别并清理（会核对进程身份，不会误杀）。
+
+**Q：备份会不会漏掉刚写入的数据？恢复会覆盖现有数据吗？**
+不会漏：`wsctl backup` 使用 SQLite 在线备份 API 生成一致快照（含 WAL 中已提交的
+数据）。恢复时若数据库已存在，必须显式 `--force`，且原库会先保存为 `.bak`。
 
 **Q：上传大文件失败？**
 调整 `file_max_upload`；注意反向代理可能也有请求体大小限制。

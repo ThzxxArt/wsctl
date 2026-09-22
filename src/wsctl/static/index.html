@@ -232,6 +232,18 @@
     </div>
   </div>
 
+  <div id="qr-overlay" class="overlay hidden">
+    <div class="modal-card narrow">
+      <div class="modal-head">
+        <h2 id="qr-title">启用两步验证</h2>
+        <button id="qr-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
+      </div>
+      <p class="hint">用认证器扫描二维码，或手动输入密钥：<b id="qr-secret"></b></p>
+      <div id="qr-image" class="qr-holder"></div>
+      <div class="modal-actions"><button id="qr-done" type="button" class="primary">完成</button></div>
+    </div>
+  </div>
+
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
   <script src="/static/vendor/xterm.js"></script>

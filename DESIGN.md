@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.2 · 状态：0.1.0/0.1.1 已发布；0.1.2 待发布
+> 版本：0.1.3 · 状态：0.1.0–0.1.2 已发布；0.1.3 待发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -151,21 +151,32 @@ settings(key, value)
 ## 6. CLI 命令树（已实现）
 
 ```
-wsctl serve                     # 起控制面，默认配置开箱即用
+wsctl serve                     # 前台起服务（--daemon 转后台）
+wsctl start|stop|restart|status|logs|reload   # 非 systemd 后台生命周期
 wsctl serve --new "bash"        # 启动时顺带开一个会话
 wsctl serve --backend tmux      # 默认使用 tmux 后端（跨重启恢复）
-wsctl doctor                    # 环境与配置自检
+wsctl doctor                    # 环境、配置、运行状态、端口、SO_REUSEPORT 自检
 wsctl session list|new|rename|kill|attach   # new 支持 --backend local|tmux|ssh
 wsctl session record|record-stop|recording
-wsctl connect [url] [-s id]     # 瘦客户端：本地 raw 终端直连
+wsctl connect [url] [-s id]     # 瘦客户端：本地 raw 终端直连（断线自动重连）
 wsctl login|logout              # 缓存/清除服务端凭据
 wsctl user add|list|del|passwd|role|disable|enable|totp
 wsctl audit                     # 查看审计日志（admin）
-wsctl config show|path|edit|set|reload
+wsctl backup FILE [--include-config] / restore FILE [--force]
+wsctl config show|get|path|edit|set|validate|reload
 wsctl version / --version
 ```
 
-> `config set` 写入配置文件（校验 TOML），`config reload` 让运行中的服务热加载。
+> `config set` 写入前会校验单项类型与整文件合法性（不合法则拒绝并回滚），
+> `config reload`（或 `wsctl reload` 的 SIGHUP）让运行中的服务热加载。
+>
+> **互斥/依赖强校验**：所有互相冲突或彼此依赖的参数在 `cli/validate.py` 中声明式
+> 定义，非法组合在进程启动前即以退出码 2 报错，而不是静默忽略其一。
+>
+> **后台生命周期**（`cli/daemon.py`）：子进程以 `start_new_session` 脱离终端，
+> stdout/stderr 重定向到 `<data_dir>/run/wsctl-<port>.log`；pid 文件记录
+> **进程身份指纹**（Linux 取 `/proc/<pid>/stat` 的 starttime），`stop/status` 在
+> 发信号前核对，避免 PID 复用误杀。`--reuse-port` 的多实例热切换不纳入托管。
 
 
 ## 7. 目录结构
@@ -246,8 +257,16 @@ pyotp  segno  websockets
 | **M25** | 0.1.2 便捷性：`config get/validate`、`doctor --json`、`backup`、终端内 TOTP 二维码、shell 补全、Docker 示例 |
 | **M26** | 0.1.2 设计系统：令牌 + 组件、图标化工具栏 + 移动端折叠、统一 Modal、主题色预览、favicon/manifest、空态/加载态、a11y、跟随系统深浅色 |
 | **M27** | 0.1.2 测试与文档：异步审计/管理 API/TOTP/节流/滑动 TTL 单测 + 浏览器用例扩展；README/DESIGN/CHANGELOG 同步 |
+| **M28** | 0.1.3 非 systemd 后台生命周期：`start/stop/restart/status/logs/reload`（`start --force` 先停再启）+ `serve --daemon`；pidfile（进程身份指纹）+ 日志文件 + stale-pid 清理；SIGHUP 配置重载；Windows 明确不支持 |
+| **M29** | 0.1.3 参数互斥/依赖强校验：`cli/validate.py` 声明式规则（conflicts/requires/requires_if/choices）；`config set` 类型与整文件校验 + 回滚；`serve --backend`/`--ssl-*`/`--daemon`/`--reuse-port` 组合约束；`--reuse-port` 在平台不支持 `SO_REUSEPORT` 时**明确报错**而非静默降级 |
+| **M29b** | 0.1.3 用户管理不变量同源：`core/user_admin.py`，CLI 与 API 共用（最后管理员保护、不能操作自身、改密/禁用即吊销登录态） |
+| **M30** | 0.1.3 事件循环解阻：argon2 认证/建用户/改密移出循环、`Recorder.close` 非阻塞、保留清理/录制容量/目录列举入线程、AuditWriter 容错与 flush 串行化、维护滞后指标 |
+| **M31** | 0.1.3 连接健壮性：WS 关闭码语义化（4400/4401/4403/4404/4408 空闲超时/4409/4500）+ 前端按码处理（永久失败不再重连、会话不存在不再误弹登录框）；**半开连接检测**（服务端 120s 无消息回收，前端与 CLI 每 25s 心跳）；`connect` 客户端指数退避自动重连；会话 id 改十六进制（避免以 `-` 开头被当选项） |
+| **M32** | 0.1.3 一致性备份/恢复：`backup` 用 SQLite 在线备份 API（含 WAL）、`restore` 校验归档/拒绝穿越/`--force` 保留 `.bak`；`status --json`；`doctor` 扩展运行状态/端口/reuse-port/后台能力 |
+| **M33** | 0.1.3 前端易用性：密码掩码对话框、QR 弹窗纳入统一 Modal（Esc 关最上层/焦点陷阱）、快捷键冲突检测 |
+| **M34** | 0.1.3 测试与文档：校验层/daemon 生命周期/备份恢复/用户不变量单测 + 关闭码测试 + e2e `daemon` 场景 + 浏览器 QR 用例；README/DESIGN/CHANGELOG 同步 |
 
-## 10.1 实现状态（截至 0.1.2）
+## 10.1 实现状态（截至 0.1.3）
 
 **已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
@@ -259,8 +278,14 @@ asciinema 录制 + 前端回放、SO_REUSEPORT 零停机重启、Webhook、
 `config set`/`reload`、前端浏览器级自动化测试、每会话内存硬上限、
 Sixel 渲染、可选 ZMODEM、终端主题市场。
 
+**0.1.3 新增**：非 systemd 后台生命周期（pidfile + 身份指纹 + 日志文件 + SIGHUP
+重载）、声明式参数互斥/依赖强校验、CLI 与 API 同源的用户管理不变量、一致性
+备份/恢复（SQLite 在线备份）、WS 关闭码语义化、`connect` 自动重连、事件循环
+解阻（argon2/录制/保留/审计容错）。
+
 **尚未实现**：无。唯一验证缺口：ZMODEM 的真实 `rz`/`sz` 传输未在 CI 端到端跑通
-（环境无 lrzsz），仅验证了集成不破坏常规终端 I/O。
+（环境无 lrzsz），仅验证了集成不破坏常规终端 I/O。后台生命周期为 POSIX-only，
+Windows 下 `serve --daemon`/`start` 会明确报错并建议用服务管理器。
 
 > 0.1.1 起，关闭标签默认只断开连接（detach），终止会话需显式操作（右键菜单 /
 > 会话列表 / `Alt+Shift+W`），与「会话独立于连接」的核心承诺一致。
@@ -268,10 +293,10 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 > 0.1.2 起，磁盘/数据库写入全部移出事件循环：审计经 `AuditWriter` 队列批量落盘，
 > 录制在后台线程写文件，上传在线程池落盘；`resolve_auth_session` 节流 `last_seen`。
 
-> 回归测试：`scripts/e2e/run_all.py` 提供 7 个后端端到端场景（server / CLI /
+> 回归测试：`scripts/e2e/run_all.py` 提供 8 个后端端到端场景（server / CLI /
 > connect / tmux 重启恢复 / crash 崩溃收养 / **multiplex 多实例隔离** /
-> SO_REUSEPORT 优雅重启）；`pytest -m browser` 为浏览器级测试；
-> `pytest -m slow` 为并发/大输出压测。CI 在独立 job 中运行浏览器测试。
+> **daemon 后台生命周期** / SO_REUSEPORT 优雅重启）；`pytest -m browser` 为
+> 浏览器级测试；`pytest -m slow` 为并发/大输出压测。CI 在独立 job 中运行浏览器测试。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
@@ -279,8 +304,9 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 
 ## 11. Backlog（后续）
 
-无（v0.1.2 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
-每用户后端策略（命令级权限隔离）、i18n 框架、更多终端协议（Kitty graphics 等）。
+无（v0.1.3 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
+每用户后端策略（命令级权限隔离）、i18n 框架、更多终端协议（Kitty graphics 等）、
+Windows 服务封装、日志轮转、`--reuse-port` 实例的托管。
 
 ## 12. 发布
 
