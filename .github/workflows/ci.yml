@@ -68,8 +68,10 @@ jobs:
         # and `test_tmux` needs tmux. Those are covered by the Linux/macOS
         # matrix above; this job only proves the package works at all on
         # Windows.
+        # `python -m pytest`, not bare `pytest`: the scripts directory is not on
+        # PATH for PowerShell on the Windows runner.
         run: >-
-          pytest -q --timeout=90
+          python -m pytest -q --timeout=90
           tests/test_passwords.py tests/test_authcache.py tests/test_config.py
           tests/test_validate.py tests/test_metrics.py tests/test_scrollback.py
           tests/test_fs.py tests/test_ratelimit.py tests/test_totp.py

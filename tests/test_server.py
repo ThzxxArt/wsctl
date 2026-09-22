@@ -308,36 +308,32 @@ def _recv_control(ws: object, wanted: set[str], timeout: float = 5.0) -> dict[st
     return None
 
 
-async def test_pty_write_reports_drops_when_the_child_stops_reading() -> None:
-    """The write path must say "dropped" instead of pretending it worked."""
+async def test_pty_write_reports_drops_when_the_child_stops_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The write path must say "dropped" instead of pretending it worked.
+
+    Deliberately *not* driven through a real PTY: how many bytes the kernel
+    accepts from a child that has stopped reading is platform-specific (macOS
+    soaks up far more than Linux), so a SIGSTOP-based version of this test only
+    passed by luck. Stub the drain instead and assert the application-level
+    contract directly.
+    """
     import asyncio
-    import contextlib
-    import os
-    import signal
 
     from wsctl.core.pty import MAX_WRITE_BUFFER, PosixPty
 
     pty = PosixPty(["/bin/sh"], cols=80, rows=24, loop=asyncio.get_running_loop())
-    pid = pty.pid
     try:
-        # Stop the shell so it stops draining its terminal. How much the
-        # *kernel* PTY buffer absorbs before the application-level cap bites is
-        # platform-specific (macOS takes far more than Linux), so fill until the
-        # drop actually happens instead of assuming a size.
-        os.killpg(os.getpgid(pid), signal.SIGSTOP)
-        assert pty.write(b"x" * MAX_WRITE_BUFFER) is True
-        for _ in range(16):
-            if pty.dropped_input:
-                break
-            pty.write(b"y" * MAX_WRITE_BUFFER)
-        assert pty.dropped_input >= 1, "a stopped child must cause dropped input"
-        assert pty.write(b"more") is False
-        before = pty.dropped_input
+        # "The child stopped reading": nothing ever drains the write buffer.
+        monkeypatch.setattr(pty, "_flush", lambda: None)
+        assert pty.write(b"x" * MAX_WRITE_BUFFER) is True  # exactly fills the cap
+        assert pty.dropped_input == 0
+        assert pty.write(b"more") is False  # buffer is at the cap
+        assert pty.dropped_input == 1
         assert pty.write(b"and more") is False
-        assert pty.dropped_input == before + 1
+        assert pty.dropped_input == 2
     finally:
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
         pty.close()
 
 

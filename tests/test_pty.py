@@ -38,26 +38,27 @@ async def test_out_of_range_dimensions_are_clamped() -> None:
         pty.close()
 
 
-async def test_dropped_input_counter_is_monotonic() -> None:
-    """The ``_total`` metric must never go down when a session goes away."""
+async def test_dropped_input_counter_is_monotonic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``_total`` metric must never go down when a session goes away.
+
+    Driven with the drain stubbed out rather than via SIGSTOP: the kernel PTY
+    buffer size is platform-specific, so filling it for real makes the test
+    flaky rather than authoritative.
+    """
     import asyncio
-    import contextlib
-    import os
-    import signal
 
     from wsctl.core import pty as pty_mod
     from wsctl.core.pty import MAX_WRITE_BUFFER, PosixPty
 
     before = pty_mod.dropped_input_total()
     pty = PosixPty(["/bin/sh"], cols=80, rows=24, loop=asyncio.get_running_loop())
-    pid = pty.pid
     try:
-        os.killpg(os.getpgid(pid), signal.SIGSTOP)
-        pty.write(b"x" * (MAX_WRITE_BUFFER * 3))
+        monkeypatch.setattr(pty, "_flush", lambda: None)  # the child never reads
+        pty.write(b"x" * MAX_WRITE_BUFFER)
         assert pty.write(b"more") is False
     finally:
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
         pty.close()
 
     after = pty_mod.dropped_input_total()
