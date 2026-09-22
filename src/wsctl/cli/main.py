@@ -86,6 +86,26 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _force_utf8_stdio() -> None:
+    """Make Chinese output survive a legacy console encoding.
+
+    A default Windows console is cp1252, and writing the Chinese help text or
+    ``doctor`` output through it raises ``UnicodeEncodeError`` before anything
+    is shown. Reconfiguring to UTF-8 with a replacement fallback means the CLI
+    degrades to ``?`` on a terminal that truly cannot render a glyph instead of
+    crashing outright.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - exotic io objects
+            continue
+        with contextlib.suppress(Exception):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_force_utf8_stdio()
+
+
 @app.callback(invoke_without_command=True)
 def _root(
     version_flag: Annotated[

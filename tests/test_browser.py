@@ -301,8 +301,10 @@ def test_browser_flow(tmp_path: Path) -> None:
                 "#admin-body .admin-table tbody tr"
             ).first.locator("button:has-text('关闭 2FA')").click()
             page.wait_for_function(
-                "() => !document.querySelector('#admin-body .admin-table tbody tr')"
-                ".innerText.includes('已启用')",
+                "() => {"
+                " const row = document.querySelector('#admin-body .admin-table tbody tr');"
+                " return row && !row.innerText.includes('已启用');"
+                "}",
                 timeout=10000,
             )
             page.click("#admin-close")

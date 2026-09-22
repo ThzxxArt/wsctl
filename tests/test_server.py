@@ -320,15 +320,21 @@ async def test_pty_write_reports_drops_when_the_child_stops_reading() -> None:
     pty = PosixPty(["/bin/sh"], cols=80, rows=24, loop=asyncio.get_running_loop())
     pid = pty.pid
     try:
-        # Stop the shell so it stops draining its terminal. The kernel PTY buffer
-        # absorbs some bytes, so write well past the application-level cap.
+        # Stop the shell so it stops draining its terminal. How much the
+        # *kernel* PTY buffer absorbs before the application-level cap bites is
+        # platform-specific (macOS takes far more than Linux), so fill until the
+        # drop actually happens instead of assuming a size.
         os.killpg(os.getpgid(pid), signal.SIGSTOP)
-        assert pty.write(b"x" * (MAX_WRITE_BUFFER * 3)) is True
-        assert pty.dropped_input == 0
-        assert pty.write(b"more") is False  # buffer is now over the cap
-        assert pty.dropped_input == 1
+        assert pty.write(b"x" * MAX_WRITE_BUFFER) is True
+        for _ in range(16):
+            if pty.dropped_input:
+                break
+            pty.write(b"y" * MAX_WRITE_BUFFER)
+        assert pty.dropped_input >= 1, "a stopped child must cause dropped input"
+        assert pty.write(b"more") is False
+        before = pty.dropped_input
         assert pty.write(b"and more") is False
-        assert pty.dropped_input == 2
+        assert pty.dropped_input == before + 1
     finally:
         with contextlib.suppress(OSError, ProcessLookupError):
             os.killpg(os.getpgid(pid), signal.SIGKILL)
