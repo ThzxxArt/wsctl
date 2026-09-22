@@ -327,11 +327,21 @@ def doctor(
         ok if daemon_ok else warn,
     )
 
-    instance = daemon_mod.read_instance(settings)
+    resolved = daemon_mod.resolve_instance(settings, port_explicit=False)
+    instance = resolved.instance
     if instance is not None:
-        add("运行状态", f"运行中（pid {instance.pid}，{instance.host}:{instance.port}）", ok)
+        note = "（未指定 --port，自动跟随）" if resolved.fallback else ""
+        add(
+            "运行状态",
+            f"运行中（pid {instance.pid}，{instance.host}:{instance.port}）{note}",
+            ok,
+        )
+        # Report the address it is really listening on, not the default one.
+        settings = daemon_mod.settings_for(instance, settings)
     else:
         add("运行状态", "未运行", "[dim]-[/]")
+        for other in resolved.found:
+            add("运行状态", f"发现其他实例：pid {other.pid} {other.host}:{other.port}", warn)
 
     reuse_ok = hasattr(socket, "SO_REUSEPORT")
     add(
@@ -345,7 +355,7 @@ def doctor(
         add(
             "监听端口",
             f"{settings.host}:{settings.port}（{'可用' if free else '被占用'}）",
-            ok if free else warn,
+            ok if free else (warn if instance is None else ok),
         )
 
     if url or client_mod.load_credentials().get("url"):
@@ -549,7 +559,37 @@ def _serve_settings(
     return settings
 
 
-def _start_background(settings: Settings, argv: list[str], *, timeout: float) -> None:
+def _warn_ignored_admin_password(settings: Settings, password: str | None) -> None:
+    """Say so on the *terminal* when ``--admin-password`` cannot take effect.
+
+    The bootstrap itself runs in the detached child, so its warning lands in the
+    log file the user has not opened yet -- which reads exactly like "the
+    password is wrong" when they then cannot log in.
+    """
+    if not password or not settings.auth_required:
+        return
+    store = store_mod.Store(settings.db_path)
+    try:
+        existing = store.user_count()
+        if existing == 0:
+            return
+        err_console.print(
+            f"[bold yellow]注意：[/]数据库已有 {existing} 个用户，"
+            "[bold]--admin-password 将被忽略[/]（不会覆盖任何现有密码）。"
+        )
+        if store.admin_count() == 0:
+            err_console.print(
+                "[dim]当前没有启用的管理员，服务启动时会用该密码恢复一个 admin 账号。[/]"
+            )
+        else:
+            err_console.print("[dim]要修改密码请执行：wsctl user passwd admin[/]")
+    finally:
+        store.close()
+
+
+def _start_background(
+    settings: Settings, argv: list[str], *, timeout: float, admin_password: str | None = None
+) -> None:
     try:
         instance = daemon_mod.start(settings, argv, timeout=timeout)
     except daemon_mod.DaemonError as exc:
@@ -559,7 +599,8 @@ def _start_background(settings: Settings, argv: list[str], *, timeout: float) ->
         f"[cyan]{instance.host}:{instance.port}[/]"
     )
     console.print(f"[dim]日志：{daemon_mod.logfile_path(settings)}（wsctl logs -f 可跟踪）[/]")
-    console.print("[dim]若为首次启动，admin 随机密码打印在日志中。[/]")
+    if not admin_password:
+        console.print("[dim]若为首次启动，admin 随机密码打印在日志中。[/]")
 
 
 def _serve_foreground(
@@ -708,7 +749,10 @@ def serve(
         log_level=log_level,
     )
     if daemon:
-        _start_background(settings, _serve_child_argv(options), timeout=timeout)
+        _warn_ignored_admin_password(settings, admin_password)
+        _start_background(
+            settings, _serve_child_argv(options), timeout=timeout, admin_password=admin_password
+        )
         return
     _serve_foreground(settings, admin_password=admin_password, startup_command=new)
 
@@ -779,7 +823,10 @@ def start(
             daemon_mod.stop(settings, timeout=timeout)
         except daemon_mod.DaemonError as exc:
             _fail(str(exc))
-    _start_background(settings, _serve_child_argv(options), timeout=timeout)
+    _warn_ignored_admin_password(settings, admin_password)
+    _start_background(
+        settings, _serve_child_argv(options), timeout=timeout, admin_password=admin_password
+    )
 
 
 @app.command()
@@ -790,13 +837,14 @@ def stop(
     timeout: Annotated[float, typer.Option("--timeout", help="优雅退出的等待秒数。")] = 15.0,
     force: Annotated[bool, typer.Option("--force", help="超时后强制 SIGKILL。")] = False,
 ) -> None:
-    """停止后台运行的 wsctl。"""
+    """停止后台运行的 wsctl（未指定 --port 时自动跟随正在运行的实例）。"""
     settings = _settings_from(config, host=host, port=port)
+    settings, _ = _resolve_target(settings, port, host, what="停止")
     try:
         instance = daemon_mod.stop(settings, timeout=timeout, force=force)
     except daemon_mod.DaemonError as exc:
         _fail(str(exc))
-    console.print(f"[green]已停止[/] pid {instance.pid}")
+    console.print(f"[green]已停止[/] pid {instance.pid}  [cyan]{instance.host}:{instance.port}[/]")
 
 
 @app.command()
@@ -846,6 +894,30 @@ def restart(
         log_json=log_json,
         log_level=log_level,
     )
+    # Follow the running instance when the user did not name a port: restarting
+    # "the default port" would stop the instance they are actually using and
+    # then boot a new one somewhere else.
+    running = daemon_mod.resolve_instance(settings, port_explicit=port is not None)
+    if running.instance is not None:
+        if running.fallback:
+            err_console.print(
+                f"[dim]未指定 --port，已跟随正在运行的实例 "
+                f"{running.instance.host}:{running.instance.port}[/]"
+            )
+        settings = daemon_mod.settings_for(running.instance, settings)
+        if port is None:
+            # Reproduce the listening address in the child argv, or the new
+            # process silently comes up on the default port instead.
+            options.set("port", running.instance.port)
+            options.set("host", running.instance.host)
+    elif running.ambiguous:
+        err_console.print(
+            f"[yellow]发现 {len(running.found)} 个实例，请用 --port 指定要重启哪一个：[/]"
+        )
+        for other in running.found:
+            err_console.print(f"[dim]  pid {other.pid}  {other.host}:{other.port}[/]")
+        raise typer.Exit(code=1)
+    _warn_ignored_admin_password(settings, admin_password)
     try:
         instance = daemon_mod.restart(settings, _serve_child_argv(options), timeout=timeout)
     except daemon_mod.DaemonError as exc:
@@ -860,22 +932,33 @@ def status(
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
 ) -> None:
-    """查看后台 wsctl 的运行状态。"""
+    """查看后台 wsctl 的运行状态（未指定 --port 时自动跟随正在运行的实例）。"""
     settings = _settings_from(config, host=host, port=port)
-    instance = daemon_mod.read_instance(settings)
+    resolved = daemon_mod.resolve_instance(settings, port_explicit=port is not None)
+    instance = resolved.instance
     if instance is None:
-        others = daemon_mod.discover(settings)
         if json_output:
-            missing = {"running": False, "others": [o.to_dict() for o in others]}
+            missing = {
+                "running": False,
+                "others": [o.to_dict() for o in resolved.found],
+                "hint": "用 --port 指定实例" if resolved.ambiguous else None,
+            }
             sys.stdout.write(json.dumps(missing, ensure_ascii=False, indent=2) + "\n")
         else:
             console.print("[yellow]未在运行[/]")
-            for other in others:
+            if resolved.ambiguous:
+                console.print(f"[yellow]发现 {len(resolved.found)} 个实例，请用 --port 指定：[/]")
+            for other in resolved.found:
                 console.print(
-                    f"[dim]发现其他实例：pid {other.pid} {other.host}:{other.port}[/]"
+                    f"[dim]  pid {other.pid}  {other.host}:{other.port}[/]"
                 )
         raise typer.Exit(code=1)
 
+    if resolved.fallback:
+        err_console.print(
+            f"[dim]未指定 --port，已跟随正在运行的实例 {instance.host}:{instance.port}[/]"
+        )
+    settings = daemon_mod.settings_for(instance, settings)
     info = daemon_mod.health_info(settings)
     payload: dict[str, object] = {"running": True, **instance.to_dict(), "health": info}
     if json_output:
@@ -900,8 +983,9 @@ def logs(
     follow: Annotated[bool, typer.Option("--follow", "-f", help="持续跟踪。")] = False,
     lines: Annotated[int, typer.Option("--lines", "-n", help="显示末尾行数。")] = 100,
 ) -> None:
-    """查看后台 wsctl 的日志。"""
+    """查看后台 wsctl 的日志（未指定 --port 时自动跟随正在运行的实例）。"""
     settings = _settings_from(config, host=host, port=port)
+    settings, _ = _resolve_target(settings, port, host, what="查看")
     try:
         daemon_mod.tail_log(settings, lines=max(lines, 0), follow=follow)
     except daemon_mod.DaemonError as exc:
@@ -914,8 +998,9 @@ def reload(
     port: Annotated[int | None, typer.Option(help="监听端口（与启动时一致）。")] = None,
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """请求运行中的 wsctl 重载配置（发送 SIGHUP）。"""
+    """请求运行中的 wsctl 重载配置（发送 SIGHUP；未指定 --port 时自动跟随实例）。"""
     settings = _settings_from(config, host=host, port=port)
+    settings, _ = _resolve_target(settings, port, host, what="重载")
     try:
         instance = daemon_mod.reload_(settings)
     except daemon_mod.DaemonError as exc:
@@ -923,10 +1008,79 @@ def reload(
     console.print(f"[green]已请求重载配置[/]（pid {instance.pid}）")
 
 
+def _resolve_target(
+    settings: Settings, port: int | None, host: str | None, *, what: str
+) -> tuple[Settings, object]:
+    """Point ``settings`` at the instance this command should act on.
+
+    Without an explicit ``--port`` the instance that is actually running wins
+    over "the default port"; otherwise ``wsctl start --port 7682`` followed by
+    ``wsctl status``/``logs``/``stop`` talks to nothing and reports 未在运行 /
+    没有日志文件 while the instance is serving right next to it.
+    """
+    resolved = daemon_mod.resolve_instance(settings, port_explicit=port is not None)
+    if resolved.instance is not None:
+        if resolved.fallback:
+            err_console.print(
+                f"[dim]未指定 --port，已跟随正在运行的实例 "
+                f"{resolved.instance.host}:{resolved.instance.port}[/]"
+            )
+        return daemon_mod.settings_for(resolved.instance, settings), resolved.instance
+    if resolved.ambiguous:
+        err_console.print(
+            f"[yellow]发现 {len(resolved.found)} 个实例，请用 --port 指定要{what}哪一个：[/]"
+        )
+    else:
+        err_console.print(f"[yellow]未在运行[/]（{settings.host}:{settings.port}）")
+    for other in resolved.found:
+        err_console.print(f"[dim]  pid {other.pid}  {other.host}:{other.port}[/]")
+    raise typer.Exit(code=1)
+
+
+def _recover_admin(store: Store, password: str) -> None:
+    """Create or re-enable an ``admin`` so the instance is not left unreachable."""
+    existing = store.user_get("admin")
+    try:
+        if existing is None:
+            user_admin.create(store, "admin", password, role="admin")
+            err_console.print("[green]已创建管理员 'admin'（用于恢复访问）。[/]")
+        else:
+            user_admin.set_role(store, "admin", "admin")
+            user_admin.set_disabled(store, "admin", False)
+            user_admin.set_password(store, "admin", password)
+            err_console.print("[green]已重置 'admin' 密码并重新启用（用于恢复访问）。[/]")
+    except Exception as exc:
+        err_console.print(f"[red]管理员恢复失败：{exc}[/]")
+
+
 def _ensure_admin(
     store: Store, settings: Settings, password: str | None
 ) -> None:
-    if not settings.auth_required or store.user_count() > 0:
+    """Bootstrap the first admin, or recover from a lock-out.
+
+    ``--admin-password`` on a database that already has users used to return
+    here without a word, which is indistinguishable from "your password is
+    wrong" when the user then cannot log in. Say so loudly, and use the value to
+    recover an instance that has no enabled admin left.
+    """
+    if not settings.auth_required:
+        return
+    existing = store.user_count()
+    if existing > 0:
+        if password:
+            err_console.print(
+                "[bold yellow]注意：[/]数据库已有 "
+                f"{existing} 个用户，[bold]--admin-password 被忽略[/]"
+                "（不会覆盖任何现有密码）。"
+            )
+            if store.admin_count() == 0:
+                # Nobody can administer this instance: take the password as the
+                # recovery value rather than leaving the box unreachable.
+                _recover_admin(store, password)
+            else:
+                err_console.print(
+                    "[dim]要修改密码请执行：wsctl user passwd admin[/]"
+                )
         return
     if not password:
         password = secrets.token_urlsafe(12)
@@ -1033,10 +1187,19 @@ def user_del(
 def user_passwd(
     username: Annotated[str, typer.Argument(help="用户名。")],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    password: Annotated[
+        str | None,
+        typer.Option("--password", "-p", help="新密码（省略则交互输入）。"),
+    ] = None,
 ) -> None:
-    """修改用户密码（并吊销该用户已有的登录态）。"""
+    """修改用户密码（并吊销该用户已有的登录态）。
+
+    用 ``-p`` 可非交互执行，便于登录不上时一条命令自救：
+    ``wsctl user passwd admin -p '新的强密码'``。
+    """
     settings = _settings_from(config)
-    password = typer.prompt("新密码", hide_input=True, confirmation_prompt=True)
+    if password is None:
+        password = typer.prompt("新密码", hide_input=True, confirmation_prompt=True)
     store = store_mod.Store(settings.db_path)
     try:
         user_admin.set_password(store, username, password)

@@ -26,6 +26,7 @@ from typing import Any
 
 from wsctl import __version__
 from wsctl.core.config import Settings
+from wsctl.core.net import opener_for
 
 
 class DaemonError(RuntimeError):
@@ -51,6 +52,52 @@ class Instance:
         payload = asdict(self)
         payload["uptime"] = round(self.uptime, 3)
         return payload
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """Which live instance a lifecycle command should act on.
+
+    ``instance`` is the target. ``found`` lists every live instance in this data
+    directory so a caller can explain an ambiguous match. ``fallback`` is set
+    when the target was picked without the user naming a port, which is the
+    case that used to report "未在运行" while a real instance was serving on a
+    non-default port right next to it.
+    """
+
+    instance: Instance | None
+    found: list[Instance]
+    fallback: bool = False
+    ambiguous: bool = False
+
+
+def resolve_instance(settings: Settings, *, port_explicit: bool = False) -> Resolved:
+    """Find the instance this invocation should act on.
+
+    An explicit ``--port`` is authoritative and is never second-guessed.
+    Without one, prefer an instance that is actually running in this data
+    directory over "the default port": otherwise ``wsctl start --port 7682``
+    followed by ``wsctl status``/``logs`` reports 未在运行 / 没有日志文件 while
+    the instance is sitting right there, and the only clue is a line further
+    down about "发现其他实例".
+    """
+    instance = read_instance(settings)
+    if instance is not None:
+        return Resolved(instance=instance, found=[instance])
+    found = discover(settings)
+    if port_explicit or len(found) != 1:
+        return Resolved(instance=None, found=found, ambiguous=len(found) > 1)
+    only = found[0]
+    return Resolved(
+        instance=only,
+        found=found,
+        fallback=(only.port != settings.port or only.host != settings.host),
+    )
+
+
+def settings_for(instance: Instance, base: Settings) -> Settings:
+    """``base`` re-pointed at ``instance``, so paths/health match the target."""
+    return base.model_copy(update={"host": instance.host, "port": instance.port})
 
 
 # -- paths -------------------------------------------------------------
@@ -239,7 +286,8 @@ def health(settings: Settings, *, timeout: float = 2.0) -> bool:
     if settings.ssl_cert:
         context = ssl._create_unverified_context()
     try:
-        with urllib.request.urlopen(health_url(settings), timeout=timeout, context=context) as resp:
+        opener = opener_for(health_url(settings), ssl_context=context)
+        with opener.open(health_url(settings), timeout=timeout) as resp:
             return int(resp.status) == 200
     except (urllib.error.URLError, OSError, ValueError):
         return False
@@ -250,7 +298,8 @@ def health_info(settings: Settings, *, timeout: float = 2.0) -> dict[str, object
     if settings.ssl_cert:
         context = ssl._create_unverified_context()
     try:
-        with urllib.request.urlopen(health_url(settings), timeout=timeout, context=context) as resp:
+        opener = opener_for(health_url(settings), ssl_context=context)
+        with opener.open(health_url(settings), timeout=timeout) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return None

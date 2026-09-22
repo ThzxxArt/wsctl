@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -386,3 +387,99 @@ def test_completion_rejects_an_unknown_shell() -> None:
     result = runner.invoke(app, ["completion", "show", "csh"])
     assert result.exit_code == 1
     assert "不支持的 shell" in result.output
+
+
+# -- 0.1.5: lifecycle follows the running instance, --admin-password is loud --
+
+
+def test_resolve_target_follows_the_running_instance(tmp_path, monkeypatch) -> None:
+    """`wsctl start --port 7682` then `wsctl status` must find it.
+
+    Regression for "你把 7681 端口写死了": without an explicit --port the
+    commands used to act on the default port and report 未在运行 / 没有日志文件.
+    """
+    from wsctl.cli import daemon
+
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    settings = load_settings()
+    inst = daemon.Instance(
+        pid=os.getpid(), host="0.0.0.0", port=18111,
+        started_at=0.0, version="0", identity="",
+    )
+    aimed = settings.model_copy(update={"port": 18111})
+    path = daemon.pidfile_path(aimed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(daemon.asdict(inst)), encoding="utf-8")
+    log_path = daemon.logfile_path(aimed)
+    log_path.write_text("booted on 18111\n", encoding="utf-8")
+    try:
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0, result.output
+        assert "18111" in result.output
+        assert "已跟随正在运行的实例" in result.output
+
+        # `logs` must open the *instance's* log, not wsctl-7681.log.
+        logs = runner.invoke(app, ["logs", "-n", "1"])
+        assert logs.exit_code == 0, logs.output
+        assert "booted on 18111" in logs.output
+    finally:
+        path.unlink(missing_ok=True)
+        log_path.unlink(missing_ok=True)
+
+
+def test_admin_password_is_never_silently_ignored(tmp_path, monkeypatch, capsys) -> None:
+    """A --admin-password that cannot take effect must say so on the terminal.
+
+    The bootstrap runs in the detached child, so its warning only reached the
+    log file -- which reads exactly like "your password is wrong" when the user
+    then cannot log in.
+    """
+    from wsctl.cli.main import _warn_ignored_admin_password
+
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    store = Store(load_settings().db_path)
+    store.user_create("admin", "password123", role="admin")
+    store.user_create("bob", "password123")
+    store.close()
+
+    _warn_ignored_admin_password(load_settings(), "somethingElse1")
+    out = capsys.readouterr().err
+    assert "--admin-password 将被忽略" in out
+    assert "wsctl user passwd admin" in out
+
+
+def test_admin_password_recovers_a_lockout(tmp_path, monkeypatch) -> None:
+    """With no enabled admin left, the value becomes the recovery password."""
+    from wsctl.cli.main import _ensure_admin
+
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    store = Store(load_settings().db_path)
+    store.user_create("bob", "password123")  # a user, but no admin at all
+    assert store.admin_count() == 0
+
+    _ensure_admin(store, load_settings(), "recoveredPass1")
+    assert store.admin_count() == 1
+    assert store.user_authenticate("admin", "recoveredPass1") is not None
+    store.close()
+
+
+def test_user_passwd_accepts_a_non_interactive_password(tmp_path, monkeypatch) -> None:
+    """The one-command fix when someone is locked out of the web UI."""
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    store = Store(load_settings().db_path)
+    store.user_create("admin", "oldpassword1", role="admin")
+    store.close()
+
+    result = runner.invoke(app, ["user", "passwd", "admin", "-p", "brandNewPass1"])
+    assert result.exit_code == 0, result.output
+
+    store = Store(load_settings().db_path)
+    try:
+        assert store.user_authenticate("admin", "brandNewPass1") is not None
+        assert store.user_authenticate("admin", "oldpassword1") is None
+    finally:
+        store.close()

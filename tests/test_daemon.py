@@ -186,3 +186,70 @@ def test_tail_log_reads_across_a_rotation(tmp_path: Path, capsys: object) -> Non
     daemon.tail_log(settings, lines=3)
     out = capsys.readouterr().out  # type: ignore[attr-defined]
     assert out.splitlines() == ["second", "third", "fourth"]
+
+
+def test_resolve_instance_follows_the_running_one(tmp_path: Path) -> None:
+    """Without --port, a running instance on a non-default port wins.
+
+    This is the "你把 7681 端口写死了" report: `wsctl start --port 7682` then
+    `wsctl status`/`logs`/`stop` used to look at the default port and say
+    未在运行 / 没有日志文件 while the instance was serving right there.
+    """
+    live = daemon.Instance(
+        pid=os.getpid(), host="0.0.0.0", port=18111,
+        started_at=0.0, version="0", identity="",
+    )
+    path = daemon.pidfile_path(settings_for(tmp_path, port=18111))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(daemon.asdict(live)), encoding="utf-8")
+    try:
+        resolved = daemon.resolve_instance(settings_for(tmp_path, port=7681))
+        assert resolved.instance is not None
+        assert resolved.instance.port == 18111
+        assert resolved.fallback is True
+
+        # An explicit --port is never second-guessed.
+        explicit = daemon.resolve_instance(settings_for(tmp_path, port=7681), port_explicit=True)
+        assert explicit.instance is None
+        assert explicit.fallback is False
+
+        # Pointing at the right port finds it directly, with no fallback note.
+        direct = daemon.resolve_instance(settings_for(tmp_path, port=18111))
+        assert direct.instance is not None and direct.fallback is False
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_resolve_instance_is_ambiguous_with_two(tmp_path: Path) -> None:
+    first = daemon.Instance(
+        pid=os.getpid(), host="127.0.0.1", port=18111,
+        started_at=0.0, version="0", identity="",
+    )
+    second = daemon.Instance(
+        pid=os.getpid(), host="127.0.0.1", port=18222,
+        started_at=0.0, version="0", identity="",
+    )
+    paths = []
+    for inst in (first, second):
+        path = daemon.pidfile_path(settings_for(tmp_path, port=inst.port))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(daemon.asdict(inst)), encoding="utf-8")
+        paths.append(path)
+    try:
+        resolved = daemon.resolve_instance(settings_for(tmp_path, port=7681))
+        assert resolved.instance is None
+        assert resolved.ambiguous is True
+        assert {i.port for i in resolved.found} == {18111, 18222}
+    finally:
+        for path in paths:
+            path.unlink(missing_ok=True)
+
+
+def test_settings_for_repoints_at_the_instance(tmp_path: Path) -> None:
+    base = settings_for(tmp_path, port=7681)
+    inst = daemon.Instance(
+        pid=1, host="0.0.0.0", port=18111, started_at=0.0, version="0", identity="",
+    )
+    aimed = daemon.settings_for(inst, base)
+    assert (aimed.host, aimed.port) == ("0.0.0.0", 18111)
+    assert daemon.logfile_path(aimed).name == "wsctl-18111.log"

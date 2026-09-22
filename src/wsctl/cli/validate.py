@@ -47,6 +47,18 @@ class Options:
     def value(self, name: str) -> Any:
         return self._values.get(name)
 
+    def set(self, name: str, value: Any) -> None:
+        """Record a value the user did not type (e.g. a resolved port).
+
+        Used when a command has to reproduce a running instance's listening
+        address in a child argv: leaving it out would boot the replacement on
+        the default port instead of the one in use.
+        """
+        if value is None or value is False:
+            self._values.pop(name, None)
+        else:
+            self._values[name] = value
+
     def names(self) -> list[str]:
         return sorted(self._values)
 

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from wsctl.core.config import default_config_dir
+from wsctl.core.net import opener_for
 
 
 class ApiError(RuntimeError):
@@ -77,7 +78,10 @@ class ApiClient:
             f"{self.base_url}{path}", data=data, headers=headers, method=method
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            # Not urlopen(): that honours http_proxy and would send even a local
+            # wsctl through the proxy, which answers 502 and looks like a dead
+            # server. See core.net.opener_for.
+            with opener_for(self.base_url).open(req, timeout=self.timeout) as resp:
                 payload = resp.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
@@ -100,7 +104,7 @@ class ApiClient:
             headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(f"{self.base_url}{path}", headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with opener_for(self.base_url).open(req, timeout=self.timeout) as resp:
                 data: bytes = resp.read()
                 return data
         except urllib.error.HTTPError as exc:
@@ -124,7 +128,8 @@ def login(
     rather than a password error, which is how the caller knows to prompt.
     """
     jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener = opener_for(base_url)
+    opener.add_handler(urllib.request.HTTPCookieProcessor(jar))
     payload: dict[str, Any] = {"username": username, "password": password}
     if totp:
         payload["totp"] = totp
