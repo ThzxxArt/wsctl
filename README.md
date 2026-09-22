@@ -42,9 +42,13 @@ CLI (wsctl connect)┘             │
 
 - **多会话**：一个服务托管多个终端，Web 端多标签切换。
 - **会话与连接解耦**：客户端断开不影响会话；重连时回放 scrollback 重建屏幕。
+  关闭标签默认只**断开连接**，会话仍在服务器上运行。
 - **跨重启恢复（可选 tmux 后端）**：shell 跑在 tmux 里，服务重启后自动重新挂载。
+- **多实例安全**：共享同一 `data_dir` 的多个实例通过租约互不干扰；`--reuse-port`
+  升级时另一实例的活跃会话不会被误标或误杀。
 - **多用户 + RBAC**：admin 管理全部，普通用户仅限自己的会话。
-- **分享**：只读或可写分享链接，带二维码；匿名观看者无需账号。
+- **分享**：只读或可写分享链接，带二维码、可设有效期；已存在的链接会被复用而非
+  静默作废。
 - **CLI 瘦客户端**：`wsctl connect` 把本地终端桥接到远程服务。
 - **SSH 会话**：会话直接是到远程主机的 `ssh` 连接。
 - **文件面板**：在可配置根目录内浏览、下载、上传（含拖拽）。
@@ -52,9 +56,12 @@ CLI (wsctl connect)┘             │
 - **终端能力**：Sixel 图像、可选 ZMODEM（`sz`/`rz`）传输。
 - **主题与快捷键**：内置主题库 + 自定义主题；快捷键可编辑。
 - **审计与 Webhook**：登录、会话、文件、管理操作全量审计，可推送到 Webhook。
-- **可观测**：`/healthz`、Prometheus `/metrics`、结构化 JSON 日志。
+- **可观测**：`/healthz`、Prometheus `/metrics`（可选要求认证）、结构化 JSON 日志。
+- **资源有界**：审计日志、已结束会话与录制文件支持保留策略清理；支持每用户会话
+  配额、每会话内存硬上限与背压。
 - **零停机重启**：`SO_REUSEPORT` 让新实例先接管端口再停旧实例。
 - **配置热更新**：大部分配置改动无需重启。
+- **全中文界面**：Web UI 与 CLI 输出均为中文。
 
 ## 与 ttyd 的差异
 
@@ -130,6 +137,14 @@ wsctl login http://127.0.0.1:7681     # 交互式输入密码，凭据缓存到�
 wsctl connect                          # 在当前终端打开远程 shell
 ```
 
+开始前可先做一次环境自检（Python 版本、数据目录、数据库、shell、tmux/ssh/lrzsz
+是否可用、配置是否合法、服务器是否可达）：
+
+```bash
+wsctl doctor
+wsctl --version
+```
+
 ## 使用教程
 
 ### 1. 会话管理（Web 端）
@@ -137,8 +152,13 @@ wsctl connect                          # 在当前终端打开远程 shell
 - 顶部 **`+`**：新建会话（新标签）。
 - 点击标签：切换会话。
 - **双击标签**：重命名会话。
-- 标签上的 **`×`**：关闭会话（会终止该 shell）。
+- 标签上的 **`×`**：**断开连接**（会话继续在服务器上运行，不会被杀掉）。
+- **右键标签**：弹出菜单，可选择「关闭标签（保持会话）」或「终止会话」。
+- 顶部 **`会话`**：打开会话列表，可重新打开已断开的会话，或终止任意会话。
 - 断线后前端自动重连，并回放屏幕内容，无需重新登录。
+
+> 默认快捷键：`Alt+N` 新建、`Alt+W` 断开标签、`Alt+Shift+W` 终止会话、
+> `Alt+→/←` 切换标签、`Alt+L` 会话列表、`Alt+F` 文件、`Alt+S` 设置、`Alt+H` 分享。
 
 ### 2. 从命令行使用
 
@@ -153,6 +173,7 @@ wsctl connect -s <session-id>          # 连接到已有会话
 # 管理会话
 wsctl session list
 wsctl session new --name build --command "bash -l"
+wsctl session rename <session-id> 构建
 wsctl session attach <session-id>
 wsctl session kill <session-id>
 
@@ -192,11 +213,13 @@ wsctl session new --ssh example.com --ssh-user root --ssh-port 2222 \
 
 ### 5. 分享会话
 
-点击顶部 **share**：
+点击顶部 **分享**：
 
 - 默认生成**只读**链接（含二维码），任何人打开即可观看但**不能输入**。
-- 勾选「allow typing」生成**可写**链接。
-- 可设置有效期（TTL），随时 **revoke** 撤销。
+- 勾选「允许输入（可写）」生成**可写**链接。
+- 可选择**有效期**（永久 / 10 分钟 / 1 小时 / 1 天），随时 **撤销分享**。
+- 再次打开分享对话框会**复用**现有链接（不会作废已发出的链接）；修改选项后点
+  「生成新链接」才会替换（旧链接随之失效）。
 
 分享链接形如 `http://host:7681/?session=<id>&share=<token>`，观看者无需账号。
 
@@ -238,6 +261,8 @@ wsctl user add alice                       # 交互式设置密码
 wsctl user list
 wsctl user role alice admin                # 提升为管理员
 wsctl user passwd alice
+wsctl user disable alice                   # 禁用（登录态立即失效）
+wsctl user enable alice
 wsctl user totp alice                      # 启用 TOTP 双因子（扫码确认）
 wsctl user totp alice --disable
 wsctl user del alice
@@ -245,6 +270,9 @@ wsctl user del alice
 
 - `admin`：可查看/管理所有会话与用户。
 - `user`：仅能操作自己的会话。
+
+> 注意：能登录并创建会话的账号，本质上就拥有以服务运行用户身份执行命令的能力。
+> RBAC 控制的是**会话可见性与管理权限**，不是命令级隔离；请像对待 SSH 一样对待它。
 
 ### 10. 审计与 Webhook
 
@@ -265,7 +293,8 @@ curl http://127.0.0.1:7681/metrics      # Prometheus 文本格式
 ```
 
 指标包含：运行状态、当前会话/客户端数、缓冲字节、会话创建数、WebSocket 连接数、
-上传数、登录结果分类。开启 `log_json = true` 输出结构化 JSON 日志。
+上传数、登录结果分类。开启 `log_json = true` 输出结构化 JSON 日志。若担心指标泄露，
+可设 `metrics_require_auth = true` 要求登录后才能抓取 `/metrics`。
 
 ## 配置详解
 
@@ -300,6 +329,7 @@ tmux_preserve_on_shutdown = true
 idle_timeout = 3600           # 空闲多久回收会话（秒，可选）
 max_life = 86400              # 会话最长寿命（秒，可选）
 max_sessions = 64
+max_sessions_per_user = 0     # 每用户会话上限（0 = 不限）
 session_max_clients = 0       # 单会话最大客户端数（0 = 不限）
 session_memory_limit = 67108864  # 单会话缓冲上限（字节）
 client_max_bytes = 8388608    # 单客户端积压上限（字节）
@@ -317,9 +347,17 @@ record_input = false          # 录制是否包含输入
 
 # ---- 可观测 / 日志 ----
 metrics_enabled = true
+metrics_require_auth = false  # true 时抓取 /metrics 需登录
 log_level = "info"
 log_json = false
 webhook_url = ""              # 审计事件 POST 目标（可选）
+
+# ---- 多实例与保留策略 ----
+instance_ttl = 30             # 其他实例租约失联多久视为已死（秒）
+audit_retention_days = 30     # 审计日志保留天数（0 = 不清理）
+term_session_retention_days = 30  # 已结束会话记录保留天数（0 = 不清理）
+recordings_retention_days = 0     # 录制保留天数（0 = 不清理）
+recordings_max_bytes = 0          # 录制目录总大小上限（0 = 不限）
 
 # ---- 数据与 TLS ----
 data_dir = "/var/lib/wsctl"   # 数据库与录制存放目录
@@ -347,25 +385,32 @@ wsctl config reload                     # 让运行中的服务重载配置
 ```
 wsctl serve                     启动服务（--host/--port/--backend/--reuse-port/
                                 --new/--ssl-cert/--ssl-key/--admin-password/--log-json）
+wsctl doctor                    环境与配置自检（Python/数据目录/DB/shell/tmux/ssh/lrzsz/服务器）
+wsctl --version                 显示版本
 wsctl connect [URL] [-s ID]     把本地终端连接到服务
 wsctl login URL                 登录并缓存凭据
 wsctl logout                    清除本地缓存凭据
 wsctl session list              列出会话
 wsctl session new               新建会话（--name/--command/--cwd/--backend/--ssh…）
+wsctl session rename ID NAME    重命名会话
 wsctl session attach ID         连接到已有会话
 wsctl session kill ID           终止会话
 wsctl session record ID         开始录制（--input）
 wsctl session record-stop ID    停止录制
 wsctl session recording ID      下载录制（-o FILE）
-wsctl user add|list|del|passwd|role|totp
+wsctl user add|list|del|passwd|role|disable|enable|totp
 wsctl audit                     查看审计日志（管理员）
 wsctl config show|path|edit|set|reload
 wsctl version
 ```
 
+> `wsctl config set` 会校验配置项名称，未知项会报错并给出最接近的候选。
+
 ## 部署
 
 ### systemd
+
+仓库内提供了可直接使用的示例：[`contrib/systemd/wsctl.service`](contrib/systemd/wsctl.service)。
 
 ```ini
 [Unit]
@@ -382,6 +427,8 @@ WantedBy=multi-user.target
 ```
 
 ### nginx 反向代理（TLS 终止）
+
+完整示例见 [`contrib/nginx/wsctl.conf`](contrib/nginx/wsctl.conf)。关键点：
 
 ```nginx
 location / {
@@ -409,7 +456,10 @@ wsctl serve --reuse-port &      # 新实例接管新连接
 kill <旧进程 PID>               # 旧实例排空后退出
 ```
 
-配合 **tmux 后端**，连会话本身也能跨重启存活。
+两个实例短暂共享同一 `data_dir` 是安全的：每个实例通过 `instances` 租约表与
+`term_sessions.instance_id` 只管理自己的会话，绝不会把对方的活跃会话标记为停止；
+tmux 会话也按 `data_dir` 命名空间隔离。配合 **tmux 后端**，连会话本身也能跨重启
+存活。
 
 ## 安全
 
@@ -436,6 +486,16 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 **Q：浏览器连不上 / 一直重连？**
 - 检查反向代理是否转发 WebSocket（`Upgrade` / `Connection` 头）。
 - 若被判定未授权（401/4401），重新登录；确认系统时间正确（TOTP 场景）。
+
+**Q：关闭标签后 shell 会结束吗？**
+不会。关闭标签默认只是**断开连接**，会话继续在服务器上运行。用标签右键菜单、
+顶部「会话」列表，或 `Alt+Shift+W` 才能真正终止会话。
+
+**Q：审计日志 / 数据库 / 录制文件会不会无限增长？**
+有保留策略：`audit_retention_days`（默认 30）清理审计日志，
+`term_session_retention_days`（默认 30）清理已结束的会话记录，
+`recordings_retention_days` 与 `recordings_max_bytes` 约束录制文件（默认关闭，
+设为 0 表示不清理）。
 
 **Q：`wsctl connect` 报「no server URL」？**
 先 `wsctl login <url>`，或显式传 URL；token 也可用 `WSCTL_TOKEN` 提供。

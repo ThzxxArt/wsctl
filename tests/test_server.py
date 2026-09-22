@@ -112,7 +112,7 @@ def test_ws_rejects_foreign_session(tmp_path: Path) -> None:
             ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
             msg = json.loads(ws.receive_text())
             assert msg["type"] == "error"
-            assert "not authorized" in msg["msg"]
+            assert "无权访问" in msg["msg"]
 
 
 def test_ws_unauthenticated_rejected_with_close_code(tmp_path: Path) -> None:
@@ -323,7 +323,7 @@ def test_session_max_clients_enforced(tmp_path: Path) -> None:
                 second.send_text(json.dumps(attach))
                 msg = _recv_control(second, {"error", "attached"})
                 assert msg is not None and msg["type"] == "error"
-                assert "client limit" in str(msg["msg"])
+                assert "连接数已达上限" in str(msg["msg"])
 
 
 def test_startup_command_creates_session(tmp_path: Path) -> None:
@@ -339,6 +339,21 @@ def test_invalid_backend_rejected(tmp_path: Path) -> None:
     with TestClient(build_app(tmp_path)) as client:
         login(client, ADMIN)
         assert client.post("/api/sessions", json={"backend": "nope"}).status_code == 400
+
+
+def test_unstartable_command_returns_400(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        r = client.post("/api/sessions", json={"command": "/nonexistent-binary-xyz"})
+        assert r.status_code == 400, r.text
+        assert "无法启动命令" in r.json()["detail"]
+
+
+def test_unstartable_startup_command_does_not_crash(tmp_path: Path) -> None:
+    app = build_app(tmp_path, startup_command="/nonexistent-binary-xyz")
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert client.get("/api/sessions").json() == []
 
 
 @pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
@@ -357,6 +372,7 @@ def test_create_and_kill_tmux_session(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
 def test_orphan_tmux_sessions_are_reaped(tmp_path: Path) -> None:
+    tmux.set_namespace(tmp_path)  # match the namespace create_app will use
     name = tmux.session_name(f"orphan-{os.getpid()}-{int(time.time() * 1000)}")
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True, timeout=10
@@ -369,11 +385,13 @@ def test_orphan_tmux_sessions_are_reaped(tmp_path: Path) -> None:
         assert not tmux.has_session(name)
     finally:
         tmux.kill_session(name)
+        tmux.set_namespace(None)
 
 
 @pytest.mark.skipif(not tmux.is_available(), reason="requires tmux")
 def test_startup_restores_tmux_session(tmp_path: Path) -> None:
     sid = f"restore-{os.getpid()}-{int(time.time() * 1000)}"
+    tmux.set_namespace(tmp_path)  # match the namespace create_app will use
     name = tmux.session_name(sid)
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", name, "/bin/sh"], check=True, timeout=10
@@ -394,6 +412,7 @@ def test_startup_restores_tmux_session(tmp_path: Path) -> None:
             assert any(s["id"] == sid and s["backend"] == "tmux" for s in sessions)
     finally:
         tmux.kill_session(name)
+        tmux.set_namespace(None)
 
 
 # -- M8: read-only sharing --------------------------------------------
@@ -446,7 +465,7 @@ def test_share_attach_readonly_without_login(tmp_path: Path) -> None:
             # input from a read-only client is refused
             ws.send_text(json.dumps({"type": "input", "data": "echo NOPE\r"}))
             err = _recv_control(ws, {"error"})
-            assert err is not None and "read-only" in str(err["msg"])
+            assert err is not None and "只读" in str(err["msg"])
 
 
 def test_share_attach_writable(tmp_path: Path) -> None:
@@ -647,3 +666,127 @@ def test_readonly_attach_does_not_resize(tmp_path: Path) -> None:
         session = app.state.manager.get(sid)  # type: ignore[attr-defined]
         assert session is not None
         assert (session.spec.cols, session.spec.rows) == (100, 40)
+
+
+# -- M22: multi-instance, quotas and retention ------------------------
+
+
+def test_get_share_reuses_token(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        assert client.get(f"/api/sessions/{sid}/share").json() == {"shared": False}
+
+        token = client.post(f"/api/sessions/{sid}/share", json={}).json()["token"]
+        got = client.get(f"/api/sessions/{sid}/share").json()
+        assert got["shared"] is True
+        assert got["token"] == token
+
+
+def test_get_share_requires_owner(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        client.post("/api/logout")
+        login(client, BOB)
+        assert client.get(f"/api/sessions/{sid}/share").status_code == 403
+
+
+def test_per_user_session_quota(tmp_path: Path) -> None:
+    app = build_app(tmp_path, max_sessions_per_user=1)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert client.post("/api/sessions", json={}).status_code == 201
+        second = client.post("/api/sessions", json={})
+        assert second.status_code == 429
+        assert "该用户" in second.json()["detail"]
+
+
+def test_metrics_can_require_auth(tmp_path: Path) -> None:
+    app = build_app(tmp_path, metrics_require_auth=True)
+    with TestClient(app) as client:
+        assert client.get("/metrics").status_code == 401
+        login(client, ADMIN)
+        assert client.get("/metrics").status_code == 200
+
+
+def test_session_row_records_owning_instance(tmp_path: Path) -> None:
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        rows = app.state.store.term_session_list()  # type: ignore[attr-defined]
+        row = next(r for r in rows if r["id"] == sid)
+        assert row["instance_id"] == app.state.instance_id  # type: ignore[attr-defined]
+
+
+def test_input_rate_limit_blocks_flood(tmp_path: Path) -> None:
+    app = build_app(tmp_path, input_rate_limit=10, input_rate_burst=10)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            # 20 bytes in one frame exceeds the 10-byte token bucket.
+            ws.send_text(json.dumps({"type": "input", "data": "x" * 20}))
+            err = _recv_control(ws, {"error"})
+            assert err is not None
+            assert "速率超限" in str(err["msg"])
+
+
+def test_startup_reclaims_sessions_of_crashed_instance(tmp_path: Path) -> None:
+    import socket as _socket
+
+    settings = load_settings(data_dir=tmp_path, auth_required=True, default_shell="/bin/sh")
+    store = Store(tmp_path / "test.db")
+    store.user_create(*ADMIN, role="admin")
+    # A peer that has exited: its pid is no longer alive on this host.
+    dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    dead.wait()
+    store.instance_register("dead-instance", pid=dead.pid, host=_socket.gethostname())
+    store.term_session_upsert(
+        "abandoned", name="gone", owner_id=None, backend="local", instance_id="dead-instance"
+    )
+
+    app = create_app(settings, store=store, manager=SessionManager())
+    with TestClient(app) as client:
+        login(client, ADMIN)
+
+    check = Store(tmp_path / "test.db")
+    try:
+        row = next(r for r in check.term_session_list() if r["id"] == "abandoned")
+        assert row["status"] == "stopped"
+        assert check.instance_alive_ids(60) == set()  # dead lease pruned
+    finally:
+        check.close()
+
+
+def test_pid_alive_helper() -> None:
+    from wsctl.server.app import _pid_alive
+
+    assert _pid_alive(os.getpid())
+    assert not _pid_alive(0)
+    assert not _pid_alive(None)
+    dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    dead.wait()
+    assert not _pid_alive(dead.pid)
+
+
+def test_disabling_a_user_closes_live_websocket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wsctl.server import ws as ws_mod
+
+    monkeypatch.setattr(ws_mod, "ACCESS_RECHECK", 0.2)
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            # Disabling the user must terminate the already-open terminal too.
+            app.state.store.user_set_disabled("admin", True)  # type: ignore[attr-defined]
+            close = _recv_until_close(ws, timeout=5)
+            assert close["code"] == 4401

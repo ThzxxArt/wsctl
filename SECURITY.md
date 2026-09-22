@@ -21,6 +21,10 @@ session can run commands as the server's user. Treat it like SSH:
 - Upload size limits and session count/idle/lifetime limits
 - Full audit log of logins, sessions, file transfers and admin actions
 - Security response headers (nosniff, frame DENY, referrer policy, CSP)
+- Bounded resources: audit/session/recording retention, per-user session quotas
+- Optional authentication on `/metrics` (`metrics_require_auth`)
+- Multi-instance leases so a peer sharing the data directory can never reconcile
+  or reap another instance's sessions
 
 ## Supported versions
 

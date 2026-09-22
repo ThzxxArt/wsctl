@@ -21,6 +21,18 @@ def test_overrides_win() -> None:
     assert settings.port == 9000
 
 
+def test_new_resource_defaults(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.setenv("WSCTL_CONFIG", str(tmp_path / "missing.toml"))  # type: ignore[attr-defined]
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.max_sessions_per_user == 0
+    assert settings.instance_ttl == 30
+    assert settings.audit_retention_days == 30
+    assert settings.term_session_retention_days == 30
+    assert settings.recordings_retention_days == 0
+    assert settings.recordings_max_bytes == 0
+    assert settings.metrics_require_auth is False
+
+
 def test_none_overrides_ignored() -> None:
     settings = load_settings(host=None, port=None)
     assert settings.host == "127.0.0.1"

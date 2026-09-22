@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wsctl.core.recording import Recorder
+from wsctl.core.recording import Recorder, has_room, recordings_usage
 
 
 def test_cast_header_and_events(tmp_path: Path) -> None:
@@ -39,3 +39,19 @@ def test_creates_parent_directory(tmp_path: Path) -> None:
     recorder.output(b"data")
     recorder.close()
     assert (tmp_path / "nested" / "deep" / "c.cast").is_file()
+
+
+def test_recordings_usage_and_room(tmp_path: Path) -> None:
+    directory = tmp_path / "rec"
+    assert recordings_usage(directory) == (0, 0)
+    assert has_room(directory, 0)  # unlimited
+
+    directory.mkdir()
+    (directory / "a.cast").write_text("x" * 10)
+    (directory / "b.cast").write_text("y" * 5)
+    (directory / "ignored.txt").write_text("z" * 100)
+
+    total, count = recordings_usage(directory)
+    assert (total, count) == (15, 2)
+    assert has_room(directory, 100)
+    assert not has_room(directory, 10)

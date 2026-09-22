@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from conftest import FakeClient
-from wsctl.core.session import ClientGone, SessionManager, SessionSpec
+from wsctl.core.session import (
+    ClientGone,
+    SessionManager,
+    SessionSpec,
+    within_user_quota,
+)
 
 SHELL = "/bin/sh"
 pytestmark = pytest.mark.skipif(not os.path.exists(SHELL), reason="requires /bin/sh")
@@ -256,5 +261,39 @@ async def test_memory_limit_drops_largest_backlog() -> None:
         session.write_input(b"echo mem\n")
         assert await wait_for(lambda: big.closed, timeout=5.0)
         assert not small.closed
+    finally:
+        await manager.shutdown()
+
+
+class FailingClient:
+    """A client whose sink rejects everything immediately."""
+
+    def put(self, item: object) -> None:
+        raise ClientGone("sink is gone")
+
+
+async def test_attach_rolls_back_on_client_gone() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        with pytest.raises(ClientGone):
+            await session.attach(FailingClient())
+        # A client that could not accept the replay must not be left attached.
+        assert session.client_count == 0
+    finally:
+        await manager.shutdown()
+
+
+async def test_within_user_quota() -> None:
+    manager = SessionManager()
+    await manager.create(SessionSpec(name="a", argv=[SHELL]), owner_id=1)
+    await manager.create(SessionSpec(name="b", argv=[SHELL]), owner_id=2)
+    try:
+        assert within_user_quota(manager, 0, 1)  # 0 = unlimited
+        assert not within_user_quota(manager, 1, 1)
+        assert within_user_quota(manager, 2, 1)
+        assert not within_user_quota(manager, 1, 2)
+        assert within_user_quota(manager, 2, 2)
+        assert within_user_quota(manager, 1, 99)
     finally:
         await manager.shutdown()

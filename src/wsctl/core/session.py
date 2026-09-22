@@ -192,24 +192,31 @@ class TermSession:
         """
         async with self._lock:
             if self.closed:
-                raise ClientGone("session is closed")
+                raise ClientGone("会话已关闭")
             if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
-                raise ClientGone("session has reached its client limit")
+                raise ClientGone("会话连接数已达上限")
             replay = self._scrollback.snapshot()
-            self._clients[id(client)] = _ClientEntry(client, writable=writable, share=share)
+            key = id(client)
+            self._clients[key] = _ClientEntry(client, writable=writable, share=share)
             self.last_active = time.time()
-            if replay:
-                client.put(replay)
-            client.put(
-                {
-                    "type": "attached",
-                    "session": self.id,
-                    "name": self.spec.name,
-                    "cols": self.spec.cols,
-                    "rows": self.spec.rows,
-                    "writable": writable,
-                }
-            )
+            try:
+                if replay:
+                    client.put(replay)
+                client.put(
+                    {
+                        "type": "attached",
+                        "session": self.id,
+                        "name": self.spec.name,
+                        "cols": self.spec.cols,
+                        "rows": self.spec.rows,
+                        "writable": writable,
+                    }
+                )
+            except ClientGone:
+                # Roll back the registration so a client that could not accept
+                # the replay never lingers in the session's client set.
+                self._clients.pop(key, None)
+                raise
 
     async def detach(self, client: Client) -> None:
         async with self._lock:
@@ -434,8 +441,10 @@ class SessionManager:
     async def reap_expired(self, now: float | None = None) -> list[str]:
         """Stop and remove sessions past their idle/max lifetime."""
         expired = [s for s in self.list_sessions() if s.is_expired(now)]
-        for session in expired:
-            await session.stop()
+        if expired:
+            await asyncio.gather(
+                *(s.stop() for s in expired), return_exceptions=True
+            )
         return [s.id for s in expired]
 
     async def remove(self, sid: str, *, sig: int | None = None) -> bool:
@@ -465,3 +474,10 @@ class SessionManager:
 
     def _new_id(self) -> str:
         return secrets.token_urlsafe(8)
+
+
+def within_user_quota(manager: SessionManager, limit: int, user_id: int | None) -> bool:
+    """Whether ``user_id`` is still below the per-user session quota (0 = none)."""
+    if limit <= 0:
+        return True
+    return sum(1 for s in manager.list_sessions() if s.owner_id == user_id) < limit

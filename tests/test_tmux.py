@@ -34,7 +34,27 @@ def unique_sid() -> str:
 
 
 def test_session_name_prefix() -> None:
-    assert tmux.session_name("abc") == "wsctl-abc"
+    tmux.set_namespace(None)
+    try:
+        assert tmux.session_name("abc") == "wsctl-abc"
+        assert tmux.owns("wsctl-abc")
+        assert tmux.sid_from_name("wsctl-abc") == "abc"
+    finally:
+        tmux.set_namespace(None)
+
+
+def test_session_name_is_namespaced_per_data_dir() -> None:
+    tmux.set_namespace("/tmp/wsctl-data-a")
+    try:
+        name = tmux.session_name("abc")
+        assert name.startswith("wsctl-") and name.endswith("-abc")
+        assert tmux.owns(name)
+        assert tmux.sid_from_name(name) == "abc"
+        # A different deployment's un-namespaced session is not ours.
+        assert not tmux.owns("wsctl-abc")
+        assert tmux.sid_from_name("wsctl-abc") == ""
+    finally:
+        tmux.set_namespace(None)
 
 
 def test_wrap_argv_contains_attach_flags() -> None:

@@ -22,8 +22,16 @@ from starlette.websockets import WebSocketState
 from wsctl.core import tmux
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
+from wsctl.core.pty import PtyError
 from wsctl.core.ratelimit import TokenBucket
-from wsctl.core.session import ClientGone, SessionManager, SessionSpec, TermSession
+from wsctl.core.recording import has_room as recordings_have_room
+from wsctl.core.session import (
+    ClientGone,
+    SessionManager,
+    SessionSpec,
+    TermSession,
+    within_user_quota,
+)
 from wsctl.core.store import Store, User
 
 from .client import WsClient
@@ -35,15 +43,17 @@ MAX_AUDIT_LINE = 512
 ACCESS_RECHECK = 5.0
 
 
+def _auth_token(websocket: WebSocket) -> str | None:
+    auth = websocket.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return websocket.cookies.get(COOKIE_NAME)
+
+
 def _resolve_user(websocket: WebSocket, store: Store, auth_required: bool) -> User | None:
     if not auth_required:
         return User(id=0, username="anonymous", role="admin", disabled=False, created_at=0.0)
-    token: str | None = None
-    auth = websocket.headers.get("authorization")
-    if auth and auth.lower().startswith("bearer "):
-        token = auth[7:].strip()
-    if not token:
-        token = websocket.cookies.get(COOKIE_NAME)
+    token = _auth_token(websocket)
     if not token:
         return None
     return store.resolve_auth_session(token)
@@ -55,7 +65,7 @@ def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
     if backend == "tmux" and not tmux.is_available():
         backend = "local"
     return SessionSpec(
-        name=Path(shell).name or "shell",
+        name=Path(shell).name or "终端",
         argv=[shell],
         cwd=settings.default_cwd,
         backend=backend,
@@ -87,6 +97,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
 
     ip = client_ip(websocket, settings)
     user = _resolve_user(websocket, store, settings.auth_required)
+    auth_token = _auth_token(websocket)
     share_param = websocket.query_params.get("share")
 
     # Accept first so the client receives a WebSocket close *code* (a close
@@ -132,8 +143,22 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         )
         on_line = _input_auditor(store, settings, user_id, session.id)
         bucket = _input_bucket(settings)
+        recheck: Callable[[], bool] | None = None
+        if user is not None and auth_token is not None:
+            token = auth_token
+
+            def recheck() -> bool:
+                return store.resolve_auth_session(token) is not None
+
         await _pump(
-            websocket, client, session, on_line, bucket, writable=writable, share=share
+            websocket,
+            client,
+            session,
+            on_line,
+            bucket,
+            writable=writable,
+            share=share,
+            recheck=recheck,
         )
     except _Denied as exc:
         close_code = exc.code
@@ -177,7 +202,7 @@ async def _handshake(
     raw = await websocket.receive_text()
     msg = json.loads(raw)
     if msg.get("type") != "attach":
-        client.put({"type": "error", "msg": "expected an 'attach' message first"})
+        client.put({"type": "error", "msg": "首条消息必须是 attach"})
         return None
 
     cols = int(msg.get("cols") or 80)
@@ -187,24 +212,35 @@ async def _handshake(
 
     session: TermSession | None
     writable = True
+    created = False
     if sid:
         session = manager.get(str(sid))
         if session is None:
-            raise _Denied(f"no such session: {sid}")
+            raise _Denied(f"会话不存在：{sid}")
         access = _access(user, session, share)
         if access is None:
-            raise _Denied("not authorized for this session")
+            raise _Denied("无权访问该会话")
         writable = access == "write"
     else:
         if user is None:
-            raise _Denied("authentication required to create a session")
+            raise _Denied("创建会话需要登录")
         if len(manager.list_sessions()) >= settings.max_sessions:
-            client.put({"type": "error", "msg": "session limit reached"})
+            client.put({"type": "error", "msg": "会话数量已达上限"})
+            return None
+        if not within_user_quota(manager, settings.max_sessions_per_user, user.id):
+            client.put({"type": "error", "msg": "该用户的会话数量已达上限"})
             return None
         spec = _default_spec(settings, cols, rows)
-        session = await manager.create(spec, owner_id=user.id)
         try:
-            if settings.auto_record:
+            session = await manager.create(spec, owner_id=user.id)
+        except (OSError, PtyError) as exc:
+            client.put({"type": "error", "msg": f"无法启动命令：{exc}"})
+            return None
+        created = True
+        try:
+            if settings.auto_record and recordings_have_room(
+                settings.recordings_dir, settings.recordings_max_bytes
+            ):
                 session.start_recording(
                     settings.recordings_dir / f"{session.id}.cast",
                     record_input=settings.record_input,
@@ -222,6 +258,7 @@ async def _handshake(
                 cwd=spec.cwd,
                 idle_timeout=spec.idle_timeout,
                 max_life=spec.max_life,
+                instance_id=getattr(websocket.app.state, "instance_id", None),
             )
             store.log_event(
                 "session_create",
@@ -232,7 +269,7 @@ async def _handshake(
         except Exception:
             # Do not leave a live process/fd behind if post-create setup fails.
             await manager.remove(session.id)
-            client.put({"type": "error", "msg": "failed to create session"})
+            client.put({"type": "error", "msg": "创建会话失败"})
             return None
 
     # Only writers may set the shared terminal size; a read-only viewer must not
@@ -242,6 +279,9 @@ async def _handshake(
     try:
         await session.attach(client, writable=writable, share=share)
     except ClientGone as exc:
+        # A session we just created has no other owner and must not be leaked.
+        if created:
+            await manager.remove(session.id)
         client.put({"type": "error", "msg": str(exc)})
         return None
     return session, writable, share
@@ -281,6 +321,7 @@ async def _pump(
     *,
     writable: bool = True,
     share: str | None = None,
+    recheck: Callable[[], bool] | None = None,
 ) -> None:
     line_buffer = bytearray()
     read_only_notice = False
@@ -299,7 +340,7 @@ async def _pump(
 
     def reject() -> None:
         with contextlib.suppress(ClientGone):
-            client.put({"type": "error", "msg": "input rate limit exceeded"})
+            client.put({"type": "error", "msg": "输入速率超限"})
 
     def reject_readonly() -> None:
         nonlocal read_only_notice
@@ -307,7 +348,7 @@ async def _pump(
             return
         read_only_notice = True
         with contextlib.suppress(ClientGone):
-            client.put({"type": "error", "msg": "session is read-only"})
+            client.put({"type": "error", "msg": "会话为只读"})
 
     def feed_audit(data: bytes) -> None:
         if on_line is None:
@@ -325,10 +366,14 @@ async def _pump(
         try:
             message = await asyncio.wait_for(websocket.receive(), timeout=ACCESS_RECHECK)
         except TimeoutError:
-            # Re-validate periodically so a revoked/expired share is enforced
-            # even on a session that produces no output.
+            # Re-validate periodically so a revoked/expired share, or a
+            # disabled user / revoked token, is enforced even on a session that
+            # produces no output.
             if share_revoked():
-                await deny("share revoked or expired")
+                await deny("分享已撤销或过期")
+                return
+            if recheck is not None and not recheck():
+                await deny("登录已失效，请重新登录")
                 return
             continue
         msg_type = message.get("type")
@@ -337,7 +382,7 @@ async def _pump(
         data_bytes = message.get("bytes")
         if data_bytes is not None:
             if share_revoked():
-                await deny("share revoked or expired")
+                await deny("分享已撤销或过期")
                 return
             if not writable:
                 reject_readonly()

@@ -42,19 +42,19 @@ class WsClient:
 
     def put(self, item: bytes | dict[str, Any]) -> None:
         if self._closed:
-            raise ClientGone("client closed")
+            raise ClientGone("连接已关闭")
         if (
             isinstance(item, bytes)
             and self._max_bytes > 0
             and self._pending_bytes + len(item) > self._max_bytes
         ):
             self._closed = True
-            raise ClientGone("client byte limit exceeded")
+            raise ClientGone("客户端缓冲超出上限")
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
             self._closed = True
-            raise ClientGone("client backlog overflow") from None
+            raise ClientGone("客户端积压溢出") from None
         if isinstance(item, bytes):
             self._pending_bytes += len(item)
 

@@ -32,12 +32,17 @@ class RateLimiter:
         now = time.monotonic() if now is None else now
         if self.limit <= 0:
             return False
-        return len(self._prune(key, now)) >= self.limit
+        events = self._prune(key, now)
+        if not events:
+            self._events.pop(key, None)
+            return False
+        return len(events) >= self.limit
 
     def retry_after(self, key: str, *, now: float | None = None) -> float:
         now = time.monotonic() if now is None else now
         events = self._prune(key, now)
         if not events:
+            self._events.pop(key, None)
             return 0.0
         return max(0.0, events[0] + self.window - now)
 
@@ -47,6 +52,20 @@ class RateLimiter:
 
     def reset(self, key: str) -> None:
         self._events.pop(key, None)
+
+    def sweep(self, *, now: float | None = None) -> int:
+        """Drop keys with no failures left in the window (bounds memory)."""
+        now = time.monotonic() if now is None else now
+        cutoff = now - self.window
+        removed = 0
+        for key in list(self._events):
+            events = self._events[key]
+            while events and events[0] < cutoff:
+                events.popleft()
+            if not events:
+                del self._events[key]
+                removed += 1
+        return removed
 
 
 class TokenBucket:

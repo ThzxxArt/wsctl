@@ -1,0 +1,33 @@
+[Unit]
+Description=wsctl 网页终端服务
+Documentation=https://github.com/ThzxxArt/wsctl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 以最小权限的专用用户运行（请按需修改）
+User=wsctl
+Group=wsctl
+WorkingDirectory=/var/lib/wsctl
+# 仅监听本机，由反向代理终止 TLS
+ExecStart=/usr/local/bin/wsctl serve --host 127.0.0.1 --port 7681
+Restart=on-failure
+RestartSec=3
+# 优雅退出，给会话清理留时间
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

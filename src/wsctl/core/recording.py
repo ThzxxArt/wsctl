@@ -71,3 +71,26 @@ class Recorder:
         self._closed = True
         self._fh.flush()
         self._fh.close()
+
+
+def recordings_usage(directory: Path) -> tuple[int, int]:
+    """Return ``(total_bytes, count)`` of ``*.cast`` files in ``directory``."""
+    total = 0
+    count = 0
+    if not directory.is_dir():
+        return 0, 0
+    for entry in directory.glob("*.cast"):
+        try:
+            total += entry.stat().st_size
+            count += 1
+        except OSError:
+            continue
+    return total, count
+
+
+def has_room(directory: Path, max_bytes: int) -> bool:
+    """Whether total recording size is still below ``max_bytes`` (0 = unlimited)."""
+    if max_bytes <= 0:
+        return True
+    total, _ = recordings_usage(directory)
+    return total < max_bytes

@@ -80,12 +80,22 @@ class Settings(BaseSettings):
     idle_timeout: float | None = None
     max_life: float | None = None
     max_sessions: int = 64
+    max_sessions_per_user: int = 0
     session_max_clients: int = 0
     session_memory_limit: int = 64 * 1024 * 1024
     client_max_bytes: int = 8 * 1024 * 1024
     input_rate_limit: int = 0
     input_rate_burst: int = 0
     scrollback_bytes: int = DEFAULT_MAX_BYTES
+
+    # How long another instance's lease may go unheard before its sessions are
+    # considered abandoned (only relevant with SO_REUSEPORT / shared data_dir).
+    instance_ttl: int = 30
+    # Retention: 0 disables the corresponding cleanup.
+    audit_retention_days: int = 30
+    term_session_retention_days: int = 30
+    recordings_retention_days: int = 0
+    recordings_max_bytes: int = 0
 
     data_dir: Path = Field(default_factory=default_data_dir)
     config_path: Path = Field(default_factory=default_config_path)
@@ -98,6 +108,7 @@ class Settings(BaseSettings):
     file_max_upload: int = 100 * 1024 * 1024
 
     metrics_enabled: bool = True
+    metrics_require_auth: bool = False
     log_level: str = "info"
     log_json: bool = False
 
@@ -166,6 +177,12 @@ HOT_FIELDS = frozenset(
         "idle_timeout",
         "max_life",
         "max_sessions",
+        "max_sessions_per_user",
+        "instance_ttl",
+        "audit_retention_days",
+        "term_session_retention_days",
+        "recordings_retention_days",
+        "recordings_max_bytes",
         "session_max_clients",
         "session_memory_limit",
         "client_max_bytes",
@@ -175,6 +192,7 @@ HOT_FIELDS = frozenset(
         "file_root",
         "file_max_upload",
         "metrics_enabled",
+        "metrics_require_auth",
         "auto_record",
         "record_input",
         "totp_issuer",

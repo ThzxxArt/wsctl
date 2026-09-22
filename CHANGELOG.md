@@ -5,6 +5,92 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-09-22
+
+Hardening release: safe multi-instance operation, bounded resource usage, and a
+full Chinese user interface. No new terminal features.
+
+### Added
+
+- **Multi-instance safety.** A per-process lease (`instances` table plus
+  `term_sessions.instance_id`) means two servers sharing one data directory
+  (e.g. during an `SO_REUSEPORT` handover) never reconcile or reap each other's
+  sessions. `--reuse-port` restarts are now correct even with live sessions.
+- tmux sessions are namespaced per data directory, so two deployments on the
+  same host sharing one tmux server cannot see or kill each other's sessions.
+- **Bounded retention.** `audit_retention_days` (default 30) and
+  `term_session_retention_days` (default 30) prune the audit log and finished
+  session rows; `recordings_retention_days` and `recordings_max_bytes` bound
+  recordings on disk.
+- `max_sessions_per_user` for per-user session quotas.
+- `metrics_require_auth` to require authentication for `GET /metrics`.
+- `instance_ttl` controls how long another instance's lease may go unheard.
+- `GET /api/sessions/{id}/share` returns the active share token so the UI can
+  reuse an existing link instead of silently invalidating it.
+- CLI: `wsctl --version`, `wsctl doctor` (environment/preflight checks),
+  `wsctl user disable|enable`, `wsctl session rename`. `wsctl config set` now
+  rejects unknown keys and suggests the closest match.
+- Web UI: a session list (`会话`) to reopen detached sessions or kill them, a
+  tab context menu (right-click, or long-press on touch devices), share expiry
+  (TTL) selection and link regeneration, and an optional TOTP field on the
+  login form.
+- `contrib/systemd/wsctl.service` and `contrib/nginx/wsctl.conf` deployment
+  examples.
+
+### Changed
+
+- **Closing a tab now detaches (keeps the session running) instead of killing
+  it.** This matches the project's core promise that a session is independent
+  of its connections. Use the tab context menu, the session list, or
+  `Alt+Shift+W` to actually terminate a session; `Alt+W` detaches.
+- The entire web UI and CLI help/output are now in Chinese (`lang="zh-CN"`),
+  including server API/WebSocket error messages surfaced to the user.
+- Live WebSocket terminals now re-validate the login session every few seconds
+  and close (`4401`) when the token is revoked/expired or the user is disabled,
+  instead of staying connected until the tab is closed.
+
+### Fixed
+
+- **Sessions could leak when a client could not accept the reconnect replay:**
+  a session created during the WebSocket handshake is now removed if attaching
+  fails, and a client that rejects the replay is no longer left registered in
+  the session's client set.
+- **Startup race between instances:** `_ensure_admin` no longer crashes with a
+  `UNIQUE constraint` error when two instances bootstrap the same database
+  concurrently.
+- **Schema migration ordering:** the `instance_id` index is created after the
+  `ALTER TABLE`, so upgrading an existing 0.1.0 database no longer fails with
+  `no such column: instance_id`.
+- `RateLimiter` no longer accumulates keys with no recent failures (a slow
+  memory leak under credential-stuffing).
+- Expired sessions are reaped concurrently instead of one at a time.
+- Sessions abandoned by a **crashed** instance are reclaimed/adopted
+  immediately (same-host pid check) rather than waiting for the lease TTL, and
+  reconciliation now runs on every maintenance tick, so a peer's sessions are
+  taken over as soon as it exits instead of only on the next restart.
+- Regenerating a share link now asks for confirmation first, so an already
+  distributed link is not invalidated by a stray click.
+- Multi-instance liveness probing is POSIX-only: `os.kill(pid, 0)` is not a
+  liveness check on Windows (CPython maps it to `TerminateProcess`), so the
+  lease falls back to the heartbeat TTL there.
+- A paused instance whose lease was pruned by a peer re-registers itself on the
+  next maintenance tick (idempotent upsert) instead of staying unregistered.
+- A command that cannot be started (bad `--command`/`--new`, missing binary) now
+  returns a clean `400 无法启动命令` instead of a `500`, and a bad `--new`
+  command no longer prevents the server from starting.
+
+### Testing
+
+- New `test_instances.py` (leases, per-instance reconciliation, retention
+  purging), plus tests for rate-limiter eviction, recording capacity, per-user
+  quotas, share reuse, `metrics_require_auth`, `within_user_quota`, attach
+  rollback, and the new CLI commands.
+- New backend e2e scenario `multiplex`: two instances share one data directory
+  and must not mark each other's sessions stopped.
+- Browser test now covers detach-on-close and share-link reuse.
+
+[0.1.1]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.1
+
 ## [0.1.0] - 2026-09-21
 
 First release. Single-server web terminal with persistent sessions, multi-user

@@ -52,3 +52,25 @@ def test_token_bucket_caps_at_capacity() -> None:
     # after a long idle period the bucket refills to capacity, not beyond
     assert bucket.allow(10.0, now=1000.0)
     assert not bucket.allow(0.1, now=1000.0)
+
+
+def test_sweep_evicts_empty_keys() -> None:
+    rl = RateLimiter(limit=3, window=10)
+    rl.record_failure("k", now=0.0)
+    assert rl.sweep(now=5.0) == 0  # still inside the window
+    assert rl.sweep(now=20.0) == 1  # expired -> evicted
+    assert rl._events == {}
+
+
+def test_is_blocked_evicts_expired_key() -> None:
+    rl = RateLimiter(limit=1, window=10)
+    rl.record_failure("k", now=0.0)
+    assert not rl.is_blocked("k", now=20.0)
+    assert "k" not in rl._events
+
+
+def test_retry_after_evicts_expired_key() -> None:
+    rl = RateLimiter(limit=1, window=10)
+    rl.record_failure("k", now=0.0)
+    assert rl.retry_after("k", now=20.0) == 0.0
+    assert "k" not in rl._events

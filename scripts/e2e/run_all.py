@@ -26,6 +26,7 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,8 @@ from pathlib import Path
 
 import httpx
 from websockets.sync.client import connect
+
+from wsctl.core import tmux as tmux_mod
 
 ROOT = Path(__file__).resolve().parents[2]
 PY = sys.executable
@@ -192,7 +195,7 @@ def scenario_cli() -> None:
 
             run("login", base, "-u", ADMIN, "-p", PASSWORD)
             out = run("session", "new", "--command", "sleep 30", "--name", "clitest")
-            sid = out.split("Created session")[1].split()[0]
+            sid = out.split("已创建会话")[1].split()[0].split("（")[0]
             assert "clitest" in run("session", "list")
             run("session", "kill", sid)
     finally:
@@ -246,6 +249,8 @@ def scenario_tmux() -> None:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     data = Path(tempfile.mkdtemp(prefix="wsctl-tmux-"))
+    tmux_mod.set_namespace(data)  # the server namespaces by data dir
+    name = tmux_mod.session_name  # bound after namespace is set
     env = {"WSCTL_DEFAULT_BACKEND": "tmux"}
     first = spawn(port, data, extra_env=env)
     second: subprocess.Popen[bytes] | None = None
@@ -261,11 +266,11 @@ def scenario_tmux() -> None:
             ws.send(b"echo TMUX-MARK\r")
             assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK")
 
-        assert _wait_tmux(f"wsctl-{sid}"), (
+        assert _wait_tmux(name(sid)), (
             "tmux session missing while the server is running: " + " ".join(_tmux_ls())
         )
         stop(first)  # graceful: preserves the tmux session
-        if not _wait_tmux(f"wsctl-{sid}"):
+        if not _wait_tmux(name(sid)):
             raise AssertionError(
                 "tmux session lost after server stop: " + " ".join(_tmux_ls())
             )
@@ -283,10 +288,109 @@ def scenario_tmux() -> None:
     finally:
         if second is not None:
             stop(second)
-        subprocess.run(["tmux", "kill-session", "-t", f"wsctl-{sid}"],
+        subprocess.run(["tmux", "kill-session", "-t", name(sid)],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        tmux_mod.set_namespace(None)
         shutil.rmtree(data, ignore_errors=True)
     print("  tmux: ok")
+
+
+def scenario_crash() -> None:
+    """A SIGKILLed instance's tmux session is adopted immediately by a new one."""
+    if shutil.which("tmux") is None:
+        print("  crash: skipped (tmux not installed)")
+        return
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    data = Path(tempfile.mkdtemp(prefix="wsctl-crash-"))
+    tmux_mod.set_namespace(data)
+    env = {"WSCTL_DEFAULT_BACKEND": "tmux"}
+    first = spawn(port, data, extra_env=env)
+    second: subprocess.Popen[bytes] | None = None
+    sid = ""
+    try:
+        wait_health(base, first)
+        token = login(base)
+        headers = {"Cookie": f"wsctl_session={token}"}
+        ws_url = base.replace("http", "ws") + "/ws"
+        sid = httpx.post(
+            f"{base}/api/sessions", headers=headers, json={}, timeout=10
+        ).json()["id"]
+
+        with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
+            ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
+            ws.send(b"echo CRASH-MARK\r")
+            assert b"CRASH-MARK" in ws_recv_until(ws, b"CRASH-MARK")
+        assert _wait_tmux(tmux_mod.session_name(sid))
+
+        # SIGKILL: the lease is NOT removed gracefully, unlike a clean shutdown.
+        first.kill()
+        first.wait(timeout=10)
+
+        second = spawn(port, data, extra_env=env)
+        wait_health(base, second)
+        token = login(base)
+        headers = {"Cookie": f"wsctl_session={token}"}
+        sessions = httpx.get(f"{base}/api/sessions", headers=headers, timeout=10).json()
+        assert any(s["id"] == sid for s in sessions), sessions
+
+        with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
+            ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
+            assert b"CRASH-MARK" in ws_recv_until(ws, b"CRASH-MARK"), "screen not restored"
+    finally:
+        if second is not None:
+            stop(second)
+        if sid:
+            subprocess.run(["tmux", "kill-session", "-t", tmux_mod.session_name(sid)],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        tmux_mod.set_namespace(None)
+        shutil.rmtree(data, ignore_errors=True)
+    print("  crash: ok")
+
+
+def scenario_multiplex() -> None:
+    """Two instances sharing one data_dir must never interfere with each other."""
+    port_a = free_port()
+    port_b = free_port()
+    base_a = f"http://127.0.0.1:{port_a}"
+    base_b = f"http://127.0.0.1:{port_b}"
+    data = Path(tempfile.mkdtemp(prefix="wsctl-multi-"))
+    first = spawn(port_a, data)
+    second = spawn(port_b, data)
+    try:
+        wait_health(base_a, first)
+        wait_health(base_b, second)
+        token = login(base_a)
+        headers = {"Cookie": f"wsctl_session={token}"}
+        sid = httpx.post(
+            f"{base_a}/api/sessions", headers=headers, json={"name": "owned-by-a"}, timeout=10
+        ).json()["id"]
+
+        # Let instance B's maintenance loop run at least once (interval is 5s).
+        time.sleep(7)
+
+        conn = sqlite3.connect(data / "wsctl.db")
+        try:
+            row = conn.execute(
+                "SELECT status, instance_id FROM term_sessions WHERE id = ?", (sid,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, "session row missing"
+        assert row[0] == "running", f"peer instance marked our session as {row[0]}"
+        assert row[1], "session row has no owning instance id"
+
+        sessions = httpx.get(f"{base_a}/api/sessions", headers=headers, timeout=10).json()
+        assert any(s["id"] == sid for s in sessions), sessions
+
+        assert httpx.delete(
+            f"{base_a}/api/sessions/{sid}", headers=headers, timeout=10
+        ).status_code == 200
+    finally:
+        stop(first)
+        stop(second)
+        shutil.rmtree(data, ignore_errors=True)
+    print("  multiplex: ok")
 
 
 def scenario_restart() -> None:
@@ -322,6 +426,8 @@ SCENARIOS = {
     "cli": scenario_cli,
     "connect": scenario_connect,
     "tmux": scenario_tmux,
+    "crash": scenario_crash,
+    "multiplex": scenario_multiplex,
     "restart": scenario_restart,
 }
 

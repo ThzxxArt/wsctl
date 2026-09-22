@@ -18,5 +18,5 @@ def test_ws_url_https_with_base() -> None:
 def test_missing_url_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("WSCTL_TOKEN", raising=False)
-    with pytest.raises(ConnectError, match="no server URL"):
+    with pytest.raises(ConnectError, match="缺少服务器地址"):
         run_connect(None, None, None)

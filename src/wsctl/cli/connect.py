@@ -33,7 +33,7 @@ def run_connect(url: str | None, session: str | None, token: str | None) -> None
     creds = load_credentials()
     base = url or (str(creds["url"]) if creds.get("url") else None)
     if not base:
-        raise ConnectError("no server URL: pass <url> or run 'wsctl login <url>' first")
+        raise ConnectError("缺少服务器地址：请传入 <url>，或先运行 'wsctl login <url>'")
     bearer = token or (str(creds["token"]) if creds.get("token") else None)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_run(base, session, bearer))
@@ -59,7 +59,7 @@ def _create_session(base: str, token: str | None) -> str:
     try:
         info = client.request("POST", "/api/sessions", {})
     except ApiError as exc:
-        raise ConnectError(f"cannot create a session: {exc}") from exc
+        raise ConnectError(f"无法创建会话：{exc}") from exc
     return str(info["id"])
 
 
@@ -70,9 +70,9 @@ def _notice(message: str) -> None:
 
 async def _run(base: str, session: str | None, token: str | None) -> None:
     if sys.platform == "win32":
-        raise ConnectError("wsctl connect currently requires a POSIX terminal")
+        raise ConnectError("wsctl connect 目前需要 POSIX 终端")
     if not sys.stdin.isatty():
-        raise ConnectError("wsctl connect requires an interactive terminal")
+        raise ConnectError("wsctl connect 需要交互式终端")
 
     session_id = session or _create_session(base, token)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -81,10 +81,10 @@ async def _run(base: str, session: str | None, token: str | None) -> None:
         ws = await websockets.connect(_ws_url(base), additional_headers=headers, max_size=None)
     except InvalidStatus as exc:
         code = exc.response.status_code
-        hint = " (is the token valid?)" if code in (401, 403) else ""
-        raise ConnectError(f"server rejected the connection: HTTP {code}{hint}") from exc
+        hint = "（令牌是否有效？）" if code in (401, 403) else ""
+        raise ConnectError(f"服务器拒绝连接：HTTP {code}{hint}") from exc
     except OSError as exc:
-        raise ConnectError(f"cannot reach {base}: {exc}") from exc
+        raise ConnectError(f"无法连接 {base}：{exc}") from exc
 
     import termios
     import tty
@@ -136,13 +136,13 @@ async def _run(base: str, session: str | None, token: str | None) -> None:
                     data = json.loads(message)
                     kind = data.get("type")
                     if kind == "exit":
-                        notice = f"session exited (code {data.get('code')})"
+                        notice = f"会话已退出（退出码 {data.get('code')}）"
                         break
                     if kind == "error":
                         notice = str(data.get("msg"))
                         break
             except ConnectionClosed:
-                notice = "connection closed"
+                notice = "连接已关闭"
         finally:
             if send_task is not None:
                 send_task.cancel()

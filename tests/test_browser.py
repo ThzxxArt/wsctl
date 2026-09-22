@@ -98,7 +98,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             # a terminal tab appears and connects
             page.wait_for_selector(".tab", timeout=15000)
             page.wait_for_function(
-                "() => document.getElementById('connection').textContent === 'connected'",
+                "() => document.getElementById('connection').textContent === '已连接'",
                 timeout=15000,
             )
             assert page.locator(".tab").count() == 1
@@ -146,6 +146,24 @@ def test_browser_flow(tmp_path: Path) -> None:
                 "() => document.querySelectorAll('.tab').length === 3", timeout=15000
             )
 
+            # closing a tab detaches (the session must survive on the server)
+            page.click(".term-pane.active .xterm-screen")
+            page.click(".tab.active .close")
+            page.wait_for_function(
+                "() => document.querySelectorAll('.tab').length === 2", timeout=15000
+            )
+            page.click("#sessions-btn")
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_function(
+                "() => document.querySelectorAll('#sessions-list .session-row').length >= 3",
+                timeout=10000,
+            )
+            # reopen the detached session from the session list
+            page.locator("#sessions-list .session-row button:has-text('打开')").first.click()
+            page.wait_for_function(
+                "() => document.querySelectorAll('.tab').length === 3", timeout=15000
+            )
+
             # file panel lists the seed file
             page.click("#files-toggle")
             page.wait_for_selector("#file-list li", timeout=10000)
@@ -168,6 +186,12 @@ def test_browser_flow(tmp_path: Path) -> None:
                 " return i && i.complete && i.naturalWidth > 0; }",
                 timeout=10000,
             )
+            page.click("#share-close")
+
+            # reopening the share dialog must reuse the existing link
+            page.click("#share-btn")
+            page.wait_for_selector("#share-overlay:not(.hidden)", timeout=10000)
+            assert page.input_value("#share-url") == share_url
             page.click("#share-close")
 
             # theme preference applies

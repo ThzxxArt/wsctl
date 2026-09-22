@@ -18,7 +18,7 @@ from typing import Any
 
 from .passwords import hash_password, verify_password
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Verified against when a username does not exist, so login timing does not
 # reveal whether an account is present.
@@ -68,8 +68,17 @@ CREATE TABLE IF NOT EXISTS term_sessions (
     idle_timeout REAL,
     max_life    REAL,
     status      TEXT NOT NULL DEFAULT 'running',
+    instance_id TEXT,
     created_at  REAL NOT NULL,
     last_active REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS instances (
+    id         TEXT PRIMARY KEY,
+    pid        INTEGER,
+    host       TEXT,
+    started_at REAL NOT NULL,
+    heartbeat  REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -84,6 +93,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts);
+CREATE INDEX IF NOT EXISTS idx_term_sessions_status ON term_sessions(status);
 """
 
 
@@ -110,6 +120,7 @@ class Store:
         self._sink: Any = None
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
@@ -139,6 +150,7 @@ class Store:
                 "env": "TEXT",
                 "idle_timeout": "REAL",
                 "max_life": "REAL",
+                "instance_id": "TEXT",
             }
         }
         with self._lock, self._conn:
@@ -150,6 +162,11 @@ class Store:
                 for name, decl in columns.items():
                     if name not in existing:
                         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            # Indexes on migrated columns must be created after the ALTER TABLE.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_term_sessions_instance"
+                " ON term_sessions(instance_id)"
+            )
             self._conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
             )
@@ -339,6 +356,7 @@ class Store:
         idle_timeout: float | None = None,
         max_life: float | None = None,
         status: str = "running",
+        instance_id: str | None = None,
     ) -> None:
         now = time.time()
         argv_json = json.dumps(argv) if argv is not None else None
@@ -347,10 +365,11 @@ class Store:
             self._conn.execute(
                 "INSERT INTO term_sessions"
                 "(id, name, owner_id, backend, command, argv, env, cwd, idle_timeout,"
-                " max_life, status, created_at, last_active)"
-                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " max_life, status, instance_id, created_at, last_active)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET"
-                " name=excluded.name, status=excluded.status, last_active=excluded.last_active",
+                " name=excluded.name, status=excluded.status,"
+                " instance_id=excluded.instance_id, last_active=excluded.last_active",
                 (
                     sid,
                     name,
@@ -363,6 +382,7 @@ class Store:
                     idle_timeout,
                     max_life,
                     status,
+                    instance_id,
                     now,
                     now,
                 ),
@@ -375,20 +395,35 @@ class Store:
                 (status, time.time(), sid),
             )
 
-    def term_session_stop_missing(self, alive_ids: set[str]) -> int:
-        """Mark rows for sessions no longer held in memory as stopped."""
+    def term_session_set_instance(self, sid: str, instance_id: str | None) -> None:
         with self._lock, self._conn:
-            if alive_ids:
-                placeholders = ",".join("?" for _ in alive_ids)
-                cur = self._conn.execute(
-                    f"UPDATE term_sessions SET status = 'stopped'"
-                    f" WHERE status = 'running' AND id NOT IN ({placeholders})",
-                    tuple(alive_ids),
-                )
-            else:
-                cur = self._conn.execute(
-                    "UPDATE term_sessions SET status = 'stopped' WHERE status = 'running'"
-                )
+            self._conn.execute(
+                "UPDATE term_sessions SET instance_id = ? WHERE id = ?", (instance_id, sid)
+            )
+
+    def term_session_stop_missing(
+        self, alive_ids: set[str], *, instance_id: str | None = None
+    ) -> int:
+        """Mark running sessions not held in memory as stopped.
+
+        When ``instance_id`` is given, only rows owned by that instance are
+        considered, so a concurrently running peer (sharing the same data
+        directory via SO_REUSEPORT) never has its live sessions marked stopped.
+        """
+        clauses = ["status = 'running'"]
+        params: list[Any] = []
+        if instance_id is not None:
+            clauses.append("instance_id = ?")
+            params.append(instance_id)
+        if alive_ids:
+            placeholders = ",".join("?" for _ in alive_ids)
+            clauses.append(f"id NOT IN ({placeholders})")
+            params.extend(sorted(alive_ids))
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"UPDATE term_sessions SET status = 'stopped' WHERE {' AND '.join(clauses)}",
+                tuple(params),
+            )
         return cur.rowcount
 
     def term_session_list(self, owner_id: int | None = None) -> list[dict[str, Any]]:
@@ -403,6 +438,84 @@ class Store:
                     (owner_id,),
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    # -- instance leases -----------------------------------------------
+
+    def instance_register(self, instance_id: str, *, pid: int | None = None,
+                          host: str | None = None) -> None:
+        """Register this process and refresh its lease (idempotent)."""
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO instances(id, pid, host, started_at, heartbeat)"
+                " VALUES(?, ?, ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET"
+                " pid=excluded.pid, host=excluded.host, heartbeat=excluded.heartbeat",
+                (instance_id, pid, host, now, now),
+            )
+
+    def instance_heartbeat(self, instance_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE instances SET heartbeat = ? WHERE id = ?", (time.time(), instance_id)
+            )
+
+    def instance_remove(self, instance_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
+
+    def instance_all(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, pid, host, heartbeat FROM instances"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def instance_alive_ids(self, ttl: float) -> set[str]:
+        """Ids whose lease was refreshed within ``ttl`` seconds."""
+        cutoff = time.time() - ttl
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM instances WHERE heartbeat >= ?", (cutoff,)
+            ).fetchall()
+        return {str(row["id"]) for row in rows}
+
+    def instance_dead_ids(self, ttl: float) -> list[str]:
+        """Ids whose lease is older than ``ttl`` seconds."""
+        cutoff = time.time() - ttl
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM instances WHERE heartbeat < ?", (cutoff,)
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def term_sessions_owned_by(self, instance_ids: set[str]) -> list[dict[str, Any]]:
+        """All session rows owned by any of ``instance_ids`` (including stopped)."""
+        if not instance_ids:
+            return []
+        placeholders = ",".join("?" for _ in instance_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM term_sessions WHERE instance_id IN ({placeholders})",
+                tuple(sorted(instance_ids)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- retention -----------------------------------------------------
+
+    def purge_audit(self, before: float) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM audit_logs WHERE ts < ?", (before,))
+        return cur.rowcount
+
+    def purge_term_sessions(self, before: float) -> int:
+        """Delete finished session rows older than ``before`` (never running ones)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM term_sessions WHERE status != 'running' AND created_at < ?",
+                (before,),
+            )
+        return cur.rowcount
 
     # -- settings ------------------------------------------------------
 

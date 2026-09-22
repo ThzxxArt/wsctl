@@ -24,11 +24,19 @@
     shareOverlay: document.getElementById("share-overlay"),
     shareQr: document.getElementById("share-qr"),
     shareWrite: document.getElementById("share-write"),
+    shareTtl: document.getElementById("share-ttl"),
     shareUrl: document.getElementById("share-url"),
     shareCopy: document.getElementById("share-copy"),
+    shareRegenerate: document.getElementById("share-regenerate"),
     shareRevoke: document.getElementById("share-revoke"),
     shareClose: document.getElementById("share-close"),
     shareNote: document.getElementById("share-note"),
+    sessionsBtn: document.getElementById("sessions-btn"),
+    sessionsOverlay: document.getElementById("sessions-overlay"),
+    sessionsList: document.getElementById("sessions-list"),
+    sessionsNew: document.getElementById("sessions-new"),
+    sessionsClose: document.getElementById("sessions-close"),
+    tabMenu: document.getElementById("tab-menu"),
     settingsBtn: document.getElementById("settings-btn"),
     settingsOverlay: document.getElementById("settings-overlay"),
     setTheme: document.getElementById("set-theme"),
@@ -52,9 +60,11 @@
   const DEFAULT_KEYS = {
     new_session: "alt+n",
     close_session: "alt+w",
+    kill_session: "alt+shift+w",
     next_tab: "alt+ArrowRight",
     prev_tab: "alt+ArrowLeft",
     toggle_files: "alt+f",
+    toggle_sessions: "alt+l",
     toggle_settings: "alt+s",
     toggle_share: "alt+h",
   };
@@ -68,6 +78,9 @@
   const sessions = new Map();
   let activeId = null;
   let me = null;
+  let menuSid = null;
+  let menuOpenedAt = 0;
+  let shareSid = null;
 
   const TERM_OPTIONS = {
     cursorBlink: true,
@@ -164,12 +177,12 @@
     for (const s of sessions.values()) {
       s.term.options.fontSize = prefs.fontSize;
       s.term.options.theme = resolveTheme();
-      try { s.fit.fit(); } catch { /* hidden */ }
+      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
     }
     try {
       localStorage.setItem("wsctl-prefs", JSON.stringify(prefs));
     } catch {
-      /* storage unavailable/full: preferences just won't persist */
+      /* 存储不可用：偏好无法持久化 */
     }
   }
 
@@ -192,11 +205,11 @@
     });
     if (res.status === 401) {
       if (!sharedMode) showLogin("请先登录");
-      throw new Error("unauthorized");
+      throw new Error("未授权");
     }
     if (!res.ok) {
       let detail = res.statusText;
-      try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
+      try { detail = (await res.json()).detail || detail; } catch { /* 忽略 */ }
       throw new Error(detail);
     }
     if (res.status === 204) return null;
@@ -227,7 +240,7 @@
 
   function connect(s) {
     s.intentional = false;
-    setConnection("connecting", "");
+    setConnection("连接中", "");
     const ws = new WebSocket(wsUrl(s));
     ws.binaryType = "arraybuffer";
     s.ws = ws;
@@ -235,13 +248,12 @@
     ws.onopen = () => {
       s.delay = 500;
       if (s.everConnected) {
-        // Reconnect: clear the local screen so the server's replay rebuilds it
-        // instead of appending to stale content.
-        try { s.term.reset(); } catch { /* ignore */ }
+        // 重连：清空本地屏幕，由服务端回放重建
+        try { s.term.reset(); } catch { /* 忽略 */ }
       }
       s.everConnected = true;
       markTab(s, "connected");
-      setConnection("connected", "ok");
+      setConnection("已连接", "ok");
       sendControl(s, {
         type: "attach",
         session: s.id,
@@ -275,15 +287,15 @@
     ws.onclose = (event) => {
       if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
       if (event.code === 4401 || event.code === 4403) {
-        setConnection("unauthorized", "bad");
+        setConnection("未授权", "bad");
         if (!sharedMode) showLogin("请先登录");
         return;
       }
-      setConnection(s.intentional ? "idle" : "disconnected", s.intentional ? "" : "bad");
+      setConnection(s.intentional ? "空闲" : "已断开", s.intentional ? "" : "bad");
       if (!s.intentional && !s.exited) scheduleReconnect(s);
     };
 
-    ws.onerror = () => setConnection("error", "bad");
+    ws.onerror = () => setConnection("连接错误", "bad");
   }
 
   function handleControl(s, msg) {
@@ -295,14 +307,14 @@
         if (s.writable === false && !s.tabEl.querySelector(".ro")) {
           const badge = document.createElement("span");
           badge.className = "readonly-badge ro";
-          badge.textContent = "read-only";
+          badge.textContent = "只读";
           s.tabEl.appendChild(badge);
         }
         break;
       case "exit":
         s.exited = true;
         markTab(s, "exited");
-        s.term.write(`\r\n\x1b[33m[wsctl] session exited (code ${msg.code})\x1b[0m\r\n`);
+        s.term.write(`\r\n\x1b[33m[wsctl] 会话已退出（退出码 ${msg.code}）\x1b[0m\r\n`);
         break;
       case "error":
         s.term.write(`\r\n\x1b[31m[wsctl] ${msg.msg}\x1b[0m\r\n`);
@@ -354,7 +366,7 @@
     tabEl.addEventListener("dblclick", async (e) => {
       if (e.target.classList.contains("close")) return;
       e.stopPropagation();
-      const name = window.prompt("Rename session", s.name);
+      const name = window.prompt("重命名会话", s.name);
       if (!name) return;
       try {
         const info = await api("PATCH", `/api/sessions/${id}`, { name });
@@ -366,8 +378,28 @@
     });
     tabEl.querySelector(".close").addEventListener("click", (e) => {
       e.stopPropagation();
-      closeTab(id);
+      detachTab(id);
     });
+    tabEl.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      openTabMenu(e.clientX, e.clientY, id);
+    });
+    // 移动端：长按标签同样弹出菜单
+    let pressTimer = null;
+    const cancelPress = () => {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+    };
+    tabEl.addEventListener("touchstart", (e) => {
+      const touch = e.touches[0];
+      cancelPress();
+      pressTimer = setTimeout(() => {
+        pressTimer = null;
+        openTabMenu(touch.clientX, touch.clientY, id);
+      }, 500);
+    }, { passive: true });
+    tabEl.addEventListener("touchend", cancelPress);
+    tabEl.addEventListener("touchmove", cancelPress);
+    tabEl.addEventListener("touchcancel", cancelPress);
 
     term.onData((data) => {
       if (s.writable === false) return;
@@ -392,13 +424,13 @@
     if (!s) return;
     els.recordBtn.classList.toggle("rec-on", Boolean(s.recording));
     requestAnimationFrame(() => {
-      try { s.fit.fit(); } catch { /* hidden */ }
+      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
       s.term.focus();
       sendControl(s, { type: "resize", cols: s.term.cols, rows: s.term.rows });
     });
   }
 
-  async function closeTab(id) {
+  function detachTab(id) {
     const s = sessions.get(id);
     if (!s) return;
     s.intentional = true;
@@ -409,9 +441,6 @@
     s.pane.remove();
     s.tabEl.remove();
     sessions.delete(id);
-
-    try { await api("DELETE", `/api/sessions/${id}`); } catch { /* already gone */ }
-
     if (activeId === id) {
       const next = sessions.keys().next();
       if (!next.done) activateTab(next.value);
@@ -419,16 +448,51 @@
     }
   }
 
+  async function killTab(id) {
+    detachTab(id);
+    try { await api("DELETE", `/api/sessions/${id}`); } catch { /* 已不存在 */ }
+    if (!els.sessionsOverlay.classList.contains("hidden")) refreshSessions();
+  }
+
+  function openTabMenu(x, y, id) {
+    menuSid = id;
+    menuOpenedAt = Date.now();
+    els.tabMenu.style.left = `${x}px`;
+    els.tabMenu.style.top = `${y}px`;
+    els.tabMenu.classList.remove("hidden");
+  }
+
+  function closeTabMenu() {
+    els.tabMenu.classList.add("hidden");
+    menuSid = null;
+  }
+
+  els.tabMenu.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = menuSid;
+      closeTabMenu();
+      if (!id) return;
+      if (btn.dataset.action === "kill") killTab(id);
+      else detachTab(id);
+    });
+  });
+  // Ignore the click synthesized right after a long-press opened the menu.
+  document.addEventListener("click", () => {
+    if (Date.now() - menuOpenedAt < 350) return;
+    closeTabMenu();
+  });
+
   async function newSession() {
     const info = await api("POST", "/api/sessions", {});
-    createTab(info.id, info.name || "shell", { recording: info.recording });
+    createTab(info.id, info.name || "终端", { recording: info.recording });
     return info;
   }
 
   window.addEventListener("resize", () => {
     const s = activeId && sessions.get(activeId);
     if (s) {
-      try { s.fit.fit(); } catch { /* ignore */ }
+      try { s.fit.fit(); } catch { /* 忽略 */ }
     }
   });
 
@@ -444,7 +508,7 @@
   });
 
   els.logout.addEventListener("click", async () => {
-    try { await api("POST", "/api/logout"); } catch { /* ignore */ }
+    try { await api("POST", "/api/logout"); } catch { /* 忽略 */ }
     location.reload();
   });
 
@@ -471,6 +535,7 @@
         body: JSON.stringify({
           username: document.getElementById("username").value,
           password: document.getElementById("password").value,
+          totp: document.getElementById("totp").value || null,
         }),
       });
       if (!res.ok) { showLogin("用户名或密码错误"); return; }
@@ -485,8 +550,8 @@
     if (sharedMode) {
       document.body.classList.add("shared");
       hideLogin();
-      els.whoami.textContent = "shared (read-only)";
-      createTab(sharedSession, "shared", { share: shareToken, writable: false });
+      els.whoami.textContent = "共享（只读）";
+      createTab(sharedSession, "共享会话", { share: shareToken, writable: false });
       return;
     }
     try {
@@ -494,7 +559,8 @@
     } catch {
       return;
     }
-    els.whoami.textContent = `${me.username} (${me.role})`;
+    const roleText = me.role === "admin" ? "管理员" : "用户";
+    els.whoami.textContent = `${me.username}（${roleText}）`;
     hideLogin();
     try {
       const list = await api("GET", "/api/sessions");
@@ -508,28 +574,42 @@
     }
   }
 
-  // -- sharing ---------------------------------------------------------
+  // -- 分享 -------------------------------------------------------------
 
   function showShareNote(text) {
     els.shareNote.textContent = text;
     els.shareNote.classList.remove("hidden");
   }
 
+  function renderShare(sid, token) {
+    els.shareUrl.value =
+      `${location.origin}/?session=${sid}&share=${encodeURIComponent(token)}`;
+    els.shareQr.src =
+      `/api/sessions/${sid}/qr.svg?origin=${encodeURIComponent(location.origin)}&t=${Date.now()}`;
+  }
+
   async function openShare() {
     const s = activeId && sessions.get(activeId);
     if (!s) {
-      setConnection("no active session", "bad");
+      setConnection("没有活动会话", "bad");
       return;
     }
     shareSid = s.id;
+    els.shareNote.classList.add("hidden");
     try {
-      const info = await api("POST", `/api/sessions/${s.id}/share`, {
-        writable: els.shareWrite.checked,
-      });
-      els.shareUrl.value =
-        `${location.origin}/?session=${s.id}&share=${encodeURIComponent(info.token)}`;
-      els.shareQr.src = `/api/sessions/${s.id}/qr.svg?origin=${encodeURIComponent(location.origin)}`;
-      els.shareNote.classList.add("hidden");
+      const existing = await api("GET", `/api/sessions/${s.id}/share`);
+      if (existing.shared) {
+        // 复用已有链接，避免静默作废之前发出的链接。
+        els.shareWrite.checked = Boolean(existing.writable);
+        renderShare(s.id, existing.token);
+        showShareNote("已复用现有分享链接；修改选项后请点“生成新链接”");
+      } else {
+        const info = await api("POST", `/api/sessions/${s.id}/share`, {
+          writable: els.shareWrite.checked,
+          ttl: els.shareTtl.value ? Number(els.shareTtl.value) : null,
+        });
+        renderShare(s.id, info.token);
+      }
       els.shareOverlay.classList.remove("hidden");
     } catch (err) {
       setConnection(String(err.message || err), "bad");
@@ -541,10 +621,24 @@
   els.shareCopy.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(els.shareUrl.value);
-      showShareNote("copied to clipboard");
+      showShareNote("已复制到剪贴板");
     } catch {
       els.shareUrl.select();
       document.execCommand("copy");
+    }
+  });
+  els.shareRegenerate.addEventListener("click", async () => {
+    if (!shareSid) return;
+    if (!window.confirm("生成新链接会立即使旧链接失效，是否继续？")) return;
+    try {
+      const info = await api("POST", `/api/sessions/${shareSid}/share`, {
+        writable: els.shareWrite.checked,
+        ttl: els.shareTtl.value ? Number(els.shareTtl.value) : null,
+      });
+      renderShare(shareSid, info.token);
+      showShareNote("已生成新链接，旧链接已失效");
+    } catch (err) {
+      showShareNote(String(err.message || err));
     }
   });
   els.shareRevoke.addEventListener("click", async () => {
@@ -557,16 +651,87 @@
     }
   });
 
-  // -- recording -------------------------------------------------------
+  // -- 会话列表 ---------------------------------------------------------
+
+  async function refreshSessions() {
+    let list;
+    try {
+      list = await api("GET", "/api/sessions");
+    } catch (err) {
+      setConnection(String(err.message || err), "bad");
+      return;
+    }
+    els.sessionsList.innerHTML = "";
+    if (!list.length) {
+      els.sessionsList.innerHTML = '<li class="fmeta">暂无会话</li>';
+      return;
+    }
+    for (const info of list) {
+      const li = document.createElement("li");
+      li.className = "session-row";
+
+      const label = document.createElement("span");
+      label.className = "session-name";
+      const tags = [];
+      tags.push(`${info.clients} 个连接`);
+      if (info.backend && info.backend !== "local") tags.push(info.backend);
+      if (info.shared) tags.push("已分享");
+      if (info.recording) tags.push("录制中");
+      label.textContent = info.name;
+      label.title = `${info.name} · ${tags.join(" · ")}`;
+
+      const meta = document.createElement("span");
+      meta.className = "session-meta";
+      meta.textContent = tags.join(" · ");
+
+      const openBtn = document.createElement("button");
+      openBtn.className = "text-btn";
+      openBtn.textContent = sessions.has(info.id) ? "切换" : "打开";
+      openBtn.addEventListener("click", () => {
+        if (sessions.has(info.id)) activateTab(info.id);
+        else createTab(info.id, info.name, { recording: info.recording });
+        els.sessionsOverlay.classList.add("hidden");
+      });
+
+      const killBtn = document.createElement("button");
+      killBtn.className = "text-btn";
+      killBtn.textContent = "终止";
+      killBtn.addEventListener("click", async () => {
+        if (sessions.has(info.id)) {
+          await killTab(info.id);
+        } else {
+          try { await api("DELETE", `/api/sessions/${info.id}`); } catch { /* 忽略 */ }
+          refreshSessions();
+        }
+      });
+
+      li.append(label, meta, openBtn, killBtn);
+      els.sessionsList.appendChild(li);
+    }
+  }
+
+  function toggleSessions() {
+    const hidden = els.sessionsOverlay.classList.toggle("hidden");
+    if (!hidden) refreshSessions();
+  }
+
+  els.sessionsBtn.addEventListener("click", toggleSessions);
+  els.sessionsClose.addEventListener("click", () => els.sessionsOverlay.classList.add("hidden"));
+  els.sessionsNew.addEventListener("click", () => {
+    newSession()
+      .then(() => els.sessionsOverlay.classList.add("hidden"))
+      .catch((err) => setConnection(String(err.message || err), "bad"));
+  });
+
+  // -- 录制 -------------------------------------------------------------
 
   let replayBlobUrl = null;
   let replayPlayer = null;
-  let shareSid = null;
 
   els.recordBtn.addEventListener("click", async () => {
     const s = activeId && sessions.get(activeId);
     if (!s) {
-      setConnection("no active session", "bad");
+      setConnection("没有活动会话", "bad");
       return;
     }
     try {
@@ -593,7 +758,7 @@
     try {
       const res = await fetch(`/api/sessions/${s.id}/recording`);
       if (!res.ok) {
-        els.replayNote.textContent = "no recording for this session";
+        els.replayNote.textContent = "该会话没有录制";
         els.replayNote.classList.remove("hidden");
         return;
       }
@@ -607,7 +772,7 @@
           controls: true,
         });
       } else {
-        els.replayNote.textContent = "player not available";
+        els.replayNote.textContent = "播放器不可用";
         els.replayNote.classList.remove("hidden");
       }
     } catch (err) {
@@ -620,7 +785,7 @@
     els.replayOverlay.classList.add("hidden");
     els.replayHost.innerHTML = "";
     if (replayPlayer && replayPlayer.dispose) {
-      try { replayPlayer.dispose(); } catch { /* ignore */ }
+      try { replayPlayer.dispose(); } catch { /* 忽略 */ }
     }
     replayPlayer = null;
     if (replayBlobUrl) {
@@ -629,7 +794,7 @@
     }
   });
 
-  // -- zmodem (sz/rz file transfer) ------------------------------------
+  // -- ZMODEM（sz/rz 文件传输）-----------------------------------------
 
   function makeSentry(s) {
     if (!window.Zmodem) return null;
@@ -656,7 +821,7 @@
       s.zmodemActive = false;
     };
     if (zsession.type === "send") {
-      // we send files to the remote (rz)
+      // 我们把文件发给远端（rz）
       const picker = document.createElement("input");
       picker.type = "file";
       picker.multiple = true;
@@ -667,7 +832,7 @@
       });
       picker.click();
     } else {
-      // the remote sends files to us (sz)
+      // 远端把文件发给我们（sz）
       zsession.on("offer", (xfer) => {
         const name = xfer.get_details().name;
         const payload = [];
@@ -692,7 +857,7 @@
     }
   });
 
-  // -- preferences -----------------------------------------------------
+  // -- 偏好与快捷键 -----------------------------------------------------
 
   function runAction(action) {
     switch (action) {
@@ -700,7 +865,10 @@
         newSession().catch(() => {});
         break;
       case "close_session":
-        if (activeId) closeTab(activeId);
+        if (activeId) detachTab(activeId);
+        break;
+      case "kill_session":
+        if (activeId) killTab(activeId);
         break;
       case "next_tab":
       case "prev_tab": {
@@ -716,6 +884,9 @@
         if (!hidden) loadFiles(filePath);
         break;
       }
+      case "toggle_sessions":
+        toggleSessions();
+        break;
       case "toggle_settings":
         els.settingsOverlay.classList.toggle("hidden");
         break;
@@ -759,13 +930,15 @@
   );
 
   const HOTKEY_LABELS = {
-    new_session: "new session",
-    close_session: "close session",
-    next_tab: "next tab",
-    prev_tab: "previous tab",
-    toggle_files: "toggle files",
-    toggle_settings: "toggle settings",
-    toggle_share: "share session",
+    new_session: "新建会话",
+    close_session: "关闭标签（保持会话）",
+    kill_session: "终止会话",
+    next_tab: "下一个标签",
+    prev_tab: "上一个标签",
+    toggle_files: "文件面板",
+    toggle_sessions: "会话列表",
+    toggle_settings: "设置",
+    toggle_share: "分享会话",
   };
 
   function renderHotkeys() {
@@ -827,7 +1000,7 @@
       applyPrefs();
       renderThemeGallery();
     } catch {
-      setConnection("invalid theme JSON", "bad");
+      setConnection("主题 JSON 无效", "bad");
     }
   });
   renderThemeGallery();
@@ -847,7 +1020,7 @@
   });
   applyPrefs();
 
-  // -- file panel ------------------------------------------------------
+  // -- 文件面板 ---------------------------------------------------------
 
   let filePath = "";
 
@@ -869,7 +1042,7 @@
   function renderCrumbs(path) {
     const parts = path ? path.split("/") : [];
     let acc = "";
-    let html = '<button data-path="">root</button>';
+    let html = '<button data-path="">根目录</button>';
     for (const part of parts) {
       acc = acc ? `${acc}/${part}` : part;
       html += ` / <button data-path="${escapeHtml(acc)}">${escapeHtml(part)}</button>`;
@@ -882,13 +1055,13 @@
 
   async function loadFiles(path) {
     filePath = path || "";
-    els.fileStatus.textContent = "loading...";
+    els.fileStatus.textContent = "加载中…";
     try {
       const data = await api("GET", `/api/files?path=${encodeURIComponent(filePath)}`);
       renderCrumbs(filePath);
       els.fileList.innerHTML = "";
       if (!data.entries.length) {
-        els.fileList.innerHTML = '<li class="fmeta">empty</li>';
+        els.fileList.innerHTML = '<li class="fmeta">空目录</li>';
       }
       for (const entry of data.entries) {
         const li = document.createElement("li");
@@ -905,7 +1078,7 @@
         });
         els.fileList.appendChild(li);
       }
-      els.fileStatus.textContent = `${data.entries.length} items`;
+      els.fileStatus.textContent = `${data.entries.length} 项`;
     } catch (err) {
       els.fileStatus.textContent = String(err.message || err);
     }
@@ -918,19 +1091,19 @@
         const form = new FormData();
         form.append("path", filePath);
         form.append("file", file);
-        els.fileStatus.textContent = `uploading ${file.name}...`;
+        els.fileStatus.textContent = `正在上传 ${file.name}…`;
         const res = await fetch("/api/files/upload", { method: "POST", body: form });
         if (!res.ok) {
           let detail = res.statusText;
-          try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
-          els.fileStatus.textContent = `failed: ${detail}`;
+          try { detail = (await res.json()).detail || detail; } catch { /* 忽略 */ }
+          els.fileStatus.textContent = `失败：${detail}`;
           return;
         }
       }
-      els.fileStatus.textContent = "upload complete";
+      els.fileStatus.textContent = "上传完成";
       await loadFiles(filePath);
     } catch (err) {
-      els.fileStatus.textContent = `failed: ${err.message || err}`;
+      els.fileStatus.textContent = `失败：${err.message || err}`;
     }
   }
 

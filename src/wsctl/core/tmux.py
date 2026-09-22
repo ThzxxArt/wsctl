@@ -11,14 +11,38 @@ tmux is optional: nothing here is used unless a session requests this backend.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
+from pathlib import Path
 
 PREFIX = "wsctl-"
+
+# Optional per-data-directory namespace so that two wsctl deployments on the
+# same host (sharing one tmux server) never see or reap each other's sessions.
+_namespace = ""
 
 
 class TmuxError(RuntimeError):
     """Raised when tmux is required but unavailable or misbehaving."""
+
+
+def set_namespace(value: str | Path | None) -> None:
+    """Bind tmux session names to a data directory (call once at startup)."""
+    global _namespace
+    if not value:
+        _namespace = ""
+        return
+    digest = hashlib.sha1(str(Path(value).resolve()).encode("utf-8")).hexdigest()
+    _namespace = digest[:8]
+
+
+def namespace() -> str:
+    return _namespace
+
+
+def _prefix() -> str:
+    return f"{PREFIX}{_namespace}-" if _namespace else PREFIX
 
 
 def tmux_path() -> str | None:
@@ -30,7 +54,17 @@ def is_available() -> bool:
 
 
 def session_name(sid: str) -> str:
-    return f"{PREFIX}{sid}"
+    return f"{_prefix()}{sid}"
+
+
+def owns(name: str) -> bool:
+    """Whether ``name`` belongs to this deployment's namespace."""
+    return name.startswith(_prefix())
+
+
+def sid_from_name(name: str) -> str:
+    prefix = _prefix()
+    return name[len(prefix):] if name.startswith(prefix) else ""
 
 
 def wrap_argv(name: str, argv: list[str]) -> list[str]:

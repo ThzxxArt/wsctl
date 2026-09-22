@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.0 · 状态：已发布（0.1.0）
+> 版本：0.1.1 · 状态：0.1.0 已发布；0.1.1 待发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -77,6 +77,24 @@ tmux 客户端；真正的 shell 活在 tmux server 内。于是：
 
 tmux 为可选的系统依赖（需在主机安装，非 pip 依赖），默认路径不依赖它。
 
+### 3.2 多实例与实例租约
+
+`--reuse-port` 让新旧实例短暂共享同一 `data_dir`。为了让两个实例互不干扰：
+
+- 每个进程启动时生成一个 `instance_id`，写入 `instances` 表并每 5 秒续约；
+  `instance_ttl`（默认 30 秒）内没有续约的实例被视为已死。
+- `term_sessions.instance_id` 记录会话归属。维护循环调用
+  `term_session_stop_missing(alive, instance_id=自己)`，**只**把本实例内存中已不存在的
+  运行中会话标记为 stopped，绝不触碰仍存活的另一实例的会话。
+- 启动时只接管「归属实例已死」的会话：tmux 会话重新 attach，local 会话标记 stopped；
+  属于存活对端的会话原样跳过。
+- 对账（`_reconcile_instances`）在启动**以及每个维护周期**运行：先按本机 PID 存活
+  情况立即清除崩溃实例的租约（无需等 `instance_ttl`），再收养无主的 tmux 会话、回收
+  无主的 local 会话。因此对端一退出，会话立刻被接管，而非等到下次重启。
+- tmux 会话名带 `data_dir` 派生的命名空间（`wsctl-<ns8>-<sid>`），因此同机、不同
+  data_dir 的两个部署即使共用同一个 tmux server 也不会互相看到或误杀。
+- 启动引导（创建 admin）容忍并发唯一约束冲突，避免多实例同时首启崩溃。
+
 ## 4. WebSocket 协议
 
 三端（浏览器 / CLI 瘦客户端）共用同一协议：**二进制帧承载原始终端字节**，
@@ -116,15 +134,19 @@ users(id, username, password_hash, role[admin|user], totp_secret, disabled, crea
 auth_sessions(id, user_id, token_hash, ip, user_agent, exp, last_seen)   -- 登录态
 
 term_sessions(id, name, owner_id, backend[local|tmux|ssh], command, argv, env,
-              cwd, idle_timeout, max_life, status, created_at, last_active)
+              cwd, idle_timeout, max_life, status, instance_id, created_at, last_active)
+
+instances(id, pid, host, started_at, heartbeat)          -- 多实例租约
 
 audit_logs(id, user_id, term_session_id, event, payload, ip, ts)
 
 settings(key, value)
 ```
 
-> 命名约定：`auth_sessions` 指**登录态**，`term_sessions` 指**终端会话**。
-> 模式版本 2；旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补齐新列。
+> 命名约定：`auth_sessions` 指**登录态**，`term_sessions` 指**终端会话**，
+> `instances` 指**服务进程租约**。
+> 模式版本 3；旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补齐新列，且索引
+> 在列补齐之后创建（否则升级旧库会因列不存在而失败）。
 
 ## 6. CLI 命令树（已实现）
 
@@ -132,14 +154,15 @@ settings(key, value)
 wsctl serve                     # 起控制面，默认配置开箱即用
 wsctl serve --new "bash"        # 启动时顺带开一个会话
 wsctl serve --backend tmux      # 默认使用 tmux 后端（跨重启恢复）
-wsctl session list|new|kill|attach   # new 支持 --backend local|tmux|ssh
+wsctl doctor                    # 环境与配置自检
+wsctl session list|new|rename|kill|attach   # new 支持 --backend local|tmux|ssh
 wsctl session record|record-stop|recording
 wsctl connect [url] [-s id]     # 瘦客户端：本地 raw 终端直连
 wsctl login|logout              # 缓存/清除服务端凭据
-wsctl user add|list|del|passwd|role|totp
+wsctl user add|list|del|passwd|role|disable|enable|totp
 wsctl audit                     # 查看审计日志（admin）
 wsctl config show|path|edit|set|reload
-wsctl version
+wsctl version / --version
 ```
 
 > `config set` 写入配置文件（校验 TOML），`config reload` 让运行中的服务热加载。
@@ -216,8 +239,10 @@ pyotp  segno  websockets
 | **M18** | 每会话内存硬上限 + 每客户端字节上限 |
 | **M19** | Sixel 图像渲染（addon-image）+ 可选 ZMODEM 传输（zmodem.js） |
 | **M20** | 终端主题市场（10 内置主题 + 自定义 JSON 主题） |
+| **M21** | 0.1.1 加固：多实例租约 + tmux 命名空间隔离、资源保留策略与每用户配额、attach 失败泄漏修复、schema 迁移顺序修复、限速器内存回收、全中文 UI、CLI 增强（doctor / --version / session rename / user disable|enable / config set 校验）、systemd 与 nginx 示例 |
+| **M22** | 0.1.1 测试：实例租约/保留/配额/分享复用单测 + e2e `multiplex` 场景 + 浏览器 detach/分享复用用例 |
 
-## 10.1 实现状态（截至 0.1.0）
+## 10.1 实现状态（截至 0.1.1）
 
 **已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
@@ -232,9 +257,13 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 **尚未实现**：无。唯一验证缺口：ZMODEM 的真实 `rz`/`sz` 传输未在 CI 端到端跑通
 （环境无 lrzsz），仅验证了集成不破坏常规终端 I/O。
 
-> 回归测试：`scripts/e2e/run_all.py` 提供 5 个后端端到端场景（server / CLI /
-> connect / tmux 重启恢复 / SO_REUSEPORT 优雅重启）；`pytest -m browser` 为浏览器级
-> 测试；`pytest -m slow` 为并发/大输出压测。CI 在独立 job 中运行浏览器测试。
+> 0.1.1 起，关闭标签默认只断开连接（detach），终止会话需显式操作（右键菜单 /
+> 会话列表 / `Alt+Shift+W`），与「会话独立于连接」的核心承诺一致。
+
+> 回归测试：`scripts/e2e/run_all.py` 提供 6 个后端端到端场景（server / CLI /
+> connect / tmux 重启恢复 / **multiplex 多实例隔离** / SO_REUSEPORT 优雅重启）；
+> `pytest -m browser` 为浏览器级测试；`pytest -m slow` 为并发/大输出压测。
+> CI 在独立 job 中运行浏览器测试。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
@@ -242,8 +271,8 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 
 ## 11. Backlog（后续）
 
-无（v0.1.0 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
-更多终端协议（Kitty graphics 等）。
+无（v0.1.1 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
+每用户后端策略（命令级权限隔离）、i18n 框架、更多终端协议（Kitty graphics 等）。
 
 ## 12. 发布
 
