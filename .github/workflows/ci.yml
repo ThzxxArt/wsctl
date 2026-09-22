@@ -55,7 +55,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[win]"
+          pip install -e ".[win,dev]"
       - name: Import smoke
         run: python -c "import wsctl, wsctl.core.pty, wsctl.core.store, wsctl.cli.main; print(wsctl.__version__)"
       - name: CLI smoke
