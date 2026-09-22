@@ -23,6 +23,12 @@ READ_SIZE = 65536
 MAX_WRITE_BUFFER = 1024 * 1024
 MAX_DIMENSION = 65535
 
+#: Default signal for "ask the child to wind down". ``signal.SIGHUP`` does not
+#: exist on Windows, and a bare ``sig: int = signal.SIGHUP`` annotation default
+#: is evaluated at *definition* time -- which would make ``import wsctl.core.pty``
+#: fail outright there. Resolve it once, at import, to something that exists.
+DEFAULT_TERM_SIGNAL: int = getattr(signal, "SIGHUP", signal.SIGTERM)
+
 # Process-wide, monotonic count of dropped write() calls. Summed per-session
 # counters would go *down* when a session ends, which is wrong for a metric
 # named ``_total`` (Prometheus ``rate()`` would see resets).
@@ -68,7 +74,7 @@ class Pty(Protocol):
         """
         ...
 
-    def terminate(self, sig: int = signal.SIGHUP) -> None:
+    def terminate(self, sig: int = DEFAULT_TERM_SIGNAL) -> None:
         ...
 
     def kill(self) -> None:
@@ -222,7 +228,7 @@ class PosixPty:
     def wait(self, timeout: float | None = None) -> int:
         return self._proc.wait(timeout=timeout)
 
-    def terminate(self, sig: int = signal.SIGHUP) -> None:
+    def terminate(self, sig: int = DEFAULT_TERM_SIGNAL) -> None:
         if self._proc.poll() is not None:
             return
         with contextlib.suppress(ProcessLookupError, PermissionError):

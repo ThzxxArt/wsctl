@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
-import signal
 import subprocess
 import time
 from collections.abc import Callable
@@ -20,7 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from . import tmux
-from .pty import Pty, create_pty
+from .pty import DEFAULT_TERM_SIGNAL, Pty, create_pty
 from .recording import Recorder
 from .scrollback import DEFAULT_MAX_BYTES, Scrollback
 
@@ -428,7 +427,7 @@ class TermSession:
         if self._tmux_name is not None and not preserve:
             await tmux.kill_session_async(self._tmux_name)
         if sig is None:
-            sig = signal.SIGHUP
+            sig = DEFAULT_TERM_SIGNAL
         if self._tmux_name is not None and preserve:
             # Detach the client without signalling its process group, so a
             # freshly forked tmux server is not caught by the signal.

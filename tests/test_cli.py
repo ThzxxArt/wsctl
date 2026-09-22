@@ -306,13 +306,20 @@ def test_login_env_var_supplies_the_totp(tmp_path: Path, monkeypatch: object) ->
     assert seen["totp"] == "111222"
 
 
-def test_session_list_json_is_machine_readable(monkeypatch: object) -> None:
+def test_session_list_json_is_machine_readable(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    # Hermetic: a real ~/.config/wsctl/credentials.json on the developer's
+    # machine must not be able to make this pass (it did, and the test then
+    # failed on a clean CI runner).
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.delenv("WSCTL_TOKEN", raising=False)  # type: ignore[attr-defined]
     rows = [{"id": "abc", "name": "build", "pid": 1, "clients": 0,
              "owner": "alice", "backend": "tmux", "alive": True}]
     monkeypatch.setattr(  # type: ignore[attr-defined]
         "wsctl.cli.client.ApiClient", lambda *a, **k: _fake_api_client(rows)
     )
-    result = runner.invoke(app, ["session", "list", "--json"])
+    result = runner.invoke(app, ["session", "list", "--json", "--url", "http://127.0.0.1:1"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload[0]["owner"] == "alice"

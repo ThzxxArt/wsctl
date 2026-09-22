@@ -322,21 +322,29 @@ def test_browser_flow(tmp_path: Path) -> None:
             # inline rename dialog (double-click the tab label, not the close button)
             page.dblclick(".tab.active .label")
             page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=5000)
+            page.wait_for_selector("#rename-input", state="visible", timeout=5000)
             page.fill("#rename-input", "重命名标签")
-            with page.expect_response(
-                lambda r: r.request.method == "PATCH" and "/api/sessions/" in r.url,
-                timeout=10000,
-            ) as rename_response:
-                page.click("#rename-form button[type=submit]")
-            assert rename_response.value.status == 200, rename_response.value.status
+            page.click("#rename-form button[type=submit]")
             page.wait_for_selector("#rename-overlay.hidden", state="attached", timeout=5000)
-            page.wait_for_function(
-                "() => document.querySelector('.tab.active .label').textContent === '重命名标签'",
-                timeout=10000,
-            )
-            # The rename must also stick on the server, not just on the label:
-            # a stale `attached` control message used to revert the tab and the
-            # round trip could send the *old* name back.
+            # Assert the *outcome*, not the request that produced it: binding to
+            # "a PATCH must be in flight while this context manager is open" is
+            # timing-sensitive and went green on a fast box while failing on CI.
+            # A stale `attached` message used to revert the label, and the round
+            # trip could even send the *old* name back, so both ends are checked.
+            try:
+                page.wait_for_function(
+                    "() => document.querySelector('.tab.active .label')"
+                    ".textContent === '重命名标签'",
+                    timeout=30000,
+                )
+            except Exception:
+                print("RENAME-DEBUG labels=", page.evaluate(
+                    "() => [...document.querySelectorAll('.tab')].map(t => "
+                    "({cls: t.className, label: t.querySelector('.label').textContent}))"))
+                print("RENAME-DEBUG sessions=", page.evaluate(
+                    "async () => (await (await fetch('/api/sessions')).json())"
+                    ".map(s => ({id: s.id, name: s.name}))"))
+                raise
             renamed = [
                 s for s in httpx.get(
                     f"{BASE}/api/sessions", headers=_headers_from(page), timeout=10

@@ -6,12 +6,11 @@ Only imported on Windows; install with ``pip install "wsctl[win]"``.
 from __future__ import annotations
 
 import asyncio
-import signal
 import subprocess
 import time
 from typing import Any
 
-from .pty import PtyError
+from .pty import DEFAULT_TERM_SIGNAL, PtyError
 
 
 def _load_pywinpty() -> Any:
@@ -80,7 +79,7 @@ class WinPty:  # pragma: no cover - platform specific
             time.sleep(0.05)
         return self._proc.exitstatus or 0
 
-    def terminate(self, sig: int = signal.SIGHUP) -> None:
+    def terminate(self, sig: int = DEFAULT_TERM_SIGNAL) -> None:
         if self._proc.isalive():
             self._proc.terminate()
 
