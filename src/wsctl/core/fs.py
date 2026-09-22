@@ -73,7 +73,13 @@ def list_dir(
 
 
 def relative_to(root: Path, path: Path) -> str:
+    """``path`` as a POSIX-style relative path, or ``""`` if it escapes ``root``.
+
+    Always uses ``/`` regardless of platform: these strings end up in audit
+    payloads and share links, and ``a\\b.txt`` on one host versus ``a/b.txt``
+    on another makes the trail needlessly hard to correlate.
+    """
     try:
-        return str(path.resolve().relative_to(root.resolve()))
+        return path.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         return ""
