@@ -143,3 +143,46 @@ def test_instance_to_dict_includes_uptime(tmp_path: Path) -> None:
     payload = instance.to_dict()
     assert payload["pid"] == 1
     assert float(payload["uptime"]) > 0  # type: ignore[arg-type]
+
+
+def test_child_env_tells_the_child_where_to_log(tmp_path: Path) -> None:
+    """Without WSCTL_LOG_FILE the in-process rotator never engages."""
+    settings = settings_for(tmp_path)
+    env = daemon.child_env(settings)
+    assert env["WSCTL_DAEMON"] == "1"
+    assert env["WSCTL_LOG_FILE"] == str(daemon.logfile_path(settings))
+
+
+def test_log_history_spans_rotated_backups(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    live = daemon.logfile_path(settings)
+    live.parent.mkdir(parents=True, exist_ok=True)
+    for index in (3, 2, 1):
+        live.with_name(f"{live.name}.{index}").write_text(f"old{index}\n", encoding="utf-8")
+    live.write_text("live\n", encoding="utf-8")
+
+    paths = daemon.log_history_paths(settings)
+    # Oldest backup first, live file last: a rotation must not hide history.
+    assert [p.name for p in paths] == [
+        f"{live.name}.3", f"{live.name}.2", f"{live.name}.1", live.name,
+    ]
+
+
+def test_log_history_without_backups_is_just_the_live_file(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    live = daemon.logfile_path(settings)
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text("live\n", encoding="utf-8")
+    assert daemon.log_history_paths(settings) == [live]
+
+
+def test_tail_log_reads_across_a_rotation(tmp_path: Path, capsys: object) -> None:
+    settings = settings_for(tmp_path)
+    live = daemon.logfile_path(settings)
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.with_name(f"{live.name}.1").write_text("first\nsecond\n", encoding="utf-8")
+    live.write_text("third\nfourth\n", encoding="utf-8")
+
+    daemon.tail_log(settings, lines=3)
+    out = capsys.readouterr().out  # type: ignore[attr-defined]
+    assert out.splitlines() == ["second", "third", "fourth"]

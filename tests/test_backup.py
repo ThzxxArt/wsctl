@@ -14,8 +14,8 @@ from wsctl.core.store import Store
 
 def _make_store(path: Path) -> Store:
     store = Store(path)
-    store.user_create("alice", "pw", role="admin")
-    store.user_create("bob", "pw")
+    store.user_create("alice", "password123", role="admin")
+    store.user_create("bob", "password123")
     return store
 
 

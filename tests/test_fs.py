@@ -29,7 +29,12 @@ def test_safe_resolve_rejects_symlink_escape(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside-target"
     outside.mkdir(exist_ok=True)
     link = tmp_path / "link"
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - Windows
+        # Creating a symlink needs SeCreateSymbolicLinkPrivilege (or Developer
+        # Mode) on Windows; the guard itself is POSIX-hardening, so skip there.
+        pytest.skip(f"symlinks unavailable here: {exc}")
     with pytest.raises(FsError):
         safe_resolve(tmp_path, "link")
 
@@ -38,10 +43,19 @@ def test_list_dir_sorted_dirs_first(tmp_path: Path) -> None:
     (tmp_path / "z.txt").write_text("z")
     (tmp_path / "sub").mkdir()
     (tmp_path / "a.txt").write_text("a")
-    entries = list_dir(tmp_path, "")
+    entries, truncated = list_dir(tmp_path, "")
     names = [e["name"] for e in entries]
     assert names[0] == "sub"
     assert set(names) == {"sub", "a.txt", "z.txt"}
+    assert truncated is False
+
+
+def test_list_dir_truncates_over_the_limit(tmp_path: Path) -> None:
+    for index in range(10):
+        (tmp_path / f"f{index:02d}.txt").write_text("x")
+    entries, truncated = list_dir(tmp_path, "", limit=4)
+    assert len(entries) == 4
+    assert truncated is True
 
 
 def test_list_dir_not_a_directory(tmp_path: Path) -> None:

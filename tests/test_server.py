@@ -16,8 +16,8 @@ from wsctl.core.session import SessionManager
 from wsctl.core.store import Store
 from wsctl.server.app import create_app
 
-ADMIN = ("admin", "adminpw")
-BOB = ("bob", "bobpw")
+ADMIN = ("admin", "adminpw123")
+BOB = ("bob", "bobpw1234")
 
 
 def build_app(
@@ -137,7 +137,7 @@ def test_login_rate_limited(tmp_path: Path) -> None:
         assert "retry-after" in {k.lower() for k in blocked.headers}
         # correct credentials are refused while the key is blocked
         assert client.post(
-            "/api/login", json={"username": "admin", "password": "adminpw"}
+            "/api/login", json={"username": "admin", "password": "adminpw123"}
         ).status_code == 429
 
 
@@ -147,7 +147,7 @@ def test_successful_login_resets_limit(tmp_path: Path) -> None:
         for _ in range(2):
             client.post("/api/login", json={"username": "admin", "password": "bad"})
         assert client.post(
-            "/api/login", json={"username": "admin", "password": "adminpw"}
+            "/api/login", json={"username": "admin", "password": "adminpw123"}
         ).status_code == 200
         for _ in range(2):
             assert client.post(
@@ -173,16 +173,16 @@ def test_totp_login_flow(tmp_path: Path) -> None:
 
         # no code provided
         assert client.post(
-            "/api/login", json={"username": "admin", "password": "adminpw"}
+            "/api/login", json={"username": "admin", "password": "adminpw123"}
         ).status_code == 401
         # wrong code
         assert client.post(
-            "/api/login", json={"username": "admin", "password": "adminpw", "totp": "000000"}
+            "/api/login", json={"username": "admin", "password": "adminpw123", "totp": "000000"}
         ).status_code == 401
         # valid code
         code = pyotp.TOTP(secret).now()
         assert client.post(
-            "/api/login", json={"username": "admin", "password": "adminpw", "totp": code}
+            "/api/login", json={"username": "admin", "password": "adminpw123", "totp": code}
         ).status_code == 200
 
 
@@ -308,6 +308,33 @@ def _recv_control(ws: object, wanted: set[str], timeout: float = 5.0) -> dict[st
     return None
 
 
+async def test_pty_write_reports_drops_when_the_child_stops_reading() -> None:
+    """The write path must say "dropped" instead of pretending it worked."""
+    import asyncio
+    import contextlib
+    import os
+    import signal
+
+    from wsctl.core.pty import MAX_WRITE_BUFFER, PosixPty
+
+    pty = PosixPty(["/bin/sh"], cols=80, rows=24, loop=asyncio.get_running_loop())
+    pid = pty.pid
+    try:
+        # Stop the shell so it stops draining its terminal. The kernel PTY buffer
+        # absorbs some bytes, so write well past the application-level cap.
+        os.killpg(os.getpgid(pid), signal.SIGSTOP)
+        assert pty.write(b"x" * (MAX_WRITE_BUFFER * 3)) is True
+        assert pty.dropped_input == 0
+        assert pty.write(b"more") is False  # buffer is now over the cap
+        assert pty.dropped_input == 1
+        assert pty.write(b"and more") is False
+        assert pty.dropped_input == 2
+    finally:
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        pty.close()
+
+
 def test_session_max_clients_enforced(tmp_path: Path) -> None:
     app = build_app(tmp_path, session_max_clients=1)
     with TestClient(app) as client:
@@ -403,7 +430,7 @@ def test_startup_restores_tmux_session(tmp_path: Path) -> None:
         assert tmux.has_session(name), "tmux session did not become visible"
         settings = load_settings(data_dir=tmp_path, auth_required=True, default_shell="/bin/sh")
         store = Store(tmp_path / "test.db")
-        store.user_create("admin", "adminpw", role="admin")
+        store.user_create("admin", "adminpw123", role="admin")
         store.term_session_upsert(sid, name="restored", owner_id=None, backend="tmux")
         app = create_app(settings, store=store, manager=SessionManager())
         with TestClient(app) as client:
@@ -616,7 +643,7 @@ def test_upload_rejects_symlink(tmp_path: Path) -> None:
 def test_duplicate_user_conflict(tmp_path: Path) -> None:
     with TestClient(build_app(tmp_path)) as client:
         login(client, ADMIN)
-        r = client.post("/api/users", json={"username": "admin", "password": "x"})
+        r = client.post("/api/users", json={"username": "admin", "password": "password123"})
         assert r.status_code == 409
 
 
@@ -815,10 +842,10 @@ def test_cannot_disable_self(tmp_path: Path) -> None:
 def test_update_user_password(tmp_path: Path) -> None:
     with TestClient(build_app(tmp_path)) as client:
         login(client, ADMIN)
-        assert client.patch("/api/users/bob", json={"password": "newpw"}).status_code == 200
+        assert client.patch("/api/users/bob", json={"password": "newpw1234"}).status_code == 200
         client.post("/api/logout")
         assert client.post(
-            "/api/login", json={"username": "bob", "password": "newpw"}
+            "/api/login", json={"username": "bob", "password": "newpw1234"}
         ).status_code == 200
 
 
@@ -983,14 +1010,170 @@ def test_ws_bad_dimensions_closes_4400(tmp_path: Path) -> None:
 
 def test_password_change_revokes_other_sessions(tmp_path: Path) -> None:
     with TestClient(build_app(tmp_path)) as client:
-        client.post("/api/login", json={"username": "bob", "password": "bobpw"})
+        client.post("/api/login", json={"username": "bob", "password": "bobpw1234"})
         bob_token = client.cookies.get("wsctl_session")
         assert bob_token
         client.cookies.clear()
 
         login(client, ADMIN)
-        assert client.patch("/api/users/bob", json={"password": "newpw"}).status_code == 200
+        assert client.patch("/api/users/bob", json={"password": "newpw1234"}).status_code == 200
 
         client.cookies.clear()
         client.cookies.set("wsctl_session", bob_token)
         assert client.get("/api/me").status_code == 401
+
+
+# -- 0.1.4: policy, persistence, overwrite, config surface ----------------
+
+
+def test_password_policy_is_enforced_over_the_api(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.post(
+            "/api/users", json={"username": "weak", "password": ""}
+        ).status_code == 400
+        assert client.post(
+            "/api/users", json={"username": "weak", "password": "short"}
+        ).status_code == 400
+        assert client.post(
+            "/api/users", json={"username": "ok", "password": "password123"}
+        ).status_code == 201
+        assert client.patch(
+            "/api/users/ok", json={"password": "short"}
+        ).status_code == 400
+
+
+def test_share_is_persisted_and_survives_a_restart(tmp_path: Path) -> None:
+    """The share token lives in the database, not only in the session object."""
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={"backend": "tmux"}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": False, "ttl": 3600}
+        ).json()["token"]
+        rows = app.state.store.term_session_list()  # type: ignore[attr-defined]
+        row = next(r for r in rows if r["id"] == sid)
+        assert row["share_token"] == token
+        assert row["share_writable"] == 0
+        assert row["share_expires"] is not None
+
+        # A rename must not silently invalidate the distributed link.
+        client.patch(f"/api/sessions/{sid}", json={"name": "renamed"})
+        rows = app.state.store.term_session_list()  # type: ignore[attr-defined]
+        row = next(r for r in rows if r["id"] == sid)
+        assert row["share_token"] == token
+
+        client.delete(f"/api/sessions/{sid}/share")
+        rows = app.state.store.term_session_list()  # type: ignore[attr-defined]
+        row = next(r for r in rows if r["id"] == sid)
+        assert row["share_token"] is None
+        client.delete(f"/api/sessions/{sid}")
+
+
+def test_upload_refuses_to_clobber_without_overwrite(tmp_path: Path) -> None:
+    app = build_app(tmp_path, file_root=tmp_path)
+    (tmp_path / "exists.txt").write_text("original")
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.post(
+            "/api/files/upload",
+            data={"path": ""},
+            files={"file": ("exists.txt", b"replacement")},
+        )
+        assert r.status_code == 409
+        assert (tmp_path / "exists.txt").read_text() == "original"
+
+        r = client.post(
+            "/api/files/upload",
+            data={"path": "", "overwrite": "1"},
+            files={"file": ("exists.txt", b"replacement")},
+        )
+        assert r.status_code == 201
+        assert (tmp_path / "exists.txt").read_bytes() == b"replacement"
+
+
+def test_file_listing_reports_truncation(tmp_path: Path) -> None:
+    from wsctl.core import fs as fs_mod
+
+    app = build_app(tmp_path, file_root=tmp_path)
+    original = fs_mod.DEFAULT_LIST_LIMIT
+    fs_mod.DEFAULT_LIST_LIMIT = 3
+    try:
+        for index in range(6):
+            (tmp_path / f"f{index}.txt").write_text("x")
+        with TestClient(app) as client:
+            login(client, ADMIN)
+            data = client.get("/api/files").json()
+            assert data["truncated"] is True
+            assert len(data["entries"]) == 3
+            assert data["limit"] == 3
+    finally:
+        fs_mod.DEFAULT_LIST_LIMIT = original
+
+
+def test_config_endpoint_lists_hot_and_restart_fields(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        data = client.get("/api/config").json()
+        kinds = {f["key"]: f["kind"] for f in data["fields"]}
+        assert kinds["max_sessions"] == "hot"
+        assert kinds["port"] == "restart"
+        assert data["config_path"]
+        assert data["data_dir"]
+
+
+def test_config_endpoint_is_admin_only(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, BOB)
+        assert client.get("/api/config").status_code == 403
+
+
+def test_config_reload_surfaces_errors(tmp_path: Path) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("max_sessions = 7\n", encoding="utf-8")
+    app = build_app(tmp_path, config_path=config)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        ok = client.post("/api/config/reload").json()
+        assert ok["errors"] == []
+        assert "max_sessions" in ok["changed"]
+
+        # A broken edit is reported instead of silently ignored.
+        config.write_text('max_sessions = "not-an-int"\n', encoding="utf-8")
+        bad = client.post("/api/config/reload").json()
+        assert bad["changed"] == []
+        assert bad["errors"]
+        assert app.state.settings.max_sessions == 7  # type: ignore[attr-defined]
+
+
+def test_session_list_includes_owner_name(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        info = next(s for s in client.get("/api/sessions").json() if s["id"] == sid)
+        assert info["owner"] == "admin"
+        client.delete(f"/api/sessions/{sid}")
+
+
+def test_ws_input_backpressure_reports_the_drop(tmp_path: Path) -> None:
+    """A dropped keystroke must be reported, not silently vanish."""
+    from wsctl.core.session import TermSession
+
+    # Deterministic: the shell drains stdin too quickly to fill the real buffer,
+    # so stand in for "the child stopped reading".
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(TermSession, "write_input", lambda self, data: False)
+        with TestClient(build_app(tmp_path)) as client:
+            login(client, ADMIN)
+            sid = client.post("/api/sessions", json={}).json()["id"]
+            with client.websocket_connect("/ws") as ws:
+                ws.send_text(
+                    json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24})
+                )
+                assert _recv_control(ws, {"attached"}) is not None
+                ws.send_text(json.dumps({"type": "input", "data": "0123456789"}))
+                err = _recv_control(ws, {"error"})
+                assert err is not None and "丢弃" in str(err["msg"])
+            client.delete(f"/api/sessions/{sid}")

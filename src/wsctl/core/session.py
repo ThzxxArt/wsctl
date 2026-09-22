@@ -12,6 +12,7 @@ import asyncio
 import os
 import secrets
 import signal
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +23,11 @@ from . import tmux
 from .pty import Pty, create_pty
 from .recording import Recorder
 from .scrollback import DEFAULT_MAX_BYTES, Scrollback
+
+#: How long ``_finalize`` waits for the child before escalating to ``kill``.
+FINALIZE_WAIT_TIMEOUT = 3.0
+#: How long it waits after ``kill`` before giving up and reporting exit code -1.
+FINALIZE_KILL_TIMEOUT = 2.0
 
 
 class ClientGone(Exception):
@@ -137,6 +143,11 @@ class TermSession:
     @property
     def is_alive(self) -> bool:
         return not self.closed and self._pty.poll() is None
+
+    @property
+    def dropped_input(self) -> int:
+        """Write calls dropped because the child stopped draining its terminal."""
+        return int(getattr(self._pty, "dropped_input", 0))
 
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
@@ -258,9 +269,26 @@ class TermSession:
             self._share_expires is None or time.time() < self._share_expires
         )
 
+    @property
+    def share_expiry(self) -> float | None:
+        return self._share_expires
+
     def peek_share(self) -> str | None:
         """Return the active share token, or ``None`` if not shared."""
         return self._share_token if self.is_shared else None
+
+    def restore_share(
+        self, token: str | None, expires: float | None, writable: bool
+    ) -> None:
+        """Rehydrate a share link persisted before a restart.
+
+        The token is restored verbatim (not rotated) so a link that was already
+        handed out keeps working across a server restart -- the same promise
+        the session itself makes on the tmux backend.
+        """
+        self._share_token = token or None
+        self._share_expires = expires
+        self._share_writable = bool(writable)
 
     # -- recording -----------------------------------------------------
 
@@ -291,13 +319,19 @@ class TermSession:
 
     # -- I/O -----------------------------------------------------------
 
-    def write_input(self, data: bytes) -> None:
+    def write_input(self, data: bytes) -> bool:
+        """Forward input to the child.
+
+        Returns ``False`` when the input was dropped because the child stopped
+        draining its terminal, so the caller can tell the user instead of
+        leaving them with a keyboard that appears dead.
+        """
         if self.closed:
-            return
+            return False
         self.last_active = time.time()
         if self._recorder is not None and self._record_input:
             self._recorder.input(data)
-        self._pty.write(data)
+        return self._pty.write(data)
 
     def resize(self, cols: int, rows: int) -> None:
         if self.closed:
@@ -359,8 +393,17 @@ class TermSession:
         await self.stop_recording()
         code = self._pty.poll()
         if code is None:
+            # A bounded wait: a child that outlives its terminal (for example a
+            # daemonized grandchild still holding the slave open) would make an
+            # unbounded ``wait()`` hang forever and leak this session object.
             try:
-                code = await self._loop.run_in_executor(None, self._pty.wait)
+                code = await asyncio.to_thread(self._pty.wait, FINALIZE_WAIT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._pty.kill()
+                    code = await asyncio.to_thread(self._pty.wait, FINALIZE_KILL_TIMEOUT)
+                except Exception:
+                    code = -1
             except Exception:
                 code = -1
         self.exit_code = code if code is not None else -1

@@ -13,15 +13,25 @@ session can run commands as the server's user. Treat it like SSH:
 ## Built-in protections
 
 - Argon2 password hashing and server-side session tokens (HttpOnly cookies)
-- Optional TOTP two-factor authentication
+- **Minimum password policy** (non-empty, at least 8 characters), enforced in
+  one shared validator at the storage boundary so the HTTP API and the CLI
+  cannot disagree. Existing accounts are not force-changed; `wsctl doctor`
+  reports which ones are below the bar rather than locking anyone out
+- Optional TOTP two-factor authentication (available from both the web UI and
+  the CLI — `wsctl login --totp` / `WSCTL_TOTP`)
 - Login rate limiting per IP + username (`429` + `Retry-After`)
 - CIDR IP allowlist for HTTP and WebSocket
 - Origin allowlist on WebSocket handshakes (anti-CSWSH)
 - Traversal-proof file panel rooted at a configurable directory
 - Upload size limits and session count/idle/lifetime limits
+- Uploads never silently replace an existing file: a name collision is refused
+  (`409`) unless the client explicitly opts in to overwriting
 - Full audit log of logins, sessions, file transfers and admin actions
 - Security response headers (nosniff, frame DENY, referrer policy, CSP)
-- Bounded resources: audit/session/recording retention, per-user session quotas
+- Bounded resources: audit/session/recording retention, per-user session quotas,
+  bounded directory listings, bounded per-client and per-session buffers
+- A dropped keystroke is reported rather than silently discarded, so input
+  backpressure cannot masquerade as a dead terminal
 - Optional authentication on `/metrics` (`metrics_require_auth`)
 - Multi-instance leases so a peer sharing the data directory can never reconcile
   or reap another instance's sessions
@@ -33,11 +43,25 @@ session can run commands as the server's user. Treat it like SSH:
   that try to escape the data directory
 - The background lifecycle verifies a process-identity fingerprint before
   signalling a PID, so it never kills an unrelated process that reused the PID
+- Log rotation uses copy-and-truncate, so the daemon's inherited append-mode
+  descriptor keeps writing to the live file across a rotation
+- Share links are unguessable, optionally time-limited, revocable, and refused
+  input when read-only. They are persisted alongside the session (schema v4), so
+  a link keeps working across a server restart — the same promise the session
+  itself makes. A rename never invalidates a distributed link.
 
 ## Supported versions
 
 Only the latest release is supported with security fixes while the project is
 pre-1.0.
+
+## Upgrading and downgrading
+
+Schema migrations are idempotent and run automatically at startup. Before
+**downgrading** to an older release, take a backup (`wsctl backup`) — a newer
+release may have written columns the older one does not know about (0.1.4 added
+`term_sessions.share_token` / `share_expires` / `share_writable` so share links
+survive a restart).
 
 ## Reporting a vulnerability
 

@@ -143,6 +143,42 @@
     </div>
   </div>
 
+  <div id="new-session-overlay" class="overlay hidden">
+    <form id="new-session-form" class="modal-card">
+      <div class="modal-head">
+        <h2>新建会话</h2>
+        <button type="button" id="new-session-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
+      </div>
+      <p class="hint">全部留空即创建默认 shell 会话。快捷键 <b>Alt+N</b> 可跳过本对话框直接创建。</p>
+      <label>名称<input id="ns-name" placeholder="留空自动命名" autocomplete="off" /></label>
+      <label>命令<input id="ns-command" placeholder="留空使用默认 shell，例如 htop" autocomplete="off" /></label>
+      <label>工作目录<input id="ns-cwd" placeholder="留空使用默认目录" autocomplete="off" /></label>
+      <label>后端
+        <select id="ns-backend">
+          <option value="local">local（服务退出即结束）</option>
+          <option value="tmux">tmux（跨重启恢复）</option>
+          <option value="ssh">ssh（跳板到远程主机）</option>
+        </select>
+      </label>
+      <div id="ns-ssh-block" class="ssh-block hidden">
+        <div class="section-title">SSH 目标</div>
+        <label>主机<input id="ns-ssh-host" placeholder="example.com" autocomplete="off" /></label>
+        <div class="field-row">
+          <label>用户名<input id="ns-ssh-user" placeholder="留空用当前用户" autocomplete="off" /></label>
+          <label>端口<input id="ns-ssh-port" placeholder="22" inputmode="numeric" autocomplete="off" /></label>
+        </div>
+        <label>私钥文件<input id="ns-ssh-identity" placeholder="~/.ssh/id_ed25519" autocomplete="off" /></label>
+        <label>额外 ssh -o 选项（每行一条）<textarea id="ns-ssh-options" rows="2" placeholder="StrictHostKeyChecking=accept-new"></textarea></label>
+      </div>
+      <p id="new-session-error" class="error hidden"></p>
+      <div class="modal-actions">
+        <button type="button" id="new-session-cancel">取消</button>
+        <button type="button" id="new-session-quick">快速创建默认会话</button>
+        <button type="submit" class="primary">创建</button>
+      </div>
+    </form>
+  </div>
+
   <div id="admin-overlay" class="overlay hidden">
     <div class="modal-card wide tall">
       <div class="modal-head">
@@ -153,6 +189,7 @@
         <button class="tab2 active" data-tab="users">用户</button>
         <button class="tab2" data-tab="audit">审计</button>
         <button class="tab2" data-tab="recordings">录制</button>
+        <button class="tab2" data-tab="config">配置</button>
       </div>
       <div id="admin-body" class="admin-body"></div>
       <p id="admin-note" class="error hidden"></p>

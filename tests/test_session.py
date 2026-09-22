@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -297,3 +298,140 @@ async def test_within_user_quota() -> None:
         assert within_user_quota(manager, 1, 99)
     finally:
         await manager.shutdown()
+
+
+async def test_restore_share_survives_without_rotation() -> None:
+    """A persisted share is rehydrated verbatim, so an issued link keeps working."""
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        session.restore_share("restored-token", None, True)
+        assert session.peek_share() == "restored-token"
+        assert session.share_access("restored-token") == "write"
+        assert session.share_writable is True
+    finally:
+        await manager.shutdown()
+
+
+async def test_restore_share_respects_expiry() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        session.restore_share("stale", time.time() - 1, False)
+        assert session.peek_share() is None
+        assert session.share_access("stale") is None
+    finally:
+        await manager.shutdown()
+
+
+async def test_restore_share_clears_when_absent() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    try:
+        session.create_share()
+        session.restore_share(None, None, False)
+        assert session.peek_share() is None
+        assert not session.is_shared
+    finally:
+        await manager.shutdown()
+
+
+class StuckChildPty:
+    """A PTY whose child never exits, to prove finalize cannot hang."""
+
+    pid = 12345
+    killed = False
+
+    def __init__(self) -> None:
+        self._closed = False
+
+    async def read(self) -> bytes:
+        await asyncio.sleep(3600)
+        return b""
+
+    def write(self, data: bytes) -> bool:
+        return True
+
+    def resize(self, cols: int, rows: int) -> None:
+        return None
+
+    def poll(self) -> int | None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.killed:
+            return -9
+        if timeout is None:
+            raise AssertionError("wait() must be called with a timeout")
+        import time as _time
+
+        _time.sleep(min(timeout, 0.05))
+        raise __import__("subprocess").TimeoutExpired(self.pid, timeout)
+
+    def terminate(self, sig: int = 0) -> None:
+        return None
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def close(self) -> None:
+        self._closed = True
+
+
+async def test_finalize_does_not_hang_on_a_stuck_child() -> None:
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="sh", argv=[SHELL]))
+    stuck = StuckChildPty()
+    session._pty = stuck  # type: ignore[attr-defined]
+    session._read_task.cancel()
+    try:
+        await asyncio.wait_for(session._finalize(), timeout=5.0)
+    except TimeoutError as exc:
+        raise AssertionError("_finalize hung waiting for a stuck child") from exc
+    assert session.closed
+    assert session.exit_code == -9  # escalated to kill()
+    assert stuck.killed
+
+
+async def test_stop_missing_with_a_stale_snapshot_is_a_trap() -> None:
+    """Document the sharp edge ``_maintenance_db_tick`` deliberately avoids.
+
+    ``term_session_stop_missing`` reads "not in this set" as "dead". If the
+    snapshot and the UPDATE are separated by an ``await`` (or a thread hop),
+    a session created in between is marked ``stopped`` while it is running --
+    and would never be adopted again after a restart.
+
+    The first half proves the hazard is real; the second half is the pattern
+    the maintenance loop uses to stay correct. Keep both.
+    """
+    from wsctl.core.store import Store
+
+    db = Path(os.environ.get("TMPDIR", "/tmp")) / f"wsctl-race-{os.getpid()}.db"
+    store = Store(db)
+    manager = SessionManager()
+    try:
+        first = await manager.create(SessionSpec(name="a", argv=[SHELL]))
+        store.term_session_upsert(first.id, name="a", owner_id=None, instance_id="me")
+
+        stale = {s.id for s in manager.list_sessions()}  # snapshot taken here
+        second = await manager.create(SessionSpec(name="b", argv=[SHELL]))
+        store.term_session_upsert(second.id, name="b", owner_id=None, instance_id="me")
+
+        # (1) Using the stale snapshot wrongly kills `b`. This is what moving
+        # the UPDATE onto a worker thread without re-snapshotting would do.
+        store.term_session_stop_missing(stale, instance_id="me")
+        rows = {r["id"]: r["status"] for r in store.term_session_list()}
+        assert rows[second.id] == "stopped", "expected the stale snapshot to mis-kill `b`"
+
+        # (2) The maintenance loop re-takes the snapshot in the same
+        # synchronous stretch as the UPDATE, so nothing is mis-killed.
+        store.term_session_set_status(second.id, "running")
+        fresh = {s.id for s in manager.list_sessions()}
+        store.term_session_stop_missing(fresh, instance_id="me")
+        rows = {r["id"]: r["status"] for r in store.term_session_list()}
+        assert rows[first.id] == "running"
+        assert rows[second.id] == "running"
+    finally:
+        await manager.shutdown()
+        store.close()
+        Path(store.path).unlink(missing_ok=True)

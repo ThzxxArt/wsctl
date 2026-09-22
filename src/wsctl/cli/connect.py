@@ -148,7 +148,14 @@ async def _recv_loop(
             if isinstance(message, bytes):
                 os.write(sys.stdout.fileno(), message)
                 continue
-            data = json.loads(message)
+            # A proxy or middlebox can inject non-JSON text frames; ignoring
+            # them keeps the terminal alive instead of tearing the link down.
+            try:
+                data = json.loads(message)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
             kind = data.get("type")
             if kind == "exit":
                 return f"会话已退出（退出码 {data.get('code')}）", 1000, True

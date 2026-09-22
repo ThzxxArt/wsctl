@@ -1,12 +1,19 @@
 # wsctl docker-compose 示例
 #
-#   WSCTL_ADMIN_PASSWORD='change-me' docker compose -f contrib/docker/docker-compose.yml up -d
+#   WSCTL_ADMIN_PASSWORD='改成你的强密码' \
+#     docker compose -f contrib/docker/docker-compose.yml up -d
+#
+# 必须显式设置 WSCTL_ADMIN_PASSWORD：默认值会让示例「开箱即被登录」，
+# 因此这里用 `${VAR:?...}` 在缺省时直接报错退出。
 #
 # 生产环境请置于 TLS 反向代理之后，并设置 WSCTL_TRUST_PROXY=true、
 # WSCTL_COOKIE_SECURE=true（见 contrib/nginx/wsctl.conf）。
 services:
   wsctl:
-    build: .
+    # 构建上下文是**仓库根**，确保装到的是本地源码。
+    build:
+      context: ../..
+      dockerfile: contrib/docker/Dockerfile
     image: wsctl:latest
     ports:
       - "127.0.0.1:7681:7681"
@@ -17,12 +24,8 @@ services:
       WSCTL_FILE_ROOT: /data
       WSCTL_HOST: 0.0.0.0
       WSCTL_PORT: "7681"
+      WSCTL_ADMIN_PASSWORD: ${WSCTL_ADMIN_PASSWORD:?请设置环境变量 WSCTL_ADMIN_PASSWORD}
       # 位于反向代理后时开启
       WSCTL_TRUST_PROXY: "false"
       WSCTL_COOKIE_SECURE: "false"
-    command:
-      - wsctl
-      - serve
-      - --admin-password
-      - ${WSCTL_ADMIN_PASSWORD:-change-me}
     restart: unless-stopped

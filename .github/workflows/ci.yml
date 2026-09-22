@@ -8,12 +8,18 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        include:
+          # One macOS leg: catches POSIX assumptions that Linux hides
+          # (process identity, /proc lookups, path handling).
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,7 +29,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-          sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
       - name: Lint
         run: ruff check .
       - name: Type check
@@ -31,9 +42,11 @@ jobs:
       - name: Test
         run: pytest
 
-  browser:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  windows-smoke:
+    # The Windows PTY backend is opt-in (wsctl[win]) and untested end to end, but
+    # the package must at least import and the CLI must run there.
+    runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,14 +55,33 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,e2e]"
-          playwright install --with-deps chromium
-      - name: Browser tests
-        run: pytest -m browser -q
+          pip install -e ".[win]"
+      - name: Import smoke
+        run: python -c "import wsctl, wsctl.core.pty, wsctl.core.store, wsctl.cli.main; print(wsctl.__version__)"
+      - name: CLI smoke
+        run: |
+          wsctl --version
+          wsctl doctor
+      - name: Platform-neutral unit tests
+        # NOT the whole suite: `test_server` / `test_session` / `test_load`
+        # spawn `/bin/sh`, `test_pty` needs `/proc`, `test_daemon` is POSIX-only
+        # and `test_tmux` needs tmux. Those are covered by the Linux/macOS
+        # matrix above; this job only proves the package works at all on
+        # Windows.
+        run: >-
+          pytest -q --timeout=90
+          tests/test_passwords.py tests/test_authcache.py tests/test_config.py
+          tests/test_validate.py tests/test_metrics.py tests/test_scrollback.py
+          tests/test_fs.py tests/test_ratelimit.py tests/test_totp.py
+          tests/test_ssh.py tests/test_recording.py tests/test_logrotate.py
+          tests/test_store.py tests/test_user_admin.py tests/test_client.py
+          tests/test_connect.py
 
-  e2e:
+  slow:
+    # Concurrency / large-output load checks. Kept separate so a slow runner
+    # cannot make the main matrix look flaky.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -59,6 +91,54 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-          sudo apt-get update && sudo apt-get install -y tmux
+      - name: Load tests
+        run: pytest -m slow -q --timeout=180
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,e2e]"
+          # lrzsz powers the real sz/rz round-trip in the browser suite.
+          sudo apt-get update && sudo apt-get install -y tmux lrzsz
+          playwright install --with-deps chromium
+      - name: Browser tests
+        run: pytest -m browser -q --timeout=180
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          sudo apt-get update && sudo apt-get install -y tmux lrzsz
       - name: Backend end-to-end scenarios
         run: python scripts/e2e/run_all.py
+
+  docker:
+    # The image must build from the repo root and install the *local* source,
+    # not whatever PyPI currently serves.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t wsctl:ci -f contrib/docker/Dockerfile .
+      - name: Smoke the image
+        run: |
+          docker run --rm wsctl:ci version
+          docker run --rm -e WSCTL_ADMIN_PASSWORD=ci-password-123 \
+            -v "$PWD/ci-data:/data" wsctl:ci doctor

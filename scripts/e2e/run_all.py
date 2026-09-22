@@ -39,6 +39,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
+import pyotp
 from websockets.sync.client import connect
 
 from wsctl.core import tmux as tmux_mod
@@ -64,8 +65,15 @@ def spawn(port: int, data: Path, *, extra_env: dict[str, str] | None = None,
            "--admin-password", PASSWORD, "--log-level", "warning"]
     if reuse_port:
         cmd.append("--reuse-port")
+    # Keep the child's output in a per-port log so a startup failure can be
+    # diagnosed instead of showing only "server exited early".
+    log_path = data / f"server-{port}.log"
+    SERVER_LOGS[port] = log_path
+    # Deliberately not closed here: the descriptor is inherited by the child and
+    # must stay open for the whole life of the server.
+    log = open(log_path, "ab")  # noqa: SIM115
     return subprocess.Popen(cmd, cwd=str(ROOT), env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                            stdout=log, stderr=subprocess.STDOUT)
 
 
 def stop(proc: subprocess.Popen[bytes]) -> None:
@@ -77,12 +85,31 @@ def stop(proc: subprocess.Popen[bytes]) -> None:
             proc.kill()
 
 
+SERVER_LOGS: dict[int, Path] = {}
+
+
+def _server_log_tail(port: int) -> str:
+    path = SERVER_LOGS.get(port)
+    if path is None or not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-2000:]
+    except OSError:
+        return ""
+
+
 def wait_health(base: str, proc: subprocess.Popen[bytes] | None = None,
                 timeout: float = 20.0) -> None:
+    try:
+        port = int(base.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        port = -1
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc is not None and proc.poll() is not None:
-            raise SystemExit(f"server exited early ({proc.returncode})")
+            raise SystemExit(
+                f"server exited early ({proc.returncode})\n{_server_log_tail(port)}"
+            )
         try:
             if httpx.get(f"{base}/healthz", timeout=1).status_code == 200:
                 return
@@ -187,8 +214,14 @@ def scenario_server() -> None:
 def scenario_cli() -> None:
     conf = Path(tempfile.mkdtemp(prefix="wsctl-conf-"))
     try:
-        with server() as (base, _, _):
-            env = {**os.environ, "XDG_CONFIG_HOME": str(conf)}
+        with server() as (base, data, _):
+            # `wsctl user` talks to the local store, so it must be pointed at the
+            # same data directory the server under test is using.
+            env = {
+                **os.environ,
+                "XDG_CONFIG_HOME": str(conf),
+                "WSCTL_DATA_DIR": str(data),
+            }
 
             def run(*args: str) -> str:
                 r = subprocess.run([PY, "-m", "wsctl", *args], cwd=str(ROOT), env=env,
@@ -201,6 +234,39 @@ def scenario_cli() -> None:
             sid = out.split("已创建会话")[1].split()[0].split("（")[0]
             assert "clitest" in run("session", "list")
             run("session", "kill", sid)
+
+            # --json must be machine-readable.
+            run("session", "new", "--command", "sleep 30", "--name", "jsoncase", "--json")
+            payload = json.loads(run("session", "list", "--json"))
+            names = {row["name"] for row in payload}
+            assert "jsoncase" in names, payload
+            json_sid = next(row["id"] for row in payload if row["name"] == "jsoncase")
+            run("session", "kill", json_sid)
+
+            # A two-factor account must still be usable from the CLI (0.1.3
+            # lock-out regression): enable 2FA over the API, then log in with
+            # a computed code.
+            run("user", "add", "totpuser", "-p", PASSWORD)
+            admin = login(base)
+            info = httpx.post(
+                f"{base}/api/users/totpuser/totp",
+                headers={"Cookie": f"wsctl_session={admin}"},
+                timeout=10,
+            )
+            assert info.status_code == 200, info.text
+            secret = info.json()["secret"]
+            code = pyotp.TOTP(secret).now()
+
+            run("logout")
+            no_code = subprocess.run(
+                [PY, "-m", "wsctl", "login", base, "-u", "totpuser", "-p", PASSWORD],
+                cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=30,
+            )
+            assert no_code.returncode != 0, "2FA account logged in without a code"
+            assert "验证码" in (no_code.stdout + no_code.stderr)
+
+            run("login", base, "-u", "totpuser", "-p", PASSWORD, "--totp", code)
+            run("session", "list")
     finally:
         shutil.rmtree(conf, ignore_errors=True)
     print("  cli: ok")
@@ -257,6 +323,7 @@ def scenario_tmux() -> None:
     env = {"WSCTL_DEFAULT_BACKEND": "tmux"}
     first = spawn(port, data, extra_env=env)
     second: subprocess.Popen[bytes] | None = None
+    sid = ""
     try:
         wait_health(base, first)
         token = login(base)
@@ -272,6 +339,12 @@ def scenario_tmux() -> None:
         assert _wait_tmux(name(sid)), (
             "tmux session missing while the server is running: " + " ".join(_tmux_ls())
         )
+        share = httpx.post(
+            f"{base}/api/sessions/{sid}/share", headers=headers, json={}, timeout=10
+        )
+        assert share.status_code == 200, share.text
+        share_token = share.json()["token"]
+
         stop(first)  # graceful: preserves the tmux session
         if not _wait_tmux(name(sid)):
             raise AssertionError(
@@ -288,11 +361,25 @@ def scenario_tmux() -> None:
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
             assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK"), "screen not restored"
+
+        # A share link must outlive the restart it was created before. The
+        # anonymous viewer authenticates with the token in the query string,
+        # exactly like the browser share link.
+        share_url = f"{ws_url}?share={share_token}"
+        with connect(share_url, open_timeout=10) as ws:
+            ws.send(json.dumps({
+                "type": "attach", "session": sid, "share": share_token,
+                "cols": 100, "rows": 30,
+            }))
+            assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK"), (
+                "share link did not survive the restart"
+            )
     finally:
         if second is not None:
             stop(second)
-        subprocess.run(["tmux", "kill-session", "-t", name(sid)],
-                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if sid:
+            subprocess.run(["tmux", "kill-session", "-t", name(sid)],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tmux_mod.set_namespace(None)
         shutil.rmtree(data, ignore_errors=True)
     print("  tmux: ok")

@@ -54,7 +54,7 @@ CLI (wsctl connect)┘             │
 - **连接自愈**：前端与 `wsctl connect` 断线自动重连并回放屏幕；服务端回收半开连接。
 - **跨重启恢复（可选 tmux 后端）**：shell 跑在 tmux 里，服务重启后自动重新挂载。
 - **多用户 + RBAC**：`admin` 管理全部；普通用户仅限自己的会话。
-- **分享**：只读/可写分享链接，带二维码、可设有效期、可撤销。
+- **分享**：只读/可写分享链接，带二维码、可设有效期、可撤销，**跨服务重启依然有效**。
 - **SSH 会话**：会话直接是到远程主机的 `ssh` 连接。
 - **文件面板**：在可配置根目录内浏览、下载、上传（含拖拽）。
 - **录制与回放**：asciinema cast 录制，浏览器内回放。
@@ -66,6 +66,8 @@ CLI (wsctl connect)┘             │
 - **零停机重启**：`SO_REUSEPORT` 让新实例先接管端口再停旧实例。
 - **配置热更新**：大部分配置改动无需重启，`wsctl reload` 可主动触发。
 - **参数强校验**：互斥/依赖参数在启动前报错，绝不静默忽略其一。
+- **配置写错必报错**：热重载遇到非法值会原样打印错误并退出非零，绝不静默吞掉。
+- **密码策略**：新建/改密强制非空且至少 8 位（存量密码不强制修改，`doctor` 会提示）。
 - **Web 管理面**：浏览器内管理用户（含 TOTP 二维码）、审计日志、录制文件。
 - **全中文界面**：Web UI 与 CLI 输出均为中文。
 
@@ -152,14 +154,25 @@ python3.11 -m venv /opt/wsctl/venv
 ### 方式四：Docker
 
 仓库内提供 [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) 与
-[`contrib/docker/docker-compose.yml`](contrib/docker/docker-compose.yml)：
+[`contrib/docker/docker-compose.yml`](contrib/docker/docker-compose.yml)。
+
+> **必须在仓库根目录构建**（`-f contrib/docker/Dockerfile .`）：构建上下文是仓库根，
+> 这样装进去的是**本地源码**；在 `contrib/docker` 目录里构建只会装到 PyPI 上的旧版。
 
 ```bash
-docker build -t wsctl contrib/docker
+# 方式一：docker build
+docker build -t wsctl -f contrib/docker/Dockerfile .
 docker run -d --name wsctl --restart unless-stopped \
-  -p 127.0.0.1:7681:7681 -v "$PWD/data:/data" wsctl \
-  wsctl serve --admin-password '改成你的强密码'
+  -p 127.0.0.1:7681:7681 -v "$PWD/data:/data" \
+  -e WSCTL_ADMIN_PASSWORD='改成你的强密码' wsctl
+
+# 方式二：docker compose（密码必须显式给出，否则直接报错退出）
+cd contrib/docker
+WSCTL_ADMIN_PASSWORD='改成你的强密码' docker compose up -d
 ```
+
+镜像自带 `tmux`、`openssh-client`、`lrzsz`，因此 tmux 后端、SSH 后端与 ZMODEM
+传输开箱可用。不给 `WSCTL_ADMIN_PASSWORD` 时，首次启动会生成随机密码并打印在日志里。
 
 ### 方式五：从源码
 
@@ -173,12 +186,13 @@ pip install ".[dev]"        # 含开发/测试工具；仅使用可改为 pip in
 ### 验证安装
 
 ```bash
-wsctl --version             # 例如 wsctl 0.1.3
+wsctl --version             # 例如 wsctl 0.1.4
 wsctl doctor                # 环境/配置/运行状态自检（--json 便于脚本消费）
 ```
 
 `doctor` 会检查 Python 版本、数据目录可写、数据库、配置文件、默认 shell、
-`tmux`/`ssh`/`lrzsz`、`SO_REUSEPORT`、监听端口占用以及后台启动能力。
+`tmux`/`ssh`/`lrzsz`、`SO_REUSEPORT`、监听端口占用、后台启动能力、**磁盘剩余空间**、
+**密码策略**、**日志文件与轮转阈值**以及**系统时间**（TOTP 依赖时钟准确）。
 
 > 想让 `wsctl <Tab>` 自动补全子命令与选项？见 [shell 补全](#shell-补全)。
 
@@ -235,7 +249,8 @@ pipx install --force "wsctl==0.1.2"
 
 > 说明：升级是向前兼容的，数据库在启动时自动做幂等迁移（`PRAGMA table_info` +
 > `ALTER TABLE`）。若从小版本回退到大版本**之前**，请先备份（`wsctl backup`），
-> 因为新版本可能已写入旧版本不认识的列。
+> 因为新版本可能已写入旧版本不认识的列（例如 0.1.4 为分享持久化新增的
+> `share_*` 三列）。
 >
 > **零停机升级**：配合 `reuse_port = true` 与 tmux 后端，可先起新实例再停旧实例，
 > 连会话都不中断。见 [零停机重启](#零停机重启)。
@@ -326,11 +341,21 @@ wsctl connect                          # 在当前终端打开远程 shell（断
 wsctl logout                           # 清除本地缓存凭据
 ```
 
+启用了两步验证的账号同样可以从 CLI 登录：
+
+```bash
+wsctl login http://host:7681 -u admin --totp 123456   # 直接传验证码
+wsctl login http://host:7681 -u admin                 # 省略 --totp，被要求时交互输入
+WSCTL_TOTP=123456 wsctl login http://host:7681        # 脚本里用环境变量
+```
+
 ## 使用教程
 
 ### 1. 会话管理（Web 端）
 
-- 顶部 **`+`**：新建会话（新标签）。
+- 顶部 **`+`**：新建会话对话框——可填名称、命令、工作目录、选择后端
+  （local / tmux / ssh）；选 ssh 时展开结构化表单（主机 / 用户 / 端口 / 私钥 /
+  `ssh -o` 选项）。全部留空即创建默认 shell；`Alt+N` 则跳过对话框直接新建。
 - 点击标签：切换；**双击标签**：重命名。
 - 标签上的 **`×`**：**断开连接**（会话仍在服务器上运行，不会被杀掉）。
 - **右键标签**：菜单选择「关闭标签（保持会话）」或「终止会话」。
@@ -385,6 +410,9 @@ wsctl session new --ssh example.com --ssh-user root --ssh-port 2222 \
 
 > 提醒：能开 shell 的账号本就能访问文件系统，文件面板不额外扩大权限面。
 
+上传遇到同名文件会**拒绝并弹出确认**（HTTP 409），确认后才覆盖；不会静默替换。
+目录条目超过 2000 项时列表会截断并明确提示。
+
 ### 5. 分享会话
 
 点击顶部 **分享**：
@@ -393,6 +421,8 @@ wsctl session new --ssh example.com --ssh-user root --ssh-port 2222 \
 - 勾选「允许输入（可写）」生成**可写**链接。
 - 可选**有效期**（永久 / 10 分钟 / 1 小时 / 1 天），随时**撤销分享**。
 - 再次打开会**复用**现有链接；修改选项后点「生成新链接」才会替换（旧链接失效）。
+- **分享链接跨服务重启依然有效**（token 与会话一同持久化，重启后原样恢复、不轮换）；
+  重命名会话也不会让已分发的链接失效。
 
 分享链接形如 `http://host:7681/?session=<id>&share=<token>`，观看者无需账号。
 
@@ -477,6 +507,8 @@ curl http://127.0.0.1:7681/metrics      # Prometheus 文本格式
 - **用户**：新建、切换角色、禁用/启用、重置密码（掩码输入）、启用两步验证（二维码）、删除。
 - **审计**：按事件类型 / 用户 ID / IP 筛选，分页「加载更多」。
 - **录制**：列出所有录制，可**回放**、下载、删除。
+- **配置**：只读查看当前生效配置，每项标注「热更新」或「需重启」，可就地**重载**并
+  显示具体变更项与解析错误。
 
 ## 后台运行（非 systemd）
 
@@ -491,7 +523,9 @@ wsctl reload                      # 让运行中的实例重载配置（SIGHUP�
 wsctl stop                        # 优雅停止（超时后用 --force 强制结束）
 ```
 
-- pid 文件：`<data_dir>/run/wsctl-<port>.pid`；日志：`<data_dir>/run/wsctl-<port>.log`。
+- pid 文件：`<data_dir>/run/wsctl-<port>.pid`；日志：`<data_dir>/run/wsctl-<port>.log`
+  （服务自身按大小轮转，保留 `log_backup_count` 份历史；`wsctl logs` 会**跨轮转文件**
+  取末尾若干行，所以刚切过日志也不会「丢历史」）。
 - `stop/status` 在发信号前会核对**进程身份**，不会误杀复用了同一 PID 的其他进程；
   崩溃留下的陈旧或损坏的 pid 文件会被自动清理。
 - 已在运行时 `start` 会被拒绝：请用 `restart`、`start --force`（先停再启）或先 `stop`。
@@ -555,6 +589,9 @@ metrics_require_auth = false  # true 时抓取 /metrics 需登录
 log_level = "info"
 log_json = false
 webhook_url = ""              # 审计事件 POST 目标（可选）
+# log_file = "/var/log/wsctl/wsctl.log"   # 启用按大小轮转的日志文件
+# log_max_bytes = 10485760               # 超过则轮转（copytruncate，保住追加型 fd）
+# log_backup_count = 3                   # 保留几份历史
 
 # ---- 多实例与保留策略 ----
 instance_ttl = 30             # 其他实例租约失联多久视为已死（秒）
@@ -575,18 +612,34 @@ ssl_key = "/etc/wsctl/key.pem"
 ### 修改与热更新
 
 ```bash
-wsctl config show                       # 查看生效配置
+wsctl config show                       # 查看生效配置（--json 便于脚本）
 wsctl config get port                   # 打印单个配置项（未知项会给出最接近的候选）
 wsctl config path                       # 配置文件路径
 wsctl config edit                       # 用 $EDITOR 编辑（不存在则生成模板）
-wsctl config set port 9000              # 写入配置（校验键名、值类型与整个文件）
+wsctl config set port 9000              # 写入配置（校验键名、值类型与整个文件；保留行内注释）
 wsctl config validate                   # 校验配置文件
 wsctl config reload                     # 让运行中的服务重载配置（HTTP）
 wsctl reload                            # 同上，走 SIGHUP（无需已登录）
 ```
 
+`config set` 会保留被改那一行尾部的注释（`port = 7681  # 监听端口` 改完注释还在），
+也不会把注释掉的 `# port = 1234` 当成真配置项。
+
+**配置写错时不会静默忽略**——错误会原样打印出来：
+
+```console
+$ wsctl reload
+配置重载存在问题：
+  - 配置项无效，已保持原值：max_sessions
+    Input should be a valid integer, got 'not-an-int'
+已重载 配置；变更项：无
+$ echo $?
+1
+```
+
 服务也会监听配置文件修改时间自动重载。可热更新的项包括白名单、限速、会话上限、
-录制、文件根目录、指标开关等；**网络、TLS、数据目录、日志级别、Webhook 需重启**。
+录制、文件根目录、指标开关等；**网络、TLS、数据目录、日志级别/轮转、Webhook 需重启**。
+Web 管理面的「配置」页签会把每一项标成「热更新」或「需重启」。
 
 ## CLI 命令参考
 
@@ -599,20 +652,27 @@ wsctl backup FILE.tar.gz          一致性备份数据库与录制（--include-
 wsctl restore FILE.tar.gz         从备份恢复（--force 覆盖，原库存为 .bak）
 wsctl --version                   显示版本
 wsctl connect [URL] [-s ID]       把本地终端连接到服务（断线自动重连；--no-reconnect）
-wsctl login URL                   登录并缓存凭据
+wsctl login URL                   登录并缓存凭据（--totp CODE 支持两步验证）
 wsctl logout                      清除本地缓存凭据
-wsctl session list                列出会话
-wsctl session new                 新建会话（--name/--command/--cwd/--backend/--ssh…）
-wsctl session rename ID NAME      重命名会话
+wsctl session list                列出会话（--json；显示用户名/后端/存活）
+wsctl session new                 新建会话（--name/--command/--cwd/--backend/--ssh…；--json）
+wsctl session rename ID NAME      重命名会话（--json）
 wsctl session attach ID           连接到已有会话
 wsctl session kill ID             终止会话
 wsctl session record ID           开始录制（--input）
 wsctl session record-stop ID      停止录制
 wsctl session recording ID        下载录制（-o FILE）
-wsctl user add|list|del|passwd|role|disable|enable|totp
-wsctl audit                       查看审计日志（管理员）
-wsctl config show|get|path|edit|set|validate|reload
+wsctl user add|list|del|passwd|role|disable|enable|totp   （add/list 支持 --json）
+wsctl audit                       查看审计日志（管理员；--event/--user-id/--ip/--json）
+wsctl config show|get|path|edit|set|validate|reload      （show/get 支持 --json）
+wsctl completion install|show     安装/查看 shell 补全（bash/zsh/fish/powershell）
 wsctl version
+```
+
+`session` / `user` / `audit` / `config show` 都支持 `--json`，便于脚本消费：
+
+```console
+$ wsctl session list --json | jq -r '.[] | "\(.name)\t\(.owner)\t\(.backend)"'
 ```
 
 > `wsctl config set` 会校验配置项名称与**值的类型**，并在写入前校验整个文件；非法值
@@ -636,16 +696,24 @@ exec "$SHELL" -l                  # 或重开终端使其生效
 wsctl --show-completion
 ```
 
-**zsh**：当前版本未单独生成 zsh 脚本，可借助 `bashcompinit` 复用同一份脚本：
+`--install-completion` 只覆盖 bash。**其余 shell 用 `wsctl completion`**，并按 `$SHELL`
+自动识别（也可显式指定）：
 
 ```bash
-# 追加到 ~/.zshrc
-autoload -U +X bashcompinit && bashcompinit
-source <(wsctl --show-completion)
+wsctl completion install            # 自动识别 $SHELL 并安装
+wsctl completion install zsh        # 显式指定：bash / zsh / fish / powershell
+wsctl completion install fish
+wsctl completion show zsh           # 只打印脚本，自行保存后 source
 ```
 
-**fish / PowerShell**：当前集成未内建生成对应脚本（`--install-completion` 只会安装 bash
-版），fish 用户可自行编写补全文件，或改用 bash/zsh。
+安装位置与生效方式：
+
+| shell | 脚本位置 | 生效 |
+|---|---|---|
+| bash | `~/.bash_completions/wsctl.sh`（并写入 `~/.bashrc` 的 `source`） | 重开终端 |
+| zsh | `~/.zfunc/_wsctl`（并写入 `fpath`/`compinit` 到 `~/.zshrc`） | 重开终端 |
+| fish | `~/.config/fish/completions/wsctl.fish` | 重开终端 |
+| PowerShell | 用户 profile 中的补全块 | 重开终端 |
 
 生效后输入 `wsctl <Tab>` 即可补全子命令（`session`、`user`、`config`…）与选项：
 
@@ -737,10 +805,12 @@ wsctl restore ~/wsctl-2026-01-01.tar.gz --force            # 覆盖前原库保�
 Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对待它：
 
 - 默认开启认证，密码使用 Argon2 哈希；会话 token 仅存哈希。
+- 密码策略：新建/改密强制非空且至少 8 位（API 与 CLI 同源强制）。
 - 可选 TOTP 双因子（`wsctl user totp <用户>`）。
 - 登录失败限速；`allowed_ips` 限制来源网段。
 - WebSocket 握手校验 Origin 白名单（防 CSWSH）。
-- 分享链接不可猜测、可设有效期、可撤销；只读链接拒绝输入。
+- 分享链接不可猜测、可设有效期、可撤销；只读链接拒绝输入；链接跨服务重启仍有效
+  （token 与会话一同持久化）。
 - 文件面板防目录穿越（含符号链接），上传有大小限制。
 - 每会话连接数/内存/输入速率上限，防止资源耗尽。
 - 全量审计日志；CLI 与 API 同源的用户管理不变量（不会锁死最后一个管理员）。
@@ -753,6 +823,18 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 **Q：首次运行没看到密码？**
 密码打印在标准错误；后台运行时在日志里（`wsctl logs`）。若已丢失，用
 `wsctl user passwd admin` 重设，或删除数据库后重启重新初始化。
+
+**Q：开了两步验证后 CLI 全都登录不上？**
+0.1.4 起 CLI 支持 2FA：`wsctl login <url> --totp 123456`，或省略 `--totp` 在被要求时
+交互输入，脚本里可用 `WSCTL_TOTP` 环境变量。（0.1.3 及更早版本确实无法从 CLI 登录。）
+
+**Q：改了配置 `wsctl reload` 说「变更项：无」？**
+如果配置里有非法值，它会**明确报错**而不是假装没变化。看输出里的「配置重载存在问题」
+一栏，或服务端日志。合法但没生效的改动，请确认该项是「热更新」而不是「需重启」
+（Web 管理面的「配置」页签会逐项标注）。
+
+**Q：上传文件报「文件已存在」？**
+这是保护行为：同名文件默认拒绝（HTTP 409），在 Web 端弹窗确认后才会覆盖。
 
 **Q：浏览器连不上 / 一直重连？**
 检查反向代理是否转发 WebSocket（`Upgrade` / `Connection` 头）；若被判定未授权

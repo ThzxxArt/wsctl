@@ -112,6 +112,12 @@ class Settings(BaseSettings):
     metrics_require_auth: bool = False
     log_level: str = "info"
     log_json: bool = False
+    # Rotation applies to ``log_file`` using copy-and-truncate semantics, so an
+    # already-open append-mode descriptor (what ``wsctl start`` gives its child)
+    # keeps writing to the same file across a rotation.
+    log_file: Path | None = None
+    log_max_bytes: int = 10 * 1024 * 1024
+    log_backup_count: int = 3
 
     auto_record: bool = False
     record_input: bool = False
@@ -204,31 +210,34 @@ HOT_FIELDS = frozenset(
 # Fields that require a restart to take effect.
 RESTART_FIELDS = frozenset(
     {"host", "port", "ssl_cert", "ssl_key", "reuse_port", "data_dir", "config_path",
-     "log_level", "log_json", "webhook_url"}
+     "log_level", "log_json", "log_file", "log_max_bytes", "log_backup_count", "webhook_url"}
 )
 
 
-def reload_settings_file(settings: Settings) -> list[str]:
+def reload_settings_file(settings: Settings) -> tuple[list[str], list[str]]:
     """Re-read the config file and apply hot-reloadable fields in place.
 
-    Returns the list of field names that changed.
+    Returns ``(changed, errors)``. ``errors`` is what makes a broken edit
+    visible: previously a bad value was silently ignored, which looked exactly
+    like "the config did not reload" and was impossible to diagnose.
     """
     path = settings.config_path
     if not path.is_file():
-        return []
+        return [], []
     import tomllib
 
     try:
         data = tomllib.loads(path.read_text("utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return []
+    except OSError as exc:
+        return [], [f"无法读取配置文件 {path}：{exc}"]
+    except tomllib.TOMLDecodeError as exc:
+        return [], [f"配置文件 TOML 语法错误：{exc}"]
     if not isinstance(data, dict):
-        return []
+        return [], ["配置文件顶层必须是键值表"]
     try:
         candidate = Settings(**data)
-    except Exception:
-        # invalid values must not break a running server
-        return []
+    except Exception as exc:
+        return [], [f"配置项无效，已保持原值：{exc}"]
     changed: list[str] = []
     for key in sorted(HOT_FIELDS):
         # Environment variables take precedence over the file (see load order),
@@ -238,4 +247,4 @@ def reload_settings_file(settings: Settings) -> list[str]:
         if key in data and getattr(settings, key) != getattr(candidate, key):
             setattr(settings, key, getattr(candidate, key))
             changed.append(key)
-    return changed
+    return changed, []

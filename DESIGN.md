@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.3 · 状态：0.1.0–0.1.2 已发布；0.1.3 待发布
+> 版本：0.1.4 · 状态：0.1.0–0.1.4 已发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -61,8 +61,11 @@ wsctl **不在原始吞吐上对标 ttyd**。纯 Python 无法在 `cat` 大文�
 - **背压**：每个客户端维护有界发送队列；慢消费者达到上限时丢弃旧帧或断开，
   防止大输出导致服务端内存暴涨。
 - **回收策略**：空闲超时 / 最大生命周期 / 管理员显式 kill，三者之一触发回收。
-- **进程治理**：`start_new_session` + `killpg`，并在会话结束时 `wait()` 回收；未安装
-  全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）。已跟踪会话不残留僵尸进程。
+- **进程治理**：`start_new_session` + `killpg`，并在会话结束时 `wait()` 回收（**有界
+  等待，超时强杀**：子进程若被守护化孙进程占住终端而不退，也不能挂死清理路径）；
+  未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）。已跟踪会话不残留僵尸进程。
+- **分享也是承诺**：share token / 有效期 / 可写标记与会话一起持久化，服务重启后原样
+  恢复（不轮换 token），已分发的二维码与链接继续可用；重命名会话不会使其失效。
 
 ### 3.1 可选 tmux 后端（跨重启恢复）
 
@@ -134,7 +137,9 @@ users(id, username, password_hash, role[admin|user], totp_secret, disabled, crea
 auth_sessions(id, user_id, token_hash, ip, user_agent, exp, last_seen)   -- 登录态
 
 term_sessions(id, name, owner_id, backend[local|tmux|ssh], command, argv, env,
-              cwd, idle_timeout, max_life, status, instance_id, created_at, last_active)
+              cwd, idle_timeout, max_life, status, instance_id,
+              share_token, share_expires, share_writable,
+              created_at, last_active)
 
 instances(id, pid, host, started_at, heartbeat)          -- 多实例租约
 
@@ -145,8 +150,12 @@ settings(key, value)
 
 > 命名约定：`auth_sessions` 指**登录态**，`term_sessions` 指**终端会话**，
 > `instances` 指**服务进程租约**。
-> 模式版本 3；旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补齐新列，且索引
+> 模式版本 4；旧库通过 `PRAGMA table_info` + `ALTER TABLE` 幂等迁移补齐新列，且索引
 > 在列补齐之后创建（否则升级旧库会因列不存在而失败）。
+>
+> `share_token` / `share_expires` / `share_writable` 持久化分享链接：分享是**承诺**，
+> 必须和会话一样跨重启存活（0.1.4 起）。降级到 0.1.3 及更早版本前请先 `wsctl backup`，
+> 旧版本不认识这几列。
 
 ## 6. CLI 命令树（已实现）
 
@@ -155,26 +164,29 @@ wsctl serve                     # 前台起服务（--daemon 转后台）
 wsctl start|stop|restart|status|logs|reload   # 非 systemd 后台生命周期
 wsctl serve --new "bash"        # 启动时顺带开一个会话
 wsctl serve --backend tmux      # 默认使用 tmux 后端（跨重启恢复）
-wsctl doctor                    # 环境、配置、运行状态、端口、SO_REUSEPORT 自检
-wsctl session list|new|rename|kill|attach   # new 支持 --backend local|tmux|ssh
+wsctl doctor                    # 环境、配置、运行状态、端口、SO_REUSEPORT、磁盘、时钟自检
+wsctl session list|new|rename|kill|attach   # 均支持 --json；new 支持 --backend local|tmux|ssh
 wsctl session record|record-stop|recording
 wsctl connect [url] [-s id]     # 瘦客户端：本地 raw 终端直连（断线自动重连）
-wsctl login|logout              # 缓存/清除服务端凭据
+wsctl login|logout              # login 支持 --totp / WSCTL_TOTP（两步验证账号）
 wsctl user add|list|del|passwd|role|disable|enable|totp
-wsctl audit                     # 查看审计日志（admin）
+wsctl audit [--event|--user-id|--ip|--json]
 wsctl backup FILE [--include-config] / restore FILE [--force]
-wsctl config show|get|path|edit|set|validate|reload
+wsctl config show|get|path|edit|set|validate|reload    # set 保留行内注释
+wsctl completion install|show [bash|zsh|fish|powershell]
 wsctl version / --version
 ```
 
-> `config set` 写入前会校验单项类型与整文件合法性（不合法则拒绝并回滚），
-> `config reload`（或 `wsctl reload` 的 SIGHUP）让运行中的服务热加载。
+> `config set` 写入前会校验单项类型与整文件合法性（不合法则拒绝并回滚），并保留被改行
+> 尾部的注释；`config reload`（或 `wsctl reload` 的 SIGHUP）让运行中的服务热加载，
+> **配置写错时会原样打印错误并以非零码退出**，绝不静默忽略。
 >
 > **互斥/依赖强校验**：所有互相冲突或彼此依赖的参数在 `cli/validate.py` 中声明式
 > 定义，非法组合在进程启动前即以退出码 2 报错，而不是静默忽略其一。
 >
 > **后台生命周期**（`cli/daemon.py`）：子进程以 `start_new_session` 脱离终端，
-> stdout/stderr 重定向到 `<data_dir>/run/wsctl-<port>.log`；pid 文件记录
+> stdout/stderr 重定向到 `<data_dir>/run/wsctl-<port>.log`（可按大小轮转，
+> copytruncate 语义以保住继承的追加型描述符）；pid 文件记录
 > **进程身份指纹**（Linux 取 `/proc/<pid>/stat` 的 starttime），`stop/status` 在
 > 发信号前核对，避免 PID 复用误杀。`--reuse-port` 的多实例热切换不纳入托管。
 
@@ -265,8 +277,13 @@ pyotp  segno  websockets
 | **M32** | 0.1.3 一致性备份/恢复：`backup` 用 SQLite 在线备份 API（含 WAL）、`restore` 校验归档/拒绝穿越/`--force` 保留 `.bak`；`status --json`；`doctor` 扩展运行状态/端口/reuse-port/后台能力 |
 | **M33** | 0.1.3 前端易用性：密码掩码对话框、QR 弹窗纳入统一 Modal（Esc 关最上层/焦点陷阱）、快捷键冲突检测 |
 | **M34** | 0.1.3 测试与文档：校验层/daemon 生命周期/备份恢复/用户不变量单测 + 关闭码测试 + e2e `daemon` 场景 + 浏览器 QR 用例；README/DESIGN/CHANGELOG 同步 |
+| **M35** | 0.1.4 「说到做到」：CLI TOTP 登录（`--totp`/`WSCTL_TOTP`/交互补录）、密码策略（非空+≥8 位，`core/passwords` 单一入口，Store/user_admin 双闸，不强制改存量）、`_finalize` 有界等待 + 强杀（子进程不退也不再挂死）、**分享 token 持久化**（schema v4 + 收养回填 + 过期清理）、录制诚实性（写失败自闭 + `close` 与写线程互斥）、配置热加载报错（`(changed, errors)` 贯通 API/CLI/日志）、Argon2 惰性化 |
+| **M36** | 0.1.4 「长跑不塌」：认证短缓存（`core/authcache.py`，改密/禁用/改角色即时失效）+ 同步 SQLite 全面出事件循环（WS 握手与周期复查、维护循环批量写、audit/users 查询）、PTY 写缓冲满**反馈**（一次性提示 + `wsctl_pty_input_dropped_total`）、日志轮转（copytruncate 保住继承的追加型 fd）、Web 惰性连接（最多 8 个在线，其余「未连接」按需挂载）、上传防覆盖（409 + 确认后 `overwrite=1`）、`list_dir` 上限 + 截断标记、`connect` 非 JSON 文本帧容错、metrics 标签转义、scrollback UTF-8 边界对齐 |
+| **M37** | 0.1.4 「脚本与界面顺手」：CLI 全线 `--json`（session/user/audit/config show）+ `audit` 筛选 + `session list` 显示用户名/后端/存活、Web 建会话对话框（名称/命令/工作目录/后端/结构化 SSH 表单 + 必填校验）、Web 管理面「配置」页签（`GET /api/config`，标注热更新/需重启 + 重载反馈）、`config set` 保留行内注释且不误改注释行、`wsctl completion install|show`（bash/zsh/fish/powershell，按 `$SHELL` 探测）、`doctor` 增检磁盘/密码策略/日志/系统时钟、CLI 冷启动懒加载（`wsctl version` 1.05s → 0.36s） |
+| **M38** | 0.1.4 部署与工程化：Docker 改**仓库根构建**（装本地源码而非 PyPI 旧版）+ `entrypoint.sh` 首启建号 + compose 强制 `WSCTL_ADMIN_PASSWORD` + `.dockerignore`、CI 加 macOS 腿与 Windows 导入/CLI 冒烟、`-m slow` 压测入 CI、装 `lrzsz` 真机验证 ZMODEM 收发、构建 Docker 镜像冒烟、systemd 单元注明 `ExecStart` 路径来源、e2e 失败时打印子进程日志 |
+| **M39** | 0.1.4 测试与文档：新增密码策略/认证缓存/日志轮转/录制失败/UTF-8/metrics 转义六个套件，扩展分享持久化、有界 `Pty.wait`、PTY 丢输入、上传覆盖、配置端点与重载报错、TOTP/`--json`/注释保留/补全；浏览器覆盖建会话对话框、配置页签、上传覆盖提示、连接预算、**ZMODEM `sz`/`rz` 字节级真机往返**；e2e 断言分享跨重启存活；README/DESIGN/CHANGELOG/SECURITY 同步 |
 
-## 10.1 实现状态（截至 0.1.3）
+## 10.1 实现状态（截至 0.1.4）
 
 **已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
@@ -283,9 +300,17 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 备份/恢复（SQLite 在线备份）、WS 关闭码语义化、`connect` 自动重连、事件循环
 解阻（argon2/录制/保留/审计容错）。
 
-**尚未实现**：无。唯一验证缺口：ZMODEM 的真实 `rz`/`sz` 传输未在 CI 端到端跑通
-（环境无 lrzsz），仅验证了集成不破坏常规终端 I/O。后台生命周期为 POSIX-only，
-Windows 下 `serve --daemon`/`start` 会明确报错并建议用服务管理器。
+**0.1.4 新增**：承诺闭环与可靠性收口——**分享链接跨重启存活**（与会话同级的承诺）、
+CLI 两步验证登录、密码策略、子进程不退也不挂死、录制失败自诚实、配置写错必报错、
+认证查询出事件循环 + 短缓存、日志轮转、上传防覆盖、Web 连接预算与 SSH 建会话表单、
+CLI 全线 `--json`、多 shell 补全。**验证深度提升**：ZMODEM 从「集成不破坏 I/O」升级为
+**`sz`/`rz` 字节级真机往返**。
+
+**尚未实现**：无。验证边界（诚实声明）：
+- ZMODEM 真机往返需要 `lrzsz`（CI 已装并执行；本地缺失时该浏览器用例跳过）。
+- 后台生命周期为 POSIX-only；Windows 下 `serve --daemon`/`start` 明确报错并建议
+  服务管理器，CI 仅做导入与 CLI 冒烟（`wsctl[win]` 的 `WinPty` 未端到端验证）。
+- Docker 镜像构建在 CI 的 `docker` job 中验证；本机无 docker 时未构建过。
 
 > 0.1.1 起，关闭标签默认只断开连接（detach），终止会话需显式操作（右键菜单 /
 > 会话列表 / `Alt+Shift+W`），与「会话独立于连接」的核心承诺一致。
@@ -293,20 +318,26 @@ Windows 下 `serve --daemon`/`start` 会明确报错并建议用服务管理器�
 > 0.1.2 起，磁盘/数据库写入全部移出事件循环：审计经 `AuditWriter` 队列批量落盘，
 > 录制在后台线程写文件，上传在线程池落盘；`resolve_auth_session` 节流 `last_seen`。
 
+> 0.1.4 起，**读路径**同样出事件循环：WS 握手与周期复查、维护循环的租约/回收/保留、
+> 审计与用户查询均在线程池执行；`resolve_auth_session` 前置一层短缓存
+> （`core/authcache.py`），改密/禁用/改角色/删除时主动失效对应条目，因此
+> 「禁用用户立即踢线」的语义不变。
+
 > 回归测试：`scripts/e2e/run_all.py` 提供 8 个后端端到端场景（server / CLI /
-> connect / tmux 重启恢复 / crash 崩溃收养 / **multiplex 多实例隔离** /
-> **daemon 后台生命周期** / SO_REUSEPORT 优雅重启）；`pytest -m browser` 为
-> 浏览器级测试；`pytest -m slow` 为并发/大输出压测。CI 在独立 job 中运行浏览器测试。
+> connect / tmux 重启恢复 **含分享跨重启存活断言** / crash 崩溃收养 /
+> **multiplex 多实例隔离** / **daemon 后台生命周期** / SO_REUSEPORT 优雅重启）；
+> `pytest -m browser` 为浏览器级测试（含 ZMODEM 真机往返）；`pytest -m slow`
+> 为并发/大输出压测。CI 在独立 job 中运行浏览器测试、慢速压测与 Docker 构建。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
-> `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
-> 会话不会残留僵尸进程。
+> `wait()`（**有界等待，超时强杀**），未安装全局 SIGCHLD handler（避免与
+> `subprocess` 争抢 PID）；已跟踪会话不会残留僵尸进程。
 
 ## 11. Backlog（后续）
 
-无（v0.1.3 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
-每用户后端策略（命令级权限隔离）、i18n 框架、更多终端协议（Kitty graphics 等）、
-Windows 服务封装、日志轮转、`--reuse-port` 实例的托管。
+无（v0.1.4 计划项已全部落地）。后续可考虑：每用户后端策略（命令级权限隔离）、
+i18n 框架、更多终端协议（Kitty graphics 等）、Windows 服务封装与 `WinPty`
+端到端验证、`--reuse-port` 实例的托管。
 
 ## 12. 发布
 

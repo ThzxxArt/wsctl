@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -18,6 +20,33 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if "slow" in item.keywords:
                 item.add_marker(skip_slow)
+
+
+@pytest.fixture(autouse=True)
+def _close_stores(tmp_path: Any) -> Iterator[None]:
+    """Close any :class:`~wsctl.core.store.Store` a test opened and forgot.
+
+    SQLite connections are file handles; leaving them open across a few hundred
+    tests leaks descriptors and can keep WAL sidecars alive past their test.
+    """
+    from wsctl.core.store import Store
+
+    opened: list[Store] = []
+    original_init = Store.__init__
+
+    def tracking_init(self: Store, path: Any) -> None:
+        original_init(self, path)
+        opened.append(self)
+
+    Store.__init__ = tracking_init  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        Store.__init__ = original_init  # type: ignore[method-assign]
+        for store in opened:
+            # Already-closed is fine (the app's lifespan may have closed it).
+            with contextlib.suppress(Exception):
+                store.close()
 
 
 class FakeClient:

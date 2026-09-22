@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import logging
 import os
 import shlex
@@ -39,10 +40,18 @@ from starlette.middleware.base import RequestResponseEndpoint
 
 from wsctl import __version__
 from wsctl.core import fs as fs_mod
+from wsctl.core import logrotate as logrotate_mod
+from wsctl.core import pty as pty_mod
 from wsctl.core import recording as recording_mod
 from wsctl.core import ssh, tmux, totp, user_admin
 from wsctl.core.audit import AuditWriter
-from wsctl.core.config import Settings, reload_settings_file
+from wsctl.core.authcache import AuthCache
+from wsctl.core.config import (
+    HOT_FIELDS,
+    RESTART_FIELDS,
+    Settings,
+    reload_settings_file,
+)
 from wsctl.core.metrics import Metrics
 from wsctl.core.pty import PtyError
 from wsctl.core.ratelimit import RateLimiter
@@ -172,6 +181,17 @@ def _qr_svg(text: str) -> str:
     buffer = io.BytesIO()
     segno.make(text, error="m").save(buffer, kind="svg")
     return buffer.getvalue().decode("utf-8")
+
+
+def _render_setting(value: Any) -> str:
+    """Render a setting for display without leaking a raw Python repr."""
+    if value is None:
+        return ""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
 
 
 def _token_from_request(request: Request) -> str | None:
@@ -315,9 +335,16 @@ async def _reconcile_instances(app: FastAPI) -> None:
             scrollback_bytes=settings.scrollback_bytes,
         )
         try:
-            await manager.create(spec, sid=sid, owner_id=row.get("owner_id"))
+            session = await manager.create(spec, sid=sid, owner_id=row.get("owner_id"))
         except (ValueError, OSError, tmux.TmuxError):
             continue
+        # A share link outlives a restart too: the token is rehydrated verbatim
+        # so a QR code already handed out keeps working.
+        session.restore_share(
+            row.get("share_token"),
+            row.get("share_expires"),
+            bool(row.get("share_writable")),
+        )
         store.term_session_set_instance(sid, me)
         store.term_session_set_status(sid, "running")
         log.info("adopted tmux session %s", sid)
@@ -333,13 +360,19 @@ def create_app(
     instance_id = uuid.uuid4().hex
     config_clock = {"mtime": _config_mtime(settings)}
 
-    def _reload_config() -> list[str]:
-        changed = reload_settings_file(settings)
-        if changed:
+    def _reload_config() -> tuple[list[str], list[str]]:
+        changed, errors = reload_settings_file(settings)
+        if changed or errors:
             limiter.limit = settings.login_rate_limit
             limiter.window = float(settings.login_rate_window)
-            log.info("config reloaded: %s", ", ".join(changed))
-        return changed
+            if errors:
+                # Never silent: a broken edit must be visible in the log, the
+                # API response and the CLI, otherwise it looks like the reload
+                # simply did nothing.
+                log.error("config reload failed: %s", "; ".join(errors))
+            if changed:
+                log.info("config reloaded: %s", ", ".join(changed))
+        return changed, errors
 
     async def _purge_retention() -> None:
         """Bound on-disk growth: audit log, finished session rows, old casts.
@@ -371,26 +404,67 @@ def create_app(
                 _prune_recordings, settings.recordings_dir, cutoff, active
             )
 
+    def _maintenance_db_writes(instance_id_: str, ttl: float) -> None:
+        """Maintenance database writes that depend on no live snapshot.
+
+        Genuinely runs on a worker thread: these used to sit on the event loop
+        and made it pay for instance leases and retention every 5s. Anything
+        that must be consistent with a freshly-taken in-memory snapshot is
+        deliberately kept on the loop in :func:`_maintenance_db_tick` instead.
+        """
+        store_ = app.state.store
+        store_.instance_register(
+            instance_id_, pid=os.getpid(), host=socket.gethostname()
+        )
+        store_.purge_expired_sessions()
+        store_.term_session_clear_expired_shares()
+        for dead in store_.instance_dead_ids(ttl):
+            if dead != instance_id_:
+                store_.instance_remove(dead)
+
+    async def _maintenance_db_tick() -> None:
+        """Collect on the loop, persist off it -- with one deliberate exception.
+
+        ``term_session_stop_missing`` takes the in-memory session set as its
+        "these are alive" list. Running it on a worker thread would widen the
+        window between the snapshot and the UPDATE to full thread-scheduling
+        latency, and a session created in that window would be marked
+        ``stopped`` while it is in fact running (and never adopted again after
+        a restart). The snapshot and that one UPDATE therefore stay in a single
+        synchronous stretch on the loop.
+        """
+        expired = await app.state.manager.reap_expired()
+        for sid in expired:
+            app.state.store.term_session_set_status(sid, "expired")
+        alive = {s.id for s in app.state.manager.list_sessions()}
+        app.state.store.term_session_stop_missing(alive, instance_id=instance_id)
+        limiter.sweep()
+        await asyncio.to_thread(
+            _maintenance_db_writes,
+            instance_id,
+            float(settings.instance_ttl),
+        )
+
+    async def _rotate_log() -> None:
+        if not settings.log_file or settings.log_max_bytes <= 0:
+            return
+        rotated = await asyncio.to_thread(
+            logrotate_mod.rotate_if_needed,
+            settings.log_file,
+            settings.log_max_bytes,
+            settings.log_backup_count,
+        )
+        if rotated:
+            log.info("log rotated: %s", settings.log_file)
+
     async def _maintenance() -> None:
+        ticks = 0
         while True:
             await asyncio.sleep(MAINTENANCE_INTERVAL)
             try:
                 # Re-register (idempotent upsert) rather than a bare heartbeat:
                 # if a peer pruned our lease while we were paused, this restores it.
-                app.state.store.instance_register(
-                    instance_id, pid=os.getpid(), host=socket.gethostname()
-                )
-                for sid in await app.state.manager.reap_expired():
-                    app.state.store.term_session_set_status(sid, "expired")
-                alive = {s.id for s in app.state.manager.list_sessions()}
-                # Only this instance's rows may be reconciled here: a live peer
-                # sharing the same database owns its own sessions.
-                app.state.store.term_session_stop_missing(alive, instance_id=instance_id)
-                app.state.store.purge_expired_sessions()
-                limiter.sweep()
-                for dead in app.state.store.instance_dead_ids(settings.instance_ttl):
-                    if dead != instance_id:
-                        app.state.store.instance_remove(dead)
+                await _maintenance_db_tick()
                 await _reconcile_instances(app)
                 await _purge_retention()
                 if app.state.reload_requested:
@@ -400,6 +474,9 @@ def create_app(
                 if mtime != config_clock["mtime"]:
                     config_clock["mtime"] = mtime
                     _reload_config()
+                ticks += 1
+                if ticks % 12 == 0:  # about once a minute
+                    await _rotate_log()
                 app.state.maintenance_last = time.monotonic()
             except asyncio.CancelledError:
                 raise
@@ -468,6 +545,10 @@ def create_app(
     app.state.instance_id = instance_id
     app.state.store = store or Store(settings.db_path)
     app.state.store.sliding_ttl = settings.session_sliding_ttl
+    # A short-lived resolution cache: WebSocket re-checks run every few seconds
+    # per connection and must not become a database query on the event loop.
+    app.state.auth_cache = AuthCache(ttl=30.0)
+    app.state.store.set_auth_cache(app.state.auth_cache)
     app.state.manager = manager or SessionManager()
 
     app.state.reload_requested = False
@@ -499,12 +580,12 @@ def create_app(
         "Approximate bytes buffered across all sessions",
         lambda: float(sum(s.memory_usage() for s in app.state.manager.list_sessions())),
     )
-    metrics.collect(
+    metrics.collect_counter(
         "wsctl_audit_dropped_total",
         "Audit events dropped because the async queue was saturated",
         lambda: float(audit.dropped),
     )
-    metrics.collect(
+    metrics.collect_counter(
         "wsctl_audit_write_errors_total",
         "Audit batches that failed to persist (logged, then dropped)",
         lambda: float(audit.errors),
@@ -515,6 +596,16 @@ def create_app(
         lambda: max(
             0.0, time.monotonic() - app.state.maintenance_last - MAINTENANCE_INTERVAL
         ),
+    )
+    metrics.collect_counter(
+        "wsctl_pty_input_dropped_total",
+        "Input writes dropped because a session's child stopped reading",
+        lambda: float(pty_mod.dropped_input_total()),
+    )
+    metrics.collect_counter(
+        "wsctl_recording_failures_total",
+        "Recorders stopped by a write failure (cast may be truncated)",
+        lambda: float(recording_mod.failure_count()),
     )
 
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
@@ -582,7 +673,7 @@ def create_app(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
             )
 
-        secret = store_.user_totp_secret(body.username)
+        secret = await asyncio.to_thread(store_.user_totp_secret, body.username)
         if secret is not None and not totp.verify(secret, body.totp or ""):
             limiter.record_failure(key)
             metrics.inc("wsctl_logins_total", result="totp_failed")
@@ -593,7 +684,8 @@ def create_app(
 
         limiter.reset(key)
         metrics.inc("wsctl_logins_total", result="ok")
-        token = store_.create_auth_session(
+        token = await asyncio.to_thread(
+            store_.create_auth_session,
             user.id,
             ttl=settings.session_ttl,
             ip=ip,
@@ -615,11 +707,16 @@ def create_app(
     async def logout(request: Request, response: Response) -> dict[str, bool]:
         token = _token_from_request(request)
         if token:
-            user = request.app.state.store.resolve_auth_session(token)
-            request.app.state.store.delete_auth_session(token)
-            request.app.state.audit.enqueue(
+            def revoke() -> int | None:
+                store_ = app.state.store
+                user = store_.resolve_auth_session(token)
+                store_.delete_auth_session(token)
+                return user.id if user else None
+
+            user_id = await asyncio.to_thread(revoke)
+            app.state.audit.enqueue(
                 "logout",
-                user_id=user.id if user else None,
+                user_id=user_id,
                 ip=client_ip(request, settings),
             )
         response.delete_cookie(COOKIE_NAME, path="/")
@@ -632,11 +729,16 @@ def create_app(
     # -- sessions ------------------------------------------------------
 
     def _serialize(session: TermSession) -> dict[str, Any]:
+        owner_name: str | None = None
+        if session.owner_id is not None:
+            owner = app.state.store.user_get_by_id(session.owner_id)
+            owner_name = owner.username if owner is not None else None
         return {
             "id": session.id,
             "name": session.spec.name,
             "pid": session.pid,
             "owner_id": session.owner_id,
+            "owner": owner_name,
             "backend": session.backend,
             "shared": session.is_shared,
             "share_writable": session.share_writable,
@@ -824,18 +926,33 @@ def create_app(
         token = session.create_share(
             ttl=float(body.ttl) if body.ttl else None, writable=body.writable
         )
+        # Persist so the link survives a restart (the same promise the session
+        # itself makes on the tmux backend).
+        await asyncio.to_thread(
+            app.state.store.term_session_set_share,
+            sid,
+            token=token,
+            expires=session.share_expiry,
+            writable=body.writable,
+        )
         app.state.audit.enqueue(
             "session_share",
             user_id=user.id,
             term_session_id=sid,
             payload="write" if body.writable else "read",
         )
-        return {"token": token, "ttl": body.ttl, "writable": body.writable}
+        return {
+            "token": token,
+            "ttl": body.ttl,
+            "writable": body.writable,
+            "expires_at": session.share_expiry,
+        }
 
     @app.delete("/api/sessions/{sid}/share")
     async def revoke_share(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
         session = _owned(sid, user)
         session.revoke_share()
+        await asyncio.to_thread(app.state.store.term_session_set_share, sid, token=None)
         app.state.audit.enqueue("session_unshare", user_id=user.id, term_session_id=sid)
         return {"ok": True}
 
@@ -921,16 +1038,20 @@ def create_app(
 
     @app.get("/api/users")
     async def list_users(_: User = Depends(require_admin)) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": u.id,
-                "username": u.username,
-                "role": u.role,
-                "disabled": u.disabled,
-                "totp": app.state.store.user_totp_secret(u.username) is not None,
-            }
-            for u in app.state.store.user_list()
-        ]
+        def snapshot() -> list[dict[str, Any]]:
+            store_ = app.state.store
+            return [
+                {
+                    "id": u.id,
+                    "username": u.username,
+                    "role": u.role,
+                    "disabled": u.disabled,
+                    "totp": store_.user_totp_secret(u.username) is not None,
+                }
+                for u in store_.user_list()
+            ]
+
+        return await asyncio.to_thread(snapshot)
 
     @app.post("/api/users", status_code=status.HTTP_201_CREATED)
     async def create_user(body: UserCreate, actor: User = Depends(require_admin)) -> dict[str, Any]:
@@ -1031,8 +1152,9 @@ def create_app(
         # Flush the async writer so the read reflects events just produced.
         await app.state.audit.flush()
         store_: Store = app.state.store
-        return store_.recent_audit(
-            limit=min(max(limit, 1), 1000),
+        return await asyncio.to_thread(
+            store_.recent_audit,
+            min(max(limit, 1), 1000),
             offset=max(offset, 0),
             event=event,
             user_id=user_id,
@@ -1041,11 +1163,31 @@ def create_app(
 
     @app.post("/api/config/reload")
     async def reload_config(actor: User = Depends(require_admin)) -> dict[str, Any]:
-        changed = _reload_config()
+        changed, errors = await asyncio.to_thread(_reload_config)
         app.state.audit.enqueue(
-            "config_reload", user_id=actor.id, payload=",".join(changed) or None
+            "config_reload",
+            user_id=actor.id,
+            payload=",".join(changed) if changed else (";".join(errors) or None),
         )
-        return {"changed": changed}
+        return {"changed": changed, "errors": errors}
+
+    @app.get("/api/config")
+    async def get_config(_: User = Depends(require_admin)) -> dict[str, Any]:
+        """Effective configuration, labelled by whether a reload can apply it."""
+        values = await asyncio.to_thread(lambda: settings.model_dump())
+        fields = [
+            {
+                "key": key,
+                "value": _render_setting(values.get(key)),
+                "kind": "restart" if key in RESTART_FIELDS else "hot",
+            }
+            for key in sorted(set(HOT_FIELDS) | set(RESTART_FIELDS))
+        ]
+        return {
+            "config_path": str(settings.config_path),
+            "data_dir": str(settings.data_dir),
+            "fields": fields,
+        }
 
     # -- files (rooted at settings.files_root) -------------------------
 
@@ -1055,10 +1197,16 @@ def create_app(
     ) -> dict[str, Any]:
         root = settings.files_root
         try:
-            entries = await asyncio.to_thread(fs_mod.list_dir, root, path)
+            entries, truncated = await asyncio.to_thread(fs_mod.list_dir, root, path)
         except fs_mod.FsError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        return {"path": path.strip().lstrip("/"), "root": str(root), "entries": entries}
+        return {
+            "path": path.strip().lstrip("/"),
+            "root": str(root),
+            "entries": entries,
+            "truncated": truncated,
+            "limit": fs_mod.DEFAULT_LIST_LIMIT,
+        }
 
     @app.get("/api/files/download")
     async def download_file(user: User = Depends(current_user), path: str = "") -> FileResponse:
@@ -1076,6 +1224,7 @@ def create_app(
         user: User = Depends(current_user),
         file: UploadFile = File(...),
         path: str = Form(""),
+        overwrite: bool = Form(False),
     ) -> dict[str, Any]:
         root = settings.files_root
         name = Path(file.filename or "").name
@@ -1089,6 +1238,22 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="不是目录")
 
         dest = directory / name
+        # A symlink at the destination is a security problem (it would redirect
+        # the write), so it is refused outright rather than offered for
+        # "overwrite"; the O_NOFOLLOW open below re-checks against a race.
+        if dest.is_symlink():
+            await file.close()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="拒绝覆盖符号链接或非法路径",
+            )
+        if dest.exists() and not overwrite:
+            await file.close()
+            # Never silently destroy an existing file: the client must opt in.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"文件已存在：{name}（确认后可覆盖）",
+            )
         # O_NOFOLLOW refuses to follow a symlink planted at the destination.
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         try:

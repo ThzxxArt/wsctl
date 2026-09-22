@@ -14,6 +14,7 @@ an instance out while the web UI correctly refuses the same operation.
 
 from __future__ import annotations
 
+from .passwords import PasswordPolicyError, validate_password
 from .store import Store, User
 
 VALID_ROLES = ("admin", "user")
@@ -26,6 +27,14 @@ class UserAdminError(Exception):
         super().__init__(message)
         self.message = message
         self.status = status
+
+
+def _check_password(password: str) -> None:
+    """Enforce the shared password policy as a 400-level product error."""
+    try:
+        validate_password(password)
+    except PasswordPolicyError as exc:
+        raise UserAdminError(str(exc)) from exc
 
 
 def _target(store: Store, username: str) -> User:
@@ -43,11 +52,17 @@ def _guard_last_admin(user: User, store: Store) -> None:
 def create(store: Store, username: str, password: str, role: str = "user") -> User:
     if role not in VALID_ROLES:
         raise UserAdminError(f"角色无效：{role}")
-    if not username:
+    if not username or not username.strip():
         raise UserAdminError("用户名不能为空")
+    if len(username) > 64:
+        raise UserAdminError("用户名过长（最多 64 个字符）")
+    _check_password(password)
     if store.user_get(username) is not None:
         raise UserAdminError(f"用户已存在：{username}", status=409)
-    return store.user_create(username, password, role=role)
+    try:
+        return store.user_create(username, password, role=role)
+    except PasswordPolicyError as exc:  # pragma: no cover - already checked above
+        raise UserAdminError(str(exc)) from exc
 
 
 def set_role(store: Store, username: str, role: str, *, actor: User | None = None) -> None:
@@ -73,7 +88,11 @@ def set_disabled(store: Store, username: str, disabled: bool, *, actor: User | N
 
 def set_password(store: Store, username: str, password: str, *, actor: User | None = None) -> None:
     target = _target(store, username)
-    store.user_set_password(username, password)
+    _check_password(password)
+    try:
+        store.user_set_password(username, password)
+    except PasswordPolicyError as exc:  # pragma: no cover - already checked above
+        raise UserAdminError(str(exc)) from exc
     # A password change revokes existing logins for that user.
     store.delete_user_sessions(target.id)
 

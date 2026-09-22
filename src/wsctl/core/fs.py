@@ -5,6 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+#: How many entries a single listing returns before it is truncated. A hostile
+#: or accidental ``ls`` of a huge directory must not build a giant response.
+DEFAULT_LIST_LIMIT = 2000
+
 
 class FsError(Exception):
     """Raised for invalid paths or filesystem operations."""
@@ -28,11 +32,25 @@ def safe_resolve(root: Path, rel: str | None) -> Path:
     return candidate
 
 
-def list_dir(root: Path, rel: str | None) -> list[dict[str, Any]]:
+def list_dir(
+    root: Path, rel: str | None, *, limit: int | None = None
+) -> tuple[list[dict[str, Any]], bool]:
+    """List ``rel`` under ``root`` as ``(entries, truncated)``.
+
+    Directory entries sort before files, then case-insensitively by name. When
+    more than ``limit`` entries exist the listing is cut short and ``truncated``
+    is true so the caller can say so instead of silently hiding files.
+
+    ``limit`` is resolved at call time so the module-level default stays
+    tunable (by configuration or by a test) after import.
+    """
+    if limit is None:
+        limit = DEFAULT_LIST_LIMIT
     target = safe_resolve(root, rel)
     if not target.is_dir():
         raise FsError("not a directory")
     entries: list[dict[str, Any]] = []
+    truncated = False
     for child in target.iterdir():
         try:
             stat = child.stat()
@@ -48,7 +66,10 @@ def list_dir(root: Path, rel: str | None) -> list[dict[str, Any]]:
             }
         )
     entries.sort(key=lambda e: (e["type"] != "dir", str(e["name"]).lower()))
-    return entries
+    if limit > 0 and len(entries) > limit:
+        entries = entries[:limit]
+        truncated = True
+    return entries, truncated
 
 
 def relative_to(root: Path, path: Path) -> str:

@@ -36,6 +36,13 @@
     qrOverlay: $("qr-overlay"), qrTitle: $("qr-title"), qrSecret: $("qr-secret"),
     qrImage: $("qr-image"), qrDone: $("qr-done"), qrClose: $("qr-close"),
     toasts: $("toasts"),
+    newSessionOverlay: $("new-session-overlay"), newSessionForm: $("new-session-form"),
+    newSessionClose: $("new-session-close"), newSessionCancel: $("new-session-cancel"),
+    newSessionQuick: $("new-session-quick"), newSessionError: $("new-session-error"),
+    nsName: $("ns-name"), nsCommand: $("ns-command"), nsCwd: $("ns-cwd"),
+    nsBackend: $("ns-backend"), nsSshBlock: $("ns-ssh-block"),
+    nsSshHost: $("ns-ssh-host"), nsSshUser: $("ns-ssh-user"), nsSshPort: $("ns-ssh-port"),
+    nsSshIdentity: $("ns-ssh-identity"), nsSshOptions: $("ns-ssh-options"),
   };
 
   const DEFAULT_KEYS = {
@@ -54,8 +61,15 @@
   // permanent and the reason was already delivered as a control message.
   const FATAL_CLOSE_CODES = new Set([4400, 4403, 4404, 4409, 4500]);
 
+  // How many sessions keep a live socket automatically. Opening every session
+  // at once (the old behaviour) means N WebSockets and N xterm instances before
+  // the user has looked at anything; the rest attach on demand.
+  const AUTO_CONNECT_MAX = 8;
+
   const encoder = new TextEncoder();
   const sessions = new Map();
+  // Session ids ordered least-recently-used first, tracking live sockets.
+  const liveOrder = [];
   let activeId = null;
   let me = null;
   let menuSid = null;
@@ -190,12 +204,21 @@
     }, 3200);
   }
 
+  // Dialogs are singletons: a second call while one is open would overwrite
+  // the input the user is typing into (this actually shipped as a rename that
+  // silently sent the *old* name back to the server).
+  let renamePromptOpen = false;
+  let confirmDialogOpen = false;
+
   function confirmDialog(message, title) {
+    if (confirmDialogOpen) return Promise.resolve(false);
+    confirmDialogOpen = true;
     return new Promise((resolve) => {
       els.confirmTitle.textContent = title || "确认";
       els.confirmMessage.textContent = message;
       els.confirmOverlay.classList.remove("hidden");
       const done = (value) => {
+        confirmDialogOpen = false;
         els.confirmOverlay.classList.add("hidden");
         els.confirmOk.removeEventListener("click", onOk);
         els.confirmCancel.removeEventListener("click", onCancel);
@@ -209,6 +232,8 @@
   }
 
   function promptDialog(title, value, opts) {
+    if (renamePromptOpen) return Promise.resolve(null);
+    renamePromptOpen = true;
     const masked = Boolean(opts && opts.masked);
     return new Promise((resolve) => {
       els.renameTitle.textContent = title || "重命名";
@@ -218,6 +243,7 @@
       els.renameInput.focus();
       els.renameInput.select();
       const done = (result) => {
+        renamePromptOpen = false;
         els.renameOverlay.classList.add("hidden");
         els.renameForm.removeEventListener("submit", onSubmit);
         els.renameCancel.removeEventListener("click", onCancel);
@@ -241,6 +267,7 @@
     "rename-overlay": () => els.renameCancel.click(),
     "confirm-overlay": () => els.confirmCancel.click(),
     "qr-overlay": () => closeQrDialog(true),
+    "new-session-overlay": () => closeNewSession(),
   };
   // Esc closes the *topmost* visible modal (they can be nested, e.g. the QR
   // dialog opened from the admin panel).
@@ -285,6 +312,24 @@
     els.connection.className = "status" + (cls ? " " + cls : "");
   }
 
+  // The indicator describes the *visible* terminal. A background tab
+  // reconnecting or being suspended must not rewrite it to "空闲"/"连接中".
+  function setConnectionFor(s, text, cls) {
+    if (s && activeId && s.id !== activeId) return;
+    setConnection(text, cls);
+  }
+
+  // Derive the indicator from a session's actual state, so switching tabs
+  // repaints it correctly regardless of which callbacks happened to fire.
+  function describeConnection(s) {
+    if (!s) return ["空闲", ""];
+    if (s.exited) return ["已结束", "bad"];
+    if (s.standby || !s.ws) return ["未连接", ""];
+    if (s.ws.readyState === WebSocket.OPEN) return ["已连接", "ok"];
+    if (s.ws.readyState === WebSocket.CONNECTING) return ["连接中", ""];
+    return ["已断开", s.intentional ? "" : "bad"];
+  }
+
   async function api(method, path, body) {
     const res = await fetch(path, {
       method,
@@ -313,6 +358,48 @@
   function markTab(s, state) {
     s.tabEl.classList.toggle("connected", state === "connected");
     s.tabEl.classList.toggle("exited", state === "exited");
+    s.tabEl.classList.toggle("standby", state === "standby");
+    s.tabEl.title = state === "standby" ? "未连接（点击打开）" : "";
+  }
+
+  // -- 连接池：最多 AUTO_CONNECT_MAX 个会话保持在线 ----------------------
+
+  function noteLive(s) {
+    const index = liveOrder.indexOf(s.id);
+    if (index >= 0) liveOrder.splice(index, 1);
+    liveOrder.push(s.id);
+  }
+
+  function forgetLive(id) {
+    const index = liveOrder.indexOf(id);
+    if (index >= 0) liveOrder.splice(index, 1);
+  }
+
+  function suspendTab(s) {
+    // Keep the tab (and the server-side session) but drop the socket, so the
+    // browser is not holding dozens of terminals open nobody is looking at.
+    if (!s || s.exited) return;
+    s.intentional = true;
+    s.standby = true;
+    if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
+    if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
+    if (s.ws) { try { s.ws.close(); } catch { /* 忽略 */ } s.ws = null; }
+    forgetLive(s.id);
+    markTab(s, "standby");
+    setConnectionFor(s, "空闲", "");
+  }
+
+  function ensureConnected(s) {
+    if (!s || s.exited) return;
+    if (s.ws && s.ws.readyState <= WebSocket.OPEN) { noteLive(s); return; }
+    while (liveOrder.length >= AUTO_CONNECT_MAX) {
+      const victim = sessions.get(liveOrder[0]);
+      if (!victim || victim === s) { forgetLive(liveOrder[0]); continue; }
+      suspendTab(victim);
+    }
+    s.standby = false;
+    noteLive(s);
+    connect(s);
   }
 
   function scheduleReconnect(s) {
@@ -323,7 +410,7 @@
 
   function connect(s) {
     s.intentional = false;
-    setConnection("连接中", "");
+    setConnectionFor(s, "连接中", "");
     const ws = new WebSocket(wsUrl(s));
     ws.binaryType = "arraybuffer";
     s.ws = ws;
@@ -332,8 +419,12 @@
       s.delay = 500;
       if (s.everConnected) { try { s.term.reset(); } catch { /* 忽略 */ } }
       s.everConnected = true;
+      s.standby = false;
+      // Remember which rename generation this attach belongs to.
+      s.attachNameVersion = s.nameVersion || 0;
+      noteLive(s);
       markTab(s, "connected");
-      setConnection("已连接", "ok");
+      setConnectionFor(s, "已连接", "ok");
       sendControl(s, { type: "attach", session: s.id, cols: s.term.cols, rows: s.term.rows, share: s.share || undefined });
       if (s.heartbeat) clearInterval(s.heartbeat);
       s.heartbeat = setInterval(() => sendControl(s, { type: "ping" }), 25000);
@@ -346,15 +437,20 @@
         handleControl(s, msg);
       } else {
         const bytes = new Uint8Array(event.data);
-        if (s.sentry) { try { s.sentry.consume(bytes); } catch { s.term.write(bytes); } }
-        else s.term.write(bytes);
+        if (s.sentry) {
+          try { s.sentry.consume(bytes); } catch { s.term.write(bytes); }
+          // Any traffic counts as transfer progress; re-arm the watchdog that
+          // releases the input lock if a transfer dies without `session_end`.
+          if (s.zmodemActive) armZmodemWatchdog(s);
+        } else s.term.write(bytes);
       }
     };
 
     ws.onclose = (event) => {
       if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
+      forgetLive(s.id);
       if (event.code === 4401) {
-        setConnection("未授权", "bad");
+        setConnectionFor(s, "未授权", "bad");
         if (!sharedMode) showLogin("请先登录");
         return;
       }
@@ -363,7 +459,7 @@
         // explained it over the control channel — do not reconnect in a loop.
         s.exited = true;
         markTab(s, "exited");
-        setConnection("已结束", "bad");
+        setConnectionFor(s, "已结束", "bad");
         if (event.code === 4404) {
           toast("会话不存在或已结束", "error");
           if (sessions.has(s.id)) detachTab(s.id);
@@ -372,18 +468,23 @@
         }
         return;
       }
-      setConnection(s.intentional ? "空闲" : "已断开", s.intentional ? "" : "bad");
+      setConnectionFor(s, s.intentional ? "空闲" : "已断开", s.intentional ? "" : "bad");
       if (!s.intentional && !s.exited) scheduleReconnect(s);
     };
-    ws.onerror = () => setConnection("连接错误", "bad");
+    ws.onerror = () => setConnectionFor(s, "连接错误", "bad");
   }
 
   function handleControl(s, msg) {
     switch (msg.type) {
       case "attached":
-        s.name = msg.name;
         s.writable = msg.writable !== false;
-        s.tabEl.querySelector(".label").textContent = msg.name;
+        // `attached` echoes the name the session had when this socket attached.
+        // A rename issued after that must win, otherwise the tab silently
+        // reverts to the old label (and looks like the rename was lost).
+        if ((s.nameVersion || 0) === (s.attachNameVersion || 0)) {
+          s.name = msg.name;
+          s.tabEl.querySelector(".label").textContent = msg.name;
+        }
         if (s.writable === false && !s.tabEl.querySelector(".ro")) {
           const badge = document.createElement("span");
           badge.className = "readonly-badge ro";
@@ -428,12 +529,14 @@
     const s = {
       id, name, term, fit, pane, tabEl,
       ws: null, heartbeat: null, reconnectTimer: null, delay: 500,
-      intentional: false, exited: false,
+      intentional: false, exited: false, standby: false,
+      nameVersion: 0, attachNameVersion: 0,
       share: options.share || null,
       writable: options.writable !== false,
       recording: Boolean(options.recording),
-      sentry: null, zmodemActive: false, everConnected: false,
+      sentry: null, zmodemActive: false, zmodemWatchdog: null, everConnected: false,
       searchHits: [], searchPos: -1,
+      autoConnect: options.autoConnect !== false,
     };
     sessions.set(id, s);
 
@@ -445,9 +548,14 @@
       if (e.target.classList.contains("close")) return;
       e.stopPropagation();
       const name = await promptDialog("重命名会话", s.name);
-      if (!name) return;
+      if (!name || name === s.name) return;
+      // Mark the rename generation *before* the round trip so a concurrent
+      // `attached` from a reconnect cannot clobber the result.
+      s.nameVersion = (s.nameVersion || 0) + 1;
+      const version = s.nameVersion;
       try {
         const info = await api("PATCH", `/api/sessions/${id}`, { name });
+        if (version !== s.nameVersion) return;  // a newer rename won
         s.name = info.name;
         tabEl.querySelector(".label").textContent = info.name;
       } catch (err) { toast(String(err.message || err), "error"); }
@@ -481,8 +589,11 @@
       navigator.clipboard.readText().then((text) => { if (text) sendInput(s, text); }).catch(() => {});
     });
 
-    connect(s);
-    activateTab(id);
+    if (s.autoConnect) ensureConnected(s);
+    else markTab(s, "standby");
+    // `activate: false` keeps bulk creation (session restore) from cycling the
+    // LRU: each created tab would otherwise come online and evict the last.
+    if (options.activate !== false) activateTab(id);
     return s;
   }
 
@@ -496,6 +607,11 @@
     const s = sessions.get(id);
     if (!s) return;
     els.recordBtn.classList.toggle("rec-on", Boolean(s.recording));
+    // Opening a tab is the user saying "show me this one": bring it online.
+    ensureConnected(s);
+    // `connect()` may have skipped its own status write (it ran before
+    // `activeId` pointed here), so repaint from the resulting state.
+    setConnection(...describeConnection(s));
     requestAnimationFrame(() => {
       try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
       s.term.focus();
@@ -510,6 +626,7 @@
     if (s.heartbeat) clearInterval(s.heartbeat);
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     if (s.ws) s.ws.close();
+    forgetLive(id);
     s.term.dispose();
     s.pane.remove();
     s.tabEl.remove();
@@ -555,11 +672,97 @@
     els.moreMenu.classList.add("hidden");
   });
 
-  async function newSession() {
+  // -- 新建会话（可指定名称/命令/后端/SSH） -----------------------------
+
+  function openNewSession() {
+    els.newSessionError.classList.add("hidden");
+    els.nsName.value = "";
+    els.nsCommand.value = "";
+    els.nsCwd.value = "";
+    els.nsBackend.value = "local";
+    els.nsSshHost.value = "";
+    els.nsSshUser.value = "";
+    els.nsSshPort.value = "";
+    els.nsSshIdentity.value = "";
+    els.nsSshOptions.value = "";
+    els.nsSshBlock.classList.add("hidden");
+    els.newSessionOverlay.classList.remove("hidden");
+    els.nsName.focus();
+  }
+
+  function closeNewSession() {
+    els.newSessionOverlay.classList.add("hidden");
+    els.newSessionError.classList.add("hidden");
+  }
+
+  function buildSessionBody() {
+    const backend = els.nsBackend.value;
+    const body = {};
+    const name = els.nsName.value.trim();
+    const command = els.nsCommand.value.trim();
+    const cwd = els.nsCwd.value.trim();
+    if (name) body.name = name;
+    if (cwd) body.cwd = cwd;
+    if (backend !== "local") body.backend = backend;
+    if (backend === "ssh") {
+      const host = els.nsSshHost.value.trim();
+      if (!host) throw new Error("SSH 后端需要填写主机名");
+      const ssh = { host };
+      const user = els.nsSshUser.value.trim();
+      const port = els.nsSshPort.value.trim();
+      const identity = els.nsSshIdentity.value.trim();
+      const options = els.nsSshOptions.value.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (user) ssh.user = user;
+      if (port) ssh.port = Number(port);
+      if (identity) ssh.identity = identity;
+      if (options.length) ssh.options = options;
+      if (command) ssh.command = command;
+      body.ssh = ssh;
+      body.backend = "ssh";
+    } else if (command) {
+      body.command = command;
+    }
+    return body;
+  }
+
+  async function newSession(quick) {
+    // `quick` (Alt+N, programmatic) skips the dialog and opens a default shell.
+    if (!quick && !sharedMode) {
+      openNewSession();
+      return null;
+    }
     const info = await api("POST", "/api/sessions", {});
     createTab(info.id, info.name || "终端", { recording: info.recording });
     return info;
   }
+
+  els.nsBackend.addEventListener("change", () => {
+    els.nsSshBlock.classList.toggle("hidden", els.nsBackend.value !== "ssh");
+  });
+  els.newSessionClose.addEventListener("click", closeNewSession);
+  els.newSessionCancel.addEventListener("click", closeNewSession);
+  els.newSessionQuick.addEventListener("click", () => {
+    closeNewSession();
+    newSession(true).catch((e) => toast(String(e.message || e), "error"));
+  });
+  els.newSessionForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    let body;
+    try { body = buildSessionBody(); }
+    catch (err) {
+      els.newSessionError.textContent = String(err.message || err);
+      els.newSessionError.classList.remove("hidden");
+      return;
+    }
+    try {
+      const info = await api("POST", "/api/sessions", body);
+      closeNewSession();
+      createTab(info.id, info.name || "终端", { recording: info.recording });
+    } catch (err) {
+      els.newSessionError.textContent = String(err.message || err);
+      els.newSessionError.classList.remove("hidden");
+    }
+  });
 
   window.addEventListener("resize", () => {
     const s = activeId && sessions.get(activeId);
@@ -569,7 +772,7 @@
     for (const s of sessions.values()) { s.intentional = true; if (s.ws) s.ws.close(); }
   });
 
-  els.newTab.addEventListener("click", () => newSession().catch((e) => toast(String(e.message || e), "error")));
+  els.newTab.addEventListener("click", () => { if (!sharedMode) openNewSession(); });
   els.logout.addEventListener("click", async () => {
     try { await api("POST", "/api/logout"); } catch { /* 忽略 */ }
     location.reload();
@@ -640,8 +843,21 @@
     hideLogin();
     try {
       const list = await api("GET", "/api/sessions");
-      if (list.length) list.forEach((s) => createTab(s.id, s.name, { recording: s.recording }));
-      else await newSession();
+      if (!list.length) { await newSession(true); return; }
+      // Most recently used first: those are the ones that get a live socket.
+      // The rest stay in the tab bar as "未连接" and attach when opened, so a
+      // user with dozens of sessions does not open dozens of sockets.
+      const ordered = list.slice().sort((a, b) => (b.last_active || 0) - (a.last_active || 0));
+      ordered.forEach((info, index) => {
+        createTab(info.id, info.name, {
+          recording: info.recording,
+          autoConnect: index < AUTO_CONNECT_MAX,
+          activate: false,
+        });
+      });
+      // Show the newest one first (and make sure it is online).
+      const newest = ordered[0] && sessions.get(ordered[0].id);
+      if (newest) activateTab(newest.id);
     } catch (err) { setConnection(String(err.message || err), "bad"); }
   }
 
@@ -783,8 +999,8 @@
   els.sessionsBtn.addEventListener("click", toggleSessions);
   els.sessionsClose.addEventListener("click", () => els.sessionsOverlay.classList.add("hidden"));
   els.sessionsNew.addEventListener("click", () => {
-    newSession().then(() => els.sessionsOverlay.classList.add("hidden"))
-      .catch((err) => toast(String(err.message || err), "error"));
+    els.sessionsOverlay.classList.add("hidden");
+    openNewSession();
   });
 
   // -- 管理面板 ---------------------------------------------------------
@@ -816,6 +1032,7 @@
     try {
       if (adminTab === "users") await renderUsers();
       else if (adminTab === "audit") await renderAudit();
+      else if (adminTab === "config") await renderConfig();
       else await renderRecordings();
     } catch (err) { adminNote(String(err.message || err), true); }
   }
@@ -1005,6 +1222,63 @@
     host.appendChild(table);
   }
 
+  async function renderConfig() {
+    const data = await api("GET", "/api/config");
+    const host = document.createElement("div");
+    els.adminBody.appendChild(host);
+
+    const meta = document.createElement("p");
+    meta.className = "hint";
+    meta.textContent = `配置文件：${data.config_path}　·　数据目录：${data.data_dir}`;
+    host.appendChild(meta);
+
+    const reloadBar = document.createElement("div");
+    reloadBar.className = "admin-toolbar";
+    const reloadBtn = document.createElement("button");
+    reloadBtn.className = "text-btn";
+    reloadBtn.textContent = "重载配置";
+    const reloadNote = document.createElement("span");
+    reloadNote.className = "file-status";
+    reloadBtn.addEventListener("click", async () => {
+      try {
+        const info = await api("POST", "/api/config/reload");
+        const changed = info.changed || [];
+        const errors = info.errors || [];
+        if (errors.length) {
+          reloadNote.textContent = "重载有问题：" + errors.join("；");
+          reloadNote.style.color = "var(--danger)";
+          toast("配置重载存在问题", "error");
+        } else {
+          reloadNote.textContent = "已重载；变更：" + (changed.join("、") || "无");
+          reloadNote.style.color = "var(--ok)";
+          toast("配置已重载", "ok");
+        }
+      } catch (err) {
+        reloadNote.textContent = String(err.message || err);
+        reloadNote.style.color = "var(--danger)";
+      }
+    });
+    reloadBar.append(reloadBtn, reloadNote);
+    host.appendChild(reloadBar);
+
+    const table = document.createElement("table");
+    table.className = "config-table";
+    table.innerHTML = "<thead><tr><th>配置项</th><th>生效值</th><th>生效方式</th></tr></thead>";
+    const tbody = document.createElement("tbody");
+    for (const field of data.fields || []) {
+      const tr = document.createElement("tr");
+      const kindLabel = field.kind === "restart" ? "需重启" : "热更新";
+      tr.innerHTML =
+        `<td>${esc(field.key)}</td>` +
+        `<td class="val">${esc(field.value === "" ? "（空）" : field.value)}</td>` +
+        `<td><span class="kind-badge ${field.kind}">${kindLabel}</span></td>`;
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    host.appendChild(table);
+    if (me && me.role !== "admin") adminNote("配置为只读视图", false);
+  }
+
   // -- 录制 -------------------------------------------------------------
 
   let replayBlobUrl = null;
@@ -1115,13 +1389,34 @@
 
   // -- ZMODEM -----------------------------------------------------------
 
+  // While a transfer runs, keystrokes are withheld from the remote (they would
+  // corrupt the protocol). If the transfer dies without its end event the
+  // terminal would look dead, so an inactivity watchdog force-releases it.
+  const ZMODEM_WATCHDOG_MS = 20000;
+
+  function armZmodemWatchdog(s) {
+    if (s.zmodemWatchdog) clearTimeout(s.zmodemWatchdog);
+    s.zmodemWatchdog = setTimeout(() => {
+      s.zmodemWatchdog = null;
+      if (s.zmodemActive) {
+        s.zmodemActive = false;
+        toast("文件传输已中断，终端输入已恢复", "error");
+      }
+    }, ZMODEM_WATCHDOG_MS);
+  }
+
+  function releaseZmodem(s) {
+    if (s.zmodemWatchdog) { clearTimeout(s.zmodemWatchdog); s.zmodemWatchdog = null; }
+    s.zmodemActive = false;
+  }
+
   function makeSentry(s) {
     if (!window.Zmodem) return null;
     return new Zmodem.Sentry({
       to_terminal: (octets) => s.term.write(new Uint8Array(octets)),
       sender: (octets) => { if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(new Uint8Array(octets)); },
       on_detect: (detection) => handleZmodem(s, detection),
-      on_retract: () => {},
+      on_retract: () => releaseZmodem(s),
     });
   }
   function handleZmodem(s, detection) {
@@ -1129,11 +1424,13 @@
     let zsession;
     try { zsession = detection.confirm(); } catch { return; }
     s.zmodemActive = true;
-    const done = () => { s.zmodemActive = false; };
+    armZmodemWatchdog(s);
+    const done = () => releaseZmodem(s);
     if (zsession.type === "send") {
       const picker = document.createElement("input");
       picker.type = "file"; picker.multiple = true;
       picker.addEventListener("change", () => {
+        if (!picker.files || !picker.files.length) { done(); return; }
         Zmodem.Browser.send_files(zsession, picker.files, {}).then(() => zsession.close()).then(done, done);
       });
       picker.click();
@@ -1141,7 +1438,7 @@
       zsession.on("offer", (xfer) => {
         const name = xfer.get_details().name;
         const payload = [];
-        xfer.on("input", (chunk) => payload.push(new Uint8Array(chunk)));
+        xfer.on("input", (chunk) => { payload.push(new Uint8Array(chunk)); armZmodemWatchdog(s); });
         xfer.accept().then(() => Zmodem.Browser.save_to_disk(payload, name));
       });
       zsession.on("session_end", done);
@@ -1151,7 +1448,7 @@
   els.zmodemBtn.addEventListener("click", () => {
     const s = activeId && sessions.get(activeId);
     if (!s) return;
-    if (s.sentry) { s.sentry = null; s.zmodemActive = false; els.zmodemBtn.classList.remove("rec-on"); }
+    if (s.sentry) { s.sentry = null; releaseZmodem(s); els.zmodemBtn.classList.remove("rec-on"); }
     else { s.sentry = makeSentry(s); if (s.sentry) els.zmodemBtn.classList.add("rec-on"); }
   });
 
@@ -1159,7 +1456,7 @@
 
   function runAction(action) {
     switch (action) {
-      case "new_session": newSession().catch(() => {}); break;
+      case "new_session": newSession(true).catch(() => {}); break;
       case "close_session": if (activeId) detachTab(activeId); break;
       case "kill_session": if (activeId) killTab(activeId); break;
       case "next_tab": case "prev_tab": {
@@ -1361,7 +1658,9 @@
         });
         els.fileList.appendChild(li);
       }
-      els.fileStatus.textContent = `${data.entries.length} 项`;
+      els.fileStatus.textContent = data.truncated
+        ? `${data.entries.length}+ 项（已截断，仅显示前 ${data.limit} 项）`
+        : `${data.entries.length} 项`;
     } catch (err) { els.fileStatus.textContent = String(err.message || err); }
   }
 
@@ -1369,21 +1668,37 @@
     if (!files || !files.length) return;
     try {
       for (const file of files) {
-        const form = new FormData();
-        form.append("path", filePath);
-        form.append("file", file);
-        els.fileStatus.textContent = `正在上传 ${file.name}…`;
-        const res = await fetch("/api/files/upload", { method: "POST", body: form });
-        if (!res.ok) {
-          let detail = res.statusText;
-          try { detail = (await res.json()).detail || detail; } catch { /* 忽略 */ }
-          els.fileStatus.textContent = `失败：${detail}`;
-          return;
+        let overwrite = false;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const form = new FormData();
+          form.append("path", filePath);
+          form.append("file", file);
+          if (overwrite) form.append("overwrite", "1");
+          els.fileStatus.textContent = `正在上传 ${file.name}…`;
+          const res = await fetch("/api/files/upload", { method: "POST", body: form });
+          if (res.status === 409 && !overwrite) {
+            // Never silently replace: ask first, then retry with overwrite=1.
+            const ok = await confirmDialog(
+              `「${file.name}」已存在，是否覆盖？`, "覆盖文件",
+            );
+            if (!ok) { els.fileStatus.textContent = "已跳过"; break; }
+            overwrite = true;
+            continue;
+          }
+          if (!res.ok) {
+            let detail = res.statusText;
+            try { detail = (await res.json()).detail || detail; } catch { /* 忽略 */ }
+            els.fileStatus.textContent = `失败：${detail}`;
+            return;
+          }
+          break;
         }
       }
+      // Reload first, then report: `loadFiles` writes its own status line and
+      // would otherwise immediately overwrite "上传完成".
+      await loadFiles(filePath);
       els.fileStatus.textContent = "上传完成";
       toast("上传完成", "ok");
-      await loadFiles(filePath);
     } catch (err) { els.fileStatus.textContent = `失败：${err.message || err}`; }
   }
 

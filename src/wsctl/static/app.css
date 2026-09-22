@@ -149,6 +149,16 @@ body { display: flex; flex-direction: column; }
 .tab .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
 .tab.connected .dot { background: var(--ok); }
 .tab.exited .dot { background: var(--danger); }
+.tab.standby .dot { background: var(--muted); opacity: 0.45; }
+.tab.standby .label { opacity: 0.7; }
+.tab.standby::after {
+  content: "未连接";
+  color: var(--muted);
+  font-size: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
 .tab .label { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .tab .close {
   color: var(--muted); padding: 0 2px; border-radius: 4px; line-height: 1;
@@ -479,6 +489,32 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--fg);
 }
+
+/* 新建会话对话框 */
+.ssh-block {
+  display: flex; flex-direction: column; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg);
+}
+.field-row { display: flex; gap: var(--sp-2); }
+.field-row label { flex: 1; }
+.new-session-error { color: var(--danger); }
+
+/* 配置查看 */
+.config-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.config-table th, .config-table td {
+  text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+}
+.config-table th { color: var(--muted); font-weight: 600; font-size: 11px; font-family: var(--font-sans); }
+.config-table td.val { word-break: break-all; }
+.kind-badge {
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px;
+  font-size: 10px; color: var(--muted); font-family: var(--font-sans);
+}
+.kind-badge.hot { color: var(--ok); border-color: var(--ok); }
+.kind-badge.restart { color: var(--warn); border-color: var(--warn); }
 .hotkey-list { display: flex; flex-direction: column; gap: var(--sp-1); max-height: 200px; overflow-y: auto; }
 .hotkey-row { display: flex; align-items: center; gap: var(--sp-2); font-size: 12px; }
 .hotkey-row span { flex: 1; color: var(--muted); }

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import subprocess
+import time
 from typing import Any
 
 from .pty import PtyError
@@ -55,8 +57,9 @@ class WinPty:  # pragma: no cover - platform specific
             return data.encode("utf-8", "replace")
         return bytes(data)
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes) -> bool:
         self._proc.write(data.decode("utf-8", "replace"))
+        return True
 
     def resize(self, cols: int, rows: int) -> None:
         self._proc.setwinsize(rows, cols)
@@ -66,13 +69,24 @@ class WinPty:  # pragma: no cover - platform specific
             return None
         return self._proc.exitstatus or 0
 
-    def wait(self) -> int:
-        self._proc.wait()
+    def wait(self, timeout: float | None = None) -> int:
+        if timeout is None:
+            self._proc.wait()
+            return self._proc.exitstatus or 0
+        deadline = time.monotonic() + timeout
+        while self._proc.isalive():
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self._proc.pid, timeout)
+            time.sleep(0.05)
         return self._proc.exitstatus or 0
 
     def terminate(self, sig: int = signal.SIGHUP) -> None:
         if self._proc.isalive():
             self._proc.terminate()
+
+    def kill(self) -> None:
+        if self._proc.isalive():
+            self._proc.kill()
 
     def close(self) -> None:
         if self._proc.isalive():

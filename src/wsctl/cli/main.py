@@ -6,6 +6,7 @@ import contextlib
 import difflib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -14,32 +15,55 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.parse
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn, cast
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from wsctl import __version__
-from wsctl.cli import daemon as daemon_mod
 from wsctl.cli import validate as vmod
-from wsctl.cli.client import (
-    ApiClient,
-    ApiError,
-    clear_credentials,
-    load_credentials,
-    save_credentials,
-)
-from wsctl.cli.client import (
-    login as api_login,
-)
-from wsctl.cli.connect import ConnectError, run_connect
-from wsctl.core import backup as backup_mod
-from wsctl.core import totp, user_admin
-from wsctl.core.config import Settings, load_settings
-from wsctl.core.logging import configure_logging
-from wsctl.core.store import Store
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    from wsctl.cli.client import ApiClient
+    from wsctl.cli.daemon import Instance
+    from wsctl.core.config import Settings
+    from wsctl.core.store import Store
+
+
+class _LazyModule:
+    """Import a module on first attribute access.
+
+    ``wsctl version`` and ``wsctl --help`` must not pay for pydantic-settings,
+    websockets, argon2 and pyotp: those belong to commands that actually talk
+    to a server or touch the database.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._module: Any = None
+
+    def _load(self) -> Any:
+        if self._module is None:
+            import importlib
+
+            self._module = importlib.import_module(self._name)
+        return self._module
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._load(), item)
+
+daemon_mod = _LazyModule("wsctl.cli.daemon")
+backup_mod = _LazyModule("wsctl.core.backup")
+totp = _LazyModule("wsctl.core.totp")
+user_admin = _LazyModule("wsctl.core.user_admin")
+config_mod = _LazyModule("wsctl.core.config")
+logging_mod = _LazyModule("wsctl.core.logging")
+store_mod = _LazyModule("wsctl.core.store")
+client_mod = _LazyModule("wsctl.cli.client")
+connect_mod = _LazyModule("wsctl.cli.connect")
 
 app = typer.Typer(
     name="wsctl",
@@ -50,9 +74,13 @@ app = typer.Typer(
 user_app = typer.Typer(name="user", help="管理用户。", no_args_is_help=True)
 config_app = typer.Typer(name="config", help="查看与管理配置。", no_args_is_help=True)
 session_app = typer.Typer(name="session", help="管理终端会话。", no_args_is_help=True)
+completion_app = typer.Typer(
+    name="completion", help="安装或查看 shell 补全脚本。", no_args_is_help=True
+)
 app.add_typer(user_app)
 app.add_typer(config_app)
 app.add_typer(session_app)
+app.add_typer(completion_app)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -105,12 +133,12 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _api_client(url: str | None) -> ApiClient:
-    creds = load_credentials()
+    creds = client_mod.load_credentials()
     base = url or (str(creds["url"]) if creds.get("url") else None)
     if not base:
         _fail("缺少服务器地址：请传入 --url，或先运行 'wsctl login <url>'")
     token = str(creds["token"]) if creds.get("token") else None
-    return ApiClient(base, token)
+    return cast("ApiClient", client_mod.ApiClient(base, token))
 
 
 def _settings_from(config: Path | None, **overrides: object) -> Settings:
@@ -118,13 +146,88 @@ def _settings_from(config: Path | None, **overrides: object) -> Settings:
         import os
 
         os.environ["WSCTL_CONFIG"] = str(config)
-    return load_settings(**overrides)
+    return cast("Settings", config_mod.load_settings(**overrides))
+
+
+def _print_json(payload: object) -> None:
+    """Machine-readable output on stdout, so it composes with pipes."""
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n")
 
 
 @app.command()
 def version() -> None:
     """显示 wsctl 版本。"""
     console.print(f"wsctl {__version__}")
+
+
+SUPPORTED_SHELLS = ("bash", "zsh", "fish", "powershell", "pwsh")
+
+
+def _detect_shell() -> str:
+    """Best-effort shell detection, preferring ``$SHELL`` over the parent proc."""
+    import os as _os
+
+    name = _os.path.basename(_os.environ.get("SHELL", "") or "")
+    if name in SUPPORTED_SHELLS:
+        return name
+    for candidate in ("bash", "zsh", "fish"):
+        if _os.environ.get(f"{candidate.upper()}_VERSION"):
+            return candidate
+    return "bash"
+
+
+@completion_app.command("install")
+def completion_install(
+    shell: Annotated[
+        str | None,
+        typer.Argument(help="目标 shell：bash / zsh / fish / powershell（省略则自动识别）。"),
+    ] = None,
+) -> None:
+    """安装 shell 补全脚本，并写入对应的 rc 文件。
+
+    支持 bash / zsh / fish / PowerShell。Typer 的 ``--install-completion``
+    只覆盖 bash，这里补齐其余 shell。
+    """
+    target = shell or _detect_shell()
+    if target not in SUPPORTED_SHELLS:
+        _fail(f"不支持的 shell：{target}（可选：{'、'.join(SUPPORTED_SHELLS)}）")
+    try:
+        from typer._completion_shared import install as typer_install
+
+        used, path = typer_install(shell=target)
+    except Exception as exc:
+        _fail(f"安装补全失败：{exc}")
+        return
+    console.print(f"[green]{used} 补全已安装到[/] {path}")
+    if used == "bash":
+        console.print("[dim]请重新打开终端，或执行：source ~/.bashrc[/]")
+    elif used == "zsh":
+        console.print("[dim]请重新打开终端，或执行：exec zsh[/]")
+    elif used == "fish":
+        console.print("[dim]请重新打开终端，或执行：exec fish[/]")
+
+
+@completion_app.command("show")
+def completion_show(
+    shell: Annotated[
+        str | None,
+        typer.Argument(help="目标 shell：bash / zsh / fish / powershell（省略则自动识别）。"),
+    ] = None,
+) -> None:
+    """打印补全脚本（可自行保存到任意位置后 source）。"""
+    target = shell or _detect_shell()
+    if target not in SUPPORTED_SHELLS:
+        _fail(f"不支持的 shell：{target}（可选：{'、'.join(SUPPORTED_SHELLS)}）")
+    try:
+        from typer._completion_shared import get_completion_script
+
+        script = get_completion_script(
+            prog_name="wsctl", complete_var="_WSCTL_COMPLETE", shell=target
+        )
+    except Exception as exc:
+        _fail(f"生成补全脚本失败：{exc}")
+        return
+    sys.stdout.write(script + "\n")
 
 
 def _which(name: str) -> str:
@@ -167,7 +270,7 @@ def doctor(
         add("数据目录", f"{settings.data_dir}（{exc}）", bad)
 
     try:
-        store = Store(settings.db_path)
+        store = store_mod.Store(settings.db_path)
         try:
             users = store.user_count()
         finally:
@@ -225,15 +328,52 @@ def doctor(
             ok if free else warn,
         )
 
-    if url or load_credentials().get("url"):
+    if url or client_mod.load_credentials().get("url"):
         try:
             client = _api_client(url)
             health = client.request("GET", "/healthz", auth=False)
             add("服务器", f"{client.base_url}（版本 {health.get('version')}）", ok)
-        except ApiError as exc:
+        except client_mod.ApiError as exc:
             add("服务器", f"（{exc}）", bad)
     else:
         add("服务器", "未配置（可用 --url 检查）", "[dim]-[/]")
+
+    # Operational details that only show up once something goes wrong.
+    try:
+        usage = shutil.disk_usage(settings.data_dir)
+        free_gb = usage.free / (1024**3)
+        add(
+            "磁盘剩余空间",
+            f"{free_gb:.1f} GB（数据目录所在分区）",
+            ok if free_gb >= 1.0 else (bad if free_gb < 0.1 else warn),
+        )
+    except OSError as exc:
+        add("磁盘剩余空间", f"（{exc}）", warn)
+
+    add(
+        "密码策略",
+        f"创建/改密强制：非空且至少 {8} 位（存量弱密码不会被强制修改）",
+        ok,
+    )
+
+    log_file = settings.log_file or (
+        daemon_mod.logfile_path(settings) if daemon_mod.read_instance(settings) else None
+    )
+    if log_file is not None and log_file.is_file():
+        size_mb = log_file.stat().st_size / (1024 * 1024)
+        detail = f"{log_file}（{size_mb:.1f} MB"
+        if settings.log_max_bytes > 0:
+            detail += f"，超过 {settings.log_max_bytes / (1024 * 1024):.0f} MB 自动轮转"
+        detail += "）"
+        add("日志文件", detail, ok if size_mb < 512 else warn)
+    else:
+        add("日志文件", "未使用文件日志（前台输出到终端）", "[dim]-[/]")
+
+    add(
+        "系统时间",
+        time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        "[dim]-[/]",
+    )
 
     if json_output:
         import re
@@ -405,12 +545,12 @@ def _start_background(settings: Settings, argv: list[str], *, timeout: float) ->
 def _serve_foreground(
     settings: Settings, *, admin_password: str | None, startup_command: str | None
 ) -> None:
-    configure_logging(settings.log_level, json_output=settings.log_json)
+    logging_mod.configure_logging(settings.log_level, json_output=settings.log_json)
 
     from wsctl.server.app import create_app
 
     try:
-        store = Store(settings.db_path)
+        store = store_mod.Store(settings.db_path)
     except (OSError, sqlite3.Error) as exc:
         _fail(f"无法打开数据库 {settings.db_path}：{exc}")
     _ensure_admin(store, settings, admin_password)
@@ -419,7 +559,7 @@ def _serve_foreground(
     if settings.reuse_port and not hasattr(socket, "SO_REUSEPORT"):
         _fail("当前平台不支持 SO_REUSEPORT，无法使用 --reuse-port")
 
-    instance: daemon_mod.Instance | None = None
+    instance: Instance | None = None
     if settings.reuse_port:
         console.print("[dim]SO_REUSEPORT：多实例共享端口，后台生命周期命令不可用[/]")
     else:
@@ -763,7 +903,9 @@ def reload(
     console.print(f"[green]已请求重载配置[/]（pid {instance.pid}）")
 
 
-def _ensure_admin(store: Store, settings: Settings, password: str | None) -> None:
+def _ensure_admin(
+    store: Store, settings: Settings, password: str | None
+) -> None:
     if not settings.auth_required or store.user_count() > 0:
         return
     if not password:
@@ -795,8 +937,9 @@ def user_add(
     ] = None,
     role: Annotated[str, typer.Option(help="角色：admin 或 user。")] = "user",
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
 ) -> None:
-    """创建一个用户。"""
+    """创建一个用户（密码须非空且至少 8 位）。"""
     try:
         vmod.validate(vmod.Options({"role": role}), [vmod.choices("role", ("admin", "user"))])
     except vmod.CliUsageError as exc:
@@ -804,25 +947,45 @@ def user_add(
     settings = _settings_from(config)
     if password is None:
         password = typer.prompt("密码", hide_input=True, confirmation_prompt=True)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         user_admin.create(store, username, password, role=role)
     except user_admin.UserAdminError as exc:
         _fail(exc.message)
     finally:
         store.close()
+    if json_output:
+        _print_json({"username": username, "role": role})
+        return
     console.print(f"[green]已创建用户[/] {username}（[cyan]{role}[/]）")
 
 
 @user_app.command("list")
-def user_list(config: Annotated[Path | None, typer.Option("--config", "-c")] = None) -> None:
+def user_list(
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
+) -> None:
     """列出所有用户。"""
     settings = _settings_from(config)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         users = store.user_list()
     finally:
         store.close()
+    if json_output:
+        _print_json(
+            [
+                {
+                    "id": u.id,
+                    "username": u.username,
+                    "role": u.role,
+                    "disabled": u.disabled,
+                    "created_at": u.created_at,
+                }
+                for u in users
+            ]
+        )
+        return
     table = Table("ID", "用户名", "角色", "已禁用")
     for u in users:
         table.add_row(str(u.id), u.username, u.role, "是" if u.disabled else "否")
@@ -836,7 +999,7 @@ def user_del(
 ) -> None:
     """删除一个用户（不会删除最后一个管理员）。"""
     settings = _settings_from(config)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         user_admin.delete(store, username)
     except user_admin.UserAdminError as exc:
@@ -854,7 +1017,7 @@ def user_passwd(
     """修改用户密码（并吊销该用户已有的登录态）。"""
     settings = _settings_from(config)
     password = typer.prompt("新密码", hide_input=True, confirmation_prompt=True)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         user_admin.set_password(store, username, password)
     except user_admin.UserAdminError as exc:
@@ -876,7 +1039,7 @@ def user_role(
     except vmod.CliUsageError as exc:
         _usage_fail(exc)
     settings = _settings_from(config)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         user_admin.set_role(store, username, role)
     except user_admin.UserAdminError as exc:
@@ -894,7 +1057,7 @@ def user_totp(
 ) -> None:
     """启用或关闭用户的 TOTP 两步验证。"""
     settings = _settings_from(config)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         if store.user_get(username) is None:
             _fail(f"没有此用户：{username}")
@@ -930,7 +1093,7 @@ def user_disable(
 ) -> None:
     """禁用一个用户（其登录态立即失效；不能禁用最后一个管理员）。"""
     settings = _settings_from(config)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         user_admin.set_disabled(store, username, True)
     except user_admin.UserAdminError as exc:
@@ -947,7 +1110,7 @@ def user_enable(
 ) -> None:
     """重新启用一个用户。"""
     settings = _settings_from(config)
-    store = Store(settings.db_path)
+    store = store_mod.Store(settings.db_path)
     try:
         user_admin.set_disabled(store, username, False)
     except user_admin.UserAdminError as exc:
@@ -961,13 +1124,27 @@ def user_enable(
 def audit(
     limit: Annotated[int, typer.Option("--limit", "-n", help="条目数量。")] = 50,
     url: Annotated[str | None, typer.Option("--url", help="服务器地址。")] = None,
+    event: Annotated[str | None, typer.Option("--event", help="按事件类型筛选。")] = None,
+    user_id: Annotated[int | None, typer.Option("--user-id", help="按用户 ID 筛选。")] = None,
+    ip: Annotated[str | None, typer.Option("--ip", help="按 IP 筛选。")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
 ) -> None:
     """查看服务端审计日志（仅管理员）。"""
     client = _api_client(url)
+    params = [f"limit={limit}"]
+    if event:
+        params.append(f"event={urllib.parse.quote(event)}")
+    if user_id is not None:
+        params.append(f"user_id={user_id}")
+    if ip:
+        params.append(f"ip={urllib.parse.quote(ip)}")
     try:
-        rows = client.request("GET", f"/api/audit?limit={limit}")
-    except ApiError as exc:
+        rows = client.request("GET", "/api/audit?" + "&".join(params))
+    except client_mod.ApiError as exc:
         _fail(str(exc))
+    if json_output:
+        _print_json(rows)
+        return
     table = Table("时间", "事件", "用户", "会话", "IP", "详情")
     for row in rows:
         table.add_row(
@@ -982,11 +1159,23 @@ def audit(
 
 
 @config_app.command("show")
-def config_show(config: Annotated[Path | None, typer.Option("--config", "-c")] = None) -> None:
+def config_show(
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
+) -> None:
     """显示生效中的配置。"""
     settings = _settings_from(config)
+    values = settings.model_dump()
+    if json_output:
+        _print_json(
+            {
+                "config_path": str(settings.config_path),
+                "values": {k: str(v) if isinstance(v, Path) else v for k, v in values.items()},
+            }
+        )
+        return
     table = Table("配置项", "值")
-    for key, value in settings.model_dump().items():
+    for key, value in values.items():
         table.add_row(key, str(value))
     console.print(table)
     console.print(f"[dim]配置文件：{settings.config_path}[/]")
@@ -1003,14 +1192,20 @@ def config_path(config: Annotated[Path | None, typer.Option("--config", "-c")] =
 def config_get(
     key: Annotated[str, typer.Argument(help="配置项名称。")],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
 ) -> None:
-    """打印某个配置项的生效值。"""
+    """打印某个配置项的生效值（默认裸值便于 $( ) 捕获）。"""
     settings = _settings_from(config)
-    if key not in Settings.model_fields:
-        suggestion = difflib.get_close_matches(key, set(Settings.model_fields), n=1)
+    if key not in config_mod.Settings.model_fields:
+        suggestion = difflib.get_close_matches(key, set(config_mod.Settings.model_fields), n=1)
         hint = f"，是否想用 “{suggestion[0]}”？" if suggestion else ""
         _fail(f"未知的配置项：{key}{hint}")
-    console.print(str(getattr(settings, key)))
+    value = getattr(settings, key)
+    if json_output:
+        _print_json({"key": key, "value": value})
+        return
+    # Bare value on stdout so it composes with $( ) and pipes.
+    sys.stdout.write(f"{value}\n")
 
 
 @config_app.command("validate")
@@ -1027,7 +1222,7 @@ def config_validate(
     except tomllib.TOMLDecodeError as exc:
         _fail(f"配置文件 TOML 语法错误：{exc}")
     try:
-        Settings(**data)
+        config_mod.Settings(**data)
     except Exception as exc:
         _fail(f"配置项无效：{exc}")
     console.print(f"[green]配置有效[/]：{path}")
@@ -1112,6 +1307,27 @@ def config_edit(config: Annotated[Path | None, typer.Option("--config", "-c")] =
         _fail(f"无法启动编辑器 '{editor}'：{exc}")
 
 
+def _split_trailing_comment(text: str) -> tuple[str, str | None]:
+    """Split ``value  # comment`` into ``(value, comment)``, quote-aware."""
+    in_single = in_double = False
+    for index, ch in enumerate(text):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif (
+            ch == "#"
+            and not in_single
+            and not in_double
+            and (index == 0 or text[index - 1] in " \t")
+        ):
+            return text[:index].rstrip(), text[index:].strip()
+    return text.rstrip(), None
+
+
+_KEY_LINE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
+
 @config_app.command("set")
 def config_set(
     key: Annotated[str, typer.Argument(help="配置项名称。")],
@@ -1120,9 +1336,9 @@ def config_set(
     ],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """在配置文件中设置一个值。"""
+    """在配置文件中设置一个值（保留原有行内注释）。"""
     settings = _settings_from(config)
-    known = set(Settings.model_fields)
+    known = set(config_mod.Settings.model_fields)
     if key not in known:
         suggestion = difflib.get_close_matches(key, known, n=1)
         hint = f"，是否想用 “{suggestion[0]}”？" if suggestion else ""
@@ -1135,7 +1351,7 @@ def config_set(
     # Type-check the single value against the settings model before touching the
     # file, so `port = "abc"` is rejected here rather than at the next start.
     try:
-        Settings(**{key: parsed})
+        config_mod.Settings(**{key: parsed})
     except Exception as exc:
         _fail(f"配置项 {key} 的值无效：{exc}")
 
@@ -1144,11 +1360,16 @@ def config_set(
     lines = original.splitlines() if original is not None else []
     replaced = False
     for index, line in enumerate(lines):
-        stripped = line.strip()
-        if "=" in stripped and stripped.split("=", 1)[0].strip() == key:
-            lines[index] = f"{key} = {value}"
-            replaced = True
-            break
+        match = _KEY_LINE.match(line)
+        if match is None or match.group(2) != key:
+            continue
+        # Keep the author's trailing comment: editing one key must not strip
+        # the explanation they wrote next to it.
+        _, comment = _split_trailing_comment(line[match.end():])
+        suffix = f"  {comment}" if comment else ""
+        lines[index] = f"{key} = {value}{suffix}"
+        replaced = True
+        break
     if not replaced:
         lines.append(f"{key} = {value}")
     new_text = "\n".join(lines).rstrip("\n") + "\n"
@@ -1157,7 +1378,7 @@ def config_set(
     # on failure so a bad edit never leaves the server unable to start.
     try:
         data = tomllib.loads(new_text)
-        Settings(**data)
+        config_mod.Settings(**data)
     except Exception as exc:
         _fail(f"写入后配置无效，已放弃修改：{exc}")
 
@@ -1170,30 +1391,52 @@ def config_set(
 def config_reload(
     url: Annotated[str | None, typer.Option("--url", help="服务器地址。")] = None,
 ) -> None:
-    """请求运行中的服务重载配置（仅管理员）。"""
+    """请求运行中的服务重载配置（仅管理员）。
+
+    配置文件写错时**不会静默忽略**：错误会在这里原样打印，服务端日志里也有。
+    """
     client = _api_client(url)
     try:
         info = client.request("POST", "/api/config/reload")
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
     changed = info.get("changed") or []
+    errors = info.get("errors") or []
+    if errors:
+        err_console.print("[red]配置重载存在问题：[/]")
+        for message in errors:
+            err_console.print(f"  [red]-[/] {message}")
     console.print("[green]已重载[/] 配置；变更项：" + ("、".join(changed) or "无"))
+    if errors:
+        raise typer.Exit(code=1)
 
 
 @session_app.command("list")
 def session_list(
     url: Annotated[str | None, typer.Option("--url", help="服务器地址。")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
 ) -> None:
     """列出运行中服务的会话。"""
     client = _api_client(url)
     try:
         sessions = client.request("GET", "/api/sessions")
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
-    table = Table("id", "名称", "PID", "连接数", "所有者")
+    if json_output:
+        _print_json(sessions)
+        return
+    table = Table("id", "名称", "PID", "连接数", "所有者", "后端", "状态")
     for s in sessions:
+        owner = s.get("owner") or (s.get("owner_id") if s.get("owner_id") is not None else "-")
+        state = "运行" if s.get("alive") else "已退出"
         table.add_row(
-            str(s["id"]), str(s["name"]), str(s["pid"]), str(s["clients"]), str(s["owner_id"])
+            str(s["id"]),
+            str(s["name"]),
+            str(s["pid"]),
+            str(s["clients"]),
+            str(owner),
+            str(s.get("backend", "local")),
+            state,
         )
     console.print(table)
 
@@ -1207,7 +1450,7 @@ def session_kill(
     client = _api_client(url)
     try:
         client.request("DELETE", f"/api/sessions/{sid}")
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
     console.print(f"[green]已终止会话[/] {sid}")
 
@@ -1234,6 +1477,7 @@ def session_new(
         list[str] | None, typer.Option("--ssh-option", help="额外的 ssh -o 选项（可重复）。")
     ] = None,
     url: Annotated[str | None, typer.Option("--url", help="服务器地址。")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
 ) -> None:
     """在运行中的服务上创建会话。"""
     options = vmod.Options(
@@ -1305,8 +1549,11 @@ def session_new(
     }
     try:
         info = client.request("POST", "/api/sessions", body)
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
+    if json_output:
+        _print_json(info)
+        return
     console.print(f"[green]已创建会话[/] {info['id']}（[cyan]{info['name']}[/]）")
 
 
@@ -1315,13 +1562,17 @@ def session_rename(
     sid: Annotated[str, typer.Argument(help="会话 id。")],
     name: Annotated[str, typer.Argument(help="新名称。")],
     url: Annotated[str | None, typer.Option("--url", help="服务器地址。")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="以 JSON 输出。")] = False,
 ) -> None:
     """重命名一个会话。"""
     client = _api_client(url)
     try:
         info = client.request("PATCH", f"/api/sessions/{sid}", {"name": name})
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
+    if json_output:
+        _print_json(info)
+        return
     console.print(f"[green]已重命名为[/] {info['name']}")
 
 
@@ -1338,8 +1589,8 @@ def session_attach(
 ) -> None:
     """把当前终端连接到已有会话。"""
     try:
-        run_connect(url, sid, token, reconnect=not no_reconnect)
-    except ConnectError as exc:
+        connect_mod.run_connect(url, sid, token, reconnect=not no_reconnect)
+    except connect_mod.ConnectError as exc:
         _fail(str(exc))
 
 
@@ -1357,7 +1608,7 @@ def session_record(
         info = client.request(
             "POST", f"/api/sessions/{sid}/recording/start", {"record_input": record_input}
         )
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
     console.print(f"[green]开始录制[/] {sid} -> {info['path']}")
 
@@ -1371,7 +1622,7 @@ def session_record_stop(
     client = _api_client(url)
     try:
         client.request("POST", f"/api/sessions/{sid}/recording/stop")
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
     console.print(f"[green]已停止录制[/] {sid}")
 
@@ -1388,7 +1639,7 @@ def session_recording(
     client = _api_client(url)
     try:
         data = client.download(f"/api/sessions/{sid}/recording")
-    except ApiError as exc:
+    except client_mod.ApiError as exc:
         _fail(str(exc))
     if output is None:
         sys.stdout.buffer.write(data)
@@ -1402,26 +1653,47 @@ def login(
     url: Annotated[str, typer.Argument(help="服务器地址，例如 http://127.0.0.1:7681")],
     username: Annotated[str, typer.Option("--username", "-u", help="用户名。")] = "admin",
     password: Annotated[str | None, typer.Option("--password", "-p", help="密码。")] = None,
+    totp: Annotated[
+        str | None,
+        typer.Option("--totp", help="TOTP 一次性验证码（启用两步验证的账号必填）。"),
+    ] = None,
 ) -> None:
-    """登录服务器并缓存令牌，供后续命令使用。"""
+    """登录服务器并缓存令牌，供后续命令使用。
+
+    启用了两步验证的账号可用 ``--totp 123445`` 直接传码，或省略 ``--totp``
+    在被要求时交互输入（也可用 ``WSCTL_TOTP`` 环境变量供脚本使用）。
+    """
     if password is None:
         password = typer.prompt("密码", hide_input=True)
+    code = totp or os.environ.get("WSCTL_TOTP") or None
     try:
-        token = api_login(url, username, password)
-    except ApiError as exc:
-        _fail(f"登录失败：{exc}")
-    save_credentials(url, token)
+        try:
+            token = client_mod.login(url, username, password, totp=code)
+        except client_mod.ApiError as exc:
+            # A 2FA-enabled account rejects a missing/wrong code with a
+            # code-specific message: that is the signal to prompt and retry
+            # rather than to fail the whole login.
+            if code is None and "验证码" in exc.detail:
+                code = typer.prompt("一次性验证码")
+                token = client_mod.login(url, username, password, totp=code)
+            else:
+                raise
+    except client_mod.ApiError as exc:
+        _fail(f"登录失败：{exc.detail}")
+    client_mod.save_credentials(url, token)
     console.print(f"[green]已登录为[/] {username} @ {url}")
 
 
 @app.command()
 def logout() -> None:
     """清除缓存的服务器凭据。"""
-    creds = load_credentials()
+    creds = client_mod.load_credentials()
     if creds.get("url") and creds.get("token"):
-        with contextlib.suppress(ApiError):
-            ApiClient(str(creds["url"]), str(creds["token"])).request("POST", "/api/logout")
-    clear_credentials()
+        with contextlib.suppress(client_mod.ApiError):
+            client_mod.ApiClient(str(creds["url"]), str(creds["token"])).request(
+                "POST", "/api/logout"
+            )
+    client_mod.clear_credentials()
     console.print("[green]已退出登录。[/]")
 
 
@@ -1440,8 +1712,8 @@ def connect(
 ) -> None:
     """把当前终端连接到远程 wsctl 服务。"""
     try:
-        run_connect(url, session, token, reconnect=not no_reconnect)
-    except ConnectError as exc:
+        connect_mod.run_connect(url, session, token, reconnect=not no_reconnect)
+    except connect_mod.ConnectError as exc:
         _fail(str(exc))
 
 

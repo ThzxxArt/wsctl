@@ -33,3 +33,22 @@ def test_multiple_label_series() -> None:
     text = metrics.render()
     assert 'wsctl_x_total{result="ok"} 2.0' in text
     assert 'wsctl_x_total{result="failed"} 1.0' in text
+
+
+def test_label_values_are_escaped() -> None:
+    """Prometheus text format requires quotes/backslashes/newlines to be escaped."""
+    metrics = Metrics()
+    metrics.inc("wsctl_odd_total", note='say "hi"\\there')
+    metrics.inc("wsctl_odd_total", note="two\nlines")
+    text = metrics.render()
+    assert 'note="say \\"hi\\"\\\\there"' in text
+    assert 'note="two\\nlines"' in text
+
+
+def test_collect_counter_declares_the_counter_type() -> None:
+    """A monotonic `_total` series must be exposed as a counter, not a gauge."""
+    metrics = Metrics()
+    metrics.collect_counter("wsctl_x_total", "help", lambda: 3.0)
+    text = metrics.render()
+    assert "# TYPE wsctl_x_total counter" in text
+    assert "wsctl_x_total 3.0" in text

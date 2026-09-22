@@ -58,7 +58,8 @@ def test_reload_settings_file(tmp_path: Path, monkeypatch: object) -> None:
 
     config.parent.mkdir(parents=True)
     config.write_text('max_sessions = 5\nhost = "0.0.0.0"\n', encoding="utf-8")
-    changed = reload_settings_file(settings)
+    changed, errors = reload_settings_file(settings)
+    assert errors == []
     assert "max_sessions" in changed
     assert settings.max_sessions == 5
     # non-hot fields are ignored
@@ -68,16 +69,28 @@ def test_reload_settings_file(tmp_path: Path, monkeypatch: object) -> None:
 
 def test_reload_missing_file_is_noop(tmp_path: Path) -> None:
     settings = load_settings(config_path=tmp_path / "nope.toml")
-    assert reload_settings_file(settings) == []
+    assert reload_settings_file(settings) == ([], [])
 
 
-def test_reload_invalid_value_is_noop(tmp_path: Path) -> None:
+def test_reload_invalid_value_reports_an_error(tmp_path: Path) -> None:
     config = tmp_path / "wsctl" / "config.toml"
     config.parent.mkdir(parents=True)
     settings = load_settings(config_path=config)
     config.write_text('max_sessions = "not-an-int"\n', encoding="utf-8")
-    assert reload_settings_file(settings) == []
-    assert settings.max_sessions == 64
+    changed, errors = reload_settings_file(settings)
+    assert changed == []
+    assert settings.max_sessions == 64  # the running server keeps its value
+    assert errors and ("not-an-int" in errors[0] or "无效" in errors[0])
+
+
+def test_reload_broken_toml_reports_an_error(tmp_path: Path) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    settings = load_settings(config_path=config)
+    config.write_text("max_sessions = [unclosed\n", encoding="utf-8")
+    changed, errors = reload_settings_file(settings)
+    assert changed == []
+    assert errors and "TOML" in errors[0]
 
 
 def test_reload_respects_env_precedence(tmp_path: Path, monkeypatch: object) -> None:
@@ -90,7 +103,8 @@ def test_reload_respects_env_precedence(tmp_path: Path, monkeypatch: object) -> 
     assert settings.max_sessions == 99  # env wins at load time
 
     config.write_text("max_sessions = 5\n", encoding="utf-8")
-    changed = reload_settings_file(settings)
+    changed, errors = reload_settings_file(settings)
+    assert errors == []
     assert "max_sessions" not in changed
     assert settings.max_sessions == 99  # env still wins after reload
 
@@ -103,6 +117,7 @@ def test_reload_skips_explicitly_empty_env(tmp_path: Path, monkeypatch: object) 
 
     settings = load_settings(config_path=config)
     assert settings.default_shell == ""  # env (empty) wins at load
-    changed = reload_settings_file(settings)
+    changed, errors = reload_settings_file(settings)
+    assert errors == []
     assert "default_shell" not in changed
     assert settings.default_shell == ""

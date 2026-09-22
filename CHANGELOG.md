@@ -5,6 +5,178 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-09-22
+
+Reliability and usability release. Every promise the product makes now holds
+across a restart, a broken disk and a broken config edit; the CLI can log in
+with 2FA and script against JSON. No new terminal protocols.
+
+### Added
+
+- **CLI can log in to a two-factor account.** `wsctl login --totp 123456`, the
+  `WSCTL_TOTP` environment variable, or a prompt when the server asks for a
+  code. Previously a 2FA-enabled account made every CLI command unusable.
+- **Share links survive a server restart.** The token, its expiry and its
+  writable flag are persisted with the session (`term_sessions.share_*`,
+  schema version 4) and rehydrated verbatim on adoption, so a QR code that was
+  already handed out keeps working — the same promise the session itself makes
+  on the tmux backend. Renaming a session no longer invalidates its link.
+- **Minimum password policy** (non-empty, at least 8 characters), enforced in
+  one place (`core/passwords.validate_password`) at the storage boundary, in
+  `user_admin`, and therefore by both the HTTP API and the CLI. Existing
+  passwords are *not* force-changed; `wsctl doctor` warns instead of locking
+  anyone out.
+- **Log rotation** for the background lifecycle. `log_file` / `log_max_bytes` /
+  `log_backup_count` rotate by copy-and-truncate, so the append-mode descriptor
+  `wsctl start` hands its child stays valid across a rotation (rename-based
+  rotation would leave the daemon writing into the rotated file forever).
+- **Web new-session dialog** with name, command, working directory, backend and
+  a structured SSH target form (host / user / port / identity / `ssh -o`
+  options). `Alt+N` still opens a default shell with one keystroke.
+- **Web admin "config" tab**: the effective configuration, each key labelled
+  `热更新` or `需重启`, plus a reload button that reports exactly what changed
+  *and* what failed to parse.
+- **`wsctl completion install|show [bash|zsh|fish|powershell]`**. Typer's
+  `--install-completion` only ever installs bash; this covers the rest and
+  picks the shell from `$SHELL` instead of guessing bash.
+- `GET /api/config` (admin) — the read-only effective-configuration view behind
+  the new tab.
+- CLI `--json` on `session list|new|rename`, `user add|list`, `audit` and
+  `config show|get`; `wsctl audit` gained `--event` / `--user-id` / `--ip` filters;
+  `wsctl session list` now shows the owner's **username** (and the backend and
+  liveness) instead of a bare numeric id.
+- `wsctl logs` reads across rotated backups, so a rotation never hides history.
+- `wsctl doctor` additionally reports free disk space on the data partition,
+  the password policy in force, the log file and its rotation threshold, and
+  the system clock (which TOTP depends on).
+- Metrics `wsctl_pty_input_dropped_total` and `wsctl_recording_failures_total`.
+- Uploads can opt in to replacing an existing file (`overwrite=1`); the web UI
+  asks first.
+- File listings report `truncated` and `limit` when a directory exceeds 2000
+  entries instead of silently returning everything.
+
+### Changed
+
+- **A broken config edit is no longer silent.** `reload_settings_file` returns
+  `(changed, errors)`; `wsctl reload` and `POST /api/config/reload` surface the
+  exact TOML/validation error and exit non-zero, and the server logs it.
+  Previously an invalid value was discarded and the reload reported "no
+  changes", which was indistinguishable from the reload not running.
+- **`config set` preserves trailing comments** on the line it edits
+  (`port = 7681  # 监听端口` stays annotated) and no longer mistakes a
+  commented-out `# port = 1234` for the real key.
+- **Web terminal connections are bounded.** At most `8` sessions hold a live
+  socket (the most recently used ones); the rest appear in the tab bar as
+  `未连接` and attach when opened. Previously every session opened a WebSocket
+  and an xterm instance at page load, which fell over past a handful.
+- Uploading over an existing file is refused with `409` unless the client
+  explicitly opts in. Files were previously truncated without warning.
+- The image in `contrib/docker` builds from the **repository root** and installs
+  the local source; `docker compose` refuses to start without
+  `WSCTL_ADMIN_PASSWORD` instead of defaulting to `change-me`.
+- CI adds a macOS leg and a Windows import/CLI smoke job, runs the `-m slow`
+  load suite, installs `lrzsz` so the ZMODEM round trip is really exercised,
+  and builds the Docker image.
+
+### Fixed
+
+- **A session whose child never exits can no longer hang the server.**
+  `TermSession._finalize` waited unboundedly on `Pty.wait()`; a daemonized
+  grandchild holding the terminal open would wedge the read loop's cleanup
+  forever and leak the session object. The wait is now bounded and escalates to
+  `kill`.
+- **A failed recording no longer claims to be recording.** When the writer hit a
+  disk error it silently stopped while `is_recording` stayed true, so the UI
+  showed a red dot for a file that was not being written. The recorder now
+  closes itself, records the error, and `close()` can no longer race the writer
+  thread into a half-closed file.
+- **`import wsctl.core.store` no longer computes an Argon2 hash**, which made
+  every CLI invocation — including `wsctl --version` — pay ~120ms before doing
+  anything. The timing-equalising dummy hash is computed lazily; combined with
+  lazy imports of the server/client dependencies, `wsctl version` went from
+  ~1.05s to ~0.36s.
+- **Authentication lookups no longer run on the event loop.** The WebSocket
+  handshake and its periodic re-check did synchronous SQLite work per
+  connection every 5s, as did the maintenance loop's leases/reaping/retention.
+  They now run on worker threads, and a short-lived auth cache
+  (`core/authcache.py`) turns the re-check into a dict lookup. Revocation stays
+  immediate: disabling a user, changing a password or changing a role drops that
+  user's cache entries at once.
+- **A dropped keystroke is now reported.** When a session's child stops
+  draining its terminal the write path drops input rather than grow without
+  bound — but it did so *silently*, which looked like a dead keyboard. The
+  client is told once (`终端输入过快，部分按键已丢弃`) and the drops are counted.
+- **A stale `attached` message can no longer revert a rename.** The tab label
+  is protected by a rename generation counter, so a reconnect that echoes the
+  pre-rename name does not silently undo what the user just typed.
+- **`promptDialog`/`confirmDialog` are singletons.** A second invocation while
+  one was open overwrote the input the user was typing into; that is how a
+  rename could send the *old* name back to the server and look lost.
+- **A finished ZMODEM transfer always releases the keyboard.** The input lock
+  was only cleared by the transfer's end event, so an aborted transfer left the
+  terminal accepting no input at all. An inactivity watchdog now force-releases
+  it (and `on_retract` does too).
+- `wsctl connect` survives non-JSON text frames (a proxy or middlebox injecting
+  one used to tear the connection down with a traceback).
+- **Maintenance reconciliation can no longer mis-kill a live session.**
+  `term_session_stop_missing` takes the in-memory session set as its liveness
+  list; running its `UPDATE` on a worker thread after taking that snapshot
+  widened the window to thread-scheduling latency, so a session created in
+  between would be written as `stopped` while running (and never adopted again
+  after a restart). The snapshot and that one statement stay in a single
+  synchronous stretch on the loop; only snapshot-independent writes are
+  threaded.
+- **Argon2 hashing no longer runs under the store lock.** `user_create` and
+  `user_set_password` hashed while holding the single store mutex, serialising
+  every other database operation — including authentication — behind one
+  ~100ms CPU-bound hash. The hash is now computed before the lock is taken.
+- **Audit input records only what actually reached the shell.** Keystrokes
+  dropped by write backpressure (or a session that had already exited) used to
+  be audited as if the command had run. Dropped input is now reported to the
+  user and simply not recorded.
+- The terminal connection indicator follows the *visible* tab: a background
+  tab reconnecting or being suspended no longer rewrites it to
+  "连接中"/"空闲".
+- Metrics named `_total` (`wsctl_audit_dropped_total`,
+  `wsctl_audit_write_errors_total`, `wsctl_pty_input_dropped_total`,
+  `wsctl_recording_failures_total`) are now exposed with `# TYPE … counter`.
+  They were declared `gauge`, which makes `rate()` reject them. The two new
+  ones are also genuinely monotonic — a per-session sum would have gone *down*
+  whenever a session ended, showing up as counter resets.
+- Metric label values are escaped for the Prometheus text format (a `"` or
+  newline in a label produced invalid exposition output).
+- Scrollback eviction no longer leaves an orphaned UTF-8 continuation byte at
+  the head of a replayed screen (rendered as a replacement glyph).
+- `wsctl doctor` no longer imports the hashing stack just to print a table.
+
+### Testing
+
+- New suites for the password policy, the auth cache (including revocation
+  guarantees), copy-and-truncate log rotation, recording-failure honesty,
+  scrollback UTF-8 alignment and metric label escaping; extended suites for
+  share persistence (including "a rename must not invalidate the link"),
+  the bounded `Pty.wait`, PTY input drops, the upload overwrite guard, the
+  config endpoint and reload errors, TOTP/`--json`/comment-preserving
+  `config set`, and `completion show`.
+- The browser suite covers the new-session dialog (including the SSH-required
+  validation), the config tab, the upload overwrite prompt, the bounded
+  connection budget, and a **real ZMODEM `sz`/`rz` byte-exact round trip**.
+- `scripts/e2e/run_all.py` asserts that a share link keeps working across a
+  full server restart, and reports the child's log when a scenario fails to
+  start.
+
+### Upgrade notes
+
+- The database migrates to schema version 4 (adds `share_token`,
+  `share_expires`, `share_writable` to `term_sessions`). The migration is
+  idempotent, but **back up before downgrading** to 0.1.3 or older —
+  `wsctl backup` first, since the older release does not know about these
+  columns.
+- New accounts and password changes must be at least 8 characters. Existing
+  accounts keep working; `wsctl doctor` reports which ones are below the bar.
+
+[0.1.4]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.4
+
 ## [0.1.3] - 2026-09-22
 
 Operations and correctness release: a background lifecycle that needs no

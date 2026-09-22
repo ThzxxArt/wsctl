@@ -282,6 +282,8 @@ def start(settings: Settings, argv: list[str], *, timeout: float = 20.0) -> Inst
         )
     log_path = logfile_path(settings)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Deliberately not closed here: the descriptor is inherited by the child and
+    # must stay open for the whole life of the server.
     with open(log_path, "ab") as log:
         try:
             proc = subprocess.Popen(
@@ -291,7 +293,7 @@ def start(settings: Settings, argv: list[str], *, timeout: float = 20.0) -> Inst
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
-                env={**os.environ, "WSCTL_DAEMON": "1"},
+                env=child_env(settings),
             )
         except OSError as exc:
             raise DaemonError(f"无法启动子进程：{exc}") from exc
@@ -378,20 +380,58 @@ def discover(settings: Settings) -> list[Instance]:
     return found
 
 
+def child_env(settings: Settings) -> dict[str, str]:
+    """Environment for the detached server child.
+
+    ``WSCTL_LOG_FILE`` tells the child which file it writes to so *it* can
+    rotate by size. Rotation has to happen in-process: the append-mode
+    descriptor we hand over keeps writing to the same inode, which is exactly
+    what the copy-and-truncate rotator is designed for.
+    """
+    return {
+        **os.environ,
+        "WSCTL_DAEMON": "1",
+        "WSCTL_LOG_FILE": str(logfile_path(settings)),
+    }
+
+
+def log_history_paths(settings: Settings, backup_count: int = 3) -> list[Path]:
+    """Log files oldest-first: ``.N`` … ``.1`` then the live file.
+
+    Rotation keeps history in sidecar files, so "show me the last N lines" has
+    to read across them or a rotation would silently hide everything.
+    """
+    live = logfile_path(settings)
+    backups = [live.with_name(f"{live.name}.{i}") for i in range(backup_count, 0, -1)]
+    return [p for p in backups if p.is_file()] + ([live] if live.is_file() else [])
+
+
 def tail_log(settings: Settings, *, lines: int = 50, follow: bool = False) -> None:
-    """Print the tail of the log file, optionally following it."""
-    path = logfile_path(settings)
-    if not path.is_file():
-        raise DaemonError(f"没有日志文件：{path}")
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        if not follow:
-            text = handle.read().splitlines()
-            sys.stdout.write("\n".join(text[-lines:]) + "\n")
-            return
-        # Start from the tail, then follow appended data.
-        text = handle.read().splitlines()
-        sys.stdout.write("\n".join(text[-lines:]) + "\n")
-        sys.stdout.flush()
+    """Print the tail of the logs, spanning rotated backups, then optionally follow."""
+    live = logfile_path(settings)
+    if not live.is_file():
+        raise DaemonError(f"没有日志文件：{live}")
+
+    if not follow:
+        collected: list[str] = []
+        for path in log_history_paths(settings):
+            try:
+                collected.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError:
+                continue
+        sys.stdout.write("\n".join(collected[-lines:]) + "\n")
+        return
+
+    # Following only makes sense on the live file; show the blended tail first.
+    collected = []
+    for path in log_history_paths(settings):
+        try:
+            collected.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            continue
+    sys.stdout.write("\n".join(collected[-lines:]) + "\n")
+    sys.stdout.flush()
+    with live.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(0, os.SEEK_END)
         try:
             while True:

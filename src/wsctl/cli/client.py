@@ -109,11 +109,26 @@ class ApiClient:
             raise ApiError(0, f"cannot reach {self.base_url}: {exc.reason}") from exc
 
 
-def login(base_url: str, username: str, password: str, *, timeout: float = 15.0) -> str:
-    """Authenticate and return the opaque session token from the cookie."""
+def login(
+    base_url: str,
+    username: str,
+    password: str,
+    *,
+    totp: str | None = None,
+    timeout: float = 15.0,
+) -> str:
+    """Authenticate and return the opaque session token from the cookie.
+
+    ``totp`` is required for accounts that have two-factor authentication
+    enabled; omitting it for such an account fails with a "一次性验证码" error
+    rather than a password error, which is how the caller knows to prompt.
+    """
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    body = json.dumps({"username": username, "password": password}).encode("utf-8")
+    payload: dict[str, Any] = {"username": username, "password": password}
+    if totp:
+        payload["totp"] = totp
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/login",
         data=body,

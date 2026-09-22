@@ -56,5 +56,22 @@ class Scrollback:
             # A single chunk larger than the cap: keep its tail.
             chunk = self._chunks[0]
             drop = self._size - self._max_bytes
-            self._chunks[0] = chunk[drop:]
-            self._size -= drop
+            tail = _align_utf8(chunk[drop:])
+            self._chunks[0] = tail
+            self._size -= len(chunk) - len(tail)
+
+
+def _align_utf8(buf: bytes) -> bytes:
+    """Drop leading UTF-8 continuation bytes after a mid-character cut.
+
+    Eviction works on bytes, so the oldest few bytes may be the tail of a
+    multi-byte character whose lead byte was just evicted. Replaying those
+    orphan continuation bytes would render as a replacement glyph, so skip to
+    the next character boundary.
+    """
+    index = 0
+    # A UTF-8 sequence is at most 4 bytes, so at most 3 continuations can be
+    # orphaned at the head.
+    while index < len(buf) and index < 3 and 0x80 <= buf[index] <= 0xBF:
+        index += 1
+    return buf[index:]

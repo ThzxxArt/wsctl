@@ -23,6 +23,15 @@ READ_SIZE = 65536
 MAX_WRITE_BUFFER = 1024 * 1024
 MAX_DIMENSION = 65535
 
+# Process-wide, monotonic count of dropped write() calls. Summed per-session
+# counters would go *down* when a session ends, which is wrong for a metric
+# named ``_total`` (Prometheus ``rate()`` would see resets).
+_dropped_input_total = 0
+
+
+def dropped_input_total() -> int:
+    return _dropped_input_total
+
 
 class PtyError(RuntimeError):
     """Raised when a PTY cannot be created or operated on."""
@@ -40,7 +49,8 @@ class Pty(Protocol):
         """Read the next chunk of output; ``b""`` signals EOF."""
         ...
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes) -> bool:
+        """Queue ``data`` for the child; ``False`` means it was dropped."""
         ...
 
     def resize(self, cols: int, rows: int) -> None:
@@ -49,10 +59,20 @@ class Pty(Protocol):
     def poll(self) -> int | None:
         ...
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for the child to exit.
+
+        ``timeout`` bounds the wait so a child that outlives its terminal (a
+        daemonized grandchild holding the slave open) cannot hang the caller.
+        Raises :class:`subprocess.TimeoutExpired` on expiry.
+        """
         ...
 
     def terminate(self, sig: int = signal.SIGHUP) -> None:
+        ...
+
+    def kill(self) -> None:
+        """Force-kill the child (SIGKILL / TerminateProcess)."""
         ...
 
     def close(self) -> None:
@@ -103,7 +123,13 @@ class PosixPty:
         self._writer_registered = False
         self._reader_fut: asyncio.Future[bytes] | None = None
         self._kill_group = True
+        self._dropped = 0
         self.resize(cols, rows)
+
+    @property
+    def dropped_input(self) -> int:
+        """How many write() calls were dropped because the child stopped reading."""
+        return self._dropped
 
     def set_detach_only(self) -> None:
         """Never signal the process group (used for tmux clients).
@@ -145,15 +171,20 @@ class PosixPty:
         self._reader_fut = None
         fut.set_result(data)
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes) -> bool:
         if not data:
-            return
+            return True
         if len(self._write_buf) >= MAX_WRITE_BUFFER:
             # The child is not draining its stdin; drop input rather than grow
-            # without bound (memory hard limit for the write path).
-            return
+            # without bound (memory hard limit for the write path). The caller
+            # is told so the user does not experience this as a dead keyboard.
+            global _dropped_input_total
+            _dropped_input_total += 1
+            self._dropped += 1
+            return False
         self._write_buf.extend(data)
         self._flush()
+        return True
 
     def _flush(self) -> None:
         while self._write_buf:
@@ -188,8 +219,8 @@ class PosixPty:
     def poll(self) -> int | None:
         return self._proc.poll()
 
-    def wait(self) -> int:
-        return self._proc.wait()
+    def wait(self, timeout: float | None = None) -> int:
+        return self._proc.wait(timeout=timeout)
 
     def terminate(self, sig: int = signal.SIGHUP) -> None:
         if self._proc.poll() is not None:
@@ -229,7 +260,8 @@ class PosixPty:
                 self._proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
-                self._proc.wait(timeout=2)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=2)
 
 
 def create_pty(

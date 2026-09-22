@@ -12,10 +12,22 @@ from collections.abc import Callable
 Labels = dict[str, str]
 
 
+def _escape_label(value: str) -> str:
+    """Escape a label value for the Prometheus text exposition format."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
 def _format_labels(labels: Labels) -> str:
     if not labels:
         return ""
-    inner = ",".join(f'{key}="{value}"' for key, value in sorted(labels.items()))
+    inner = ",".join(
+        f'{key}="{_escape_label(value)}"' for key, value in sorted(labels.items())
+    )
     return "{" + inner + "}"
 
 
@@ -26,7 +38,7 @@ class Metrics:
         self._lock = threading.Lock()
         self._counters: dict[str, dict[tuple[tuple[str, str], ...], float]] = {}
         self._gauges: dict[str, dict[tuple[tuple[str, str], ...], float]] = {}
-        self._collectors: list[tuple[str, str, Callable[[], float]]] = []
+        self._collectors: list[tuple[str, str, str, Callable[[], float]]] = []
 
     def inc(self, name: str, value: float = 1.0, **labels: str) -> None:
         key = tuple(sorted(labels.items()))
@@ -41,7 +53,16 @@ class Metrics:
 
     def collect(self, name: str, help_text: str, fn: Callable[[], float]) -> None:
         """Register a gauge evaluated lazily at scrape time."""
-        self._collectors.append((name, help_text, fn))
+        self._collectors.append((name, help_text, "gauge", fn))
+
+    def collect_counter(self, name: str, help_text: str, fn: Callable[[], float]) -> None:
+        """Register a lazily-evaluated *monotonic* series.
+
+        ``fn`` must never return a value below its previous one. Declaring the
+        type as ``counter`` matters: a ``_total`` series exposed as a gauge is
+        rejected by ``rate()``.
+        """
+        self._collectors.append((name, help_text, "counter", fn))
 
     def render(self) -> str:
         lines: list[str] = []
@@ -59,9 +80,9 @@ class Metrics:
             for key, value in sorted(series.items()):
                 lines.append(f"{name}{_format_labels(dict(key))} {value}")
 
-        for name, help_text, fn in self._collectors:
+        for name, help_text, kind, fn in self._collectors:
             lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} gauge")
+            lines.append(f"# TYPE {name} {kind}")
             lines.append(f"{name} {fn()}")
 
         return "\n".join(lines) + "\n"

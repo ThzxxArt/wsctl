@@ -14,7 +14,7 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
@@ -69,15 +69,6 @@ def _auth_token(websocket: WebSocket) -> str | None:
     return websocket.cookies.get(COOKIE_NAME)
 
 
-def _resolve_user(websocket: WebSocket, store: Store, auth_required: bool) -> User | None:
-    if not auth_required:
-        return User(id=0, username="anonymous", role="admin", disabled=False, created_at=0.0)
-    token = _auth_token(websocket)
-    if not token:
-        return None
-    return store.resolve_auth_session(token)
-
-
 def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
     shell = settings.shell
     backend = settings.default_backend
@@ -98,6 +89,18 @@ def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
     )
 
 
+async def _resolve_user(
+    websocket: WebSocket, store: Store, auth_required: bool
+) -> User | None:
+    """Resolve the connecting user; the token lookup runs off the event loop."""
+    if not auth_required:
+        return User(id=0, username="anonymous", role="admin", disabled=False, created_at=0.0)
+    token = _auth_token(websocket)
+    if not token:
+        return None
+    return await asyncio.to_thread(store.resolve_auth_session, token)
+
+
 class _Denied(Exception):
     """Handshake denial: the client is told and the socket closed with a code."""
 
@@ -116,7 +119,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     audit: AuditWriter = app.state.audit
 
     ip = client_ip(websocket, settings)
-    user = _resolve_user(websocket, store, settings.auth_required)
+    user = await _resolve_user(websocket, store, settings.auth_required)
     auth_token = _auth_token(websocket)
     share_param = websocket.query_params.get("share")
 
@@ -163,12 +166,14 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         )
         on_line = _input_auditor(audit, settings, user_id, session.id)
         bucket = _input_bucket(settings)
-        recheck: Callable[[], bool] | None = None
+        recheck: Callable[[], Awaitable[bool]] | None = None
         if user is not None and auth_token is not None:
             token = auth_token
 
-            def recheck() -> bool:
-                return store.resolve_auth_session(token) is not None
+            async def recheck() -> bool:
+                # Off the event loop: this runs every few seconds per connection
+                # and the store consults a short-lived cache on the hot path.
+                return await asyncio.to_thread(store.resolve_auth_session, token) is not None
 
         await _pump(
             websocket,
@@ -343,10 +348,11 @@ async def _pump(
     *,
     writable: bool = True,
     share: str | None = None,
-    recheck: Callable[[], bool] | None = None,
+    recheck: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     line_buffer = bytearray()
     read_only_notice = False
+    backpressure_notice = False
     last_rx = time.monotonic()
 
     def share_revoked() -> bool:
@@ -372,6 +378,28 @@ async def _pump(
         read_only_notice = True
         with contextlib.suppress(ClientGone):
             client.put({"type": "error", "msg": "会话为只读"})
+
+    def reject_backpressure() -> None:
+        nonlocal backpressure_notice
+        if backpressure_notice:
+            return
+        backpressure_notice = True
+        with contextlib.suppress(ClientGone):
+            client.put({"type": "error", "msg": "终端输入过快，部分按键已丢弃"})
+
+    def forward_input(data: bytes) -> None:
+        """Feed input to the child; report a drop instead of hiding it.
+
+        Only input that actually reached the child is audited: a record
+        implying a command ran when it was silently discarded would be worse
+        than no record at all.
+        """
+        if session.closed:
+            return
+        if not session.write_input(data):
+            reject_backpressure()
+            return
+        feed_audit(data)
 
     def feed_audit(data: bytes) -> None:
         if on_line is None:
@@ -406,7 +434,7 @@ async def _pump(
             if share_revoked():
                 await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
                 return
-            if recheck is not None and not recheck():
+            if recheck is not None and not await recheck():
                 await deny("登录已失效，请重新登录", CLOSE_UNAUTHORIZED)
                 return
             continue
@@ -429,8 +457,7 @@ async def _pump(
             if over_limit(len(data_bytes)):
                 reject()
                 return
-            session.write_input(data_bytes)
-            feed_audit(data_bytes)
+            forward_input(data_bytes)
             continue
         text = message.get("text")
         if not text:
@@ -456,8 +483,7 @@ async def _pump(
             if over_limit(len(chunk)):
                 reject()
                 return
-            session.write_input(chunk)
-            feed_audit(chunk)
+            forward_input(chunk)
         elif kind == "ping":
             try:
                 client.put({"type": "pong"})

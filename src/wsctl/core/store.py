@@ -14,15 +14,17 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from .passwords import hash_password, verify_password
+from .authcache import MISS as _CACHE_MISS
+from .passwords import (
+    burn_verification,
+    hash_password,
+    validate_password,
+    verify_password,
+)
 
-SCHEMA_VERSION = 3
-
-# Verified against when a username does not exist, so login timing does not
-# reveal whether an account is present.
-_DUMMY_HASH = hash_password("wsctl-timing-equalizer")
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -57,20 +59,23 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 );
 
 CREATE TABLE IF NOT EXISTS term_sessions (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    owner_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    backend     TEXT NOT NULL DEFAULT 'local',
-    command     TEXT,
-    argv        TEXT,
-    env         TEXT,
-    cwd         TEXT,
-    idle_timeout REAL,
-    max_life    REAL,
-    status      TEXT NOT NULL DEFAULT 'running',
-    instance_id TEXT,
-    created_at  REAL NOT NULL,
-    last_active REAL NOT NULL
+    id             TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    owner_id       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    backend        TEXT NOT NULL DEFAULT 'local',
+    command        TEXT,
+    argv           TEXT,
+    env            TEXT,
+    cwd            TEXT,
+    idle_timeout   REAL,
+    max_life       REAL,
+    status         TEXT NOT NULL DEFAULT 'running',
+    instance_id    TEXT,
+    share_token    TEXT,
+    share_expires  REAL,
+    share_writable INTEGER NOT NULL DEFAULT 0,
+    created_at     REAL NOT NULL,
+    last_active    REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS instances (
@@ -118,6 +123,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._sink: Any = None
+        self._auth_cache: Any = None
         # When true, an active session's expiry slides forward on each use.
         self.sliding_ttl = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -136,6 +142,10 @@ class Store:
         """Register a callback invoked with every audit event (e.g. a webhook)."""
         self._sink = sink
 
+    def set_auth_cache(self, cache: Any) -> None:
+        """Register a short-lived cache for :meth:`resolve_auth_session`."""
+        self._auth_cache = cache
+
     def _init_schema(self) -> None:
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
@@ -153,6 +163,9 @@ class Store:
                 "idle_timeout": "REAL",
                 "max_life": "REAL",
                 "instance_id": "TEXT",
+                "share_token": "TEXT",
+                "share_expires": "REAL",
+                "share_writable": "INTEGER NOT NULL DEFAULT 0",
             }
         }
         with self._lock, self._conn:
@@ -192,11 +205,16 @@ class Store:
     def user_create(self, username: str, password: str, role: str = "user") -> User:
         if role not in ("admin", "user"):
             raise ValueError(f"invalid role: {role}")
+        validate_password(password)
+        # Hash *before* taking the lock: Argon2 costs tens of milliseconds of
+        # CPU and holding the store lock over it would serialise every other
+        # database operation (including authentication) behind one hash.
+        password_hash = hash_password(password)
         now = time.time()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO users(username, password_hash, role, created_at) VALUES(?, ?, ?, ?)",
-                (username, hash_password(password), role, now),
+                (username, password_hash, role, now),
             )
             user_id = int(cur.lastrowid or 0)
         return User(id=user_id, username=username, role=role, disabled=False, created_at=now)
@@ -220,32 +238,51 @@ class Store:
 
     def user_delete(self, username: str) -> bool:
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM users WHERE username = ?", (username,)
+            ).fetchone()
             cur = self._conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        self._invalidate_user(int(row["id"]) if row else None)
         return cur.rowcount > 0
 
     def user_set_password(self, username: str, password: str) -> bool:
+        validate_password(password)
+        # See user_create: hash outside the lock.
+        password_hash = hash_password(password)
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM users WHERE username = ?", (username,)
+            ).fetchone()
             cur = self._conn.execute(
                 "UPDATE users SET password_hash = ? WHERE username = ?",
-                (hash_password(password), username),
+                (password_hash, username),
             )
+        self._invalidate_user(int(row["id"]) if row else None)
         return cur.rowcount > 0
 
     def user_set_role(self, username: str, role: str) -> bool:
         if role not in ("admin", "user"):
             raise ValueError(f"invalid role: {role}")
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM users WHERE username = ?", (username,)
+            ).fetchone()
             cur = self._conn.execute(
                 "UPDATE users SET role = ? WHERE username = ?", (role, username)
             )
+        self._invalidate_user(int(row["id"]) if row else None)
         return cur.rowcount > 0
 
     def user_set_disabled(self, username: str, disabled: bool) -> bool:
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM users WHERE username = ?", (username,)
+            ).fetchone()
             cur = self._conn.execute(
                 "UPDATE users SET disabled = ? WHERE username = ?",
                 (1 if disabled else 0, username),
             )
+        self._invalidate_user(int(row["id"]) if row else None)
         return cur.rowcount > 0
 
     def user_set_totp(self, username: str, secret: str) -> bool:
@@ -277,7 +314,7 @@ class Store:
                 "SELECT * FROM users WHERE username = ?", (username,)
             ).fetchone()
         if row is None:
-            verify_password(password, _DUMMY_HASH)  # equalize timing
+            burn_verification(password)  # equalize timing
             return None
         if row["disabled"]:
             verify_password(password, str(row["password_hash"]))
@@ -309,9 +346,45 @@ class Store:
 
     LAST_SEEN_THROTTLE = 30.0
 
+    def _invalidate_user(self, user_id: int | None) -> None:
+        cache = self._auth_cache
+        if cache is not None and user_id is not None:
+            cache.invalidate_user(user_id)
+
+    def _invalidate_token(self, token_hash: str) -> None:
+        cache = self._auth_cache
+        if cache is not None:
+            cache.invalidate_token(token_hash)
+
     def resolve_auth_session(self, token: str) -> User | None:
-        now = time.time()
+        """Resolve a bearer/cookie token to its user, honouring expiry.
+
+        Consults the optional short-lived cache first. Every mutation that
+        changes what a token may do (disable, password, role, delete) drops the
+        affected entries, so revocation is immediate even on a cache hit.
+        """
         token_hash = hash_token(token)
+        cache = self._auth_cache
+        if cache is not None:
+            hit = cache.get(token_hash)
+            if hit is not _CACHE_MISS:
+                return cast("User | None", hit)
+            # Taken *before* the read: if a revocation lands while we are
+            # talking to the database the write-back below is discarded rather
+            # than repopulating the cache with the pre-revocation user.
+            epoch = cache.epoch()
+        else:
+            epoch = None
+        user, token_expiry = self._resolve_auth_session_uncached(token_hash)
+        if cache is not None:
+            cache.put(token_hash, user, token_expiry=token_expiry, epoch=epoch)
+        return user
+
+    def _resolve_auth_session_uncached(
+        self, token_hash: str
+    ) -> tuple[User | None, float]:
+        """Return ``(user, token_expiry)``; ``user`` is ``None`` when rejected."""
+        now = time.time()
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT user_id, expires_at, created_at, last_seen FROM auth_sessions"
@@ -319,10 +392,13 @@ class Store:
                 (token_hash,),
             ).fetchone()
             if row is None:
-                return None
-            if float(row["expires_at"]) < now:
+                # A known-bad token: cache the rejection for one cache TTL only.
+                ttl = getattr(self._auth_cache, "ttl", 0.0) if self._auth_cache else 0.0
+                return None, now + float(ttl)
+            expires_at = float(row["expires_at"])
+            if expires_at < now:
                 self._conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
-                return None
+                return None, now
             updates = ""
             params: list[Any] = []
             # Throttle the last_seen write: it runs on every request and on the
@@ -332,9 +408,10 @@ class Store:
                 updates = "last_seen = ?"
                 params.append(now)
             if self.sliding_ttl:
-                ttl = float(row["expires_at"]) - float(row["created_at"])
+                ttl = expires_at - float(row["created_at"])
+                expires_at = now + ttl
                 updates = f"{updates + ', ' if updates else ''}expires_at = ?"
-                params.append(now + ttl)
+                params.append(expires_at)
             if updates:
                 params.append(token_hash)
                 self._conn.execute(
@@ -342,15 +419,21 @@ class Store:
                 )
         user = self.user_get_by_id(int(row["user_id"]))
         if user is not None and user.disabled:
-            self.delete_auth_session(token)
-            return None
-        return user
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,)
+                )
+            self._invalidate_token(token_hash)
+            return None, expires_at
+        return user, expires_at
 
     def delete_auth_session(self, token: str) -> None:
+        token_hash = hash_token(token)
         with self._lock, self._conn:
             self._conn.execute(
-                "DELETE FROM auth_sessions WHERE token_hash = ?", (hash_token(token),)
+                "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,)
             )
+        self._invalidate_token(token_hash)
 
     def delete_user_sessions(self, user_id: int) -> int:
         """Revoke every login session of a user (e.g. after a password reset)."""
@@ -358,6 +441,7 @@ class Store:
             cur = self._conn.execute(
                 "DELETE FROM auth_sessions WHERE user_id = ?", (user_id,)
             )
+        self._invalidate_user(user_id)
         return cur.rowcount
 
     def admin_count(self) -> int:
@@ -473,6 +557,40 @@ class Store:
                     (owner_id,),
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    def term_session_set_share(
+        self,
+        sid: str,
+        *,
+        token: str | None,
+        expires: float | None = None,
+        writable: bool = False,
+    ) -> None:
+        """Persist (or clear, with ``token=None``) a session's share link.
+
+        Shares live in the database rather than only in memory so a link keeps
+        working across a server restart -- the same promise the session itself
+        makes when it runs on the tmux backend.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE term_sessions SET share_token = ?, share_expires = ?,"
+                " share_writable = ? WHERE id = ?",
+                (token, expires, 1 if writable else 0, sid),
+            )
+
+    def term_session_clear_expired_shares(self, now: float | None = None) -> int:
+        """Drop share links whose TTL has elapsed (their token is worthless)."""
+        now = time.time() if now is None else now
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE term_sessions SET share_token = NULL, share_expires = NULL,"
+                " share_writable = 0"
+                " WHERE share_token IS NOT NULL AND share_expires IS NOT NULL"
+                " AND share_expires < ?",
+                (now,),
+            )
+        return cur.rowcount
 
     # -- instance leases -----------------------------------------------
 

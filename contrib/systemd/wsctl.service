@@ -10,8 +10,21 @@ Type=simple
 User=wsctl
 Group=wsctl
 WorkingDirectory=/var/lib/wsctl
-# 仅监听本机，由反向代理终止 TLS
+
+# ！！请把下面的可执行文件路径改成你自己的安装位置！！
+#   pipx:            /home/<user>/.local/bin/wsctl
+#   uv tool:         /home/<user>/.local/bin/wsctl
+#   自建 venv:       /opt/wsctl/venv/bin/wsctl
+#   发行版/系统安装:  /usr/local/bin/wsctl   ← 下面的默认值
+# 仅监听本机，由反向代理终止 TLS。
 ExecStart=/usr/local/bin/wsctl serve --host 127.0.0.1 --port 7681
+
+# 也可让 wsctl 自己管理日志轮转（按大小切分，见 log_max_bytes），
+# 此时把标准输出/错误都交给它：
+# Environment=WSCTL_LOG_FILE=/var/log/wsctl/wsctl.log
+# StandardOutput=append:/var/log/wsctl/wsctl.log
+# StandardError=append:/var/log/wsctl/wsctl.log
+
 Restart=on-failure
 RestartSec=3
 # 优雅退出，给会话清理留时间

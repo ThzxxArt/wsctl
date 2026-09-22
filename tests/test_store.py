@@ -13,11 +13,11 @@ def test_user_lifecycle(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
         assert store.user_count() == 0
-        user = store.user_create("alice", "s3cret", role="admin")
+        user = store.user_create("alice", "s3cret12", role="admin")
         assert user.username == "alice"
         assert store.user_count() == 1
         assert store.user_get("alice") is not None
-        assert store.user_set_password("alice", "newpass")
+        assert store.user_set_password("alice", "newpass123")
         assert store.user_set_role("alice", "user")
         assert store.user_get("alice") is not None
         assert store.user_get("alice").role == "user"  # type: ignore[union-attr]
@@ -30,10 +30,10 @@ def test_user_lifecycle(tmp_path: Path) -> None:
 def test_authenticate(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
-        store.user_create("bob", "hunter2")
-        assert store.user_authenticate("bob", "hunter2") is not None
+        store.user_create("bob", "hunter22")
+        assert store.user_authenticate("bob", "hunter22") is not None
         assert store.user_authenticate("bob", "wrong") is None
-        assert store.user_authenticate("nobody", "hunter2") is None
+        assert store.user_authenticate("nobody", "hunter22") is None
     finally:
         store.close()
 
@@ -41,13 +41,13 @@ def test_authenticate(tmp_path: Path) -> None:
 def test_duplicate_username(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
-        store.user_create("carol", "pw")
+        store.user_create("carol", "password123")
         import sqlite3
 
         import pytest
 
         with pytest.raises(sqlite3.IntegrityError):
-            store.user_create("carol", "pw")
+            store.user_create("carol", "password123")
     finally:
         store.close()
 
@@ -55,7 +55,7 @@ def test_duplicate_username(tmp_path: Path) -> None:
 def test_auth_session_lifecycle(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
-        user = store.user_create("dave", "pw")
+        user = store.user_create("dave", "password123")
         token = store.create_auth_session(user.id, ttl=3600)
         resolved = store.resolve_auth_session(token)
         assert resolved is not None
@@ -69,7 +69,7 @@ def test_auth_session_lifecycle(tmp_path: Path) -> None:
 def test_expired_session(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
-        user = store.user_create("erin", "pw")
+        user = store.user_create("erin", "password123")
         token = store.create_auth_session(user.id, ttl=-1)
         assert store.resolve_auth_session(token) is None
     finally:
@@ -79,12 +79,12 @@ def test_expired_session(tmp_path: Path) -> None:
 def test_disabling_a_user_invalidates_sessions(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
-        user = store.user_create("gina", "pw")
+        user = store.user_create("gina", "password123")
         token = store.create_auth_session(user.id, ttl=3600)
         assert store.resolve_auth_session(token) is not None
         assert store.user_set_disabled("gina", True)
         assert store.resolve_auth_session(token) is None
-        assert store.user_authenticate("gina", "pw") is None
+        assert store.user_authenticate("gina", "password123") is None
     finally:
         store.close()
 
@@ -102,7 +102,7 @@ def test_audit_roundtrip(tmp_path: Path) -> None:
 def test_totp_secret_lifecycle(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
-        store.user_create("frank", "pw")
+        store.user_create("frank", "password123")
         assert store.user_totp_secret("frank") is None
         assert store.user_set_totp("frank", "ABCDEF")
         assert store.user_totp_secret("frank") == "ABCDEF"
@@ -157,7 +157,7 @@ def test_last_seen_write_is_throttled(tmp_path: Path) -> None:
 
     store = make_store(tmp_path)
     try:
-        user = store.user_create("throttle", "pw")
+        user = store.user_create("throttle", "password123")
         token = store.create_auth_session(user.id, ttl=3600)
 
         def last_seen() -> float:
@@ -189,7 +189,7 @@ def test_sliding_ttl_extends_expiry(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
         store.sliding_ttl = True
-        user = store.user_create("slider", "pw")
+        user = store.user_create("slider", "password123")
         token = store.create_auth_session(user.id, ttl=100)
         conn = sqlite3.connect(tmp_path / "test.db")
         conn.execute(
@@ -211,8 +211,8 @@ def test_sliding_ttl_extends_expiry(tmp_path: Path) -> None:
 def test_delete_user_sessions_and_admin_count(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
-        store.user_create("root", "pw", role="admin")
-        user = store.user_create("u", "pw")
+        store.user_create("root", "password123", role="admin")
+        user = store.user_create("u", "password123")
         assert store.admin_count() == 1
         store.user_set_disabled("root", True)
         assert store.admin_count() == 0
@@ -221,5 +221,137 @@ def test_delete_user_sessions_and_admin_count(tmp_path: Path) -> None:
         assert store.delete_user_sessions(user.id) == 2
         assert store.resolve_auth_session(t1) is None
         assert store.resolve_auth_session(t2) is None
+    finally:
+        store.close()
+
+
+# -- password policy at the storage boundary -------------------------------
+
+
+def test_store_enforces_the_password_policy(tmp_path: Path) -> None:
+    import pytest
+
+    from wsctl.core.passwords import PasswordPolicyError
+
+    store = make_store(tmp_path)
+    try:
+        with pytest.raises(PasswordPolicyError):
+            store.user_create("a", "")
+        with pytest.raises(PasswordPolicyError):
+            store.user_create("a", "short")
+        with pytest.raises(PasswordPolicyError):
+            store.user_set_password("a", "short")
+    finally:
+        store.close()
+
+
+# -- share persistence ----------------------------------------------------
+
+
+def test_share_round_trips_through_the_database(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        store.term_session_upsert("s1", name="n", owner_id=None, backend="tmux")
+        store.term_session_set_share(
+            "s1", token="tok", expires=4102444800.0, writable=True
+        )
+        row = store.term_session_list()[0]
+        assert row["share_token"] == "tok"
+        assert row["share_writable"] == 1
+        assert row["share_expires"] == 4102444800.0
+
+        store.term_session_set_share("s1", token=None)
+        row = store.term_session_list()[0]
+        assert row["share_token"] is None
+        assert row["share_writable"] == 0
+    finally:
+        store.close()
+
+
+def test_clear_expired_shares(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        store.term_session_upsert("old", name="a", owner_id=None)
+        store.term_session_upsert("new", name="b", owner_id=None)
+        store.term_session_set_share("old", token="t1", expires=1.0, writable=False)
+        store.term_session_set_share("new", token="t2", expires=4102444800.0, writable=True)
+        assert store.term_session_clear_expired_shares(now=1000.0) == 1
+        rows = {str(r["id"]): r for r in store.term_session_list()}
+        assert rows["old"]["share_token"] is None
+        assert rows["new"]["share_token"] == "t2"
+    finally:
+        store.close()
+
+
+def test_upsert_does_not_clobber_an_existing_share(tmp_path: Path) -> None:
+    """Renaming a session must not silently invalidate its share link."""
+    store = make_store(tmp_path)
+    try:
+        store.term_session_upsert("s1", name="n", owner_id=None)
+        store.term_session_set_share("s1", token="keepme", expires=None, writable=False)
+        store.term_session_upsert("s1", name="renamed", owner_id=None, instance_id="A")
+        row = store.term_session_list()[0]
+        assert row["name"] == "renamed"
+        assert row["share_token"] == "keepme"
+    finally:
+        store.close()
+
+
+# -- auth cache integration ------------------------------------------------
+
+
+def test_auth_cache_hides_the_database_but_revokes_immediately(tmp_path: Path) -> None:
+    from wsctl.core.authcache import AuthCache
+
+    store = make_store(tmp_path)
+    store.set_auth_cache(AuthCache(ttl=30.0))
+    try:
+        user = store.user_create("cached", "password123")
+        token = store.create_auth_session(user.id, ttl=3600)
+
+        assert store.resolve_auth_session(token) is not None
+        # A second lookup must come from the cache (same object identity is not
+        # guaranteed, so assert on the observable outcome).
+        assert store.resolve_auth_session(token).username == "cached"  # type: ignore[union-attr]
+
+        # Disabling the user drops the cache entry at once: the very next
+        # resolve sees the change even though the TTL has not elapsed.
+        store.user_set_disabled("cached", True)
+        assert store.resolve_auth_session(token) is None
+    finally:
+        store.close()
+
+
+def test_auth_cache_drops_on_password_and_role_change(tmp_path: Path) -> None:
+    from wsctl.core.authcache import AuthCache
+
+    store = make_store(tmp_path)
+    store.set_auth_cache(AuthCache(ttl=30.0))
+    try:
+        user = store.user_create("u", "password123")
+        token = store.create_auth_session(user.id, ttl=3600)
+        assert store.resolve_auth_session(token).role == "user"  # type: ignore[union-attr]
+
+        store.user_set_role("u", "admin")
+        assert store.resolve_auth_session(token).role == "admin"  # type: ignore[union-attr]
+
+        store.user_set_password("u", "password456")
+        store.delete_user_sessions(user.id)  # what user_admin does on a reset
+        assert store.resolve_auth_session(token) is None
+    finally:
+        store.close()
+
+
+def test_delete_auth_session_drops_the_cache_entry(tmp_path: Path) -> None:
+    from wsctl.core.authcache import AuthCache
+
+    store = make_store(tmp_path)
+    store.set_auth_cache(AuthCache(ttl=30.0))
+    try:
+        user = store.user_create("u", "password123")
+        token = store.create_auth_session(user.id, ttl=3600)
+        assert store.resolve_auth_session(token) is not None
+        store.delete_auth_session(token)
+        assert store.resolve_auth_session(token) is None
     finally:
         store.close()
