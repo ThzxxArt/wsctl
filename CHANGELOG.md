@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-09-22
+
+Operational-usability release. Four bugs behind one bug report — "you hardcoded
+7681", "the web page says my username or password is wrong", "doctor shows
+502" — plus a fifth in the same family found while fixing. No new features, no
+schema change.
+
+### Fixed
+
+- **Lifecycle commands now follow the running instance.** `wsctl start --port
+  7682` followed by `wsctl status` / `logs` / `stop` / `reload` / `restart`
+  looked at the *default* port and reported 未在运行 / 没有日志文件 for
+  `wsctl-7681.log` while the instance was serving right there — `status` even
+  printed "发现其他实例：… 0.0.0.0:7682" and then refused to use it. Without an
+  explicit `--port`, an instance actually running in this data directory now
+  wins over "the default port", and the command says which one it followed.
+  With more than one instance it lists them and asks for `--port`.
+- **`--admin-password` is never silently ignored.** The bootstrap returns early
+  when the database already has users, so the flag did nothing; and because the
+  warning only reached the detached child's log, it read exactly like "your
+  password is wrong" when the user then could not log in. The parent now warns
+  on the terminal before spawning and names the command that does change the
+  password. With no enabled admin left the value recovers the instance instead
+  of leaving it unreachable.
+- **A local wsctl is no longer routed through `http_proxy`.** `urlopen` honours
+  the proxy unconditionally, so a WSL/VPN/Clash-style environment sent even
+  `http://127.0.0.1:7682/healthz` to the proxy, which answered 502 and made a
+  healthy instance look dead. This affected `doctor`, `status` and every
+  `ApiClient` command (`login`, `connect`, `session`, `audit`, `config reload`).
+  Loopback targets go direct; remote targets keep the proxy.
+- `wsctl doctor` reports the address the instance is really listening on
+  (`0.0.0.0:7682`) instead of the default `127.0.0.1:7681`, and lists any
+  other instances it finds rather than flatly claiming nothing is running.
+- `wsctl restart` without `--port` no longer drops the port from the child argv,
+  which used to bring the replacement up on the default port.
+
+### Added
+
+- `wsctl user passwd <name> -p <password>` for a one-command, non-interactive
+  password reset — the way out when someone is locked out of the web UI.
+
+### Testing
+
+- Ten new tests pin the instance resolution (single instance auto-follows, two
+  instances are ambiguous, an explicit `--port` is never second-guessed), the
+  proxy bypass (behaviourally: a real local server must answer while a bogus
+  `http_proxy` is set), the loud `--admin-password` warning and the lock-out
+  recovery.
+
+[0.1.6]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.6
+
 ## [0.1.5] - 2026-09-22
 
 Windows portability and test-independence release. Two of the three fixes below

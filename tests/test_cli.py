@@ -340,6 +340,10 @@ def test_user_list_json(monkeypatch: object, tmp_path: Path) -> None:
 
 
 def test_config_show_json(tmp_path: Path, monkeypatch: object) -> None:
+    import os
+
+    for key in [k for k in os.environ if k.startswith("WSCTL_")]:
+        monkeypatch.delenv(key, raising=False)  # type: ignore[attr-defined]
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
     result = runner.invoke(app, ["config", "show", "--json"])
     assert result.exit_code == 0, result.output

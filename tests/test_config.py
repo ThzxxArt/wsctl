@@ -5,9 +5,23 @@ from pathlib import Path
 from wsctl.core.config import Settings, load_settings, reload_settings_file
 
 
+def _isolate_env(monkeypatch: object) -> None:
+    """Drop every ``WSCTL_*`` override so the *defaults* are actually tested.
+
+    A developer (or CI) exporting ``WSCTL_PORT`` used to turn these into tests
+    of their environment instead of of the code.
+    """
+    import os
+
+    for key in [k for k in os.environ if k.startswith("WSCTL_")]:
+        monkeypatch.delenv(key, raising=False)  # type: ignore[attr-defined]
+
+
 def test_defaults(tmp_path: Path, monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     # Hermetic: point at a non-existent config file so a developer's real
     # ~/.config/wsctl/config.toml cannot change the result.
+    _isolate_env(monkeypatch)
     monkeypatch.setenv("WSCTL_CONFIG", str(tmp_path / "missing.toml"))  # type: ignore[attr-defined]
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.host == "127.0.0.1"
@@ -22,6 +36,8 @@ def test_overrides_win() -> None:
 
 
 def test_new_resource_defaults(tmp_path: Path, monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
+    _isolate_env(monkeypatch)
     monkeypatch.setenv("WSCTL_CONFIG", str(tmp_path / "missing.toml"))  # type: ignore[attr-defined]
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.max_sessions_per_user == 0
@@ -33,23 +49,27 @@ def test_new_resource_defaults(tmp_path: Path, monkeypatch: object) -> None:
     assert settings.metrics_require_auth is False
 
 
-def test_none_overrides_ignored() -> None:
+def test_none_overrides_ignored(monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     settings = load_settings(host=None, port=None)
     assert settings.host == "127.0.0.1"
     assert settings.port == 7681
 
 
-def test_db_path_within_data_dir(tmp_path: Path) -> None:
+def test_db_path_within_data_dir(tmp_path: Path, monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     settings = load_settings(data_dir=tmp_path)
     assert settings.db_path == tmp_path / "wsctl.db"
 
 
-def test_shell_fallback() -> None:
+def test_shell_fallback(monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     settings = load_settings(default_shell="/bin/zsh")
     assert settings.shell == "/bin/zsh"
 
 
 def test_reload_settings_file(tmp_path: Path, monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     config = tmp_path / "wsctl" / "config.toml"
     monkeypatch.setenv("WSCTL_CONFIG", str(config))  # type: ignore[attr-defined]
 
@@ -67,12 +87,16 @@ def test_reload_settings_file(tmp_path: Path, monkeypatch: object) -> None:
     assert settings.host == "127.0.0.1"
 
 
-def test_reload_missing_file_is_noop(tmp_path: Path) -> None:
+def test_reload_missing_file_is_noop(tmp_path: Path, monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     settings = load_settings(config_path=tmp_path / "nope.toml")
     assert reload_settings_file(settings) == ([], [])
 
 
-def test_reload_invalid_value_reports_an_error(tmp_path: Path) -> None:
+def test_reload_invalid_value_reports_an_error(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    _isolate_env(monkeypatch)
     config = tmp_path / "wsctl" / "config.toml"
     config.parent.mkdir(parents=True)
     settings = load_settings(config_path=config)
@@ -83,7 +107,10 @@ def test_reload_invalid_value_reports_an_error(tmp_path: Path) -> None:
     assert errors and ("not-an-int" in errors[0] or "无效" in errors[0])
 
 
-def test_reload_broken_toml_reports_an_error(tmp_path: Path) -> None:
+def test_reload_broken_toml_reports_an_error(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    _isolate_env(monkeypatch)
     config = tmp_path / "wsctl" / "config.toml"
     config.parent.mkdir(parents=True)
     settings = load_settings(config_path=config)
@@ -94,6 +121,7 @@ def test_reload_broken_toml_reports_an_error(tmp_path: Path) -> None:
 
 
 def test_reload_respects_env_precedence(tmp_path: Path, monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     config = tmp_path / "wsctl" / "config.toml"
     config.parent.mkdir(parents=True)
     config.write_text("max_sessions = 5\n", encoding="utf-8")
@@ -110,6 +138,7 @@ def test_reload_respects_env_precedence(tmp_path: Path, monkeypatch: object) -> 
 
 
 def test_reload_skips_explicitly_empty_env(tmp_path: Path, monkeypatch: object) -> None:
+    _isolate_env(monkeypatch)
     config = tmp_path / "wsctl" / "config.toml"
     config.parent.mkdir(parents=True)
     config.write_text('default_shell = "/bin/zsh"\n', encoding="utf-8")

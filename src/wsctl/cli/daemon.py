@@ -80,11 +80,14 @@ def resolve_instance(settings: Settings, *, port_explicit: bool = False) -> Reso
     followed by ``wsctl status``/``logs`` reports 未在运行 / 没有日志文件 while
     the instance is sitting right there, and the only clue is a line further
     down about "发现其他实例".
+
+    ``found`` is always every live instance in this data directory, matched or
+    not, so a caller can show what else is running (``doctor`` does).
     """
+    found = discover(settings)
     instance = read_instance(settings)
     if instance is not None:
-        return Resolved(instance=instance, found=[instance])
-    found = discover(settings)
+        return Resolved(instance=instance, found=found or [instance])
     if port_explicit or len(found) != 1:
         return Resolved(instance=None, found=found, ambiguous=len(found) > 1)
     only = found[0]

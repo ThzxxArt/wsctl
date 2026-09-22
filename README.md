@@ -186,7 +186,7 @@ pip install ".[dev]"        # 含开发/测试工具；仅使用可改为 pip in
 ### 验证安装
 
 ```bash
-wsctl --version             # 例如 wsctl 0.1.5
+wsctl --version             # 例如 wsctl 0.1.6
 wsctl doctor                # 环境/配置/运行状态自检（--json 便于脚本消费）
 ```
 
@@ -530,7 +530,10 @@ wsctl stop                        # 优雅停止（超时后用 --force 强制�
   崩溃留下的陈旧或损坏的 pid 文件会被自动清理。
 - 已在运行时 `start` 会被拒绝：请用 `restart`、`start --force`（先停再启）或先 `stop`。
 - `start` 与 `serve` 接受同样的参数（`--port`、`--config`、`--backend` 等）；
-  `stop/status/logs/reload` 用相同参数找到对应实例。
+- **未指定 `--host`/`--port` 时自动跟随正在运行的实例**：`stop`/`status`/`logs`/
+  `reload`/`restart`/`doctor` 会去找这个数据目录里真正跑着的那个，而不是盯着默认端口报
+  「未在运行」。发现多个实例时会列出并让你用 `--port` 选一个；显式写了 `--host` 或
+  `--port` 则严格按你说的来。
 - `--daemon` 与 `--reuse-port` 互斥：多实例热切换请用 `--foreground` 或 systemd。
 - 后台启动仅支持 Linux/macOS；Windows 请用 NSSM/计划任务运行 `wsctl serve --foreground`。
 

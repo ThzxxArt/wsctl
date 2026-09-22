@@ -253,3 +253,46 @@ def test_settings_for_repoints_at_the_instance(tmp_path: Path) -> None:
     aimed = daemon.settings_for(inst, base)
     assert (aimed.host, aimed.port) == ("0.0.0.0", 18111)
     assert daemon.logfile_path(aimed).name == "wsctl-18111.log"
+
+
+def test_found_lists_every_live_instance_even_when_one_matches(tmp_path: Path) -> None:
+    """``found`` is "everything live here", not just the one we matched.
+
+    `doctor` uses it to say what else is running, so dropping the others hides
+    the very thing an operator is looking for.
+    """
+    for port in (18111, 18222):
+        inst = daemon.Instance(
+            pid=os.getpid(), host="127.0.0.1", port=port,
+            started_at=0.0, version="0", identity="",
+        )
+        path = daemon.pidfile_path(settings_for(tmp_path, port=port))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(daemon.asdict(inst)), encoding="utf-8")
+    try:
+        resolved = daemon.resolve_instance(settings_for(tmp_path, port=18111))
+        assert resolved.instance is not None and resolved.instance.port == 18111
+        assert {i.port for i in resolved.found} == {18111, 18222}, (
+            "the sibling instance must stay visible"
+        )
+    finally:
+        for port in (18111, 18222):
+            daemon.pidfile_path(settings_for(tmp_path, port=port)).unlink(missing_ok=True)
+
+
+def test_explicit_host_is_never_second_guessed(tmp_path: Path) -> None:
+    """Naming the target means "this one", not "whichever is running"."""
+    live = daemon.Instance(
+        pid=os.getpid(), host="0.0.0.0", port=18111,
+        started_at=0.0, version="0", identity="",
+    )
+    path = daemon.pidfile_path(settings_for(tmp_path, port=18111))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(daemon.asdict(live)), encoding="utf-8")
+    try:
+        aimed = settings_for(tmp_path, port=7681).model_copy(update={"host": "127.0.0.1"})
+        resolved = daemon.resolve_instance(aimed, port_explicit=True)
+        assert resolved.instance is None
+        assert resolved.fallback is False
+    finally:
+        path.unlink(missing_ok=True)
