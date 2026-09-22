@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.4 · 状态：0.1.0–0.1.4 已发布
+> 版本：0.1.5 · 状态：0.1.0–0.1.5 已发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -282,8 +282,9 @@ pyotp  segno  websockets
 | **M37** | 0.1.4 「脚本与界面顺手」：CLI 全线 `--json`（session/user/audit/config show）+ `audit` 筛选 + `session list` 显示用户名/后端/存活、Web 建会话对话框（名称/命令/工作目录/后端/结构化 SSH 表单 + 必填校验）、Web 管理面「配置」页签（`GET /api/config`，标注热更新/需重启 + 重载反馈）、`config set` 保留行内注释且不误改注释行、`wsctl completion install|show`（bash/zsh/fish/powershell，按 `$SHELL` 探测）、`doctor` 增检磁盘/密码策略/日志/系统时钟、CLI 冷启动懒加载（`wsctl version` 1.05s → 0.36s） |
 | **M38** | 0.1.4 部署与工程化：Docker 改**仓库根构建**（装本地源码而非 PyPI 旧版）+ `entrypoint.sh` 首启建号 + compose 强制 `WSCTL_ADMIN_PASSWORD` + `.dockerignore`、CI 加 macOS 腿与 Windows 导入/CLI 冒烟、`-m slow` 压测入 CI、装 `lrzsz` 真机验证 ZMODEM 收发、构建 Docker 镜像冒烟、systemd 单元注明 `ExecStart` 路径来源、e2e 失败时打印子进程日志 |
 | **M39** | 0.1.4 测试与文档：新增密码策略/认证缓存/日志轮转/录制失败/UTF-8/metrics 转义六个套件，扩展分享持久化、有界 `Pty.wait`、PTY 丢输入、上传覆盖、配置端点与重载报错、TOTP/`--json`/注释保留/补全；浏览器覆盖建会话对话框、配置页签、上传覆盖提示、连接预算、**ZMODEM `sz`/`rz` 字节级真机往返**；e2e 断言分享跨重启存活；README/DESIGN/CHANGELOG/SECURITY 同步 |
+| **M40** | 0.1.5 Windows 可用性与跨平台收敛：`signal.SIGHUP` 默认参数不再在定义期求值（此前 Windows 一 import 就炸，`DEFAULT_TERM_SIGNAL` 回落 `SIGTERM`）、CLI 启动时把 stdio 切到 UTF-8 + `errors="replace"`（此前 cp1252 控制台编不了中文，`wsctl doctor` 直接崩）、`fs.relative_to` 恒用 POSIX 分隔符（审计/分享路径跨平台可对齐）；测试改为封闭与确定性：CLI 用例不依赖开发者本机 `credentials.json`、PTY 丢输入用例 stub 掉内核缓冲而非假设其尺寸、浏览器断言改为结果导向并做空值守卫；CI 的 Windows job 装齐 `dev` extras 并用 `python -m pytest` |
 
-## 10.1 实现状态（截至 0.1.4）
+## 10.1 实现状态（截至 0.1.5）
 
 **已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
@@ -299,6 +300,8 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 重载）、声明式参数互斥/依赖强校验、CLI 与 API 同源的用户管理不变量、一致性
 备份/恢复（SQLite 在线备份）、WS 关闭码语义化、`connect` 自动重连、事件循环
 解阻（argon2/录制/保留/审计容错）。
+
+**0.1.5 新增**：Windows 可用性与跨平台收敛。此前 `import wsctl.core.pty` 在 Windows 直接抛 `AttributeError: module 'signal' has no attribute 'SIGHUP'`（注解默认值在定义期求值），且默认 cp1252 控制台下 `wsctl doctor` 因中文输出抛 `UnicodeEncodeError`——**Windows 上 CLI 此前完全不可用**。两条均已根治，并把审计/分享里的相对路径统一为 POSIX 分隔符。测试侧同步收敛为封闭且确定（不再依赖开发者本机凭证、不再假设内核 PTY 缓冲尺寸）。
 
 **0.1.4 新增**：承诺闭环与可靠性收口——**分享链接跨重启存活**（与会话同级的承诺）、
 CLI 两步验证登录、密码策略、子进程不退也不挂死、录制失败自诚实、配置写错必报错、

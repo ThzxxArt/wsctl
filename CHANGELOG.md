@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-09-22
+
+Windows portability and test-independence release. Two of the three fixes below
+are real product bugs that made the CLI unusable on Windows; the rest make the
+suite mean what it says on every platform. No new features, no schema change.
+
+### Fixed
+
+- **`import wsctl.core.pty` no longer crashes on Windows.** `Pty.terminate`
+  declared `sig: int = signal.SIGHUP` as an *annotation default*, which Python
+  evaluates at definition time -- and `signal.SIGHUP` does not exist on
+  Windows, so merely importing the module raised `AttributeError`. The signal is
+  now resolved once into `DEFAULT_TERM_SIGNAL` (`SIGHUP` where it exists,
+  `SIGTERM` otherwise).
+- **Chinese output no longer crashes a default Windows console.** Such a
+  console is cp1252, so writing the help text or `wsctl doctor` through it
+  raised `UnicodeEncodeError` before anything appeared. The CLI now
+  reconfigures stdout/stderr to UTF-8 with a replacement fallback at startup: a
+  terminal that truly cannot render a glyph degrades to `?` instead of dying.
+- `fs.relative_to` returns POSIX separators on every platform. Those strings
+  land in audit payloads and share links, so the same upload used to look like
+  `a\b.txt` on one host and `a/b.txt` on another.
+
+### Testing
+
+- `test_session_list_json_is_machine_readable` is hermetic: it passed locally
+  only because the developer's `~/.config/wsctl/credentials.json` gave the CLI
+  a URL to fall back on, and failed on a clean runner. It now isolates
+  `XDG_CONFIG_HOME` and passes `--url` explicitly.
+- The PTY input-drop tests stub the write-buffer drain instead of filling a
+  real PTY after `SIGSTOP`. How many bytes the kernel soaks up first is
+  platform-specific (macOS takes far more than Linux), so the old version was
+  measuring the kernel rather than wsctl.
+- The browser rename step asserts the outcome (tab label and server-side name)
+  rather than "a PATCH must be in flight while this context manager is open",
+  which was timing-dependent, and guards a `querySelector` that can legitimately
+  be null while the admin table renders.
+
+[0.1.5]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.5
+
 ## [0.1.4] - 2026-09-22
 
 Reliability and usability release. Every promise the product makes now holds

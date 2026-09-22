@@ -186,7 +186,7 @@ pip install ".[dev]"        # 含开发/测试工具；仅使用可改为 pip in
 ### 验证安装
 
 ```bash
-wsctl --version             # 例如 wsctl 0.1.4
+wsctl --version             # 例如 wsctl 0.1.5
 wsctl doctor                # 环境/配置/运行状态自检（--json 便于脚本消费）
 ```
 
