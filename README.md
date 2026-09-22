@@ -530,10 +530,10 @@ wsctl stop                        # 优雅停止（超时后用 --force 强制�
   崩溃留下的陈旧或损坏的 pid 文件会被自动清理。
 - 已在运行时 `start` 会被拒绝：请用 `restart`、`start --force`（先停再启）或先 `stop`。
 - `start` 与 `serve` 接受同样的参数（`--port`、`--config`、`--backend` 等）；
-- **未指定 `--host`/`--port` 时自动跟随正在运行的实例**：`stop`/`status`/`logs`/
-  `reload`/`restart`/`doctor` 会去找这个数据目录里真正跑着的那个，而不是盯着默认端口报
-  「未在运行」。发现多个实例时会列出并让你用 `--port` 选一个；显式写了 `--host` 或
-  `--port` 则严格按你说的来。
+- **生命周期命令自动跟随正在运行的实例**：`stop`/`status`/`logs`/`reload`/`restart`/
+  `doctor` 会去找这个数据目录里真正跑着的那个，而不是盯着默认地址报「未在运行」。
+  传参只会**收窄**搜索、绝不放行：`--port` 只认该端口，`--host` 只认绑定在该地址的实例，
+  两者都给则取交集；候选多于一个时列出并让你选，一个都不匹配就明说「未在运行」。
 - `--daemon` 与 `--reuse-port` 互斥：多实例热切换请用 `--foreground` 或 systemd。
 - 后台启动仅支持 Linux/macOS；Windows 请用 NSSM/计划任务运行 `wsctl serve --foreground`。
 

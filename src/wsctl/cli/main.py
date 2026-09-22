@@ -327,10 +327,10 @@ def doctor(
         ok if daemon_ok else warn,
     )
 
-    resolved = daemon_mod.resolve_instance(settings, port_explicit=False)
+    resolved = daemon_mod.resolve_instance(settings)
     instance = resolved.instance
     if instance is not None:
-        note = "（未指定 --host/--port，自动跟随）" if resolved.fallback else ""
+        note = "（已自动选定）" if resolved.fallback else ""
         add(
             "运行状态",
             f"运行中（pid {instance.pid}，{instance.host}:{instance.port}）{note}",
@@ -341,7 +341,7 @@ def doctor(
     else:
         add("运行状态", "未运行", "[dim]-[/]")
         for other in resolved.found:
-            add("运行状态", f"发现其他实例：pid {other.pid} {other.host}:{other.port}", warn)
+            add("其他实例", f"pid {other.pid}  {other.host}:{other.port}", warn)
 
     reuse_ok = hasattr(socket, "SO_REUSEPORT")
     add(
@@ -842,7 +842,7 @@ def stop(
 ) -> None:
     """停止后台运行的 wsctl（未指定 --host/--port 时自动跟随正在运行的实例）。"""
     settings = _settings_from(config, host=host, port=port)
-    settings, _ = _resolve_target(settings, port, host, what="停止")
+    settings = _resolve_target(settings, port, host, what="停止")
     try:
         instance = daemon_mod.stop(settings, timeout=timeout, force=force)
     except daemon_mod.DaemonError as exc:
@@ -901,12 +901,12 @@ def restart(
     # "the default port" would stop the instance they are actually using and
     # then boot a new one somewhere else.
     running = daemon_mod.resolve_instance(
-        settings, port_explicit=(port is not None or host is not None)
+        settings, port_explicit=port is not None, host_explicit=host is not None
     )
     if running.instance is not None:
         if running.fallback:
             err_console.print(
-                f"[dim]未指定 --host/--port，已跟随正在运行的实例 "
+                f"[dim]已自动跟随正在运行的实例 "
                 f"{running.instance.host}:{running.instance.port}[/]"
             )
         settings = daemon_mod.settings_for(running.instance, settings)
@@ -939,7 +939,9 @@ def status(
 ) -> None:
     """查看后台 wsctl 的运行状态（未指定 --host/--port 时自动跟随正在运行的实例）。"""
     settings = _settings_from(config, host=host, port=port)
-    resolved = daemon_mod.resolve_instance(settings, port_explicit=port is not None)
+    resolved = daemon_mod.resolve_instance(
+        settings, port_explicit=port is not None, host_explicit=host is not None
+    )
     instance = resolved.instance
     if instance is None:
         if json_output:
@@ -961,7 +963,7 @@ def status(
 
     if resolved.fallback:
         err_console.print(
-            f"[dim]未指定 --host/--port，已跟随正在运行的实例 {instance.host}:{instance.port}[/]"
+            f"[dim]已自动跟随正在运行的实例 {instance.host}:{instance.port}[/]"
         )
     settings = daemon_mod.settings_for(instance, settings)
     info = daemon_mod.health_info(settings)
@@ -990,7 +992,7 @@ def logs(
 ) -> None:
     """查看后台 wsctl 的日志（未指定 --host/--port 时自动跟随正在运行的实例）。"""
     settings = _settings_from(config, host=host, port=port)
-    settings, _ = _resolve_target(settings, port, host, what="查看")
+    settings = _resolve_target(settings, port, host, what="查看")
     try:
         daemon_mod.tail_log(settings, lines=max(lines, 0), follow=follow)
     except daemon_mod.DaemonError as exc:
@@ -1005,7 +1007,7 @@ def reload(
 ) -> None:
     """请求运行中的 wsctl 重载配置（发送 SIGHUP；未指定 --port 时自动跟随实例）。"""
     settings = _settings_from(config, host=host, port=port)
-    settings, _ = _resolve_target(settings, port, host, what="重载")
+    settings = _resolve_target(settings, port, host, what="重载")
     try:
         instance = daemon_mod.reload_(settings)
     except daemon_mod.DaemonError as exc:
@@ -1015,24 +1017,27 @@ def reload(
 
 def _resolve_target(
     settings: Settings, port: int | None, host: str | None, *, what: str
-) -> tuple[Settings, Any]:
+) -> Settings:
     """Point ``settings`` at the instance this command should act on.
 
     Without an explicit ``--host``/``--port`` the instance that is actually
     running wins over "the default address"; otherwise ``wsctl start --port
     7682`` followed by ``wsctl status``/``logs``/``stop`` talks to nothing and
     reports 未在运行 / 没有日志文件 while the instance is serving right next to
-    it. Naming either flag means "this one", and is never second-guessed.
+    it. Naming a flag narrows the search, it never broadens it: ``--port``
+    restricts to that port, ``--host`` to instances bound there, both to the
+    intersection.
     """
-    explicit = port is not None or host is not None
-    resolved = daemon_mod.resolve_instance(settings, port_explicit=explicit)
+    resolved = daemon_mod.resolve_instance(
+        settings, port_explicit=port is not None, host_explicit=host is not None
+    )
     if resolved.instance is not None:
         if resolved.fallback:
             err_console.print(
-                f"[dim]未指定 --host/--port，已跟随正在运行的实例 "
+                f"[dim]已自动跟随正在运行的实例 "
                 f"{resolved.instance.host}:{resolved.instance.port}[/]"
             )
-        return daemon_mod.settings_for(resolved.instance, settings), resolved.instance
+        return cast("Settings", daemon_mod.settings_for(resolved.instance, settings))
     if resolved.ambiguous:
         err_console.print(
             f"[yellow]发现 {len(resolved.found)} 个实例，请用 --port 指定要{what}哪一个：[/]"

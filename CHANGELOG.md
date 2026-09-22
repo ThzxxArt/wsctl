@@ -18,10 +18,14 @@ schema change.
   7682` followed by `wsctl status` / `logs` / `stop` / `reload` / `restart`
   looked at the *default* port and reported 未在运行 / 没有日志文件 for
   `wsctl-7681.log` while the instance was serving right there — `status` even
-  printed "发现其他实例：… 0.0.0.0:7682" and then refused to use it. Without an
-  explicit `--port`, an instance actually running in this data directory now
-  wins over "the default port", and the command says which one it followed.
-  With more than one instance it lists them and asks for `--port`.
+  printed "发现其他实例：… 0.0.0.0:7682" and then refused to use it. An instance
+  actually running in this data directory now wins over "the default address",
+  and the command says which one it followed. A named flag only ever *narrows*
+  the search — `--port` restricts to that port, `--host` to instances bound
+  there, both to the intersection (a pid file is keyed by port alone, so
+  `--host 127.0.0.1` used to be handed the `0.0.0.0` instance). With more than
+  one candidate it lists them and asks for `--port`; with none it says 未在运行
+  instead of silently starting something else.
 - **`--admin-password` is never silently ignored.** The bootstrap returns early
   when the database already has users, so the flag did nothing; and because the
   warning only reached the detached child's log, it read exactly like "your
@@ -49,7 +53,7 @@ schema change.
 ### Testing
 
 - Ten new tests pin the instance resolution (single instance auto-follows, two
-  instances are ambiguous, an explicit `--port` is never second-guessed), the
+  instances are ambiguous, a named flag narrows rather than broadens), the
   proxy bypass (behaviourally: a real local server must answer while a bogus
   `http_proxy` is set), the loud `--admin-password` warning and the lock-out
   recovery.

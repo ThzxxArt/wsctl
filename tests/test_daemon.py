@@ -291,8 +291,34 @@ def test_explicit_host_is_never_second_guessed(tmp_path: Path) -> None:
     path.write_text(json.dumps(daemon.asdict(live)), encoding="utf-8")
     try:
         aimed = settings_for(tmp_path, port=7681).model_copy(update={"host": "127.0.0.1"})
-        resolved = daemon.resolve_instance(aimed, port_explicit=True)
+        resolved = daemon.resolve_instance(aimed, port_explicit=True, host_explicit=True)
         assert resolved.instance is None
         assert resolved.fallback is False
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_explicit_host_refuses_a_different_host(tmp_path: Path) -> None:
+    """`--host 127.0.0.1` must not be handed the `0.0.0.0` instance.
+
+    A pid file is keyed by port alone, so an explicit host has to be checked
+    here or the command silently acts on an instance the user did not name.
+    """
+    live = daemon.Instance(
+        pid=os.getpid(), host="0.0.0.0", port=18111,
+        started_at=0.0, version="0", identity="",
+    )
+    path = daemon.pidfile_path(settings_for(tmp_path, port=18111))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(daemon.asdict(live)), encoding="utf-8")
+    try:
+        aimed = settings_for(tmp_path, port=18111).model_copy(update={"host": "127.0.0.1"})
+        resolved = daemon.resolve_instance(aimed, port_explicit=True, host_explicit=True)
+        assert resolved.instance is None, "host mismatch must not match"
+        assert resolved.fallback is False
+
+        # Without --host the same instance is still the right answer.
+        loose = daemon.resolve_instance(settings_for(tmp_path, port=18111))
+        assert loose.instance is not None and loose.instance.host == "0.0.0.0"
     finally:
         path.unlink(missing_ok=True)

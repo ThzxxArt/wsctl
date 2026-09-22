@@ -421,7 +421,7 @@ def test_resolve_target_follows_the_running_instance(tmp_path, monkeypatch) -> N
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0, result.output
         assert "18111" in result.output
-        assert "已跟随正在运行的实例" in result.output
+        assert "已自动跟随正在运行的实例" in result.output
 
         # `logs` must open the *instance's* log, not wsctl-7681.log.
         logs = runner.invoke(app, ["logs", "-n", "1"])

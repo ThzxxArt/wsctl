@@ -60,9 +60,9 @@ class Resolved:
 
     ``instance`` is the target. ``found`` lists every live instance in this data
     directory so a caller can explain an ambiguous match. ``fallback`` is set
-    when the target was picked without the user naming a port, which is the
-    case that used to report "未在运行" while a real instance was serving on a
-    non-default port right next to it.
+    when the target was picked without the user naming ``--host``/``--port``,
+    which is the case that used to report "未在运行" while a real instance was
+    serving on a non-default port right next to it.
     """
 
     instance: Instance | None
@@ -71,22 +71,29 @@ class Resolved:
     ambiguous: bool = False
 
 
-def resolve_instance(settings: Settings, *, port_explicit: bool = False) -> Resolved:
+def resolve_instance(
+    settings: Settings, *, port_explicit: bool = False, host_explicit: bool = False
+) -> Resolved:
     """Find the instance this invocation should act on.
 
-    An explicit ``--port`` is authoritative and is never second-guessed.
-    Without one, prefer an instance that is actually running in this data
-    directory over "the default port": otherwise ``wsctl start --port 7682``
-    followed by ``wsctl status``/``logs`` reports 未在运行 / 没有日志文件 while
-    the instance is sitting right there, and the only clue is a line further
-    down about "发现其他实例".
+    Naming a flag narrows the search, it never broadens it:
 
-    ``found`` is always every live instance in this data directory, matched or
-    not, so a caller can show what else is running (``doctor`` does).
+    * ``--port`` — only that port is a candidate (a pid file is keyed by port);
+    * ``--host`` — only instances bound to that host are candidates;
+    * both — the candidate must match both;
+    * neither — the instance actually running here wins over "the default
+      address", which is what used to report 未在运行 / 没有日志文件 for
+      ``wsctl-7681.log`` while ``wsctl start --port 7682`` was serving.
+
+    ``found`` is every live instance considered (before host filtering is not
+    useful to a caller, so it reflects the narrowed set), so a caller can show
+    what else is running or why nothing matched.
     """
     found = discover(settings)
+    if host_explicit:
+        found = [i for i in found if i.host == settings.host]
     instance = read_instance(settings)
-    if instance is not None:
+    if instance is not None and (not host_explicit or instance.host == settings.host):
         return Resolved(instance=instance, found=found or [instance])
     if port_explicit or len(found) != 1:
         return Resolved(instance=None, found=found, ambiguous=len(found) > 1)
