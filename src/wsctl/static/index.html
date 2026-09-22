@@ -1,69 +1,114 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="referrer" content="no-referrer" />
+  <meta name="theme-color" content="#0e1117" />
   <title>wsctl 网页终端</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="stylesheet" href="/static/vendor/xterm.css" />
   <link rel="stylesheet" href="/static/vendor/asciinema-player.css" />
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
+  <svg width="0" height="0" style="display:none" aria-hidden="true">
+    <defs>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-record" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5l10 6.5-10 6.5z"/></symbol>
+      <symbol id="i-transfer" viewBox="0 0 24 24"><path d="M7 10l-4 4 4 4M3 14h13M17 4l4 4-4 4M21 8H8"/></symbol>
+      <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3v12M8 7l4-4 4 4M5 15v4h14v-4"/></symbol>
+      <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+      <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l-5-5 5-5M15 12H5"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+      <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4M8 8l4-4 4 4M4 20h16"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></symbol>
+      <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></symbol>
+      <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v12M8 12l4 4 4-4M4 20h16"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+    </defs>
+  </svg>
+
   <header class="topbar">
-    <span class="brand">wsctl</span>
+    <span class="brand"><span class="brand-dot"></span>wsctl</span>
     <div id="tabs" class="tabs"></div>
-    <button id="new-tab" class="icon-btn" title="新建会话">+</button>
+    <button id="new-tab" class="icon-btn" title="新建会话" aria-label="新建会话"><svg class="ico"><use href="#i-plus"/></svg></button>
     <div class="spacer"></div>
     <span id="connection" class="status">空闲</span>
-    <button id="record-btn" class="text-btn" title="开始/停止录制">录制</button>
-    <button id="replay-btn" class="text-btn" title="回放录制">回放</button>
-    <button id="zmodem-btn" class="text-btn" title="切换 ZMODEM 文件传输（sz/rz）">传输</button>
-    <button id="share-btn" class="text-btn" title="分享会话">分享</button>
-    <button id="sessions-btn" class="text-btn" title="会话列表">会话</button>
-    <button id="settings-btn" class="text-btn" title="设置">设置</button>
-    <button id="files-toggle" class="text-btn" title="文件面板">文件</button>
+    <button id="search-btn" class="icon-btn desktop-only" title="搜索终端 (Ctrl+Shift+F)" aria-label="搜索终端"><svg class="ico"><use href="#i-search"/></svg></button>
+    <button id="record-btn" class="icon-btn desktop-only" title="开始/停止录制" aria-label="录制"><svg class="ico"><use href="#i-record"/></svg></button>
+    <button id="replay-btn" class="icon-btn desktop-only" title="回放录制" aria-label="回放"><svg class="ico"><use href="#i-play"/></svg></button>
+    <button id="zmodem-btn" class="icon-btn desktop-only" title="切换 ZMODEM 文件传输（sz/rz）" aria-label="文件传输"><svg class="ico"><use href="#i-transfer"/></svg></button>
+    <button id="share-btn" class="icon-btn desktop-only" title="分享会话" aria-label="分享"><svg class="ico"><use href="#i-share"/></svg></button>
+    <button id="sessions-btn" class="icon-btn desktop-only" title="会话列表" aria-label="会话列表"><svg class="ico"><use href="#i-list"/></svg></button>
+    <button id="admin-btn" class="icon-btn desktop-only hidden" title="管理" aria-label="管理"><svg class="ico"><use href="#i-user"/></svg></button>
+    <button id="settings-btn" class="icon-btn desktop-only" title="设置" aria-label="设置"><svg class="ico"><use href="#i-gear"/></svg></button>
+    <button id="files-toggle" class="icon-btn desktop-only" title="文件面板" aria-label="文件面板"><svg class="ico"><use href="#i-folder"/></svg></button>
     <span id="whoami" class="whoami"></span>
-    <button id="logout" class="text-btn" title="退出登录">退出</button>
+    <button id="logout" class="icon-btn desktop-only" title="退出登录" aria-label="退出登录"><svg class="ico"><use href="#i-logout"/></svg></button>
+    <button id="more-btn" class="icon-btn mobile-only" title="更多" aria-label="更多"><svg class="ico"><use href="#i-menu"/></svg></button>
   </header>
+
+  <div id="more-menu" class="context-menu hidden"></div>
 
   <main id="terminal-wrap"></main>
 
+  <div id="search-bar" class="search-bar hidden">
+    <svg class="ico"><use href="#i-search"/></svg>
+    <input id="search-input" placeholder="搜索终端内容（Enter 下一个）" />
+    <span id="search-count" class="search-count"></span>
+    <button id="search-next" class="text-btn" title="下一个">↓</button>
+    <button id="search-close" class="icon-btn" title="关闭" aria-label="关闭搜索"><svg class="ico"><use href="#i-close"/></svg></button>
+  </div>
+
   <div id="tab-menu" class="context-menu hidden">
     <button data-action="detach">关闭标签（保持会话）</button>
-    <button data-action="kill">终止会话</button>
+    <button data-action="kill" class="danger">终止会话</button>
   </div>
 
   <aside id="file-panel" class="file-panel hidden">
     <header class="file-head">
       <span id="file-crumbs" class="crumbs"></span>
-      <button id="file-close" class="text-btn" title="关闭">&times;</button>
+      <button id="file-close" class="icon-btn" title="关闭" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
     </header>
     <div class="file-toolbar">
-      <button id="file-upload-btn" class="text-btn">上传</button>
-      <button id="file-refresh" class="text-btn">刷新</button>
+      <button id="file-upload-btn" class="text-btn"><svg class="ico sm"><use href="#i-upload"/></svg>上传</button>
+      <button id="file-refresh" class="text-btn"><svg class="ico sm"><use href="#i-refresh"/></svg>刷新</button>
       <span id="file-status" class="file-status"></span>
       <input id="file-input" type="file" multiple hidden />
     </div>
     <ul id="file-list" class="file-list"></ul>
   </aside>
 
+  <!-- 统一弹窗 -->
   <div id="login-overlay" class="overlay hidden">
-    <form id="login-form" class="login-card">
-      <h1>wsctl</h1>
+    <form id="login-form" class="modal-card login-card">
+      <div class="login-brand">
+        <span class="login-logo"><svg class="ico"><use href="#i-terminal"/></svg></span>
+        <div><h2>wsctl</h2><p class="hint">单机部署的 Web 在线终端</p></div>
+      </div>
       <p id="login-error" class="error hidden"></p>
       <label>用户名<input id="username" name="username" autocomplete="username" autofocus /></label>
       <label>密码<input id="password" name="password" type="password" autocomplete="current-password" /></label>
       <label>两步验证码（未启用可留空）<input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" /></label>
-      <button type="submit">登录</button>
+      <button type="submit" class="primary">登录</button>
     </form>
   </div>
 
   <div id="share-overlay" class="overlay hidden">
-    <div class="login-card share-card">
-      <h1>分享会话</h1>
-      <p class="share-hint">任何拿到此链接的人都能观看该终端。</p>
-      <label class="share-write"><input id="share-write" type="checkbox" /> 允许输入（可写）</label>
+    <div class="modal-card">
+      <div class="modal-head"><h2>分享会话</h2><button id="share-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button></div>
+      <p class="hint">任何拿到此链接的人都能观看该终端。</p>
+      <label class="row"><input id="share-write" type="checkbox" /> 允许输入（可写）</label>
       <label>有效期
         <select id="share-ttl">
           <option value="">永久</option>
@@ -72,49 +117,74 @@
           <option value="86400">1 天</option>
         </select>
       </label>
-      <img id="share-qr" alt="分享二维码" />
+      <img id="share-qr" class="qr" alt="分享二维码" />
       <input id="share-url" readonly />
-      <div class="share-actions">
+      <div class="modal-actions">
         <button id="share-copy" type="button">复制链接</button>
         <button id="share-regenerate" type="button">生成新链接</button>
-        <button id="share-revoke" type="button">撤销分享</button>
-        <button id="share-close" type="button">关闭</button>
+        <button id="share-revoke" type="button" class="danger">撤销分享</button>
       </div>
       <p id="share-note" class="error hidden"></p>
     </div>
   </div>
 
   <div id="sessions-overlay" class="overlay hidden">
-    <div class="login-card sessions-card">
-      <h1>会话列表</h1>
-      <p class="share-hint">关闭标签只会断开连接，会话仍在服务器上运行。</p>
+    <div class="modal-card wide">
+      <div class="modal-head"><h2>会话列表</h2><button id="sessions-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button></div>
+      <p class="hint">关闭标签只会断开连接，会话仍在服务器上运行。</p>
+      <div class="admin-toolbar">
+        <input id="session-filter" placeholder="筛选会话" />
+        <button id="sessions-detach-all" type="button" class="text-btn">全部断开</button>
+      </div>
       <ul id="sessions-list" class="session-list"></ul>
-      <div class="share-actions">
-        <button id="sessions-new" type="button">新建会话</button>
-        <button id="sessions-close" type="button">关闭</button>
+      <div class="modal-actions">
+        <button id="sessions-new" type="button" class="primary">新建会话</button>
       </div>
     </div>
   </div>
 
+  <div id="admin-overlay" class="overlay hidden">
+    <div class="modal-card wide tall">
+      <div class="modal-head">
+        <h2>管理</h2>
+        <button id="admin-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
+      </div>
+      <div class="tabs2" role="tablist">
+        <button class="tab2 active" data-tab="users">用户</button>
+        <button class="tab2" data-tab="audit">审计</button>
+        <button class="tab2" data-tab="recordings">录制</button>
+      </div>
+      <div id="admin-body" class="admin-body"></div>
+      <p id="admin-note" class="error hidden"></p>
+    </div>
+  </div>
+
   <div id="settings-overlay" class="overlay hidden">
-    <div class="login-card">
-      <h1>设置</h1>
+    <div class="modal-card">
+      <div class="modal-head"><h2>设置</h2><button id="settings-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button></div>
       <label>页面主题
         <select id="set-theme">
+          <option value="auto">跟随系统</option>
           <option value="dark">深色</option>
           <option value="light">浅色</option>
         </select>
       </label>
       <label>字号
         <select id="set-fontsize">
-          <option value="12">12</option>
-          <option value="13">13</option>
-          <option value="14">14</option>
-          <option value="16">16</option>
-          <option value="18">18</option>
+          <option value="12">12</option><option value="13">13</option>
+          <option value="14">14</option><option value="16">16</option><option value="18">18</option>
         </select>
       </label>
-      <div class="hotkey-title">终端主题</div>
+      <label>字体
+        <select id="set-font">
+          <option value="">默认等宽</option>
+          <option value='ui-monospace, SFMono-Regular, Menlo, monospace'>系统等宽</option>
+          <option value='"JetBrains Mono", ui-monospace, monospace'>JetBrains Mono</option>
+          <option value='"Fira Code", ui-monospace, monospace'>Fira Code</option>
+          <option value='"Cascadia Code", ui-monospace, monospace'>Cascadia Code</option>
+        </select>
+      </label>
+      <div class="section-title">终端主题</div>
       <div id="theme-gallery" class="theme-gallery"></div>
       <details class="custom-theme">
         <summary>自定义主题</summary>
@@ -122,25 +192,47 @@
         <textarea id="custom-theme-json" rows="3" placeholder='{"background":"#000","foreground":"#fff"}'></textarea>
         <button id="custom-theme-add" type="button" class="text-btn">添加主题</button>
       </details>
-      <div class="hotkey-title">快捷键</div>
+      <div class="section-title">快捷键</div>
       <div id="hotkey-list" class="hotkey-list"></div>
       <button id="hotkeys-reset" type="button" class="text-btn">恢复默认快捷键</button>
-      <div class="share-actions">
-        <button id="settings-close" type="button">关闭</button>
-      </div>
+      <div class="modal-actions"><button id="settings-done" type="button" class="primary">完成</button></div>
     </div>
   </div>
 
   <div id="replay-overlay" class="overlay hidden">
-    <div class="replay-card">
-      <div class="replay-head">
-        <span>会话录制</span>
-        <button id="replay-close" class="text-btn" title="关闭">&times;</button>
+    <div class="modal-card wide tall replay-card">
+      <div class="modal-head">
+        <h2>会话录制</h2>
+        <button id="replay-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
       </div>
       <p id="replay-note" class="error hidden"></p>
       <div id="replay-host" class="replay-host"></div>
     </div>
   </div>
+
+  <div id="rename-overlay" class="overlay hidden">
+    <form id="rename-form" class="modal-card narrow">
+      <div class="modal-head"><h2 id="rename-title">重命名会话</h2></div>
+      <input id="rename-input" autocomplete="off" />
+      <div class="modal-actions">
+        <button type="button" id="rename-cancel">取消</button>
+        <button type="submit" class="primary">确定</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="confirm-overlay" class="overlay hidden">
+    <div class="modal-card narrow">
+      <div class="modal-head"><h2 id="confirm-title">确认</h2></div>
+      <p id="confirm-message" class="hint"></p>
+      <div class="modal-actions">
+        <button type="button" id="confirm-cancel">取消</button>
+        <button type="button" id="confirm-ok" class="danger">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
 
   <script src="/static/vendor/xterm.js"></script>
   <script src="/static/vendor/addon-fit.js"></script>

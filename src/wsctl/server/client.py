@@ -40,6 +40,10 @@ class WsClient:
     def pending_bytes(self) -> int:
         return self._pending_bytes
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def put(self, item: bytes | dict[str, Any]) -> None:
         if self._closed:
             raise ClientGone("连接已关闭")

@@ -40,6 +40,7 @@ from wsctl import __version__
 from wsctl.core import fs as fs_mod
 from wsctl.core import recording as recording_mod
 from wsctl.core import ssh, tmux, totp
+from wsctl.core.audit import AuditWriter
 from wsctl.core.config import Settings, reload_settings_file
 from wsctl.core.metrics import Metrics
 from wsctl.core.pty import PtyError
@@ -62,6 +63,31 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 MAINTENANCE_INTERVAL = 5.0
 
 log = logging.getLogger("wsctl.app")
+
+
+class _UploadTooLarge(Exception):
+    """Raised when an upload exceeds ``file_max_upload``."""
+
+
+def _copy_upload(src: Any, fd: int, limit: int, chunk_size: int = 1 << 20) -> int:
+    """Copy an uploaded file to ``fd`` on a worker thread (blocking I/O).
+
+    ``fd`` is always closed. Raises :class:`_UploadTooLarge` past ``limit``.
+    """
+    size = 0
+    out = os.fdopen(fd, "wb")
+    try:
+        while True:
+            chunk = src.read(chunk_size)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                raise _UploadTooLarge
+            out.write(chunk)
+        return size
+    finally:
+        out.close()
 
 
 class LoginRequest(BaseModel):
@@ -108,8 +134,17 @@ class UserCreate(BaseModel):
     role: str = "user"
 
 
-class UserRoleUpdate(BaseModel):
-    role: str
+class UserUpdate(BaseModel):
+    role: str | None = None
+    disabled: bool | None = None
+    password: str | None = None
+
+
+def _qr_svg(text: str) -> str:
+    """Render ``text`` as a standalone SVG QR code (for TOTP provisioning)."""
+    buffer = io.BytesIO()
+    segno.make(text, error="m").save(buffer, kind="svg")
+    return buffer.getvalue().decode("utf-8")
 
 
 def _token_from_request(request: Request) -> str | None:
@@ -199,12 +234,16 @@ async def _reconcile_instances(app: FastAPI) -> None:
     _prune_dead_local_leases(store, me, host)
 
     rows = store.term_session_list()
-    if tmux.is_available():
-        # Reap tmux sessions we own (same namespace) that have no database row.
+    tick = int(getattr(app.state, "_reconcile_tick", 0))
+    app.state._reconcile_tick = tick + 1
+    has_tmux_rows = any(row.get("backend") == "tmux" for row in rows)
+    # Probing tmux spawns a subprocess; only scan for orphans when there are
+    # tmux-backed rows, and otherwise just occasionally.
+    if tmux.is_available() and (has_tmux_rows or tick % 12 == 0):
         known = {str(row["id"]) for row in rows}
-        for name in tmux.list_sessions():
+        for name in await tmux.list_sessions_async():
             if tmux.owns(name) and tmux.sid_from_name(name) not in known:
-                tmux.kill_session(name)
+                await tmux.kill_session_async(name)
                 log.info("reaped orphan tmux session %s", name)
 
     live = store.instance_alive_ids(settings.instance_ttl) - {me}
@@ -220,7 +259,7 @@ async def _reconcile_instances(app: FastAPI) -> None:
             # A local session died together with its instance.
             store.term_session_set_status(sid, "stopped")
             continue
-        if not tmux.has_session(tmux.session_name(sid)):
+        if not await tmux.has_session_async(tmux.session_name(sid)):
             store.term_session_set_status(sid, "stopped")
             continue
         spec = SessionSpec(
@@ -325,6 +364,7 @@ def create_app(
             instance_id, pid=os.getpid(), host=socket.gethostname()
         )
         maint = asyncio.create_task(_maintenance())
+        audit.start()
         if webhook is not None:
             webhook.start()
         await _reconcile_instances(app)
@@ -360,9 +400,12 @@ def create_app(
             maint.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await maint
+            await app.state.manager.shutdown(preserve=settings.tmux_preserve_on_shutdown)
+            # Flush queued audit events (and deliver them to the webhook) before
+            # tearing the webhook down.
+            await audit.stop()
             if webhook is not None:
                 await webhook.stop()
-            await app.state.manager.shutdown(preserve=settings.tmux_preserve_on_shutdown)
             with contextlib.suppress(Exception):
                 app.state.store.instance_remove(instance_id)
             app.state.store.close()
@@ -373,7 +416,11 @@ def create_app(
     app.state.settings = settings
     app.state.instance_id = instance_id
     app.state.store = store or Store(settings.db_path)
+    app.state.store.sliding_ttl = settings.session_sliding_ttl
     app.state.manager = manager or SessionManager()
+
+    audit = AuditWriter(app.state.store)
+    app.state.audit = audit
 
     webhook = WebhookDispatcher(settings.webhook_url) if settings.webhook_url else None
     if webhook is not None:
@@ -397,6 +444,11 @@ def create_app(
         "Approximate bytes buffered across all sessions",
         lambda: float(sum(s.memory_usage() for s in app.state.manager.list_sessions())),
     )
+    metrics.collect(
+        "wsctl_audit_dropped_total",
+        "Audit events dropped because the async queue was saturated",
+        lambda: float(audit.dropped),
+    )
 
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
 
@@ -404,7 +456,7 @@ def create_app(
     async def _guard(request: Request, call_next: RequestResponseEndpoint) -> Response:
         ip = client_ip(request, settings)
         if not ip_allowed(ip, settings.allowed_ips):
-            app.state.store.log_event("ip_rejected", ip=ip, payload=request.url.path)
+            app.state.audit.enqueue("ip_rejected", ip=ip, payload=request.url.path)
             return JSONResponse({"detail": "forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
         response = await call_next(request)
         if settings.security_headers:
@@ -445,7 +497,7 @@ def create_app(
         if limiter.is_blocked(key):
             retry_after = int(limiter.retry_after(key)) + 1
             metrics.inc("wsctl_logins_total", result="blocked")
-            store_.log_event("login_blocked", ip=ip, payload=body.username)
+            audit.enqueue("login_blocked", ip=ip, payload=body.username)
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="尝试次数过多，请稍后再试",
@@ -456,7 +508,7 @@ def create_app(
         if user is None:
             limiter.record_failure(key)
             metrics.inc("wsctl_logins_total", result="failed")
-            store_.log_event("login_failed", ip=ip, payload=body.username)
+            audit.enqueue("login_failed", ip=ip, payload=body.username)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
             )
@@ -465,7 +517,7 @@ def create_app(
         if secret is not None and not totp.verify(secret, body.totp or ""):
             limiter.record_failure(key)
             metrics.inc("wsctl_logins_total", result="totp_failed")
-            store_.log_event("login_totp_failed", user_id=user.id, ip=ip, payload=body.username)
+            audit.enqueue("login_totp_failed", user_id=user.id, ip=ip, payload=body.username)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="一次性验证码错误"
             )
@@ -487,7 +539,7 @@ def create_app(
             samesite="lax",
             path="/",
         )
-        store_.log_event("login", user_id=user.id, ip=ip)
+        audit.enqueue("login", user_id=user.id, ip=ip)
         return {"username": user.username, "role": user.role}
 
     @app.post("/api/logout")
@@ -496,7 +548,7 @@ def create_app(
         if token:
             user = request.app.state.store.resolve_auth_session(token)
             request.app.state.store.delete_auth_session(token)
-            request.app.state.store.log_event(
+            request.app.state.audit.enqueue(
                 "logout",
                 user_id=user.id if user else None,
                 ip=client_ip(request, settings),
@@ -524,6 +576,7 @@ def create_app(
             "alive": session.is_alive,
             "created_at": session.created_at,
             "last_active": session.last_active,
+            "bytes": session.memory_usage(),
         }
 
     @app.get("/api/sessions")
@@ -629,7 +682,7 @@ def create_app(
                 max_life=spec.max_life,
                 instance_id=instance_id,
             )
-            app.state.store.log_event(
+            app.state.audit.enqueue(
                 "session_create", user_id=user.id, term_session_id=session.id, payload=name
             )
         except Exception as exc:
@@ -650,7 +703,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该会话")
         await app.state.manager.remove(sid)
         app.state.store.term_session_set_status(sid, "killed")
-        app.state.store.log_event("session_kill", user_id=user.id, term_session_id=sid)
+        app.state.audit.enqueue("session_kill", user_id=user.id, term_session_id=sid)
         return {"ok": True}
 
     @app.patch("/api/sessions/{sid}")
@@ -700,7 +753,7 @@ def create_app(
         token = session.create_share(
             ttl=float(body.ttl) if body.ttl else None, writable=body.writable
         )
-        app.state.store.log_event(
+        app.state.audit.enqueue(
             "session_share",
             user_id=user.id,
             term_session_id=sid,
@@ -712,7 +765,7 @@ def create_app(
     async def revoke_share(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
         session = _owned(sid, user)
         session.revoke_share()
-        app.state.store.log_event("session_unshare", user_id=user.id, term_session_id=sid)
+        app.state.audit.enqueue("session_unshare", user_id=user.id, term_session_id=sid)
         return {"ok": True}
 
     @app.get("/api/sessions/{sid}/qr.svg")
@@ -743,14 +796,14 @@ def create_app(
         path = session.start_recording(
             settings.recordings_dir / f"{sid}.cast", record_input=body.record_input
         )
-        app.state.store.log_event("recording_start", user_id=user.id, term_session_id=sid)
+        app.state.audit.enqueue("recording_start", user_id=user.id, term_session_id=sid)
         return {"path": str(path)}
 
     @app.post("/api/sessions/{sid}/recording/stop")
     async def stop_recording(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
         session = _owned(sid, user)
         session.stop_recording()
-        app.state.store.log_event("recording_stop", user_id=user.id, term_session_id=sid)
+        app.state.audit.enqueue("recording_stop", user_id=user.id, term_session_id=sid)
         return {"ok": True}
 
     @app.get("/api/sessions/{sid}/recording")
@@ -768,17 +821,55 @@ def create_app(
         directory = settings.recordings_dir
         if not directory.is_dir():
             return []
-        return [
-            {"name": entry.name, "size": entry.stat().st_size}
-            for entry in sorted(directory.glob("*.cast"))
-        ]
+        items = []
+        for entry in sorted(directory.glob("*.cast")):
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            items.append(
+                {"name": entry.name, "size": stat.st_size, "mtime": stat.st_mtime}
+            )
+        return items
+
+    def _recording_path(name: str) -> Path:
+        safe = Path(name).name
+        if safe != name or not safe.endswith(".cast"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件名无效")
+        return settings.recordings_dir / safe
+
+    @app.get("/api/recordings/{name}")
+    async def download_recording_by_name(
+        name: str, _: User = Depends(require_admin)
+    ) -> FileResponse:
+        path = _recording_path(name)
+        if not path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
+        return FileResponse(path, media_type="application/x-asciicast", filename=name)
+
+    @app.delete("/api/recordings/{name}")
+    async def delete_recording_by_name(
+        name: str, actor: User = Depends(require_admin)
+    ) -> dict[str, bool]:
+        path = _recording_path(name)
+        if not path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
+        path.unlink(missing_ok=True)
+        audit.enqueue("recording_delete", user_id=actor.id, payload=name)
+        return {"ok": True}
 
     # -- users (admin only) --------------------------------------------
 
     @app.get("/api/users")
     async def list_users(_: User = Depends(require_admin)) -> list[dict[str, Any]]:
         return [
-            {"id": u.id, "username": u.username, "role": u.role, "disabled": u.disabled}
+            {
+                "id": u.id,
+                "username": u.username,
+                "role": u.role,
+                "disabled": u.disabled,
+                "totp": app.state.store.user_totp_secret(u.username) is not None,
+            }
             for u in app.state.store.user_list()
         ]
 
@@ -794,7 +885,7 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="用户已存在"
             ) from exc
-        app.state.store.log_event(
+        app.state.audit.enqueue(
             "user_create", user_id=actor.id, payload=f"{user.username}:{user.role}"
         )
         return {"id": user.id, "username": user.username, "role": user.role}
@@ -803,33 +894,102 @@ def create_app(
     async def delete_user(
         username: str, actor: User = Depends(require_admin)
     ) -> dict[str, bool]:
-        if not app.state.store.user_delete(username):
+        target = app.state.store.user_get(username)
+        if target is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-        app.state.store.log_event("user_delete", user_id=actor.id, payload=username)
+        if username == actor.username:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不能删除自己")
+        if target.role == "admin" and app.state.store.admin_count() <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="至少保留一个管理员"
+            )
+        app.state.store.user_delete(username)
+        audit.enqueue("user_delete", user_id=actor.id, payload=username)
         return {"ok": True}
 
     @app.patch("/api/users/{username}")
-    async def set_user_role(
-        username: str, body: UserRoleUpdate, actor: User = Depends(require_admin)
+    async def update_user(
+        username: str, body: UserUpdate, actor: User = Depends(require_admin)
     ) -> dict[str, bool]:
-        if body.role not in ("admin", "user"):
+        if body.role is None and body.disabled is None and body.password is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="没有需要更新的字段"
+            )
+        if body.role is not None and body.role not in ("admin", "user"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="角色无效")
-        if not app.state.store.user_set_role(username, body.role):
+        target = app.state.store.user_get(username)
+        if target is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-        app.state.store.log_event("user_role", user_id=actor.id, payload=f"{username}:{body.role}")
+        if body.disabled and username == actor.username:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不能禁用自己")
+        demoting = body.role == "user" and target.role == "admin"
+        disabling = body.disabled is True and target.role == "admin"
+        if (demoting or disabling) and app.state.store.admin_count() <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="至少保留一个管理员"
+            )
+        changed: list[str] = []
+        if body.role is not None:
+            app.state.store.user_set_role(username, body.role)
+            changed.append(f"role={body.role}")
+        if body.disabled is not None:
+            app.state.store.user_set_disabled(username, body.disabled)
+            changed.append(f"disabled={body.disabled}")
+            if body.disabled:
+                app.state.store.delete_user_sessions(target.id)
+        if body.password is not None:
+            app.state.store.user_set_password(username, body.password)
+            # A password change revokes existing logins for that user.
+            app.state.store.delete_user_sessions(target.id)
+            changed.append("password")
+        audit.enqueue("user_update", user_id=actor.id, payload=f"{username}:{','.join(changed)}")
+        return {"ok": True}
+
+    @app.post("/api/users/{username}/totp")
+    async def enable_totp(
+        username: str, actor: User = Depends(require_admin)
+    ) -> dict[str, str]:
+        if app.state.store.user_get(username) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+        secret = totp.generate_secret()
+        app.state.store.user_set_totp(username, secret)
+        audit.enqueue("user_totp_on", user_id=actor.id, payload=username)
+        uri = totp.provisioning_uri(secret, username, issuer=settings.totp_issuer)
+        return {"secret": secret, "uri": uri, "qr_svg": _qr_svg(uri)}
+
+    @app.delete("/api/users/{username}/totp")
+    async def disable_totp(
+        username: str, actor: User = Depends(require_admin)
+    ) -> dict[str, bool]:
+        if not app.state.store.user_clear_totp(username):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+        audit.enqueue("user_totp_off", user_id=actor.id, payload=username)
         return {"ok": True}
 
     @app.get("/api/audit")
     async def get_audit(
-        _: User = Depends(require_admin), limit: int = 100
+        _: User = Depends(require_admin),
+        limit: int = 100,
+        offset: int = 0,
+        event: str | None = None,
+        user_id: int | None = None,
+        ip: str | None = None,
     ) -> list[dict[str, Any]]:
+        # Flush the async writer so the read reflects events just produced.
+        await app.state.audit.flush()
         store_: Store = app.state.store
-        return store_.recent_audit(limit=min(max(limit, 1), 1000))
+        return store_.recent_audit(
+            limit=min(max(limit, 1), 1000),
+            offset=max(offset, 0),
+            event=event,
+            user_id=user_id,
+            ip=ip,
+        )
 
     @app.post("/api/config/reload")
     async def reload_config(actor: User = Depends(require_admin)) -> dict[str, Any]:
         changed = _reload_config()
-        app.state.store.log_event(
+        app.state.audit.enqueue(
             "config_reload", user_id=actor.id, payload=",".join(changed) or None
         )
         return {"changed": changed}
@@ -887,22 +1047,22 @@ def create_app(
             ) from exc
         size = 0
         try:
-            with os.fdopen(fd, "wb") as handle:
-                while chunk := await file.read(1 << 20):
-                    size += len(chunk)
-                    if size > settings.file_max_upload:
-                        handle.close()
-                        dest.unlink(missing_ok=True)
-                        raise HTTPException(
-                            status_code=413,
-                            detail="文件过大",
-                        )
-                    handle.write(chunk)
+            loop = asyncio.get_running_loop()
+            size = await loop.run_in_executor(
+                None, _copy_upload, file.file, fd, settings.file_max_upload
+            )
+        except _UploadTooLarge as exc:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(status_code=413, detail="文件过大") from exc
+        except Exception:
+            # Do not leave a half-written file behind on any other failure.
+            dest.unlink(missing_ok=True)
+            raise
         finally:
             await file.close()
 
         metrics.inc("wsctl_uploads_total")
-        app.state.store.log_event(
+        app.state.audit.enqueue(
             "file_upload",
             user_id=user.id,
             payload=fs_mod.relative_to(root, dest)[:256],

@@ -17,9 +17,17 @@ log = logging.getLogger("wsctl.webhook")
 
 
 class WebhookDispatcher:
-    def __init__(self, url: str, *, timeout: float = 10.0, max_queue: int = 1000) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout: float = 10.0,
+        max_queue: int = 1000,
+        max_attempts: int = 3,
+    ) -> None:
         self.url = url
         self.timeout = timeout
+        self.max_attempts = max_attempts
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
 
@@ -45,10 +53,18 @@ class WebhookDispatcher:
         loop = asyncio.get_running_loop()
         while True:
             payload = await self._queue.get()
-            try:
-                await loop.run_in_executor(None, self._post, payload)
-            except Exception:
-                log.exception("webhook delivery failed")
+            for attempt in range(1, self.max_attempts + 1):
+                try:
+                    await loop.run_in_executor(None, self._post, payload)
+                    break
+                except Exception:
+                    if attempt >= self.max_attempts:
+                        log.exception(
+                            "webhook delivery failed after %d attempts", attempt
+                        )
+                    else:
+                        # Exponential backoff, capped, without blocking the loop.
+                        await asyncio.sleep(min(0.5 * 2 ** (attempt - 1), 5.0))
 
     def _post(self, payload: dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")

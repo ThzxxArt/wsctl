@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import json
 import os
 import secrets
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import time
 import tomllib
 from pathlib import Path
@@ -40,7 +42,7 @@ app = typer.Typer(
     name="wsctl",
     help="单机部署的 Web 在线终端：多会话、多用户、审计、分享、录制与可观测。",
     no_args_is_help=True,
-    add_completion=False,
+    add_completion=True,
 )
 user_app = typer.Typer(name="user", help="管理用户。", no_args_is_help=True)
 config_app = typer.Typer(name="config", help="查看与管理配置。", no_args_is_help=True)
@@ -102,14 +104,23 @@ def doctor(
     url: Annotated[
         str | None, typer.Option("--url", help="服务器地址（可选，用于检查连通性）。")
     ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="以 JSON 输出检查结果。")
+    ] = False,
 ) -> None:
     """检查运行环境、配置与依赖是否就绪。"""
     ok, warn, bad = "[green]正常[/]", "[yellow]警告[/]", "[red]失败[/]"
-    table = Table("检查项", "结果")
+    rows: list[tuple[str, str]] = []
+
+    def add(label: str, value: str, plain: str) -> None:
+        rows.append((label, f"{value} {plain}"))
 
     py = sys.version_info
-    py_state = ok if py >= (3, 11) else bad
-    table.add_row("Python", f"{py.major}.{py.minor}.{py.micro} {py_state}")
+    add(
+        "Python",
+        f"{py.major}.{py.minor}.{py.micro}",
+        ok if py >= (3, 11) else bad,
+    )
 
     settings = _settings_from(config)
 
@@ -118,9 +129,9 @@ def doctor(
         probe = settings.data_dir / ".wsctl-doctor"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-        table.add_row("数据目录", f"{settings.data_dir} {ok}")
+        add("数据目录", str(settings.data_dir), ok)
     except OSError as exc:
-        table.add_row("数据目录", f"{settings.data_dir} {bad}（{exc}）")
+        add("数据目录", f"{settings.data_dir}（{exc}）", bad)
 
     try:
         store = Store(settings.db_path)
@@ -128,44 +139,73 @@ def doctor(
             users = store.user_count()
         finally:
             store.close()
-        table.add_row("数据库", f"{settings.db_path}（{users} 个用户）{ok}")
+        add("数据库", f"{settings.db_path}（{users} 个用户）", ok)
     except Exception as exc:
-        table.add_row("数据库", f"{bad}（{exc}）")
+        add("数据库", f"（{exc}）", bad)
 
     cfg = settings.config_path
     if cfg.is_file():
         try:
             tomllib.loads(cfg.read_text("utf-8"))
-            table.add_row("配置文件", f"{cfg} {ok}")
+            add("配置文件", str(cfg), ok)
         except tomllib.TOMLDecodeError as exc:
-            table.add_row("配置文件", f"{cfg} {bad}（{exc}）")
+            add("配置文件", f"{cfg}（{exc}）", bad)
     else:
-        table.add_row("配置文件", f"{cfg}（不存在，使用默认值）{warn}")
+        add("配置文件", f"{cfg}（不存在，使用默认值）", warn)
 
     shell = settings.shell
     shell_ok = Path(shell).exists() or bool(_which(shell))
-    table.add_row("默认 shell", f"{shell} {ok if shell_ok else bad}")
+    add("默认 shell", shell, ok if shell_ok else bad)
 
     tmux = _which("tmux")
-    table.add_row(
-        "tmux（跨重启恢复）", f"{tmux} {ok}" if tmux else f"未安装 {warn}"
-    )
+    add("tmux（跨重启恢复）", tmux or "未安装", ok if tmux else warn)
     ssh = _which("ssh")
-    table.add_row("ssh（SSH 后端）", f"{ssh} {ok}" if ssh else f"未安装 {warn}")
+    add("ssh（SSH 后端）", ssh or "未安装", ok if ssh else warn)
     lrzsz = _which("sz") or _which("rz")
-    table.add_row("lrzsz（ZMODEM）", f"{lrzsz} {ok}" if lrzsz else f"未安装 {warn}")
+    add("lrzsz（ZMODEM）", lrzsz or "未安装", ok if lrzsz else warn)
 
     if url or load_credentials().get("url"):
         try:
             client = _api_client(url)
             health = client.request("GET", "/healthz", auth=False)
-            table.add_row("服务器", f"{client.base_url}（版本 {health.get('version')}）{ok}")
+            add("服务器", f"{client.base_url}（版本 {health.get('version')}）", ok)
         except ApiError as exc:
-            table.add_row("服务器", f"{bad}（{exc}）")
+            add("服务器", f"（{exc}）", bad)
     else:
-        table.add_row("服务器", "未配置（可用 --url 检查）")
+        add("服务器", "未配置（可用 --url 检查）", "[dim]-[/]")
 
+    if json_output:
+        import re
+
+        payload = [
+            {"check": label, "result": re.sub(r"\[[^\]]*\]", "", value).strip()}
+            for label, value in rows
+        ]
+        # ``sys.stdout`` so it composes with pipes.
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        return
+
+    table = Table("检查项", "结果")
+    for label, value in rows:
+        table.add_row(label, value)
     console.print(table)
+
+
+@app.command()
+def backup(
+    output: Annotated[Path, typer.Argument(help="输出的 tar.gz 路径。")],
+    config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
+) -> None:
+    """把数据库与录制打包备份到 tar.gz。"""
+    settings = _settings_from(config)
+    output = output.expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(output, "w:gz") as tar:
+        if settings.db_path.is_file():
+            tar.add(settings.db_path, arcname="wsctl.db")
+        if settings.recordings_dir.is_dir():
+            tar.add(settings.recordings_dir, arcname="recordings")
+    console.print(f"[green]已备份到[/] {output}")
 
 
 @app.command()
@@ -393,7 +433,14 @@ def user_totp(
         uri = totp.provisioning_uri(secret, username, issuer=settings.totp_issuer)
         console.print(f"密钥：[bold]{secret}[/]")
         console.print(f"otpauth URI：{uri}")
-        console.print("[dim]在认证器中扫描该 URI，然后输入一次验证码确认。[/]")
+        try:
+            import segno
+
+            segno.make(uri, error="m").terminal(compact=True)
+        except Exception:
+            # A QR is a convenience; if it cannot be rendered fall back to the URI.
+            console.print("[dim]（无法在终端渲染二维码，请手动录入上方 URI）[/]")
+        console.print("[dim]在认证器中扫描二维码，然后输入一次验证码确认。[/]")
         code = typer.prompt("一次性验证码")
         if not totp.verify(secret, code):
             _fail("验证码校验失败，未启用 TOTP")
@@ -475,6 +522,40 @@ def config_path(config: Annotated[Path | None, typer.Option("--config", "-c")] =
     """打印配置文件路径。"""
     settings = _settings_from(config)
     console.print(str(settings.config_path))
+
+
+@config_app.command("get")
+def config_get(
+    key: Annotated[str, typer.Argument(help="配置项名称。")],
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+) -> None:
+    """打印某个配置项的生效值。"""
+    settings = _settings_from(config)
+    if key not in Settings.model_fields:
+        suggestion = difflib.get_close_matches(key, set(Settings.model_fields), n=1)
+        hint = f"，是否想用 “{suggestion[0]}”？" if suggestion else ""
+        _fail(f"未知的配置项：{key}{hint}")
+    console.print(str(getattr(settings, key)))
+
+
+@config_app.command("validate")
+def config_validate(
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+) -> None:
+    """校验配置文件是否合法。"""
+    path = _settings_from(config).config_path
+    if not path.is_file():
+        console.print(f"[yellow]配置文件不存在[/]（将使用默认值）：{path}")
+        return
+    try:
+        data = tomllib.loads(path.read_text("utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        _fail(f"配置文件 TOML 语法错误：{exc}")
+    try:
+        Settings(**data)
+    except Exception as exc:
+        _fail(f"配置项无效：{exc}")
+    console.print(f"[green]配置有效[/]：{path}")
 
 
 CONFIG_TEMPLATE = """# wsctl 配置文件

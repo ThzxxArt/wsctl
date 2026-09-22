@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.1 · 状态：0.1.0 已发布；0.1.1 待发布
+> 版本：0.1.2 · 状态：0.1.0/0.1.1 已发布；0.1.2 待发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -241,8 +241,13 @@ pyotp  segno  websockets
 | **M20** | 终端主题市场（10 内置主题 + 自定义 JSON 主题） |
 | **M21** | 0.1.1 加固：多实例租约 + tmux 命名空间隔离、资源保留策略与每用户配额、attach 失败泄漏修复、schema 迁移顺序修复、限速器内存回收、全中文 UI、CLI 增强（doctor / --version / session rename / user disable|enable / config set 校验）、systemd 与 nginx 示例 |
 | **M22** | 0.1.1 测试：实例租约/保留/配额/分享复用单测 + e2e `multiplex` 场景 + 浏览器 detach/分享复用用例 |
+| **M23** | 0.1.2 异步化：审计写入队列 + 批量落盘（`core/audit.py`）、`last_seen` 节流、上传/录制移出事件循环、tmux 探测异步化、内存背压断连、审计缓冲上限、webhook 重试 |
+| **M24** | 0.1.2 Web 管理面：用户管理（含 TOTP 二维码）、审计查看器（筛选）、录制管理；终端搜索、内联重命名、终止确认、Toast |
+| **M25** | 0.1.2 便捷性：`config get/validate`、`doctor --json`、`backup`、终端内 TOTP 二维码、shell 补全、Docker 示例 |
+| **M26** | 0.1.2 设计系统：令牌 + 组件、图标化工具栏 + 移动端折叠、统一 Modal、主题色预览、favicon/manifest、空态/加载态、a11y、跟随系统深浅色 |
+| **M27** | 0.1.2 测试与文档：异步审计/管理 API/TOTP/节流/滑动 TTL 单测 + 浏览器用例扩展；README/DESIGN/CHANGELOG 同步 |
 
-## 10.1 实现状态（截至 0.1.1）
+## 10.1 实现状态（截至 0.1.2）
 
 **已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
@@ -260,10 +265,13 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 > 0.1.1 起，关闭标签默认只断开连接（detach），终止会话需显式操作（右键菜单 /
 > 会话列表 / `Alt+Shift+W`），与「会话独立于连接」的核心承诺一致。
 
-> 回归测试：`scripts/e2e/run_all.py` 提供 6 个后端端到端场景（server / CLI /
-> connect / tmux 重启恢复 / **multiplex 多实例隔离** / SO_REUSEPORT 优雅重启）；
-> `pytest -m browser` 为浏览器级测试；`pytest -m slow` 为并发/大输出压测。
-> CI 在独立 job 中运行浏览器测试。
+> 0.1.2 起，磁盘/数据库写入全部移出事件循环：审计经 `AuditWriter` 队列批量落盘，
+> 录制在后台线程写文件，上传在线程池落盘；`resolve_auth_session` 节流 `last_seen`。
+
+> 回归测试：`scripts/e2e/run_all.py` 提供 7 个后端端到端场景（server / CLI /
+> connect / tmux 重启恢复 / crash 崩溃收养 / **multiplex 多实例隔离** /
+> SO_REUSEPORT 优雅重启）；`pytest -m browser` 为浏览器级测试；
+> `pytest -m slow` 为并发/大输出压测。CI 在独立 job 中运行浏览器测试。
 
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`，未安装全局 SIGCHLD handler（避免与 `subprocess` 争抢 PID）；已跟踪
@@ -271,7 +279,7 @@ Sixel 渲染、可选 ZMODEM、终端主题市场。
 
 ## 11. Backlog（后续）
 
-无（v0.1.1 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
+无（v0.1.2 计划项已全部落地）。后续可考虑：ZMODEM 真机端到端测试、
 每用户后端策略（命令级权限隔离）、i18n 框架、更多终端协议（Kitty graphics 等）。
 
 ## 12. 发布

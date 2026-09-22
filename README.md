@@ -61,7 +61,12 @@ CLI (wsctl connect)┘             │
   配额、每会话内存硬上限与背压。
 - **零停机重启**：`SO_REUSEPORT` 让新实例先接管端口再停旧实例。
 - **配置热更新**：大部分配置改动无需重启。
+- **Web 管理面**：管理员可在浏览器内管理用户（含 TOTP 二维码）、查看审计日志、
+  管理录制文件。
+- **终端搜索**：`Ctrl+Shift+F` 在回滚缓冲中查找。
 - **全中文界面**：Web UI 与 CLI 输出均为中文。
+- **设计系统**：图标化工具栏、统一弹窗与 Toast、主题色预览、移动端折叠菜单、
+  跟随系统的深/浅色主题。
 
 ## 与 ttyd 的差异
 
@@ -145,6 +150,30 @@ wsctl doctor
 wsctl --version
 ```
 
+## 界面截图
+
+| 登录 | 终端 | 文件面板 |
+|---|---|---|
+| ![登录](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/01-login.png) | ![终端](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/02-terminal.png) | ![文件](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/03-files.png) |
+
+| 会话列表 | 管理 · 用户 | 管理 · 审计 |
+|---|---|---|
+| ![会话](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/04-sessions.png) | ![用户](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/05-admin-users.png) | ![审计](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/06-admin-audit.png) |
+
+![设置](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/07-settings.png)
+
+## 界面设计
+
+前端零构建（vendored xterm.js），并有一套轻量设计系统：
+
+- **设计令牌**：颜色、间距、圆角、阴影、字号、动效时长统一在 `:root` 定义，浅色主题只
+  覆盖变量。
+- **组件**：统一 Modal（进出场动效、Esc/遮罩关闭、焦点陷阱）、Toast、按钮、徽章、
+  空状态与骨架屏。
+- **图标化工具栏**：内联 SVG 图标 + tooltip，窄屏自动折叠为「更多」菜单。
+- **终端主题**：内置 10 套 + 自定义 JSON，画廊直接预览各主题配色；页面深浅色可跟随系统。
+- **可访问性**：图标按钮带 `aria-label`、`:focus-visible` 焦点环、弹窗焦点管理。
+
 ## 使用教程
 
 ### 1. 会话管理（Web 端）
@@ -155,6 +184,7 @@ wsctl --version
 - 标签上的 **`×`**：**断开连接**（会话继续在服务器上运行，不会被杀掉）。
 - **右键标签**：弹出菜单，可选择「关闭标签（保持会话）」或「终止会话」。
 - 顶部 **`会话`**：打开会话列表，可重新打开已断开的会话，或终止任意会话。
+- 顶部 **`搜索`**（或 `Ctrl+Shift+F`）：在终端回滚缓冲中查找文本，`Enter` 跳到下一个。
 - 断线后前端自动重连，并回放屏幕内容，无需重新登录。
 
 > 默认快捷键：`Alt+N` 新建、`Alt+W` 断开标签、`Alt+Shift+W` 终止会话、
@@ -271,6 +301,10 @@ wsctl user del alice
 - `admin`：可查看/管理所有会话与用户。
 - `user`：仅能操作自己的会话。
 
+管理员也可以直接在 Web 端点顶部 **`管理`**：管理用户（新建/改角色/禁用/重置密码/
+启用 2FA 并显示二维码）、查看审计日志（可按事件/用户/IP 筛选）、管理录制文件
+（下载/删除）。
+
 > 注意：能登录并创建会话的账号，本质上就拥有以服务运行用户身份执行命令的能力。
 > RBAC 控制的是**会话可见性与管理权限**，不是命令级隔离；请像对待 SSH 一样对待它。
 
@@ -293,8 +327,18 @@ curl http://127.0.0.1:7681/metrics      # Prometheus 文本格式
 ```
 
 指标包含：运行状态、当前会话/客户端数、缓冲字节、会话创建数、WebSocket 连接数、
-上传数、登录结果分类。开启 `log_json = true` 输出结构化 JSON 日志。若担心指标泄露，
-可设 `metrics_require_auth = true` 要求登录后才能抓取 `/metrics`。
+上传数、登录结果分类、**审计丢弃数**。开启 `log_json = true` 输出结构化 JSON 日志。
+若担心指标泄露，可设 `metrics_require_auth = true` 要求登录后才能抓取 `/metrics`。
+
+### 12. Web 管理面（管理员）
+
+点击顶部 **`管理`**（仅管理员可见），包含三个页签：
+
+- **用户**：新建用户、切换角色、禁用/启用、重置密码、启用两步验证（显示二维码）、删除。
+- **审计**：按事件类型 / 用户 ID / IP 筛选，分页「加载更多」。
+- **录制**：列出所有录制，可**回放**、下载、删除。
+
+另外，会话列表支持**按名称筛选**与**全部断开**（只断开连接，不终止会话）。
 
 ## 配置详解
 
@@ -311,6 +355,7 @@ reuse_port = false            # SO_REUSEPORT：新实例先接管端口再停旧
 # ---- 认证与安全 ----
 auth_required = true          # 是否强制登录（关闭仅供受信本地使用）
 session_ttl = 43200           # 登录态有效期（秒）
+session_sliding_ttl = false   # true 时活动中的登录态自动续期
 cookie_secure = false         # 走 HTTPS 时置 true
 trust_proxy = false           # 位于反向代理后时置 true，读取 X-Forwarded-For
 allowed_origins = []          # WebSocket Origin 白名单（空 = 同源）
@@ -385,7 +430,8 @@ wsctl config reload                     # 让运行中的服务重载配置
 ```
 wsctl serve                     启动服务（--host/--port/--backend/--reuse-port/
                                 --new/--ssl-cert/--ssl-key/--admin-password/--log-json）
-wsctl doctor                    环境与配置自检（Python/数据目录/DB/shell/tmux/ssh/lrzsz/服务器）
+wsctl doctor                    环境与配置自检（--json 输出 JSON）
+wsctl backup FILE.tar.gz        备份数据库与录制
 wsctl --version                 显示版本
 wsctl connect [URL] [-s ID]     把本地终端连接到服务
 wsctl login URL                 登录并缓存凭据
@@ -400,13 +446,23 @@ wsctl session record-stop ID    停止录制
 wsctl session recording ID      下载录制（-o FILE）
 wsctl user add|list|del|passwd|role|disable|enable|totp
 wsctl audit                     查看审计日志（管理员）
-wsctl config show|path|edit|set|reload
+wsctl config show|get|path|edit|set|validate|reload
 wsctl version
 ```
 
 > `wsctl config set` 会校验配置项名称，未知项会报错并给出最接近的候选。
 
 ## 部署
+
+### Docker
+
+仓库内提供了示例：[`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) 与
+[`contrib/docker/docker-compose.yml`](contrib/docker/docker-compose.yml)。
+
+```bash
+docker build -t wsctl contrib/docker
+docker run --rm -p 127.0.0.1:7681:7681 -v "$PWD/data:/data" wsctl
+```
 
 ### systemd
 
@@ -529,7 +585,7 @@ playwright install chromium
 pytest -m browser
 ```
 
-后端端到端场景（server / CLI / connect / tmux / 零停机重启）：
+后端端到端场景（server / CLI / connect / tmux / crash / multiplex / 零停机重启）：
 
 ```bash
 python scripts/e2e/run_all.py

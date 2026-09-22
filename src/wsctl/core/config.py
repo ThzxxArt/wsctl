@@ -61,6 +61,7 @@ class Settings(BaseSettings):
 
     auth_required: bool = True
     session_ttl: int = 12 * 3600
+    session_sliding_ttl: bool = False
     cookie_secure: bool = False
     trust_proxy: bool = False
 
@@ -162,6 +163,7 @@ def load_settings(**overrides: Any) -> Settings:
 HOT_FIELDS = frozenset(
     {
         "session_ttl",
+        "session_sliding_ttl",
         "cookie_secure",
         "trust_proxy",
         "allowed_origins",

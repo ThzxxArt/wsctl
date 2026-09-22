@@ -11,6 +11,7 @@ tmux is optional: nothing here is used unless a session requests this backend.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import shutil
 import subprocess
@@ -114,3 +115,17 @@ def list_sessions() -> list[str]:
     if result.returncode != 0:
         return []
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+# Async wrappers: the subprocess calls above block, so async callers must run
+# them off the event loop.
+async def has_session_async(name: str) -> bool:
+    return await asyncio.to_thread(has_session, name)
+
+
+async def kill_session_async(name: str) -> None:
+    await asyncio.to_thread(kill_session, name)
+
+
+async def list_sessions_async() -> list[str]:
+    return await asyncio.to_thread(list_sessions)

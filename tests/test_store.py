@@ -150,3 +150,76 @@ def test_term_session_full_fields(tmp_path: Path) -> None:
         assert row["max_life"] == 3600.0
     finally:
         store.close()
+
+
+def test_last_seen_write_is_throttled(tmp_path: Path) -> None:
+    import sqlite3
+
+    store = make_store(tmp_path)
+    try:
+        user = store.user_create("throttle", "pw")
+        token = store.create_auth_session(user.id, ttl=3600)
+
+        def last_seen() -> float:
+            conn = sqlite3.connect(tmp_path / "test.db")
+            try:
+                return float(conn.execute("SELECT last_seen FROM auth_sessions").fetchone()[0])
+            finally:
+                conn.close()
+
+        store.resolve_auth_session(token)  # fresh: within throttle, no write
+        first = last_seen()
+        store.resolve_auth_session(token)
+        assert last_seen() == first
+        # Age the row past the throttle; the next resolve must refresh it.
+        conn = sqlite3.connect(tmp_path / "test.db")
+        conn.execute("UPDATE auth_sessions SET last_seen = 0")
+        conn.commit()
+        conn.close()
+        store.resolve_auth_session(token)
+        assert last_seen() > 0
+    finally:
+        store.close()
+
+
+def test_sliding_ttl_extends_expiry(tmp_path: Path) -> None:
+    import sqlite3
+    import time
+
+    store = make_store(tmp_path)
+    try:
+        store.sliding_ttl = True
+        user = store.user_create("slider", "pw")
+        token = store.create_auth_session(user.id, ttl=100)
+        conn = sqlite3.connect(tmp_path / "test.db")
+        conn.execute(
+            "UPDATE auth_sessions SET last_seen = 0, expires_at = ?", (time.time() + 100,)
+        )
+        conn.commit()
+        conn.close()
+        store.resolve_auth_session(token)
+        conn = sqlite3.connect(tmp_path / "test.db")
+        try:
+            expires = float(conn.execute("SELECT expires_at FROM auth_sessions").fetchone()[0])
+        finally:
+            conn.close()
+        assert expires > time.time() + 90
+    finally:
+        store.close()
+
+
+def test_delete_user_sessions_and_admin_count(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    try:
+        store.user_create("root", "pw", role="admin")
+        user = store.user_create("u", "pw")
+        assert store.admin_count() == 1
+        store.user_set_disabled("root", True)
+        assert store.admin_count() == 0
+        t1 = store.create_auth_session(user.id, ttl=3600)
+        t2 = store.create_auth_session(user.id, ttl=3600)
+        assert store.delete_user_sessions(user.id) == 2
+        assert store.resolve_auth_session(t1) is None
+        assert store.resolve_auth_session(t2) is None
+    finally:
+        store.close()

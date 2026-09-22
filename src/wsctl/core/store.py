@@ -118,6 +118,8 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._sink: Any = None
+        # When true, an active session's expiry slides forward on each use.
+        self.sliding_ttl = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout=5000")
@@ -305,12 +307,15 @@ class Store:
             )
         return token
 
+    LAST_SEEN_THROTTLE = 30.0
+
     def resolve_auth_session(self, token: str) -> User | None:
         now = time.time()
         token_hash = hash_token(token)
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT user_id, expires_at FROM auth_sessions WHERE token_hash = ?",
+                "SELECT user_id, expires_at, created_at, last_seen FROM auth_sessions"
+                " WHERE token_hash = ?",
                 (token_hash,),
             ).fetchone()
             if row is None:
@@ -318,9 +323,23 @@ class Store:
             if float(row["expires_at"]) < now:
                 self._conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
                 return None
-            self._conn.execute(
-                "UPDATE auth_sessions SET last_seen = ? WHERE token_hash = ?", (now, token_hash)
-            )
+            updates = ""
+            params: list[Any] = []
+            # Throttle the last_seen write: it runs on every request and on the
+            # periodic WebSocket re-check, so writing every time would add a DB
+            # write per request even for an idle connection.
+            if now - float(row["last_seen"]) >= self.LAST_SEEN_THROTTLE:
+                updates = "last_seen = ?"
+                params.append(now)
+            if self.sliding_ttl:
+                ttl = float(row["expires_at"]) - float(row["created_at"])
+                updates = f"{updates + ', ' if updates else ''}expires_at = ?"
+                params.append(now + ttl)
+            if updates:
+                params.append(token_hash)
+                self._conn.execute(
+                    f"UPDATE auth_sessions SET {updates} WHERE token_hash = ?", tuple(params)
+                )
         user = self.user_get_by_id(int(row["user_id"]))
         if user is not None and user.disabled:
             self.delete_auth_session(token)
@@ -332,6 +351,22 @@ class Store:
             self._conn.execute(
                 "DELETE FROM auth_sessions WHERE token_hash = ?", (hash_token(token),)
             )
+
+    def delete_user_sessions(self, user_id: int) -> int:
+        """Revoke every login session of a user (e.g. after a password reset)."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM auth_sessions WHERE user_id = ?", (user_id,)
+            )
+        return cur.rowcount
+
+    def admin_count(self) -> int:
+        """Number of enabled admins (used to protect the last one)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0"
+            ).fetchone()
+        return int(row["n"])
 
     def purge_expired_sessions(self) -> int:
         with self._lock, self._conn:
@@ -539,6 +574,48 @@ class Store:
 
     # -- audit ---------------------------------------------------------
 
+    def write_events(self, events: list[dict[str, Any]]) -> None:
+        """Persist a batch of audit events (no sink dispatch).
+
+        Kept separate from :meth:`dispatch_events` so the async audit writer can
+        run the DB write in a worker thread while dispatching the webhook sink
+        back on the event loop (``asyncio.Queue`` is not thread-safe).
+        """
+        if not events:
+            return
+        now = time.time()
+        rows: list[tuple[Any, ...]] = []
+        for event in events:
+            ts = float(event.get("ts", now))
+            event["ts"] = ts
+            rows.append(
+                (
+                    event.get("user_id"),
+                    event.get("term_session_id"),
+                    event["event"],
+                    event.get("payload"),
+                    event.get("ip"),
+                    ts,
+                )
+            )
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT INTO audit_logs(user_id, term_session_id, event, payload, ip, ts)"
+                " VALUES(?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def dispatch_events(self, events: list[dict[str, Any]]) -> None:
+        """Forward events to the registered sink (e.g. a webhook)."""
+        if self._sink is None:
+            return
+        for event in events:
+            self._sink(dict(event))
+
+    def log_events(self, events: list[dict[str, Any]]) -> None:
+        self.write_events(events)
+        self.dispatch_events(events)
+
     def log_event(
         self,
         event: str,
@@ -548,28 +625,42 @@ class Store:
         payload: str | None = None,
         ip: str | None = None,
     ) -> None:
-        now = time.time()
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO audit_logs(user_id, term_session_id, event, payload, ip, ts)"
-                " VALUES(?, ?, ?, ?, ?, ?)",
-                (user_id, term_session_id, event, payload, ip, now),
-            )
-        if self._sink is not None:
-            self._sink(
+        self.log_events(
+            [
                 {
                     "event": event,
                     "user_id": user_id,
                     "term_session_id": term_session_id,
                     "payload": payload,
                     "ip": ip,
-                    "ts": now,
                 }
-            )
+            ]
+        )
 
-    def recent_audit(self, limit: int = 100) -> list[dict[str, Any]]:
+    def recent_audit(
+        self,
+        limit: int = 100,
+        *,
+        offset: int = 0,
+        event: str | None = None,
+        user_id: int | None = None,
+        ip: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if event:
+            clauses.append("event = ?")
+            params.append(event)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if ip:
+            clauses.append("ip = ?")
+            params.append(ip)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM audit_logs{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, limit, max(offset, 0)),
             ).fetchall()
         return [dict(row) for row in rows]

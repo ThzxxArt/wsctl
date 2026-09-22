@@ -203,7 +203,56 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click(".theme-swatch:has-text('dracula')")
             stored = page.evaluate("() => JSON.parse(localStorage.getItem('wsctl-prefs'))")
             assert stored["termTheme"] == "dracula"
+            # font family selection persists
+            page.select_option("#set-font", '"JetBrains Mono", ui-monospace, monospace')
+            stored = page.evaluate("() => JSON.parse(localStorage.getItem('wsctl-prefs'))")
+            assert "JetBrains" in stored["fontFamily"]
+            # "follow system" page theme
+            page.select_option("#set-theme", "auto")
+            assert page.get_attribute("html", "data-theme") in ("dark", "light")
             page.click("#settings-close")
+
+            # Esc closes the topmost modal
+            page.click("#settings-btn")
+            page.wait_for_selector("#settings-overlay:not(.hidden)", timeout=5000)
+            page.keyboard.press("Escape")
+            page.wait_for_selector("#settings-overlay.hidden", state="attached", timeout=5000)
+
+            # admin panel: users / audit / recordings tabs
+            page.click("#admin-btn")
+            page.wait_for_selector("#admin-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_function(
+                "() => document.querySelectorAll('#admin-body .admin-table tbody tr').length >= 1",
+                timeout=10000,
+            )
+            page.click(".tab2[data-tab='audit']")
+            page.wait_for_selector("#admin-body .admin-table", timeout=10000)
+            page.click(".tab2[data-tab='recordings']")
+            page.wait_for_timeout(300)
+            page.click("#admin-close")
+            page.wait_for_selector("#admin-overlay.hidden", state="attached", timeout=5000)
+
+            # terminal search over the buffer
+            page.click(".term-pane.active .xterm-screen")
+            page.click("#search-btn")
+            page.wait_for_selector("#search-bar:not(.hidden)", timeout=5000)
+            page.fill("#search-input", "BROWSER-OK")
+            page.wait_for_function(
+                "() => document.getElementById('search-count').textContent.includes('/')",
+                timeout=10000,
+            )
+            page.click("#search-close")
+
+            # inline rename dialog (double-click the tab label, not the close button)
+            page.dblclick(".tab.active .label")
+            page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=5000)
+            page.fill("#rename-input", "重命名标签")
+            page.click("#rename-form button[type=submit]")
+            page.wait_for_selector("#rename-overlay.hidden", state="attached", timeout=5000)
+            page.wait_for_function(
+                "() => document.querySelector('.tab.active .label').textContent === '重命名标签'",
+                timeout=10000,
+            )
 
             # record the session, then replay it in the asciinema player
             page.click("#record-btn")
@@ -248,6 +297,20 @@ def test_browser_flow(tmp_path: Path) -> None:
             )
             assert "SHOULD-NOT-APPEAR" not in rows
             viewer.close()
+
+            # session filter and "detach all" (keeps sessions on the server)
+            page.click("#sessions-btn")
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=10000)
+            page.fill("#session-filter", "重命名标签")
+            page.wait_for_function(
+                "() => document.querySelectorAll('#sessions-list .session-row').length >= 1",
+                timeout=10000,
+            )
+            page.click("#sessions-detach-all")
+            page.wait_for_function(
+                "() => document.querySelectorAll('.tab').length === 0", timeout=10000
+            )
+            assert page.locator("#sessions-overlay").get_attribute("class") is not None
 
             browser.close()
     finally:

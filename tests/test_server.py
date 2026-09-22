@@ -790,3 +790,127 @@ def test_disabling_a_user_closes_live_websocket(
             app.state.store.user_set_disabled("admin", True)  # type: ignore[attr-defined]
             close = _recv_until_close(ws, timeout=5)
             assert close["code"] == 4401
+
+
+# -- M24: admin surface (users / audit / recordings) ------------------
+
+
+def test_update_user_role_and_disabled(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.patch("/api/users/bob", json={"role": "admin"}).status_code == 200
+        assert client.patch("/api/users/bob", json={"disabled": True}).status_code == 200
+        users = {u["username"]: u for u in client.get("/api/users").json()}
+        assert users["bob"]["role"] == "admin"
+        assert users["bob"]["disabled"] is True
+
+
+def test_cannot_disable_self(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.patch("/api/users/admin", json={"disabled": True}).status_code == 400
+
+
+def test_update_user_password(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        assert client.patch("/api/users/bob", json={"password": "newpw"}).status_code == 200
+        client.post("/api/logout")
+        assert client.post(
+            "/api/login", json={"username": "bob", "password": "newpw"}
+        ).status_code == 200
+
+
+def test_totp_admin_endpoints(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        info = client.post("/api/users/bob/totp").json()
+        assert info["secret"]
+        assert "<svg" in info["qr_svg"]
+        users = {u["username"]: u for u in client.get("/api/users").json()}
+        assert users["bob"]["totp"] is True
+        assert client.delete("/api/users/bob/totp").status_code == 200
+        users = {u["username"]: u for u in client.get("/api/users").json()}
+        assert users["bob"]["totp"] is False
+
+
+def test_recordings_admin_crud(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        client.post(f"/api/sessions/{sid}/recording/start", json={})
+        client.post(f"/api/sessions/{sid}/recording/stop")
+        items = client.get("/api/recordings").json()
+        assert items and items[0]["name"].endswith(".cast")
+        name = items[0]["name"]
+        dl = client.get(f"/api/recordings/{name}")
+        assert dl.status_code == 200
+        assert dl.content.startswith(b'{"version": 2')
+        assert client.delete(f"/api/recordings/{name}").status_code == 200
+        assert client.get(f"/api/recordings/{name}").status_code == 404
+        # non-.cast / traversal-ish names are rejected
+        assert client.delete("/api/recordings/evil.txt").status_code == 400
+
+
+def test_audit_filter_by_event(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        events = client.get("/api/audit", params={"event": "login"}).json()
+        assert events
+        assert all(e["event"] == "login" for e in events)
+
+
+def test_audit_writer_flushes_before_read(tmp_path: Path) -> None:
+    # The audit writer is async; the API must flush so reads are consistent.
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        events = {e["event"] for e in client.get("/api/audit").json()}
+        assert "login" in events
+
+
+def test_audit_pagination(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        for _ in range(5):
+            client.post("/api/login", json={"username": "admin", "password": "bad"})
+        first = client.get("/api/audit", params={"limit": 3, "offset": 0}).json()
+        second = client.get("/api/audit", params={"limit": 3, "offset": 3}).json()
+        assert len(first) == 3
+        assert first and second
+        assert {e["id"] for e in first}.isdisjoint({e["id"] for e in second})
+
+
+def test_session_serialize_includes_bytes(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        info = next(s for s in client.get("/api/sessions").json() if s["id"] == sid)
+        assert "bytes" in info and isinstance(info["bytes"], int)
+        assert "created_at" in info and "last_active" in info
+
+
+def test_cannot_remove_last_admin(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        # admin is the only admin and cannot demote/disable/delete itself
+        assert client.patch("/api/users/admin", json={"role": "user"}).status_code == 400
+        assert client.patch("/api/users/admin", json={"disabled": True}).status_code == 400
+        assert client.delete("/api/users/admin").status_code == 400
+        # with a second admin, demotion is allowed
+        assert client.patch("/api/users/bob", json={"role": "admin"}).status_code == 200
+        assert client.patch("/api/users/admin", json={"role": "user"}).status_code == 200
+
+
+def test_password_change_revokes_other_sessions(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        client.post("/api/login", json={"username": "bob", "password": "bobpw"})
+        bob_token = client.cookies.get("wsctl_session")
+        assert bob_token
+        client.cookies.clear()
+
+        login(client, ADMIN)
+        assert client.patch("/api/users/bob", json={"password": "newpw"}).status_code == 200
+
+        client.cookies.clear()
+        client.cookies.set("wsctl_session", bob_token)
+        assert client.get("/api/me").status_code == 401

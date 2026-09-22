@@ -1,0 +1,18 @@
+{
+  "name": "wsctl 网页终端",
+  "short_name": "wsctl",
+  "description": "单机部署的 Web 在线终端：多会话、多用户、审计、分享与录制。",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0e1117",
+  "theme_color": "#0e1117",
+  "icons": [
+    {
+      "src": "/static/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

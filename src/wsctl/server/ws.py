@@ -20,6 +20,7 @@ from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
 from wsctl.core import tmux
+from wsctl.core.audit import AuditWriter
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
 from wsctl.core.pty import PtyError
@@ -40,6 +41,7 @@ from .security import COOKIE_NAME, client_ip, ip_allowed, is_origin_allowed
 log = logging.getLogger("wsctl.ws")
 
 MAX_AUDIT_LINE = 512
+MAX_AUDIT_BUFFER = 8192
 ACCESS_RECHECK = 5.0
 
 
@@ -94,6 +96,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     store: Store = app.state.store
     manager = app.state.manager
     metrics: Metrics = app.state.metrics
+    audit: AuditWriter = app.state.audit
 
     ip = client_ip(websocket, settings)
     user = _resolve_user(websocket, store, settings.auth_required)
@@ -106,7 +109,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     metrics.inc("wsctl_ws_connections_total")
 
     if not ip_allowed(ip, settings.allowed_ips):
-        store.log_event("ip_rejected", ip=ip, payload="ws")
+        audit.enqueue("ip_rejected", ip=ip, payload="ws")
         await websocket.close(code=4403)
         return
 
@@ -134,14 +137,14 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         if result is None:
             return
         session, writable, share = result
-        store.log_event(
+        audit.enqueue(
             "session_attach",
             user_id=user_id,
             term_session_id=session.id,
             ip=ip,
             payload="readonly" if not writable else None,
         )
-        on_line = _input_auditor(store, settings, user_id, session.id)
+        on_line = _input_auditor(audit, settings, user_id, session.id)
         bucket = _input_bucket(settings)
         recheck: Callable[[], bool] | None = None
         if user is not None and auth_token is not None:
@@ -170,7 +173,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         if session is not None:
             with contextlib.suppress(Exception):
                 await session.detach(client)
-            store.log_event(
+            audit.enqueue(
                 "session_detach", user_id=user_id, term_session_id=session.id, ip=ip
             )
         client.close()
@@ -260,7 +263,7 @@ async def _handshake(
                 max_life=spec.max_life,
                 instance_id=getattr(websocket.app.state, "instance_id", None),
             )
-            store.log_event(
+            websocket.app.state.audit.enqueue(
                 "session_create",
                 user_id=user.id,
                 term_session_id=session.id,
@@ -288,14 +291,14 @@ async def _handshake(
 
 
 def _input_auditor(
-    store: Store, settings: Settings, user_id: int | None, session_id: str
+    audit: AuditWriter, settings: Settings, user_id: int | None, session_id: str
 ) -> Callable[[str], None] | None:
     """Return a line callback that audits submitted input, if enabled."""
     if not settings.audit_input:
         return None
 
     def record(line: str) -> None:
-        store.log_event(
+        audit.enqueue(
             "input",
             user_id=user_id,
             term_session_id=session_id,
@@ -354,6 +357,9 @@ async def _pump(
         if on_line is None:
             return
         line_buffer.extend(data)
+        if len(line_buffer) > MAX_AUDIT_BUFFER:
+            # A line with no newline must not grow the buffer without bound.
+            del line_buffer[:-MAX_AUDIT_BUFFER]
         while b"\r" in line_buffer or b"\n" in line_buffer:
             indices = [i for i in (line_buffer.find(b"\r"), line_buffer.find(b"\n")) if i >= 0]
             cut = min(indices)
@@ -369,6 +375,10 @@ async def _pump(
             # Re-validate periodically so a revoked/expired share, or a
             # disabled user / revoked token, is enforced even on a session that
             # produces no output.
+            if client.closed:
+                # The session dropped this client (e.g. memory backpressure);
+                # close the socket rather than lingering here.
+                return
             if share_revoked():
                 await deny("分享已撤销或过期")
                 return
@@ -376,6 +386,10 @@ async def _pump(
                 await deny("登录已失效，请重新登录")
                 return
             continue
+        if client.closed:
+            # The session dropped this client (e.g. memory backpressure); stop
+            # accepting further input from it.
+            return
         msg_type = message.get("type")
         if msg_type == "websocket.disconnect":
             return

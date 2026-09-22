@@ -1,0 +1,28 @@
+# wsctl docker-compose 示例
+#
+#   WSCTL_ADMIN_PASSWORD='change-me' docker compose -f contrib/docker/docker-compose.yml up -d
+#
+# 生产环境请置于 TLS 反向代理之后，并设置 WSCTL_TRUST_PROXY=true、
+# WSCTL_COOKIE_SECURE=true（见 contrib/nginx/wsctl.conf）。
+services:
+  wsctl:
+    build: .
+    image: wsctl:latest
+    ports:
+      - "127.0.0.1:7681:7681"
+    volumes:
+      - ./data:/data
+    environment:
+      WSCTL_DATA_DIR: /data
+      WSCTL_FILE_ROOT: /data
+      WSCTL_HOST: 0.0.0.0
+      WSCTL_PORT: "7681"
+      # 位于反向代理后时开启
+      WSCTL_TRUST_PROXY: "false"
+      WSCTL_COOKIE_SECURE: "false"
+    command:
+      - wsctl
+      - serve
+      - --admin-password
+      - ${WSCTL_ADMIN_PASSWORD:-change-me}
+    restart: unless-stopped

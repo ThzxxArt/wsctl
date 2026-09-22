@@ -14,7 +14,7 @@ import secrets
 import signal
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -68,7 +68,6 @@ class _ClientEntry:
     client: Client
     writable: bool = True
     share: str | None = None
-    joined_at: float = field(default_factory=time.time)
 
 
 class TermSession:
@@ -378,7 +377,7 @@ class TermSession:
         if self.closed:
             return
         if self._tmux_name is not None and not preserve:
-            tmux.kill_session(self._tmux_name)
+            await tmux.kill_session_async(self._tmux_name)
         if sig is None:
             sig = signal.SIGHUP
         if self._tmux_name is not None and preserve:

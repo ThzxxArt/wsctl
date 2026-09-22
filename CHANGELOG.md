@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-09-22
+
+Polish and robustness release: disk/DB I/O is moved off the event loop, the web
+UI gains an admin surface and a design system, and the CLI gets a few
+conveniences. No new terminal protocols.
+
+### Added
+
+- **Admin surface in the web UI**: user management (create, role, enable/disable,
+  password reset, TOTP with an inline QR code), an audit log viewer with filters
+  and pagination, and recording management (list / replay / download / delete).
+- **Terminal search** over the buffer (toolbar button or `Ctrl+Shift+F`).
+- **Toasts**, a unified modal component, an inline rename dialog, and a
+  confirmation before terminating a session.
+- Font-family selection, `Ctrl+Shift+C` / `Ctrl+Shift+V` copy/paste (and `Ctrl+C`
+  to copy a selection, right-click to paste), and "follow system" light/dark
+  theme.
+- Session list enhancements: uptime / idle / buffer size, name filter, and
+  "detach all".
+- A `wsctl_audit_dropped_total` metric for the async audit queue.
+- A **design system** (tokens + components), an icon-based toolbar with a
+  mobile overflow menu, theme-gallery colour previews, empty/loading skeleton
+  states, a branded login screen, `favicon.svg`, and a PWA manifest.
+- README screenshots under `docs/screenshots/`.
+- CLI: `config get` / `config validate`, `doctor --json`, `backup`, an inline
+  TOTP QR code in `user totp`, and shell completion.
+- `contrib/docker/` (Dockerfile + compose).
+- `session_sliding_ttl` to keep an active login alive.
+
+### Changed
+
+- **Audit logging is now asynchronous**: events are queued and written in
+  batches off the event loop, so `audit_input` and connection events no longer
+  add latency to other sessions.
+- Recording writes run on a background thread instead of the event loop.
+- File uploads are written on a worker thread instead of the event loop.
+- `resolve_auth_session` throttles its `last_seen` write (every 30s) instead of
+  writing on every request.
+- tmux probing is asynchronous and only runs when tmux-backed sessions exist.
+- Webhook delivery retries with exponential backoff.
+
+### Fixed
+
+- A client dropped by per-session memory backpressure now has its socket closed
+  and can no longer inject input, instead of lingering.
+- The audit input line buffer is bounded.
+- The last enabled admin can no longer be demoted, disabled or deleted, and an
+  admin cannot disable or delete itself (prevents locking the instance out).
+- Changing a user's password (or disabling the user) now revokes that user's
+  existing login sessions.
+- A failed upload no longer leaves a partially written file behind.
+- Unified modals close on `Esc` or a backdrop click and trap keyboard focus.
+- Enabling TOTP for a user is now audited.
+
+### Testing
+
+- New tests for the async audit writer, admin APIs (users / audit / recordings),
+  TOTP endpoints, `last_seen` throttling, and sliding TTL.
+- Browser test extended to cover the admin panel, terminal search, the inline
+  rename dialog, font selection and the "follow system" theme.
+
+[0.1.2]: https://github.com/ThzxxArt/wsctl/releases/tag/v0.1.2
+
 ## [0.1.1] - 2026-09-22
 
 Hardening release: safe multi-instance operation, bounded resource usage, and a
