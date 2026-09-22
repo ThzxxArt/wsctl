@@ -194,6 +194,10 @@ wsctl doctor                # 环境/配置/运行状态自检（--json 便于�
 `tmux`/`ssh`/`lrzsz`、`SO_REUSEPORT`、监听端口占用、后台启动能力、**磁盘剩余空间**、
 **密码策略**、**日志文件与轮转阈值**以及**系统时间**（TOTP 依赖时钟准确）。
 
+「服务器」一项**优先探测你正在跑的那个实例**，而不是 `wsctl login` 留下的缓存地址——
+后者指向早已下线的端口时，会把一台完全健康的机器报成「服务器失败」。显式传 `--url`
+则按你说的查；没有实例在跑时才回退到缓存地址，并注明来源与 `wsctl logout` 清理方式。
+
 > 想让 `wsctl <Tab>` 自动补全子命令与选项？见 [shell 补全](#shell-补全)。
 
 ### 可选依赖（extras）
@@ -650,7 +654,7 @@ Web 管理面的「配置」页签会把每一项标成「热更新」或「需�
 wsctl serve                       启动服务（前台；--daemon 转后台）
 wsctl start|stop|restart|status|logs|reload
                                   后台生命周期（非 systemd；status 支持 --json）
-wsctl doctor                      环境/配置/运行状态自检（--json 输出 JSON）
+wsctl doctor                      环境/配置/运行状态自检（--json；--host/--port 选定实例）
 wsctl backup FILE.tar.gz          一致性备份数据库与录制（--include-config）
 wsctl restore FILE.tar.gz         从备份恢复（--force 覆盖，原库存为 .bak）
 wsctl --version                   显示版本

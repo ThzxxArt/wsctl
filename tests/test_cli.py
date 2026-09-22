@@ -487,3 +487,88 @@ def test_user_passwd_accepts_a_non_interactive_password(tmp_path, monkeypatch) -
         assert store.user_authenticate("admin", "oldpassword1") is None
     finally:
         store.close()
+
+
+# -- 0.1.6 review: doctor probes the instance, not a stale login URL --------
+
+
+def _doctor_rows(result) -> dict[str, str]:
+    payload = json.loads(result.stdout)
+    return {row["check"]: row["result"] for row in payload}
+
+
+def test_doctor_probes_the_running_instance_not_a_stale_credential(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    """A URL cached by an old `wsctl login` must not make a healthy box look dead.
+
+    This is the exact report: doctor said "cannot reach http://127.0.0.1:7720"
+    while an instance was serving on 7682 in the same data directory.
+    """
+    import json as _json
+
+    from wsctl.cli import daemon
+
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    creds = tmp_path / "wsctl" / "credentials.json"
+    creds.parent.mkdir(parents=True, exist_ok=True)
+    creds.write_text(_json.dumps({"url": "http://127.0.0.1:7720", "token": "stale"}))
+
+    inst = daemon.Instance(
+        pid=os.getpid(), host="0.0.0.0", port=18111,
+        started_at=0.0, version="0", identity="",
+    )
+    aimed = load_settings().model_copy(update={"host": "0.0.0.0", "port": 18111})
+    path = daemon.pidfile_path(aimed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(daemon.asdict(inst)), encoding="utf-8")
+    try:
+        rows = _doctor_rows(runner.invoke(app, ["doctor", "--json"]))
+        assert "0.0.0.0:18111" in rows["运行状态"]
+        assert "18111" in rows["服务器"], rows["服务器"]
+        assert "7720" not in rows["服务器"], "the stale login URL must be ignored"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_doctor_falls_back_to_the_credential_and_says_so(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    """With nothing running, the cached URL is used -- and identified as such."""
+    import json as _json
+
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    creds = tmp_path / "wsctl" / "credentials.json"
+    creds.parent.mkdir(parents=True, exist_ok=True)
+    creds.write_text(_json.dumps({"url": "http://127.0.0.1:1", "token": "stale"}))
+
+    rows = _doctor_rows(runner.invoke(app, ["doctor", "--json"]))
+    assert rows["运行状态"].startswith("未运行")
+    assert "7720" not in rows["服务器"]
+    assert "wsctl login" in rows["服务器"], "the origin of the address must be named"
+    assert "wsctl logout" in rows["服务器"], "the remedy must be named"
+
+
+def test_doctor_explicit_url_wins(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    creds = tmp_path / "wsctl" / "credentials.json"
+    creds.parent.mkdir(parents=True, exist_ok=True)
+    creds.write_text('{"url": "http://127.0.0.1:1", "token": "stale"}')
+
+    rows = _doctor_rows(
+        runner.invoke(app, ["doctor", "--json", "--url", "http://127.0.0.1:2"])
+    )
+    assert "127.0.0.1:2" in rows["服务器"]
+
+
+def test_doctor_accepts_host_and_port(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
+    """`wsctl doctor --port N` used to die with "No such option: --port"."""
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["doctor", "--port", "18111"])
+    assert result.exit_code != 2, result.output  # 2 = usage error

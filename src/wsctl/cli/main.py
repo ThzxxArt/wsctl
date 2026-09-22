@@ -254,17 +254,42 @@ def _which(name: str) -> str:
     return shutil.which(name) or ""
 
 
+def _add_server_check(
+    add: Any, ok: str, bad: str, url: str, *, origin: str
+) -> None:
+    """Probe ``url``'s ``/healthz``, naming where the address came from."""
+    try:
+        client = _api_client(url)
+        health = client.request("GET", "/healthz", auth=False)
+        add("服务器", f"{client.base_url}（版本 {health.get('version')}）", ok)
+    except client_mod.ApiError as exc:
+        hint = f"（来源：{origin}"
+        if origin != "--url":
+            hint += "，已失效？可用 wsctl logout 清除"
+        hint += "）"
+        add("服务器", f"{url}（{exc}）{hint}", bad)
+
+
 @app.command()
 def doctor(
     config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
     url: Annotated[
         str | None, typer.Option("--url", help="服务器地址（可选，用于检查连通性）。")
     ] = None,
+    host: Annotated[
+        str | None, typer.Option(help="监听地址（与启动时一致，用于选定实例）。")
+    ] = None,
+    port: Annotated[
+        int | None, typer.Option(help="监听端口（与启动时一致，用于选定实例）。")
+    ] = None,
     json_output: Annotated[
         bool, typer.Option("--json", help="以 JSON 输出检查结果。")
     ] = False,
 ) -> None:
-    """检查运行环境、配置与依赖是否就绪。"""
+    """检查运行环境、配置与依赖是否就绪。
+
+    未指定 ``--host``/``--port`` 时自动跟随正在运行的实例；传参只收窄搜索。
+    """
     ok, warn, bad = "[green]正常[/]", "[yellow]警告[/]", "[red]失败[/]"
     rows: list[tuple[str, str]] = []
 
@@ -327,7 +352,11 @@ def doctor(
         ok if daemon_ok else warn,
     )
 
-    resolved = daemon_mod.resolve_instance(settings)
+    if host is not None or port is not None:
+        settings = _settings_from(config, host=host, port=port)
+    resolved = daemon_mod.resolve_instance(
+        settings, port_explicit=port is not None, host_explicit=host is not None
+    )
     instance = resolved.instance
     if instance is not None:
         note = "（已自动选定）" if resolved.fallback else ""
@@ -358,13 +387,29 @@ def doctor(
             ok if free else (warn if instance is None else ok),
         )
 
-    if url or client_mod.load_credentials().get("url"):
-        try:
-            client = _api_client(url)
-            health = client.request("GET", "/healthz", auth=False)
-            add("服务器", f"{client.base_url}（版本 {health.get('version')}）", ok)
-        except client_mod.ApiError as exc:
-            add("服务器", f"（{exc}）", bad)
+    # Probe what the user is actually running first. Falling back to the URL
+    # cached by a past `wsctl login` reported "cannot reach http://127.0.0.1:7720"
+    # for a perfectly healthy instance on another port, which reads like the
+    # server is down.
+    cached_url = client_mod.load_credentials().get("url")
+    if url:
+        _add_server_check(add, ok, bad, url, origin="--url")
+    elif instance is not None:
+        info = daemon_mod.health_info(settings)
+        if info is not None:
+            add(
+                "服务器",
+                f"{instance.host}:{instance.port}（版本 {info.get('version')}）",
+                ok,
+            )
+        else:
+            add(
+                "服务器",
+                f"{instance.host}:{instance.port} 未响应 /healthz",
+                bad,
+            )
+    elif cached_url:
+        _add_server_check(add, ok, bad, str(cached_url), origin="wsctl login 的缓存地址")
     else:
         add("服务器", "未配置（可用 --url 检查）", "[dim]-[/]")
 

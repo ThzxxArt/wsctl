@@ -39,6 +39,13 @@ schema change.
   healthy instance look dead. This affected `doctor`, `status` and every
   `ApiClient` command (`login`, `connect`, `session`, `audit`, `config reload`).
   Loopback targets go direct; remote targets keep the proxy.
+- `wsctl doctor` gained `--host`/`--port`, and its "服务器" row now probes **the
+  instance it just resolved** instead of the URL cached by an old `wsctl login`.
+  A stale credential made a perfectly healthy instance report
+  `cannot reach http://127.0.0.1:7720`, which read like the server was down.
+  An explicit `--url` still wins; with nothing running the cached URL is used
+  and the row says where the address came from and how to clear it
+  (`wsctl logout`).
 - `wsctl doctor` reports the address the instance is really listening on
   (`0.0.0.0:7682`) instead of the default `127.0.0.1:7681`, and lists any
   other instances it finds rather than flatly claiming nothing is running.
@@ -52,7 +59,7 @@ schema change.
 
 ### Testing
 
-- Ten new tests pin the instance resolution (single instance auto-follows, two
+- Fourteen new tests pin the instance resolution, the `doctor` probe order (single instance auto-follows, two
   instances are ambiguous, a named flag narrows rather than broadens), the
   proxy bypass (behaviourally: a real local server must answer while a bogus
   `http_proxy` is set), the loud `--admin-password` warning and the lock-out
