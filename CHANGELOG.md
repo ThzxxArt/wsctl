@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-09-23
+
+修复 0.1.9 发布过程中由 CI 暴露的一个**产品缺陷**：上传结果谎报。
+
+### Fixed
+
+- **上传取消 / 跳过不再报「上传完成」。** 原本用户拒绝覆盖同名文件后，队列走空即进入
+  完成分支，状态行照样写「上传完成」——**声明与行为不符**。同一行状态还在多轮上传间
+  复用，于是下一次上传的完成判定会被上一次的残留文案提前命中。
+  现在按实际结果四态分开：`上传完成（N 个文件）` / `（跳过 N 个同名文件）` /
+  `未上传任何文件（已跳过）` / `已取消上传` / `上传失败（N 个文件）`，并计数贯穿整批。
+  取消（abort）显式清空队列，绝不落入完成分支。
+
+### Fixed（测试侧）
+
+- **覆盖上传用例改为等文件真实落盘**，而不是等一句可能陈旧的状态文案。这正是它在
+  CI 上读到 `b"original-content"` 而失败的原因——`上传完成` 是上一轮被拒绝的那次
+  留下的。
+
+### Verified
+
+browser 连跑 3 次 3/3（12 用例）稳定；378 unit · 9 e2e · 1 slow · 12 guards 全绿。
+
 ## [0.1.9] - 2026-09-23
 
 **零产品变更。** 这一版只做测试加固，把 0.1.8 发布后 CI 暴露的两个**测试缺陷**

@@ -545,17 +545,32 @@ def test_browser_session_form_config_and_upload_guard(tmp_path: Path) -> None:
             )
             page.wait_for_selector("#confirm-overlay:not(.hidden)", timeout=10000)
             page.click("#confirm-ok")
+            # Wait on the *file*, not on a status string. The status element is
+            # reused across uploads and across the "skip" path, so a stale
+            # 上传完成 from an earlier declined upload satisfies a text check
+            # before this one has landed -- which is exactly how this test
+            # read b"original-content" and failed on CI.
+            deadline = time.time() + 20
+            current = b"original-content"
+            while time.time() < deadline:
+                current = httpx.get(
+                    f"{BASE}/api/files/download",
+                    params={"path": "exists.txt"},
+                    headers=_admin_headers(),
+                    timeout=10,
+                ).content
+                if current == b"replaced":
+                    break
+                page.wait_for_timeout(200)
+            assert current == b"replaced", "the confirmed overwrite never landed"
+
+            # And the status line must not claim success for the upload the
+            # user *declined* earlier in this same dialog.
             page.wait_for_function(
-                "() => document.getElementById('file-status').textContent.includes('上传完成')",
+                "() => document.getElementById('file-status')"
+                ".textContent.includes('上传完成')",
                 timeout=15000,
             )
-            current = httpx.get(
-                f"{BASE}/api/files/download",
-                params={"path": "exists.txt"},
-                headers=_admin_headers(),
-                timeout=10,
-            ).content
-            assert current == b"replaced"
 
             browser.close()
     finally:

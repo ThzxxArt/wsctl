@@ -2421,19 +2421,32 @@
     const dest = targetPath === undefined ? filePath : targetPath;
     if (!files || !files.length) return;
     const queue = Array.from(files);
-    uploadNext(queue, dest, false);
+    uploadNext(queue, dest, false, { sent: 0, skipped: 0, failed: 0 });
   }
 
-  async function uploadNext(queue, dest, overwrite) {
+  async function uploadNext(queue, dest, overwrite, outcome) {
+    const tally = outcome || { sent: 0, skipped: 0, failed: 0 };
     if (!queue.length) {
       els.upProgress.classList.add("hidden");
       uploadXhr = null;
       // Reload first, *then* report: `loadFiles` writes its own status line
-      // and would immediately overwrite "上传完成". The pre-refactor code had
-      // this ordering in a comment and it still got lost in the rewrite.
+      // and would immediately overwrite the outcome.
       await loadFiles(filePath);
-      els.fileStatus.textContent = "上传完成";
-      toast("上传完成", "ok");
+      // The message must say what actually happened. Reporting 上传完成 after
+      // the user *declined* an overwrite -- or cancelled -- is a lie, and a
+      // stale 上传完成 is indistinguishable from a fresh one to anything
+      // watching this element.
+      if (tally.sent > 0) {
+        const extra = tally.skipped ? `（跳过 ${tally.skipped} 个同名文件）` : "";
+        els.fileStatus.textContent = `上传完成${extra}`;
+        toast(`上传完成：${tally.sent} 个文件`, "ok");
+      } else if (tally.failed > 0) {
+        els.fileStatus.textContent = `上传失败（${tally.failed} 个文件）`;
+        toast("上传失败", "error");
+      } else {
+        els.fileStatus.textContent = "未上传任何文件（已跳过）";
+        toast("已跳过，未上传任何文件", "");
+      }
       return;
     }
     const file = queue[0];
@@ -2455,6 +2468,7 @@
       els.upLabel.textContent = `正在上传 ${file.name}… ${pct}%（${formatSize(e.loaded)} / ${formatSize(e.total)}）`;
     };
     xhr.onerror = () => {
+      tally.failed += 1;
       els.upProgress.classList.add("hidden");
       els.fileStatus.textContent = "上传失败：网络错误";
     };
@@ -2462,26 +2476,35 @@
       els.upProgress.classList.add("hidden");
       els.fileStatus.textContent = "已取消上传";
       uploadXhr = null;
+      // An abort is not a success: never fall through to the completion path.
+      queue.length = 0;
     };
     xhr.onload = async () => {
       uploadXhr = null;
       if (xhr.status === 409 && !overwrite) {
         // Never silently replace: ask first, then retry with overwrite=1.
         const ok = await confirmDialog(`「${file.name}」已存在，是否覆盖？`, "覆盖文件");
-        if (!ok) { queue.shift(); uploadNext(queue, dest, false); return; }
-        uploadNext(queue, dest, true);
+        if (!ok) {
+          tally.skipped += 1;
+          queue.shift();
+          uploadNext(queue, dest, false, tally);
+          return;
+        }
+        uploadNext(queue, dest, true, tally);
         return;
       }
       if (xhr.status >= 400) {
         let detail = xhr.statusText;
         try { detail = JSON.parse(xhr.responseText).detail || detail; } catch { /* 忽略 */ }
+        tally.failed += 1;
         els.upProgress.classList.add("hidden");
         els.fileStatus.textContent = `失败：${detail}`;
         return;
       }
       els.upFill.style.width = "100%";
+      tally.sent += 1;
       queue.shift();
-      uploadNext(queue, dest, false);
+      uploadNext(queue, dest, false, tally);
     };
     xhr.send(form);
   }
