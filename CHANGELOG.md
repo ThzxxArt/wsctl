@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.14] - 2026-09-23
+
+**「操作无声无息不执行」——对话框的静默取消改为串行排队。**
+
+0.1.13 发布后 CI 暴露的第三个真缺陷。`test_browser_flow` 的重命名一步报超时，
+但它的自诊断输出证明**根本不是超时**：
+
+```
+labels=  [{'label':'bash'}, {'label':'bash'}, {'label':'bash'}]
+sessions=[{'name':'bash'}, {'name':'bash'}, {'name':'bash'}]
+```
+
+服务端三个会话仍叫 `bash`——**PATCH 压根没发出去**。
+
+### Fixed
+
+- **`promptDialog` / `confirmByName` / `confirmDialog` 改为串行排队。** 三者共用一个
+  互斥标志，本意是防止第二个弹窗覆盖你正在输入的内容（那确实出过事：一次重命名把
+  *旧*名字发回了服务端）。但护栏的实现是**对第二个调用返回 `Promise.resolve(null)`**，
+  而所有调用方都把 `null` 读作「用户取消」——于是操作**悄无声息地没执行**，任何地方
+  都没有说明。**静默丢失比覆盖输入更糟。** 现在第二个弹窗排队等第一个跑完再真跑。
+- **`test_browser_flow` 的等待预算统一为 60 秒。** 此前是 5s/10s/15s/30s 混杂，冷启动
+  的 CI runner 上某一环耗尽预算就会红，而本地全绿。现在一处常量统一管，慢机器只是
+  更耐心，不会更倒霉。
+
+### Verified
+
+browser 17/17（含重命名一步）· 420 unit · 10 e2e 全绿；`node --check` 与 ruff/mypy
+strict 通过。修改过程中曾把 `app.js` 改成语法错，被 `node --check` 当场抓住并恢复到
+已提交良态后整块重做——写在案，避免重犯。
+
 ## [0.1.13] - 2026-09-23
 
 **升级后界面「设了不生效」的根因：浏览器把旧 `app.js` 缓存住了。**
