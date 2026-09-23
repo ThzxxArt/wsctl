@@ -70,8 +70,16 @@
     <button id="search-regex" class="text-btn opt" title="正则表达式" aria-pressed="false">.*</button>
     <span id="search-count" class="search-count"></span>
     <button id="search-next" class="text-btn" title="下一个">↓</button>
-    <button id="search-close" class="icon-btn" title="关闭" aria-label="关闭搜索"><svg class="ico"><use href="#i-close"/></svg></button>
-  </div>
+      <button id="search-close" class="icon-btn" title="关闭" aria-label="关闭搜索"><svg class="ico"><use href="#i-close"/></svg></button>
+    </div>
+
+    <!-- 失步提示条：屏幕已知不完整，提供一键重新同步 -->
+    <div id="desync-bar" class="desync-bar hidden" role="status">
+      <svg class="ico sm"><use href="#i-refresh"/></svg>
+      <span id="desync-note">输出过快，部分内容已省略</span>
+      <button id="desync-btn" type="button" class="text-btn">重新同步</button>
+      <span class="desync-hint">全屏程序可再按 Ctrl+L 或调整一次窗口大小触发自身重绘</span>
+    </div>
 
   <div id="term-menu" class="context-menu hidden">
     <button data-taction="copy">复制选区<span class="kbd">Alt+C</span></button>
@@ -264,48 +272,75 @@
   </div>
 
   <div id="settings-overlay" class="overlay hidden">
-    <div class="modal-card">
+    <div class="modal-card settings-card lg tall">
       <div class="modal-head"><h2>设置</h2><button id="settings-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button></div>
-      <label>页面主题
-        <select id="set-theme">
-          <option value="auto">跟随系统</option>
-          <option value="dark">深色</option>
-          <option value="light">浅色</option>
-        </select>
-      </label>
-      <label>字号
-        <select id="set-fontsize">
-          <option value="12">12</option><option value="13">13</option>
-          <option value="14">14</option><option value="16">16</option><option value="18">18</option>
-        </select>
-      </label>
-      <label>字体
-        <select id="set-font">
-          <option value="">默认等宽</option>
-          <option value='ui-monospace, SFMono-Regular, Menlo, monospace'>系统等宽</option>
-          <option value='"JetBrains Mono", ui-monospace, monospace'>JetBrains Mono</option>
-          <option value='"Fira Code", ui-monospace, monospace'>Fira Code</option>
-          <option value='"Cascadia Code", ui-monospace, monospace'>Cascadia Code</option>
-        </select>
-      </label>
-      <div class="section-title">终端主题</div>
-      <div id="theme-gallery" class="theme-gallery"></div>
-      <details class="custom-theme">
-        <summary>自定义主题</summary>
-        <input id="custom-theme-name" placeholder="名称" />
-        <textarea id="custom-theme-json" rows="3" placeholder='{"background":"#000","foreground":"#fff"}'></textarea>
-        <button id="custom-theme-add" type="button" class="text-btn">添加主题</button>
-      </details>
-      <label>终端右键行为
-        <select id="set-rightclick">
-          <option value="menu">弹出菜单（推荐）</option>
-          <option value="quick">快捷复制粘贴（有选区复制，否则粘贴）</option>
-          <option value="paste">始终粘贴</option>
-        </select>
-      </label>
-      <div class="section-title">快捷键</div>
-      <div id="hotkey-list" class="hotkey-list"></div>
-      <button id="hotkeys-reset" type="button" class="text-btn">恢复默认快捷键</button>
+
+      <div class="field-group">
+        <h3>外观</h3>
+        <div class="form-grid">
+          <label>页面主题
+            <select id="set-theme">
+              <option value="auto">跟随系统</option>
+              <option value="dark">深色</option>
+              <option value="light">浅色</option>
+            </select>
+          </label>
+          <label>字号
+            <select id="set-fontsize">
+              <option value="12">12</option><option value="13">13</option>
+              <option value="14">14</option><option value="16">16</option><option value="18">18</option>
+            </select>
+          </label>
+          <label class="span2">字体
+            <select id="set-font">
+              <option value="">默认等宽（含中日韩等宽回退）</option>
+              <option value='ui-monospace, SFMono-Regular, Menlo, monospace'>系统等宽</option>
+              <option value='"JetBrains Mono", ui-monospace, "Sarasa Mono SC", monospace'>JetBrains Mono</option>
+              <option value='"Fira Code", ui-monospace, "Sarasa Mono SC", monospace'>Fira Code</option>
+              <option value='"Cascadia Mono", ui-monospace, "Sarasa Mono SC", monospace'>Cascadia Mono</option>
+              <option value='"Sarasa Mono SC", "Noto Sans Mono CJK SC", ui-monospace, monospace'>Sarasa Mono SC（中日韩对齐最佳）</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="field-group">
+        <h3>终端</h3>
+        <div id="theme-gallery" class="theme-gallery"></div>
+        <details class="custom-theme">
+          <summary>自定义主题</summary>
+          <input id="custom-theme-name" placeholder="名称" />
+          <textarea id="custom-theme-json" rows="3" placeholder='{"background":"#000","foreground":"#fff"}'></textarea>
+          <button id="custom-theme-add" type="button" class="text-btn">添加主题</button>
+        </details>
+        <div class="form-grid">
+          <label>渲染器
+            <select id="set-renderer">
+              <option value="auto">自动（WebGL → Canvas → DOM）</option>
+              <option value="webgl">强制 WebGL</option>
+              <option value="canvas">强制 Canvas</option>
+              <option value="dom">纯 DOM（最慢，兼容性最好）</option>
+            </select>
+            <span id="renderer-note" class="hint">当前：检测中…</span>
+          </label>
+          <label>终端右键行为
+            <select id="set-rightclick">
+              <option value="menu">弹出菜单（推荐）</option>
+              <option value="quick">快捷复制粘贴（有选区复制，否则粘贴）</option>
+              <option value="paste">始终粘贴</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="field-group">
+        <h3>快捷键</h3>
+        <div id="hotkey-list" class="hotkey-list grid"></div>
+        <div class="modal-actions">
+          <button id="hotkeys-reset" type="button" class="ghost">恢复默认快捷键</button>
+        </div>
+      </div>
+
       <div class="modal-actions"><button id="settings-done" type="button" class="primary">完成</button></div>
     </div>
   </div>
@@ -337,8 +372,8 @@
       <div class="modal-head"><h2 id="confirm-title">确认</h2></div>
       <p id="confirm-message" class="hint"></p>
       <div class="modal-actions">
-        <button type="button" id="confirm-cancel">取消</button>
-        <button type="button" id="confirm-ok" class="danger">确定</button>
+          <button type="button" id="confirm-cancel">取消</button>
+          <button type="button" id="confirm-ok" class="primary">确定</button>
       </div>
     </div>
   </div>
@@ -366,13 +401,16 @@
     </div>
   </div>
 
-  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="toasts" class="toasts"></div>
 
   <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-unicode11.js"></script>
   <script src="/static/vendor/addon-fit.js"></script>
   <script src="/static/vendor/addon-web-links.js"></script>
   <script src="/static/vendor/addon-image.js"></script>
   <script src="/static/vendor/addon-search.js"></script>
+  <script src="/static/vendor/addon-webgl.js"></script>
+  <script src="/static/vendor/addon-canvas.js"></script>
   <script src="/static/vendor/zmodem.js"></script>
   <script src="/static/vendor/asciinema-player.min.js"></script>
   <script src="/static/app.js"></script>

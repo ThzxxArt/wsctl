@@ -230,6 +230,8 @@ def create_app(
             instance_id, pid=os.getpid(), host=socket.gethostname()
         )
         maint = asyncio.create_task(_maintenance())
+        # Start the event-loop lag watchdog now that a loop is actually running.
+        app.state.loop_lag_starter()
         _install_sighup(app)
         audit.start()
         if webhook is not None:
@@ -364,6 +366,46 @@ def create_app(
         "Recorders stopped by a write failure (cast may be truncated)",
         lambda: float(recording_mod.failure_count()),
     )
+
+    # Event-loop lag: the one number that says whether the server is keeping up.
+    # A terminal that "卡住" because the loop is wedged is indistinguishable from
+    # one that is merely busy unless something measures the difference, and the
+    # shedding work this release moved off the lock is exactly the kind of thing
+    # that used to hide here. A 0.5s tick measures its own scheduling delay:
+    # the callback is promised for T and reports how late it actually ran.
+    LOOP_LAG_INTERVAL = 0.5
+    lag = {"due": 0.0, "last": 0.0, "peak": 0.0}
+
+    def _lag_tick() -> None:
+        now = time.monotonic()
+        due = lag["due"]
+        if due:
+            observed = max(0.0, now - due)
+            # Instantaneous value, and a decaying peak so one outlier stays
+            # visible without pinning the gauge forever.
+            lag["last"] = observed
+            lag["peak"] = max(observed, lag["peak"] * 0.97)
+        lag["due"] = now + LOOP_LAG_INTERVAL
+        with contextlib.suppress(RuntimeError, AttributeError):
+            asyncio.get_running_loop().call_later(LOOP_LAG_INTERVAL, _lag_tick)
+
+    app.state.loop_lag_starter = _lag_tick
+    app.state.loop_lag = lag
+    metrics.collect(
+        "wsctl_event_loop_lag_seconds",
+        "How late the last 0.5s watchdog tick actually ran (0 when healthy)",
+        lambda: float(lag["last"]),
+    )
+    metrics.collect(
+        "wsctl_event_loop_lag_peak_seconds",
+        "Decaying peak of the watchdog tick delay since startup",
+        lambda: float(lag["peak"]),
+    )
+    # ``wsctl_shed_resync_requests_total`` and ``wsctl_ws_frames_coalesced_total``
+    # are *not* registered here: ``ws.py`` counts both with ``metrics.inc``,
+    # which already puts them in the exposition as counters. Registering a
+    # collector as well would print each series twice -- the same trap the
+    # input-rate-limit counter already fell into.
 
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
     app.state.limiter = limiter

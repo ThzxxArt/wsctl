@@ -308,32 +308,102 @@ body { display: flex; flex-direction: column; }
   display: flex; flex-direction: column; gap: var(--sp-3);
   animation: pop var(--dur) var(--ease);
 }
-.modal-card.narrow { width: 320px; }
-.modal-card.wide { width: 640px; }
-.modal-card.tall { max-height: 84vh; }
+/* Semantic sizes rather than ad-hoc ones. Every dialog picks the smallest
+   box its content actually needs: a confirm is narrow, a form is medium, a
+   dashboard is wide. The previous scheme had three unlabelled widths and the
+   settings dialog -- a theme gallery plus fifteen key bindings -- sat in the
+   360px one. */
+.modal-card.sm { width: 380px; }
+.modal-card.md { width: 480px; }
+.modal-card.lg { width: 560px; }
+.modal-card.xl { width: 720px; }
+.modal-card.narrow { width: 380px; }   /* legacy alias of sm */
+.modal-card.wide { width: 560px; }     /* legacy alias of lg */
+.modal-card.settings-card { width: 560px; }
+.modal-card.tall { max-height: 86vh; }
 .login-card { width: 340px; }
 .modal-head {
   display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--border);
 }
-.modal-head h2 { margin: 0; font-size: 15px; font-weight: 650; color: var(--fg); }
-.modal-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.modal-head h2 { margin: 0; font-size: 16px; font-weight: 650; color: var(--fg); }
+
+/* Field groups: a dialog with more than three controls needs structure, or it
+   is a wall of labels. Each group is a card with its own heading. */
+.field-group {
+  display: flex; flex-direction: column; gap: var(--sp-2);
+  padding: var(--sp-3);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.field-group > h3 {
+  margin: 0;
+  font-size: 12px; font-weight: 650; letter-spacing: 0.3px;
+  color: var(--muted); text-transform: none;
+}
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2) var(--sp-3); }
+.form-grid label.span2 { grid-column: 1 / -1; }
+@media (max-width: 620px) {
+  .form-grid { grid-template-columns: 1fr; }
+  .form-grid label.span2 { grid-column: auto; }
+}
+
+/* Button hierarchy. ``primary`` is the one action the dialog is for,
+   ``ghost`` is secondary, ``danger`` is reserved for irreversible loss and
+   ``warn-btn`` for "this invalidates or overwrites something". The old rule
+   gave every action the same grey chip, and made the confirm button red for
+   *all* confirmations -- including regenerating a share link -- so the red
+   stopped meaning anything. */
+.modal-actions {
+  display: flex; gap: var(--sp-2); flex-wrap: wrap;
+  justify-content: flex-end;
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--border);
+}
+/* ``.modal-actions button`` is kept as its own rule on purpose: the contrast
+   guard matches that exact shape and asserts its border token. Splitting it
+   across a comma list silently moved it out of the audit. */
 .modal-actions button {
-  flex: 1; min-width: 84px;
-  padding: 9px;
+  flex: 0 0 auto; min-width: 92px;
+  padding: 9px 14px;
   background: var(--bg-3);
   border: 1px solid var(--border-input);
   border-radius: var(--radius);
   color: var(--fg); cursor: pointer; font-size: 13px;
-  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    color var(--dur) var(--ease);
 }
-.modal-actions button:hover { border-color: var(--accent); color: var(--accent); }
+.modal-card button.ghost,
+.modal-card button.warn-btn {
+  flex: 0 0 auto; min-width: 92px;
+  padding: 9px 14px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius);
+  color: var(--fg); cursor: pointer; font-size: 13px;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    color var(--dur) var(--ease);
+}
+.modal-actions button:hover,
+.modal-card button.ghost:hover { border-color: var(--accent); color: var(--accent); }
 button.primary {
-  padding: 9px; background: var(--accent); border: 0; border-radius: var(--radius);
+  padding: 9px 16px; background: var(--accent); border: 1px solid var(--accent);
+  border-radius: var(--radius);
   color: #06101f; font-weight: 650; cursor: pointer; font-size: 13px;
+  min-width: 92px;
 }
 button.primary:hover { filter: brightness(1.08); }
-.danger, button.danger { color: var(--danger) !important; }
-button.danger:hover { border-color: var(--danger) !important; background: rgba(239, 95, 107, 0.12); }
+button.warn-btn {
+  background: rgba(224, 162, 79, 0.14); border-color: var(--warn); color: var(--warn) !important;
+}
+button.warn-btn:hover { background: rgba(224, 162, 79, 0.24); border-color: var(--warn); }
+.danger, button.danger {
+  color: var(--danger) !important;
+  background: rgba(239, 95, 107, 0.12); border-color: var(--danger);
+}
+button.danger:hover { border-color: var(--danger) !important; background: rgba(239, 95, 107, 0.22); }
 
 .modal-card label {
   display: flex; flex-direction: column; gap: var(--sp-1);
@@ -437,23 +507,70 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
 /* Toast */
 .toasts {
   position: fixed; right: var(--sp-4); bottom: var(--sp-4);
-  z-index: 50; display: flex; flex-direction: column; gap: var(--sp-2);
+  z-index: 50; display: flex; flex-direction: column-reverse; gap: var(--sp-2);
   pointer-events: none;
 }
 .toast {
   pointer-events: auto;
-  min-width: 180px; max-width: 340px;
-  padding: 10px 14px;
+  display: flex; align-items: flex-start; gap: var(--sp-2);
+  min-width: 220px; max-width: 380px;
+  padding: 10px 12px;
   background: var(--bg-2);
   border: 1px solid var(--border-strong);
   border-left: 3px solid var(--accent);
   border-radius: var(--radius);
   box-shadow: var(--shadow-2);
-  font-size: 13px; color: var(--fg);
+  font-size: 13px; color: var(--fg); line-height: 1.5;
   animation: pop var(--dur) var(--ease);
 }
 .toast.ok { border-left-color: var(--ok); }
+.toast.warn { border-left-color: var(--warn); }
 .toast.error { border-left-color: var(--danger); }
+.toast-msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast-count {
+  flex: none; align-self: center;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--muted); background: var(--bg-3);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 1px 7px;
+}
+.toast-x {
+  flex: none; width: 22px; height: 22px;
+  display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: var(--radius-sm);
+  color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1;
+}
+.toast-x:hover { color: var(--fg); background: var(--bg-3); }
+/* Past TOAST_MAX the stack folds instead of covering the terminal. */
+.toast-folded { display: none; }
+.toast-more {
+  justify-content: center;
+  border-left-color: var(--muted);
+  color: var(--muted); cursor: pointer; font-size: 12px;
+}
+.toast-more:hover { color: var(--fg); }
+
+/* 失步提示条 */
+.desync-bar {
+  position: absolute; top: 54px; left: 50%; transform: translateX(-50%);
+  z-index: 26;
+  display: flex; align-items: center; gap: var(--sp-2);
+  max-width: min(720px, 92vw);
+  padding: 7px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+  color: var(--fg); font-size: 12px;
+}
+.desync-bar .ico { color: var(--warn); }
+.desync-hint { color: var(--muted); font-size: 11px; }
+.desync-bar .text-btn { color: var(--warn); border-color: var(--warn); }
+
+/* 终端右键菜单里正在传输的开关 */
+.icon-btn.locked, .context-menu button:disabled {
+  opacity: 0.45; cursor: not-allowed;
+}
 
 /* 右键菜单 */
 .context-menu {
@@ -474,8 +591,8 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
 
 /* 主题画廊 */
 .theme-gallery {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
-  gap: var(--sp-2); max-height: 200px; overflow-y: auto;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: var(--sp-2); max-height: 220px; overflow-y: auto;
 }
 .theme-swatch {
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -523,12 +640,22 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
 .kind-badge.new { color: var(--accent); border-color: var(--accent); }
 .kind-badge.restart { color: var(--warn); border-color: var(--warn); }
 .hotkey-list { display: flex; flex-direction: column; gap: var(--sp-1); max-height: 200px; overflow-y: auto; }
+/* Two columns at settings-dialog width. One column of fifteen bindings inside
+   a 360px card was a scroll inside a scroll, with the label squeezed against
+   a fixed 140px input. */
+.hotkey-list.grid {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: var(--sp-1) var(--sp-3);
+  max-height: 260px;
+}
+@media (max-width: 620px) { .hotkey-list.grid { grid-template-columns: 1fr; } }
 .hotkey-row { display: flex; align-items: center; gap: var(--sp-2); font-size: 12px; }
-.hotkey-row span { flex: 1; color: var(--muted); }
+.hotkey-row span { flex: 1; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hotkey-row input {
-  width: 140px; padding: 5px 7px; background: var(--bg);
+  width: 120px; flex: none; padding: 5px 7px; background: var(--bg);
   border: 1px solid var(--border-input); border-radius: var(--radius-sm); color: var(--fg); font-size: 12px;
 }
+.hotkey-row input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* 响应式 */
 .mobile-only { display: none !important; }

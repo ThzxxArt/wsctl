@@ -1820,8 +1820,8 @@ def test_a_slow_viewer_is_shed_not_disconnected(tmp_path: Path) -> None:
     assert client.pending_bytes <= 100
     # ...and the shed is announced rather than silently swallowed.
     assert any(
-        isinstance(i, dict) and i.get("type") == "notice" for i in client._items
-    ), "shedding must be reported to the viewer"
+        i.get("type") == "desync" for i in client.queued_controls()
+    ), "shedding must be reported to the viewer as a desync"
 
 
 def test_control_frames_survive_the_shed(tmp_path: Path) -> None:
@@ -1840,7 +1840,7 @@ def test_control_frames_survive_the_shed(tmp_path: Path) -> None:
     for _ in range(100):
         client.put(b"z" * 30)
     assert any(
-        isinstance(i, dict) and i.get("type") == "attached" for i in client._items
+        i.get("type") == "attached" for i in client.queued_controls()
     ), "a control message was evicted by the shed"
 
 

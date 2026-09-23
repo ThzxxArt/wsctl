@@ -65,18 +65,25 @@ def test_control_frames_are_bounded_too() -> None:
     for i in range(5 * MAX_CONTROL_PENDING):
         client.put({"type": "noise", "n": i})
     assert client.closed is False, "a flood of control frames must not close the link"
-    assert len(client._items) <= MAX_CONTROL_PENDING + 1, (
-        f"control frames are unbounded: {len(client._items)}"
+    assert len(client.queued_controls()) <= MAX_CONTROL_PENDING + 1, (
+        f"control frames are unbounded: {len(client.queued_controls())}"
     )
 
 
-def test_shedding_lands_on_an_ansi_boundary(tmp_path) -> None:
-    """A dropped frame must not leave the next one starting mid-escape.
+def test_shedding_reaches_a_sequence_boundary_before_stopping(tmp_path) -> None:
+    """Eviction must keep dropping until the cut lands *outside* a sequence.
 
-    A PTY read can cut ``ESC[31m`` in half. Dropping the first half in
-    isolation leaves the stream starting at ``31m``, which a terminal reads as
-    literal text -- that is what made ``vi``/``htop`` render as garbage after a
-    shed. Whatever survives must start where a terminal considers fresh.
+    A PTY read can cut ``ESC[31m`` in half. Dropping the first half on its own
+    leaves the stream to resume at ``1m...``, which a terminal reads as literal
+    text -- that is what made ``vi``/``htop`` render as garbage after a shed.
+
+    The budget below is built so that **freeing one frame's worth of room is
+    already enough**. Dropping only the partial sequence satisfies the byte cap
+    while leaving the cut inside ``ESC[3``; a correct eviction keeps going to
+    the next frame, which is the one that ends outside. That single extra drop
+    is the whole contract, and this input is what makes it observable: with it,
+    "drop one frame and stop" and "drop until a boundary" end with different
+    heads.
     """
     from wsctl.core.ansi import is_boundary_aligned
 
@@ -91,15 +98,59 @@ def test_shedding_lands_on_an_ansi_boundary(tmp_path) -> None:
             pass
 
     ws = Capture()
-    client = WsClient(ws, max_pending=6, max_bytes=60)  # type: ignore[arg-type]
-    red = b"\x1b[31m"
-    split = [red[:3], red[3:] + b"AAAA", b"\x1b[0m" + b"BBBB", b"plainCCCC"]
-    for part in split * 20:
-        client.put(part)
+    # The queue-length cap is what triggers the eviction here, deliberately:
+    # the byte cap has a second "does not fit, drop *this* frame" escape hatch
+    # in ``put`` that would eat the pressure before eviction ever ran, and the
+    # point of the test is what eviction does.
+    client = WsClient(ws, max_pending=4, max_bytes=0)  # type: ignore[arg-type]
+    client.put(b"\x1b[3")     # ends INSIDE a CSI
+    client.put(b"1mABC")     # completes it, then plain text
+    client.put(b"Z" * 40)    # plain output
+    client.put(b"Q")
+    client.put(b"R")         # 5th frame: exactly one must go
 
-    kept = b"".join(i for i in client._items if isinstance(i, bytes))
+    kept = client.queued_binary()
     assert client.dropped_bytes > 0, "this test only means something if we shed"
-    assert is_boundary_aligned(kept), "the surviving stream starts mid-escape"
+    # "drop one frame and stop" would leave `1mABC` at the head -- the tail of
+    # a colour sequence, about to be read as text. A boundary-aligned cut puts
+    # the plain output first.
+    assert kept.startswith(b"Z"), (
+        f"the cut did not reach a sequence boundary; the surviving stream opens {kept[:8]!r}"
+    )
+    assert is_boundary_aligned(kept)
+
+
+def test_a_dropped_frame_still_advances_the_sequence_tracker(tmp_path) -> None:
+    """Dropping a frame must not desynchronise where the *next* cut may land.
+
+    The streaming tracker models the source stream. A frame discarded under
+    pressure still moves the parser along -- the next kept frame begins
+    wherever that one would have left off. The bookkeeping kept per *queued*
+    frame has to reflect that, or a later cut is judged against a state the
+    stream is not in.
+    """
+    class Capture:
+        async def send_bytes(self, data: bytes) -> None:
+            pass
+
+        async def send_json(self, obj: object) -> None:  # pragma: no cover
+            pass
+
+    client = WsClient(Capture(), max_pending=512, max_bytes=20)  # type: ignore[arg-type]
+    # Frame 2 is discarded entirely by the byte cap (nothing left to evict and
+    # it still does not fit), and it is the one that *completes* the sequence
+    # frame 1 opened.
+    client.put(b"\x1b[3")          # ends inside
+    client.put(b"1m" + b"A" * 20)  # discarded whole
+    client.put(b"PLAIN")           # must be judged as starting outside
+    queued = list(client._binary)
+    assert queued, "the surviving frames must still be there"
+    _seq, payload, ends_inside = queued[-1]
+    assert payload == b"PLAIN"
+    assert ends_inside is False, (
+        "the tracker was not advanced by the discarded frame: the state after "
+        "PLAIN is being computed from a stream that never saw the sequence tail"
+    )
 
 
 def test_shed_oldest_gives_up_backlog_before_a_viewer(tmp_path) -> None:

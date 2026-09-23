@@ -1,10 +1,10 @@
 """Adapts a Starlette WebSocket to the :class:`~wsctl.core.session.Client` protocol.
 
-The outbound side is a bounded FIFO of frames. What happens at the bound is
-the whole point of this module: the earlier version **killed the connection**
-the moment a client fell behind. On a burst of output that turned a merely
-slow viewer into a dropped one, and the browser then looped reconnect -> clear
--> replay -> dropped again. To the person watching, their terminal froze and
+The outbound side is a bounded pair of FIFOs. What happens at the bound is the
+whole point of this module: the earlier version **killed the connection** the
+moment a client fell behind. On a burst of output that turned a merely slow
+viewer into a dropped one, and the browser then looped reconnect -> clear ->
+replay -> dropped again. To the person watching, their terminal froze and
 "jumped".
 
 A terminal is a *current view*, not an archive: when the far end cannot keep
@@ -12,6 +12,23 @@ up, the right answer is to shed the oldest frames and say so, never to cut the
 cord. ``bytes`` items are terminal data and are evictable; ``dict`` items are
 control messages and are bounded separately -- the one message explaining what
 was lost must still get through, but it must not become the leak.
+
+Two queues, one sequence
+------------------------
+
+Terminal frames and control frames live in separate deques, every item tagged
+with a monotonic sequence number, and ``run()`` emits whichever queue holds the
+lower number. Splitting them must not change the order a client observes, and
+the tests assert that.
+
+The split is what makes eviction O(1). The single-queue version had to *scan*
+for the first ``bytes`` item on every drop (the head might be a control
+message) -- an O(n) pass per drop, O(n^2) for a burst -- and that scan ran
+inside :meth:`~wsctl.core.session.TermSession._broadcast`, i.e. on the same
+event loop that is reading the PTY. Under a flood the loop stalled, the kernel
+buffer filled, and the shell itself stopped writing. That is a *server-side*
+freeze, a different failure from the client-side one shedding exists to
+prevent. Now the oldest terminal frame is simply ``popleft()``.
 """
 
 from __future__ import annotations
@@ -35,7 +52,7 @@ MAX_CONTROL_PENDING = 128
 
 
 class WsClient:
-    """Ordered, bounded outbound queue for one WebSocket connection.
+    """Ordered, bounded outbound queues for one WebSocket connection.
 
     ``bytes`` items become binary frames (terminal data); ``dict`` items become
     JSON text frames (control messages).
@@ -49,19 +66,22 @@ class WsClient:
         max_bytes: int = 0,
     ) -> None:
         self._ws = websocket
-        self._items: deque[bytes | dict[str, Any]] = deque()
-        # Streaming ANSI state at each *frame* boundary, so a drop can land
-        # where a terminal would consider the stream fresh. A frame that
-        # begins mid-escape (a PTY read cut a sequence) is not a safe cut
-        # point, and no stateless scan can tell that.
+        #: ``(seq, payload, ends_inside_escape)`` -- the flag is the streaming
+        #: ANSI state *after* that frame. A drop may only land where the state
+        #: is outside a sequence, otherwise the surviving stream resumes
+        #: mid-escape and a full-screen program renders as garbage.
+        self._binary: deque[tuple[int, bytes, bool]] = deque()
+        self._control: deque[tuple[int, dict[str, Any]]] = deque()
+        # Streaming ANSI state fed once per terminal frame. A stateless scan of
+        # a single frame cannot answer "does this end inside a sequence",
+        # because a PTY read can begin one.
         self._tracker = AnsiTracker()
-        self._item_inside: deque[bool] = deque()
+        self._seq = 0
         self._wakeup = asyncio.Event()
         self._max_pending = max_pending
         self._max_bytes = max_bytes
         self._pending_bytes = 0
         self._closed = False
-        self._control_count = 0
         #: Why this client ended, when the sink decided for itself. ``None``
         #: means nothing unusual; the transport reports this instead of a plain
         #: 1000 ("normal closure"), which would be a lie for "we threw you out".
@@ -73,6 +93,8 @@ class WsClient:
         self.dropped_events = 0
         self._shed_notice_open = False
 
+    # -- introspection (also the tests' view of the queue) ---------------
+
     @property
     def pending_bytes(self) -> int:
         return self._pending_bytes
@@ -80,6 +102,21 @@ class WsClient:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def queued_binary(self) -> bytes:
+        """The terminal frames still queued, oldest first."""
+        return b"".join(payload for _seq, payload, _inside in self._binary)
+
+    def queued_controls(self) -> list[dict[str, Any]]:
+        """The control frames still queued, oldest first."""
+        return [payload for _seq, payload in self._control]
+
+    @property
+    def queue_len(self) -> int:
+        """Total frames waiting to go out, of either kind."""
+        return len(self._binary) + len(self._control)
+
+    # -- shedding --------------------------------------------------------
 
     def _drop_oldest_binary(self) -> bool:
         """Evict the oldest terminal frame(s), landing on an ANSI boundary.
@@ -91,31 +128,20 @@ class WsClient:
         *ends outside* a sequence, which is what the streaming tracker (not a
         stateless scan) can tell us: a frame may well begin mid-escape.
 
+        O(1) per drop: the oldest terminal frame is the head of its own deque,
+        so there is nothing to scan for.
+
         Returns ``False`` when nothing terminal-shaped is left to give up.
         """
-        while True:
-            victim: tuple[int, bytes] | None = None
-            for index, item in enumerate(self._items):
-                if isinstance(item, bytes):
-                    victim = (index, item)
-                    break
-            if victim is None:
-                return False
-            index, item = victim
-            # Read the state *before* deleting: the two deques are parallel and
-            # the index stops meaning anything the moment either is shortened.
-            ends_inside = self._item_inside[index]
-            # Delete outside the scan: mutating the deque while enumerating it
-            # raises RuntimeError the moment a second pass is needed.
-            del self._items[index]
-            del self._item_inside[index]
+        while self._binary:
+            _seq, item, ends_inside = self._binary.popleft()
             self._pending_bytes = max(0, self._pending_bytes - len(item))
             self.dropped_bytes += len(item)
             # ``ends_inside`` is the state *after* that frame. A frame that
             # leaves us outside a sequence is a safe cut point.
             if not ends_inside:
                 return True
-
+        return False
 
     def shed_oldest(self, target_bytes: int) -> int:
         """Give up at least ``target_bytes`` of queued terminal data.
@@ -134,26 +160,17 @@ class WsClient:
         return self.dropped_bytes - before
 
     def _drop_oldest_control(self) -> None:
-        """Make room for one control message by dropping the oldest one.
-
-        Both deques are parallel -- dropping from one and not the other leaves
-        their indices meaningless and the next binary eviction reads the wrong
-        state (or falls off the end).
-        """
-        for index, item in enumerate(self._items):
-            if isinstance(item, dict):
-                del self._items[index]
-                del self._item_inside[index]
-                self._control_count -= 1
-                return
+        """Make room for one control message by dropping the oldest one."""
+        if self._control:
+            self._control.popleft()
 
     def _shed_for(self, size: int) -> None:
         """Make room for ``size`` bytes by evicting the oldest terminal data."""
-        if self._max_bytes <= 0 and len(self._items) < self._max_pending:
+        if self._max_bytes <= 0 and self.queue_len < self._max_pending:
             return
         shed = False
         while (self._max_bytes > 0 and self._pending_bytes + size > self._max_bytes) or (
-            len(self._items) >= self._max_pending
+            self.queue_len >= self._max_pending
         ):
             if not self._drop_oldest_binary():
                 break
@@ -163,10 +180,15 @@ class WsClient:
             self._announce_shed()
 
     def _announce_shed(self) -> None:
-        """Tell the viewer, once per burst, that history was shortened.
+        """Tell the viewer, once per burst, that its screen is now incomplete.
 
         Losing frames is the lesser evil; losing them *silently* is not, which
         is the same rule the input path already follows for dropped keystrokes.
+
+        ``desync`` rather than a plain ``notice`` because the consequence is
+        specific and actionable: a full-screen program is now drawing from a
+        gapped stream, and the remedy is a resync (or the program's own
+        repaint) -- not an acknowledgement.
         """
         if self._shed_notice_open:
             return
@@ -174,11 +196,13 @@ class WsClient:
         with contextlib.suppress(Exception):
             self._put_control(
                 {
-                    "type": "notice",
+                    "type": "desync",
                     "level": "warn",
-                    "msg": "输出过快，已省略部分较早内容（会话仍在，连接未断）",
+                    "msg": "输出过快，部分内容已省略（连接未断）",
                 }
             )
+
+    # -- queueing --------------------------------------------------------
 
     def _put_control(self, message: dict[str, Any]) -> bool:
         """Queue a control frame, shedding the *oldest control frame* if needed.
@@ -188,14 +212,13 @@ class WsClient:
         being bounded. An earlier rewrite of this class let them accumulate
         without limit, which is its own way to take a connection down.
         """
-        while self._control_count >= MAX_CONTROL_PENDING:
-            before = self._control_count
+        while len(self._control) >= MAX_CONTROL_PENDING:
+            before = len(self._control)
             self._drop_oldest_control()
-            if self._control_count == before:
+            if len(self._control) == before:
                 break
-        self._items.append(message)
-        self._item_inside.append(False)
-        self._control_count += 1
+        self._seq += 1
+        self._control.append((self._seq, message))
         self._wakeup.set()
         return True
 
@@ -204,6 +227,14 @@ class WsClient:
         if self._closed:
             raise ClientGone("连接已关闭")
         if isinstance(item, bytes):
+            # Feed the tracker *unconditionally*, before any eviction decision.
+            # It models the source stream, and a frame dropped under pressure
+            # still moves the parser along: the next kept frame begins wherever
+            # this one would have left off. Skipping it (as the "does not fit"
+            # path used to) desynchronised the recorded state, and the next cut
+            # could land inside an escape sequence -- the exact corruption this
+            # whole mechanism exists to prevent.
+            ends_inside = self._tracker.feed(item)
             self._shed_for(len(item))
             if self._max_bytes > 0 and self._pending_bytes + len(item) > self._max_bytes:
                 # Nothing left to evict and the frame still does not fit: lose
@@ -212,8 +243,8 @@ class WsClient:
                 self.dropped_events += 1
                 return
             self._pending_bytes += len(item)
-            self._items.append(item)
-            self._item_inside.append(self._tracker.feed(item))
+            self._seq += 1
+            self._binary.append((self._seq, item, ends_inside))
             self._wakeup.set()
         else:
             self._put_control(item)
@@ -242,23 +273,28 @@ class WsClient:
     async def run(self) -> None:
         try:
             while True:
-                if not self._items:
+                if not self._binary and not self._control:
                     self._wakeup.clear()
-                    if self._closed and not self._items:
+                    if self._closed:
                         return
                     await self._wakeup.wait()
                     continue
-                item = self._items.popleft()
-                self._item_inside.popleft()
-                if not self._items and self._shed_notice_open:
-                    self._shed_notice_open = False
-                if isinstance(item, bytes):
-                    self._pending_bytes = max(0, self._pending_bytes - len(item))
-                    await self._ws.send_bytes(item)
+                # Arrival order survives the split: whichever queue holds the
+                # lower sequence number goes first. A client must not be able to
+                # tell the two deques apart from the single queue this replaced.
+                use_binary = bool(self._binary) and (
+                    not self._control or self._binary[0][0] < self._control[0][0]
+                )
+                if use_binary:
+                    _seq, frame, _inside = self._binary.popleft()
+                    self._pending_bytes = max(0, self._pending_bytes - len(frame))
+                    await self._ws.send_bytes(frame)
                 else:
-                    self._control_count -= 1
-                    await self._ws.send_json(item)
-                if self._closed and not self._items:
+                    _seq, message = self._control.popleft()
+                    await self._ws.send_json(message)
+                if not self._binary and not self._control and self._shed_notice_open:
+                    self._shed_notice_open = False
+                if self._closed and not self._binary and not self._control:
                     return
         except asyncio.CancelledError:
             raise

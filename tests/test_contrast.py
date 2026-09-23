@@ -100,15 +100,25 @@ def test_interactive_controls_use_the_accessible_border() -> None:
     """
     css = APP_CSS.read_text(encoding="utf-8")
     # Every rule that styles an input/select/textarea/button border must use
-    # the token this test proves is legible.
+    # the token this test proves is legible. The list grows whenever a new kind
+    # of control appears -- 0.1.15 added ghost/warn actions, the settings
+    # dialog's key-binding inputs and the search toggles -- and a control that
+    # slips past this list is exactly how the 0.1.8 failure happened.
     for pattern in (
         r"\.modal-card input, \.modal-card select, \.modal-card textarea "
         r"\{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
         r"\.modal-actions button \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
+        r"\.modal-card button\.ghost,\s*\.modal-card button\.warn-btn "
+        r"\{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
         r"\.admin-toolbar input \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
+        r"\.hotkey-row input \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
+        r"\.custom-theme input, \.custom-theme textarea "
+        r"\{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
+        r"#file-filter \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
+        r"\.search-bar \.opt \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
     ):
         match = re.search(pattern, css, re.S)
-        assert match is not None, f"rule not found: {pattern[:40]}"
+        assert match is not None, f"rule not found: {pattern[:44]}"
         assert match.group("tok") == "border-input", (
             f"interactive control uses --{match.group('tok')}, which is decorative"
         )

@@ -27,6 +27,7 @@
     adminBtn: $("admin-btn"), adminOverlay: $("admin-overlay"), adminBody: $("admin-body"),
     adminClose: $("admin-close"), adminNote: $("admin-note"),
     tabMenu: $("tab-menu"), termMenu: $("term-menu"), setRightclick: $("set-rightclick"),
+    setRenderer: $("set-renderer"), rendererNote: $("renderer-note"),
     moreBtn: $("more-btn"), moreMenu: $("more-menu"),
     settingsBtn: $("settings-btn"), settingsOverlay: $("settings-overlay"),
     setTheme: $("set-theme"), setFontsize: $("set-fontsize"), setFont: $("set-font"),
@@ -47,6 +48,7 @@
     qrOverlay: $("qr-overlay"), qrTitle: $("qr-title"), qrSecret: $("qr-secret"),
     qrImage: $("qr-image"), qrDone: $("qr-done"), qrClose: $("qr-close"),
     toasts: $("toasts"),
+    desyncBar: $("desync-bar"), desyncNote: $("desync-note"), desyncBtn: $("desync-btn"),
     newSessionOverlay: $("new-session-overlay"), newSessionForm: $("new-session-form"),
     newSessionClose: $("new-session-close"), newSessionCancel: $("new-session-cancel"),
     newSessionQuick: $("new-session-quick"), newSessionError: $("new-session-error"),
@@ -139,9 +141,16 @@
   let menuSid = null;
   let menuOpenedAt = 0;
   let shareSid = null;
-  let adminTab = "users";
+  let adminTab = "overview";
 
-  const DEFAULT_MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace';
+  // Latin glyphs come from a real monospace; CJK falls through to a CJK
+  // monospace whose advance width is exactly twice the Latin one. Without a
+  // CJK face in the stack the browser substitutes a *proportional* face, one
+  // character ends up narrower or wider than its cell, and every column after
+  // it slides -- which is what "花屏" looks like when the text is Chinese.
+  // `@xterm/addon-unicode11` (loaded in createTab) supplies the matching
+  // width table; the font stack is the other half of the same fix.
+  const DEFAULT_MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Cascadia Mono", "Sarasa Mono SC", "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", monospace';
 
   const TERM_OPTIONS = {
     cursorBlink: true,
@@ -215,9 +224,13 @@
 
   const prefs = Object.assign(
     {
-      theme: "auto", termTheme: "dark", fontSize: 14, fontFamily: "",
-      keybindings: {}, customThemes: {}, rightClickMode: "menu",
-    },
+        theme: "auto", termTheme: "dark", fontSize: 14, fontFamily: "",
+        keybindings: {}, customThemes: {}, rightClickMode: "menu",
+        // auto -> WebGL, then Canvas, then the DOM renderer. Pinning "dom"
+        // disables acceleration; "webgl" asks for WebGL and falls back if it
+        // will not initialise rather than leaving a blank terminal.
+        termRenderer: "auto",
+      },
     readPrefs(),
   );
   prefs.keybindings = Object.assign({}, DEFAULT_KEYS, prefs.keybindings);
@@ -248,7 +261,14 @@
       s.term.options.fontSize = prefs.fontSize;
       s.term.options.fontFamily = prefs.fontFamily || DEFAULT_MONO;
       s.term.options.theme = resolveTheme();
-      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
+      // Only the visible terminal is re-measured now. Re-fitting every session
+      // at once re-laid out N xterm instances in a single turn, which is what
+      // made a theme or font change flash across the whole tab bar.
+      if (s.id === activeId) {
+        try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
+      } else {
+        s.needsRefit = true;
+      }
     }
     try { localStorage.setItem("wsctl-prefs", JSON.stringify(prefs)); } catch { /* 忽略 */ }
   }
@@ -259,24 +279,108 @@
 
   // -- Toast / 弹窗 -----------------------------------------------------
 
-  function toast(message, kind) {
-    const el = document.createElement("div");
-    el.className = "toast" + (kind ? " " + kind : "");
-    el.textContent = message;
-    // Every toast can be dismissed by clicking it; errors stay until then, so
-    // a failure the user was not looking at is not swallowed by a timer.
-    el.title = "点击关闭";
-    el.addEventListener("click", () => el.remove());
-    els.toasts.appendChild(el);
-    if (kind !== "error") {
-      setTimeout(() => {
-        if (!el.isConnected) return;
-        el.style.transition = "opacity .3s";
-        el.style.opacity = "0";
-        setTimeout(() => el.remove(), 300);
-      }, 3200);
-    }
+  // Toast lifetimes by severity. Errors used to stay until clicked, on the
+  // theory that a failure the user was not looking at must not be swallowed by
+  // a timer. In practice one batch operation pinned a dozen toasts on screen
+  // permanently and buried the ones worth reading -- the opposite of the
+  // intent. Everything ages out now; the timer pauses while the pointer is
+  // over the stack so a long message can still be read, and the stack folds
+  // past four so it can never cover the terminal.
+  const TOAST_MS = { ok: 2500, info: 4000, warn: 6000, error: 10000 };
+  const TOAST_MAX = 4;
+  const TOAST_DEDUPE_MS = 5000;
+  /** kind -> [{el, hideTimer, remaining, message, count}] */
+  const toastLive = [];
+  let toastOverflow = null;
+
+  function toastDismiss(entry) {
+    const index = toastLive.indexOf(entry);
+    if (index >= 0) toastLive.splice(index, 1);
+    if (entry.hideTimer) clearTimeout(entry.hideTimer);
+    entry.el.remove();
+    toastUnfold();
   }
+
+  function toastSchedule(entry) {
+    if (entry.hideTimer) clearTimeout(entry.hideTimer);
+    if (entry.remaining <= 0) return;
+    entry.hideTimer = setTimeout(() => toastDismiss(entry), entry.remaining);
+  }
+
+  /** Collapse everything past TOAST_MAX behind one "N more" chip. */
+  function toastUnfold() {
+    const hidden = toastLive.slice(0, Math.max(0, toastLive.length - TOAST_MAX));
+    for (const entry of toastLive) entry.el.classList.toggle("toast-folded", hidden.includes(entry));
+    if (!hidden.length) {
+      if (toastOverflow) { toastOverflow.remove(); toastOverflow = null; }
+      return;
+    }
+    if (!toastOverflow) {
+      toastOverflow = document.createElement("button");
+      toastOverflow.type = "button";
+      toastOverflow.className = "toast toast-more";
+      toastOverflow.addEventListener("click", () => {
+        for (const entry of toastLive) entry.el.classList.remove("toast-folded");
+        if (toastOverflow) { toastOverflow.remove(); toastOverflow = null; }
+      });
+      els.toasts.appendChild(toastOverflow);
+    }
+    toastOverflow.textContent = `还有 ${hidden.length} 条通知`;
+  }
+
+  function toast(message, kind) {
+    const level = kind === "error" || kind === "warn" || kind === "ok" ? kind : "info";
+    // A message repeating within a few seconds is the same event, not a new
+    // one: count it instead of stacking a second identical card.
+    const recent = toastLive.find((e) => e.message === message && e.level === level);
+    if (recent) {
+      recent.count += 1;
+      recent.countEl.textContent = `×${recent.count}`;
+      recent.countEl.classList.remove("hidden");
+      recent.remaining = TOAST_MS[level];
+      toastSchedule(recent);
+      toastUnfold();
+      return;
+    }
+
+    const el = document.createElement("div");
+    el.className = `toast ${level}`;
+    el.setAttribute("role", level === "error" || level === "warn" ? "alert" : "status");
+    const text = document.createElement("span");
+    text.className = "toast-msg";
+    text.textContent = message;
+    const countEl = document.createElement("span");
+    countEl.className = "toast-count hidden";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "toast-x";
+    close.setAttribute("aria-label", "关闭通知");
+    close.textContent = "×";
+    el.append(text, countEl, close);
+    els.toasts.appendChild(el);
+
+    const entry = {
+      el, message, level, countEl, count: 1,
+      hideTimer: null, remaining: TOAST_MS[level],
+    };
+    // Click anywhere dismisses (kept from the first version); the × is for
+    // discoverability and for anyone who does not realise the card is a button.
+    el.addEventListener("click", () => toastDismiss(entry));
+    toastLive.push(entry);
+    toastSchedule(entry);
+    toastUnfold();
+  }
+
+  // Hovering the stack pauses every timer, so a message that needs reading is
+  // not lost to the clock. Leaving restarts it from where it stopped.
+  els.toasts.addEventListener("mouseenter", () => {
+    for (const entry of toastLive) {
+      if (entry.hideTimer) { clearTimeout(entry.hideTimer); entry.hideTimer = null; }
+    }
+  });
+  els.toasts.addEventListener("mouseleave", () => {
+    for (const entry of toastLive) toastSchedule(entry);
+  });
 
   // Dialogs must never overwrite the input the user is typing into (that
   // actually shipped as a rename that silently sent the *old* name back to the
@@ -295,11 +399,20 @@
     return run;
   }
 
-  function confirmDialog(message, title) {
+  // ``variant`` decides the confirm button's weight. It used to be red for
+  // every confirmation -- including "generate a new share link", which is
+  // recoverable -- so the colour stopped meaning "this destroys something" and
+  // became noise. ``danger`` is reserved for irreversible loss.
+  //   danger -> irreversible (kill a session, delete a user/file/recording)
+  //   warn   -> invalidates or overwrites something (regenerate a link, overwrite)
+  //   primary-> ordinary confirmation
+  function confirmDialog(message, title, opts) {
+    const variant = (opts && opts.variant) || "danger";
     return afterCurrentDialog(() => new Promise((resolve) => {
       confirmDialogOpen = true;
       els.confirmTitle.textContent = title || "确认";
       els.confirmMessage.textContent = message;
+      els.confirmOk.className = variant === "danger" ? "danger" : variant === "warn" ? "warn-btn" : "primary";
       els.confirmOverlay.classList.remove("hidden");
       const done = (value) => {
         confirmDialogOpen = false;
@@ -512,6 +625,136 @@
     s.tabEl.title = state === "standby" ? "未连接（点击打开）" : "";
   }
 
+  // -- 出站写合批 -------------------------------------------------------
+  //
+  // One `term.write` per WebSocket message is one parse-and-diff pass per
+  // message. A `seq 1 50000` produces thousands of small messages, so the
+  // main thread spends all its time re-entering the parser and never gets to
+  // paint -- the terminal appears to freeze, then lurch. Queuing the frames and
+  // handing xterm a single buffer per animation frame turns N passes into one.
+  const WRITE_FLUSH_MS = 16;
+
+  function enqueueWrite(s, bytes) {
+    // While a resync is in flight the replay supersedes whatever arrives: the
+    // server's scrollback already contains these bytes (it appended them before
+    // it snapshotted), so writing them as well would duplicate them. Drop, do
+    // not queue.
+    if (s.resyncing) return;
+    s.writeFrames += 1;
+    s.writeQueue.push(bytes);
+    if (s.writeTimer !== null) return;
+    s.writeTimer = setTimeout(() => flushWrite(s), WRITE_FLUSH_MS);
+  }
+
+  function flushWrite(s) {
+    s.writeTimer = null;
+    if (!s.writeQueue.length || s.resyncing) return;
+    const chunks = s.writeQueue;
+    s.writeQueue = [];
+    s.writeBatches += 1;
+    // One merged buffer, one call: xterm's parser is far happier with a few
+    // large writes than with many small ones.
+    let total = 0;
+    for (const chunk of chunks) total += chunk.length;
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.length; }
+    if (s.sentry) {
+      try { s.sentry.consume(merged); }
+      catch { try { s.term.write(merged); } catch { /* 忽略 */ } }
+      // Any traffic counts as transfer progress; re-arm the watchdog that
+      // releases the input lock if a transfer dies without `session_end`.
+      if (s.zmodemActive) armZmodemWatchdog(s);
+    } else {
+      try { s.term.write(merged); } catch { /* 忽略 */ }
+    }
+  }
+
+  // -- 尺寸合流 ---------------------------------------------------------
+  //
+  // Both directions matter: the window resize handler must not call `fit()`
+  // per pixel, and the terminal's own `onResize` must not forward per-pixel
+  // changes to the server (each one is a SIGWINCH and a full repaint over
+  // there). A size that did not change is not sent at all.
+  const RESIZE_MS = 120;
+
+  function scheduleResize(s, cols, rows) {
+    s.pendingCols = cols;
+    s.pendingRows = rows;
+    if (s.resizeTimer !== null) return;
+    s.resizeTimer = setTimeout(() => {
+      s.resizeTimer = null;
+      const c = s.pendingCols;
+      const r = s.pendingRows;
+      if (!c || !r || (c === s.sentCols && r === s.sentRows)) return;
+      s.sentCols = c;
+      s.sentRows = r;
+      sendControl(s, { type: "resize", cols: c, rows: r });
+    }, RESIZE_MS);
+  }
+
+  let windowResizeTimer = null;
+  function fitActiveSoon() {
+    if (windowResizeTimer !== null) clearTimeout(windowResizeTimer);
+    windowResizeTimer = setTimeout(() => {
+      windowResizeTimer = null;
+      const s = activeId && sessions.get(activeId);
+      if (s) { try { s.fit.fit(); } catch { /* 隐藏时忽略 */ } }
+    }, RESIZE_MS);
+  }
+
+  // -- 失步与重新同步 ---------------------------------------------------
+  //
+  // Shedding frames keeps the connection alive, but a full-screen application
+  // then holds a screen built from an incomplete stream: its next partial
+  // redraw paints the wrong cells and the display stays wrong until something
+  // forces a full repaint. Nothing could, so say so and offer one.
+  function markDesynced(s, note) {
+    s.desynced = true;
+    s.tabEl.classList.add("desync");
+    if (s.id === activeId) showDesyncBar(note);
+  }
+
+  function clearDesync(s) {
+    s.desynced = false;
+    s.tabEl.classList.remove("desync");
+    if (s.id === activeId) hideDesyncBar();
+  }
+
+  function showDesyncBar(note) {
+    els.desyncNote.textContent = note || "输出过快，部分内容已省略";
+    els.desyncBar.classList.remove("hidden");
+  }
+
+  function hideDesyncBar() {
+    els.desyncBar.classList.add("hidden");
+  }
+
+  // Ask the server to replay what it still holds into a cleared screen. That
+  // is an honest best effort, not a guarantee: bytes the server also shed are
+  // gone for good, and a full-screen application may still need its own
+  // repaint (Ctrl+L, or `resize`) afterwards. The bar says exactly that.
+  const RESYNC_TIMEOUT_MS = 4000;
+
+  function requestResync(s) {
+    if (!s) return;
+    flushWrite(s);
+    s.writeQueue = [];
+    s.resyncing = true;
+    try { s.term.reset(); } catch { /* 忽略 */ }
+    clearDesync(s);
+    sendControl(s, { type: "resync" });
+    // If the reply never comes -- the socket died between the request and the
+    // replay -- the terminal must not stay write-locked forever.
+    if (s.resyncTimer) clearTimeout(s.resyncTimer);
+    s.resyncTimer = setTimeout(() => {
+      s.resyncTimer = null;
+      s.resyncing = false;
+    }, RESYNC_TIMEOUT_MS);
+  }
+
+  els.desyncBtn.addEventListener("click", () => requestResync(activeId && sessions.get(activeId)));
+
   // -- 连接池：最多 AUTO_CONNECT_MAX 个会话保持在线 ----------------------
 
   function noteLive(s) {
@@ -584,7 +827,16 @@
       setConnectionFor(s, "已连接", "ok");
       sendControl(s, { type: "attach", session: s.id, cols: s.term.cols, rows: s.term.rows, share: s.share || undefined });
       if (s.heartbeat) clearInterval(s.heartbeat);
-      s.heartbeat = setInterval(() => sendControl(s, { type: "ping" }), 25000);
+      s.heartbeat = setInterval(() => {
+        // Piggy-back the client's write-batching counters on the heartbeat that
+        // already goes out every 25s. They say whether coalescing is actually
+        // happening in the field, which is the one number that proves the
+        // frame-batching fix is working on a real page rather than in a test.
+        const coalesced = s.writeBatches > 0 ? s.writeFrames - s.writeBatches : 0;
+        s.writeFrames = 0;
+        s.writeBatches = 0;
+        sendControl(s, { type: "ping", coalesced });
+      }, 25000);
     };
 
     ws.onmessage = (event) => {
@@ -601,12 +853,7 @@
           s.pendingReplayClear = false;
           try { s.term.reset(); } catch { /* 忽略 */ }
         }
-        if (s.sentry) {
-          try { s.sentry.consume(bytes); } catch { s.term.write(bytes); }
-          // Any traffic counts as transfer progress; re-arm the watchdog that
-          // releases the input lock if a transfer dies without `session_end`.
-          if (s.zmodemActive) armZmodemWatchdog(s);
-        } else s.term.write(bytes);
+        enqueueWrite(s, bytes);
       }
     };
 
@@ -681,7 +928,21 @@
         s.tabEl.querySelector(".label").textContent = msg.name;
         break;
       case "notice":
-        toast(msg.msg || "提示", msg.level === "error" ? "error" : "");
+        toast(msg.msg || "提示", msg.level === "error" ? "error" : msg.level === "warn" ? "warn" : "info");
+        break;
+      case "resynced":
+        // The replay has been fully enqueued behind this marker. Live output
+        // resumes from here and only here, so nothing can land on top of it.
+        s.resyncing = false;
+        if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
+        flushWrite(s);
+        break;
+      case "desync":
+        // Distinct from a notice: the screen is now known to be incomplete, and
+        // the remedy is a resync rather than an acknowledgement. Surfaced as a
+        // bar with a button, not a toast that ages out before it is read.
+        markDesynced(s, msg.msg);
+        toast(msg.msg || "输出过快，部分内容已省略", "warn");
         break;
       case "evicted":
         // A notice, not terminal output: writing it into the buffer would make
@@ -719,10 +980,46 @@
       fontFamily: prefs.fontFamily || DEFAULT_MONO,
       theme: resolveTheme(),
     }));
+    // Width table first: without it xterm uses its bundled Unicode v6 data,
+    // whose East Asian widths are years out of date. Every CJK glyph then
+    // occupies the wrong number of cells and the whole line slides -- the
+    // Chinese-text version of 花屏. Must be active before any data is written.
+    if (window.Unicode11Addon && window.Unicode11Addon.Unicode11Addon) {
+      try {
+        term.loadAddon(new Unicode11Addon.Unicode11Addon());
+        term.unicode.activeVersion = "11";
+      } catch { /* 旧核心不支持时退回内置宽度表 */ }
+    }
+    // Which width table is actually in force. xterm's bundled one is Unicode v6
+    // and its East Asian widths are years out of date; "Unicode 11" here is the
+    // difference between aligned CJK columns and a line that slides. Surfaced in
+    // Settings because that is a fact a support conversation needs.
+    const unicodeVersion = (term.unicode && term.unicode.activeVersion) || "6";
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     if (window.WebLinksAddon) term.loadAddon(new WebLinksAddon.WebLinksAddon());
     if (window.ImageAddon) term.loadAddon(new ImageAddon.ImageAddon());
+    // Renderer: WebGL first (orders of magnitude faster under a flood), then
+    // Canvas for machines where WebGL will not initialise (remote desktop,
+    // software-only GL, locked-down browsers), then xterm's DOM renderer. A
+    // failure to accelerate must degrade, never leave the terminal blank.
+    let renderer = "dom";
+    if (prefs.termRenderer !== "dom" && window.WebglAddon && window.WebglAddon.WebglAddon) {
+      try {
+        term.loadAddon(new WebglAddon.WebglAddon());
+        renderer = "webgl";
+      } catch { renderer = "dom"; }
+    }
+    if (renderer === "dom" && prefs.termRenderer === "webgl") {
+      // Explicitly asked for WebGL and it failed: fall through to canvas.
+      prefs.termRenderer = "auto";
+    }
+    if (renderer === "dom" && prefs.termRenderer !== "dom" && window.CanvasAddon && window.CanvasAddon.CanvasAddon) {
+      try {
+        term.loadAddon(new CanvasAddon.CanvasAddon());
+        renderer = "canvas";
+      } catch { renderer = "dom"; }
+    }
     term.open(pane);
 
     const tabEl = document.createElement("div");
@@ -732,7 +1029,7 @@
     els.tabs.appendChild(tabEl);
 
     const s = {
-      id, name, term, fit, pane, tabEl,
+      id, name, term, fit, pane, tabEl, renderer, unicodeVersion,
       ws: null, heartbeat: null, reconnectTimer: null, delay: 500,
       intentional: false, exited: false, standby: false, attached: false,
       pendingReplayClear: false,
@@ -743,6 +1040,18 @@
       sentry: null, zmodemActive: false, zmodemWatchdog: null, everConnected: false,
       searchAddon: null, searchHits: [], searchPos: -1,
       autoConnect: options.autoConnect !== false,
+      // Outbound-terminal write batching (see ws.onmessage): frames queue here
+      // and are handed to xterm once per animation frame instead of once per
+      // WebSocket message.
+      writeQueue: [], writeTimer: null, writeBatches: 0, writeFrames: 0,
+      needsRefit: false,
+      // Set while a resync replay is in flight; live frames are dropped, not
+      // queued, because the replay is a superset of them.
+      resyncing: false, resyncTimer: null,
+      // Last size reported to the server, so a refit that changes nothing does
+      // not become a resize storm (and a SIGWINCH) at the far end.
+      sentCols: 0, sentRows: 0, resizeTimer: null,
+      desynced: false,
     };
     sessions.set(id, s);
 
@@ -784,7 +1093,12 @@
       if (s.zmodemActive) return;
       sendInput(s, data);
     });
-    term.onResize(({ cols, rows }) => sendControl(s, { type: "resize", cols, rows }));
+    // Coalesced: `fit()` fires this on every layout change, and dragging a
+    // window produces one per pixel. Each one became a `resize` control message
+    // and a SIGWINCH at the far end -- a full-screen app then repaints on every
+    // one of them, which is both the flicker and the freeze. Also skip the
+    // round trip entirely when the size did not actually change.
+    term.onResize(({ cols, rows }) => scheduleResize(s, cols, rows));
 
     // Terminal right-click. The old behaviour ("copy if there is a selection,
     // otherwise paste") is still available, but it was completely undiscoverable
@@ -827,12 +1141,50 @@
     // `connect()` may have skipped its own status write (it ran before
     // `activeId` pointed here), so repaint from the resulting state.
     setConnection(...describeConnection(s));
-    requestAnimationFrame(() => {
-      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
-      s.term.focus();
-      sendControl(s, { type: "resize", cols: s.term.cols, rows: s.term.rows });
-    });
+    // Fit *synchronously* after the pane becomes visible. Deferring it to
+    // requestAnimationFrame let the browser paint the tab switch first -- at
+    // which point the terminal still had the hidden pane's zero size, so every
+    // switch showed one blank frame and then jumped. Reading the layout here
+    // forces the measurement before that paint can happen.
+    try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
+    s.needsRefit = false;
+    try { s.term.refresh(0, Math.max(0, s.term.rows - 1)); } catch { /* 忽略 */ }
+    scheduleResize(s, s.term.cols, s.term.rows);
+    if (s.desynced) showDesyncBar(); else hideDesyncBar();
+    syncZmodemButton(s);
+    updateRendererNote(s);
+    requestAnimationFrame(() => s.term.focus());
   }
+
+  // "Which renderer am I actually on" is not a guess: WebGL falls back silently
+  // on machines without it, and the difference is the whole story when someone
+  // reports a slow terminal.
+  const RENDERER_LABELS = { webgl: "WebGL", canvas: "Canvas", dom: "DOM" };
+
+  function updateRendererNote(s) {
+    if (!els.rendererNote) return;
+    const label = RENDERER_LABELS[s && s.renderer] || "DOM";
+    const uni = (s && s.unicodeVersion) || "6";
+    els.rendererNote.textContent = `当前：${label} · Unicode ${uni}`;
+  }
+
+  // Renderer-independent screen text. The WebGL and Canvas renderers paint to
+  // a canvas and leave no ``.xterm-rows`` DOM behind at all, so "what does the
+  // terminal actually say" cannot be answered by reading the page -- which is
+  // the first thing any support conversation asks for, and the only way to
+  // assert on terminal content without pinning a renderer. Reads xterm's own
+  // buffer, which holds the same text whichever renderer drew it.
+  window.__wsctlScreen = () => {
+    const s = activeId && sessions.get(activeId);
+    if (!s || !s.term || !s.term.buffer) return "";
+    const buf = s.term.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buf.length; i += 1) {
+      const line = buf.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines.join("\n");
+  };
 
   function detachTab(id) {
     const s = sessions.get(id);
@@ -856,7 +1208,9 @@
   async function killTab(id) {
     const s = sessions.get(id);
     const name = s ? s.name : id;
-    const ok = await confirmDialog(`确定终止会话「${name}」？该 shell 进程会被结束。`, "终止会话");
+    const ok = await confirmDialog(
+      `确定终止会话「${name}」？该 shell 进程会被结束。`, "终止会话", { variant: "danger" },
+    );
     if (!ok) return;
     detachTab(id);
     try { await api("DELETE", `/api/sessions/${id}`); toast("会话已终止", "ok"); }
@@ -934,7 +1288,7 @@
         case "clear": clearScreen(s); break;
         case "font+": changeFont(s, +1); break;
         case "font-": changeFont(s, -1); break;
-        case "zmodem": els.zmodemBtn.click(); break;
+        case "zmodem": toggleZmodem(s); break;
         case "detach": detachTab(s.id); break;
         case "kill": killTab(s.id); break;
         default: break;
@@ -1058,10 +1412,7 @@
     }
   });
 
-  window.addEventListener("resize", () => {
-    const s = activeId && sessions.get(activeId);
-    if (s) { try { s.fit.fit(); } catch { /* 忽略 */ } }
-  });
+  window.addEventListener("resize", fitActiveSoon);
   window.addEventListener("beforeunload", () => {
     for (const s of sessions.values()) { s.intentional = true; if (s.ws) s.ws.close(); }
   });
@@ -1193,7 +1544,9 @@
   });
   els.shareRegenerate.addEventListener("click", async () => {
     if (!shareSid) return;
-    if (!(await confirmDialog("生成新链接会立即使旧链接失效，是否继续？", "生成新链接"))) return;
+    if (!(await confirmDialog(
+      "生成新链接会立即使旧链接失效，是否继续？", "生成新链接", { variant: "warn" },
+    ))) return;
     try {
       const info = await api("POST", `/api/sessions/${shareSid}/share`, {
         writable: els.shareWrite.checked,
@@ -1225,136 +1578,152 @@
     return `${seconds}秒`;
   }
 
-  // Which half of the session dialog is showing. The finished half used to be
-  // unreachable: the rows were written to `term_sessions` and pruned by the
-  // retention policy, but never displayed anywhere.
-  let sessionTab = "live";
+    // Which half of the session dialog is showing. The finished half used to be
+    // unreachable: the rows were written to `term_sessions` and pruned by the
+    // retention policy, but never displayed anywhere.
+    let sessionTab = "live";
+    // Row payloads live here, keyed by id, so the list can use one delegated
+    // listener instead of three closures per row (see the file panel).
+    const sessionRowData = new Map();
 
-  async function refreshSessions() {
-    els.sessionsList.innerHTML = '<li class="sk"></li><li class="sk"></li><li class="sk"></li>';
-    if (sessionTab === "history") return refreshSessionHistory();
-    let list;
-    try { list = await api("GET", "/api/sessions"); }
-    catch (err) { toast(String(err.message || err), "error"); return; }
-    const filter = (els.sessionFilter.value || "").trim().toLowerCase();
-    const now = Date.now() / 1000;
-    els.sessionsList.innerHTML = "";
-    const shown = list.filter((i) =>
-      !filter || i.name.toLowerCase().includes(filter) || i.id.toLowerCase().includes(filter));
-    if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty">暂无会话</li>'; return; }
-    for (const info of shown) {
-      const li = document.createElement("li");
-      li.className = "session-row";
-      const label = document.createElement("span");
-      label.className = "session-name";
-      label.textContent = info.name;
-      const tags = [
-        `${info.clients} 连接`,
-        `运行 ${formatDuration(now - info.created_at)}`,
-        `空闲 ${formatDuration(now - info.last_active)}`,
-      ];
-      if (info.backend && info.backend !== "local") tags.push(info.backend);
-      if (info.bytes) tags.push(formatSize(info.bytes));
-      if (info.shared) tags.push("已分享");
-      if (info.recording) tags.push("录制中");
-      label.title = tags.join(" · ");
-      const meta = document.createElement("span");
-      meta.className = "session-meta";
-      meta.textContent = tags.join(" · ");
-      const openBtn = document.createElement("button");
-      openBtn.className = "text-btn";
-      openBtn.textContent = sessions.has(info.id) ? "切换" : "打开";
-      openBtn.addEventListener("click", () => {
-        if (sessions.has(info.id)) activateTab(info.id);
-        else createTab(info.id, info.name, { recording: info.recording });
+    els.sessionsList.addEventListener("click", async (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest("button[data-act]") : null;
+      if (!btn) return;
+      const act = btn.dataset.act;
+      const row = sessionRowData.get(btn.dataset.sid);
+      if (!row) return;
+      if (act === "open") {
+        if (sessions.has(row.id)) activateTab(row.id);
+        else createTab(row.id, row.name, { recording: row.recording });
         els.sessionsOverlay.classList.add("hidden");
-      });
-      const killBtn = document.createElement("button");
-      killBtn.className = "text-btn danger";
-      killBtn.textContent = "终止";
-      killBtn.addEventListener("click", async () => {
-        if (sessions.has(info.id)) { await killTab(info.id); }
+      } else if (act === "kill") {
+        if (sessions.has(row.id)) { await killTab(row.id); }
         else {
-          if (!(await confirmDialog(`确定终止会话「${info.name}」？`, "终止会话"))) return;
-          try { await api("DELETE", `/api/sessions/${info.id}`); toast("会话已终止", "ok"); } catch { /* 忽略 */ }
+          if (!(await confirmDialog(
+            `确定终止会话「${row.name}」？`, "终止会话", { variant: "danger" },
+          ))) return;
+          try { await api("DELETE", `/api/sessions/${row.id}`); toast("会话已终止", "ok"); } catch { /* 忽略 */ }
           refreshSessions();
         }
-      });
-      li.append(label, meta, openBtn, killBtn);
-      els.sessionsList.appendChild(li);
-    }
-  }
-
-  async function refreshSessionHistory() {
-    let rows;
-    try { rows = await api("GET", "/api/sessions/history"); }
-    catch (err) { toast(String(err.message || err), "error"); return; }
-    const filter = (els.sessionFilter.value || "").trim().toLowerCase();
-    els.sessionsList.innerHTML = "";
-    const shown = rows.filter((r) =>
-      !filter || String(r.name || "").toLowerCase().includes(filter)
-        || String(r.id || "").toLowerCase().includes(filter));
-    if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty">暂无已结束的会话</li>'; return; }
-    const STATUS_LABELS = { killed: "已终止", expired: "已过期", stopped: "已停止", interrupted: "已中断" };
-    for (const r of shown) {
-      const li = document.createElement("li");
-      li.className = "session-row";
-      const label = document.createElement("span");
-      label.className = "session-name";
-      label.textContent = r.name || r.id;
-      const meta = document.createElement("span");
-      meta.className = "session-meta";
-      meta.textContent = [
-        STATUS_LABELS[r.status] || r.status,
-        `运行 ${formatDuration(r.duration)}`,
-        r.backend && r.backend !== "local" ? r.backend : "",
-      ].filter(Boolean).join(" · ");
-      li.title = `命令：${r.command || (r.argv ? JSON.parse(r.argv).join(" ") : "默认 shell")}`;
-      const detail = document.createElement("button");
-      detail.className = "text-btn";
-      detail.textContent = "详情";
-      detail.addEventListener("click", async () => {
+      } else if (act === "detail") {
         try {
-          const info = await api("GET", `/api/sessions/${encodeURIComponent(r.id)}/detail`);
-          toast(`${info.name}：${info.status}，运行 ${formatDuration(info.duration)}`, "");
+          const info = await api("GET", `/api/sessions/${encodeURIComponent(row.id)}/detail`);
+          toast(`${info.name}：${info.status}，运行 ${formatDuration(info.duration)}`, "info");
         } catch (err) { toast(String(err.message || err), "error"); }
-      });
-      const reopen = document.createElement("button");
-      reopen.className = "text-btn";
-      reopen.textContent = "重新打开";
-      // An SSH session needs its structured target (host/user/port/identity)
-      // which history does not keep. Reopening it as a local shell would run
-      // the remote command on this machine -- so the button says why instead.
-      if (r.backend === "ssh") {
-        reopen.disabled = true;
-        reopen.title = "SSH 会话需在「新建会话」中重新填写目标后打开";
-      }
-      reopen.addEventListener("click", async () => {
+      } else if (act === "reopen") {
         try {
           // Replay the recorded argv, not "command + backend name". For an SSH
-          // session the old shape sent backend=ssh with no ssh block (400),
-          // and the tempting fix -- dropping the backend -- would have run the
+          // session the old shape sent backend=ssh with no ssh block (400), and
+          // the tempting fix -- dropping the backend -- would have run the
           // *remote* command on the *local* shell.
           let argv = [];
-          try { argv = typeof r.argv === "string" ? JSON.parse(r.argv) : (r.argv || []); }
+          try { argv = typeof row.argv === "string" ? JSON.parse(row.argv) : (row.argv || []); }
           catch { argv = []; }
           if (!argv.length) {
             toast("该会话未记录启动命令，无法原样重开", "error");
             return;
           }
-          const backend = r.backend === "tmux" ? "tmux" : "local";
-          const info = await api("POST", `/api/sessions/${encodeURIComponent(r.id)}/reopen`, {
-            argv, name: r.name, cwd: r.cwd || undefined, backend,
+          const backend = row.backend === "tmux" ? "tmux" : "local";
+          const info = await api("POST", `/api/sessions/${encodeURIComponent(row.id)}/reopen`, {
+            argv, name: row.name, cwd: row.cwd || undefined, backend,
           });
           els.sessionsOverlay.classList.add("hidden");
           sessionTab = "live";
           createTab(info.id, info.name || "终端", { recording: info.recording });
         } catch (err) { toast(String(err.message || err), "error"); }
-      });
-      li.append(label, meta, detail, reopen);
-      els.sessionsList.appendChild(li);
+      }
+    });
+
+    function sessionButton(act, sid, label, cls) {
+      const b = document.createElement("button");
+      b.className = "text-btn" + (cls ? " " + cls : "");
+      b.dataset.act = act;
+      b.dataset.sid = sid;
+      b.textContent = label;
+      return b;
     }
-  }
+
+    async function refreshSessions() {
+      els.sessionsList.innerHTML = '<li class="sk"></li><li class="sk"></li><li class="sk"></li>';
+      if (sessionTab === "history") return refreshSessionHistory();
+      let list;
+      try { list = await api("GET", "/api/sessions"); }
+      catch (err) { toast(String(err.message || err), "error"); return; }
+      const filter = (els.sessionFilter.value || "").trim().toLowerCase();
+      const now = Date.now() / 1000;
+      els.sessionsList.innerHTML = "";
+      sessionRowData.clear();
+      const shown = list.filter((i) =>
+        !filter || i.name.toLowerCase().includes(filter) || i.id.toLowerCase().includes(filter));
+      if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty">暂无会话</li>'; return; }
+      for (const info of shown) {
+        sessionRowData.set(info.id, info);
+        const li = document.createElement("li");
+        li.className = "session-row";
+        const label = document.createElement("span");
+        label.className = "session-name";
+        label.textContent = info.name;
+        const tags = [
+          `${info.clients} 连接`,
+          `运行 ${formatDuration(now - info.created_at)}`,
+          `空闲 ${formatDuration(now - info.last_active)}`,
+        ];
+        if (info.backend && info.backend !== "local") tags.push(info.backend);
+        if (info.bytes) tags.push(formatSize(info.bytes));
+        if (info.shared) tags.push("已分享");
+        if (info.recording) tags.push("录制中");
+        label.title = tags.join(" · ");
+        const meta = document.createElement("span");
+        meta.className = "session-meta";
+        meta.textContent = tags.join(" · ");
+        li.append(
+          label, meta,
+          sessionButton("open", info.id, sessions.has(info.id) ? "切换" : "打开"),
+          sessionButton("kill", info.id, "终止", "danger"),
+        );
+        els.sessionsList.appendChild(li);
+      }
+    }
+
+    async function refreshSessionHistory() {
+      let rows;
+      try { rows = await api("GET", "/api/sessions/history"); }
+      catch (err) { toast(String(err.message || err), "error"); return; }
+      const filter = (els.sessionFilter.value || "").trim().toLowerCase();
+      els.sessionsList.innerHTML = "";
+      sessionRowData.clear();
+      const shown = rows.filter((r) =>
+        !filter || String(r.name || "").toLowerCase().includes(filter)
+          || String(r.id || "").toLowerCase().includes(filter));
+      if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty">暂无已结束的会话</li>'; return; }
+      const STATUS_LABELS = { killed: "已终止", expired: "已过期", stopped: "已停止", interrupted: "已中断" };
+      for (const r of shown) {
+        sessionRowData.set(r.id, r);
+        const li = document.createElement("li");
+        li.className = "session-row";
+        const label = document.createElement("span");
+        label.className = "session-name";
+        label.textContent = r.name || r.id;
+        const meta = document.createElement("span");
+        meta.className = "session-meta";
+        meta.textContent = [
+          STATUS_LABELS[r.status] || r.status,
+          `运行 ${formatDuration(r.duration)}`,
+          r.backend && r.backend !== "local" ? r.backend : "",
+        ].filter(Boolean).join(" · ");
+        li.title = `命令：${r.command || (r.argv ? JSON.parse(r.argv).join(" ") : "默认 shell")}`;
+        // An SSH session needs its structured target (host/user/port/identity)
+        // which history does not keep. Reopening it as a local shell would run
+        // the remote command on this machine -- so the button says why instead.
+        const reopen = sessionButton("reopen", r.id, "重新打开");
+        if (r.backend === "ssh") {
+          reopen.disabled = true;
+          reopen.title = "SSH 会话需在「新建会话」中重新填写目标后打开";
+        }
+        li.append(label, meta, sessionButton("detail", r.id, "详情"), reopen);
+        els.sessionsList.appendChild(li);
+      }
+    }
 
   document.querySelectorAll("[data-stab]").forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -1365,7 +1734,7 @@
     });
   });
 
-  els.sessionFilter.addEventListener("input", () => refreshSessions());
+  els.sessionFilter.addEventListener("input", debounceFilter(() => refreshSessions()));
   els.sessionsDetachAll.addEventListener("click", () => {
     for (const id of Array.from(sessions.keys())) detachTab(id);
     els.sessionsOverlay.classList.add("hidden");
@@ -1390,6 +1759,18 @@
   // a "load more"), so a hundred-row table was one unsorted wall of text.
   const TABLE_PAGE = 25;
   const tableState = {};
+
+  // A filter box refetches and rebuilds the whole list. On every keystroke
+  // that is one request and one full DOM rebuild per character; with a few
+  // hundred rows it is also a stutter per character.
+  function debounceFilter(fn, ms) {
+    const wait = ms === undefined ? 250 : ms;
+    let timer = null;
+    return () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => { timer = null; fn(); }, wait);
+    };
+  }
 
   function sortRows(rows, key, spec) {
     const { field, numeric } = spec[key] || {};
@@ -1477,22 +1858,38 @@
     els.adminNote.style.color = isError ? "var(--danger)" : "var(--ok)";
   }
 
+  // ``adminTab`` is the single source of truth; the buttons' ``active`` class
+  // is *derived* from it. Two sources is exactly what shipped: ``index.html``
+  // marked 概览 as selected while ``adminTab`` still said ``"users"``, so the
+  // panel opened with 概览 highlighted and the user table underneath. The
+  // selector is also scoped to ``[data-tab]`` -- a bare ``.tab2`` matches the
+  // session dialog's 运行中/已结束 tabs too and used to clear their highlight.
+  function setAdminTab(name) {
+    adminTab = name;
+    for (const t of document.querySelectorAll("#admin-overlay .tab2")) {
+      t.classList.toggle("active", t.dataset.tab === adminTab);
+    }
+  }
+
   async function openAdmin() {
     els.adminOverlay.classList.remove("hidden");
     adminNote("");
+    setAdminTab("overview");
     await renderAdmin();
   }
   els.adminBtn.addEventListener("click", openAdmin);
   els.adminClose.addEventListener("click", () => els.adminOverlay.classList.add("hidden"));
-  document.querySelectorAll(".tab2").forEach((tab) => {
+  document.querySelectorAll("#admin-overlay .tab2").forEach((tab) => {
     tab.addEventListener("click", () => {
-      document.querySelectorAll(".tab2").forEach((t) => t.classList.toggle("active", t === tab));
-      adminTab = tab.dataset.tab;
+      setAdminTab(tab.dataset.tab);
       renderAdmin();
     });
   });
 
   async function renderAdmin() {
+    // Belt and braces: however ``renderAdmin`` is reached, the highlight and
+    // the content must agree.
+    setAdminTab(adminTab);
     // Rebuilding the whole body used to throw away scroll position and focus,
     // so a filter typed into the audit box vanished the moment anything
     // refreshed. Both are restored across the rebuild.
@@ -2059,7 +2456,7 @@
     s.zmodemWatchdog = setTimeout(() => {
       s.zmodemWatchdog = null;
       if (s.zmodemActive) {
-        s.zmodemActive = false;
+        releaseZmodem(s);
         toast("文件传输已中断，终端输入已恢复", "error");
       }
     }, ZMODEM_WATCHDOG_MS);
@@ -2068,6 +2465,37 @@
   function releaseZmodem(s) {
     if (s.zmodemWatchdog) { clearTimeout(s.zmodemWatchdog); s.zmodemWatchdog = null; }
     s.zmodemActive = false;
+    syncZmodemButton(s);
+  }
+
+  // The transfer switch must be unusable *while* a transfer runs. Unloading
+  // the sentry mid-session handed the protocol bytes straight to
+  // `term.write`, which rendered the ZMODEM handshake as text -- genuine
+  // 花屏 -- and released the input lock so keystrokes went into the protocol
+  // stream as well. There is now no code path that can do either.
+  function syncZmodemButton(s) {
+    const busy = Boolean(s && s.zmodemActive);
+    els.zmodemBtn.disabled = busy;
+    els.zmodemBtn.title = busy ? "传输进行中，结束后才能关闭" : "切换 ZMODEM 文件传输（sz/rz）";
+    els.zmodemBtn.classList.toggle("locked", busy);
+    const item = els.termMenu.querySelector('[data-taction="zmodem"]');
+    if (item) {
+      item.disabled = busy;
+      item.title = busy ? "传输进行中，结束后才能关闭" : "切换 ZMODEM 传输";
+    }
+  }
+
+  function toggleZmodem(s) {
+    if (!s || s.zmodemActive) return;
+    if (s.sentry) {
+      s.sentry = null;
+      releaseZmodem(s);
+      els.zmodemBtn.classList.remove("rec-on");
+    } else {
+      s.sentry = makeSentry(s);
+      els.zmodemBtn.classList.toggle("rec-on", Boolean(s.sentry));
+    }
+    syncZmodemButton(s);
   }
 
   function makeSentry(s) {
@@ -2084,6 +2512,7 @@
     let zsession;
     try { zsession = detection.confirm(); } catch { return; }
     s.zmodemActive = true;
+    syncZmodemButton(s);
     armZmodemWatchdog(s);
     const done = () => releaseZmodem(s);
     if (zsession.type === "send") {
@@ -2105,12 +2534,7 @@
       zsession.start();
     }
   }
-  els.zmodemBtn.addEventListener("click", () => {
-    const s = activeId && sessions.get(activeId);
-    if (!s) return;
-    if (s.sentry) { s.sentry = null; releaseZmodem(s); els.zmodemBtn.classList.remove("rec-on"); }
-    else { s.sentry = makeSentry(s); if (s.sentry) els.zmodemBtn.classList.add("rec-on"); }
-  });
+  els.zmodemBtn.addEventListener("click", () => toggleZmodem(activeId && sessions.get(activeId)));
 
   // -- 快捷键 -----------------------------------------------------------
 
@@ -2399,13 +2823,26 @@
   els.setTheme.value = prefs.theme;
   els.setFontsize.value = String(prefs.fontSize);
   els.setFont.value = prefs.fontFamily || "";
-  els.settingsBtn.addEventListener("click", () => els.settingsOverlay.classList.remove("hidden"));
+  els.settingsBtn.addEventListener("click", () => {
+    els.settingsOverlay.classList.remove("hidden");
+    updateRendererNote(activeId && sessions.get(activeId));
+  });
   els.settingsClose.addEventListener("click", () => els.settingsOverlay.classList.add("hidden"));
   els.settingsDone.addEventListener("click", () => els.settingsOverlay.classList.add("hidden"));
   els.setRightclick.value = prefs.rightClickMode || "menu";
   els.setRightclick.addEventListener("change", () => {
     prefs.rightClickMode = els.setRightclick.value;
     applyPrefs();
+  });
+  // The renderer is baked into a Terminal when it is constructed, so this
+  // cannot be swapped under a live session. Say so rather than pretending the
+  // change landed: new sessions pick it up at once, existing ones on reload.
+  els.setRenderer.value = prefs.termRenderer || "auto";
+  updateRendererNote(activeId && sessions.get(activeId));
+  els.setRenderer.addEventListener("change", () => {
+    prefs.termRenderer = els.setRenderer.value;
+    applyPrefs();
+    toast("渲染器已更改：新建会话立即生效，已有会话刷新页面后生效", "info");
   });
   els.setTheme.addEventListener("change", () => { prefs.theme = els.setTheme.value; applyPrefs(); });
   els.setFontsize.addEventListener("change", () => { prefs.fontSize = Number(els.setFontsize.value); applyPrefs(); });
@@ -2505,27 +2942,6 @@
         const icon = entry.type === "dir" ? "📁" : "📄";
         const meta = entry.type === "dir" ? "" : formatSize(entry.size);
         li.innerHTML = `<span class="ficon">${icon}</span><span class="fname">${esc(entry.name)}</span><span class="fmeta">${meta}</span>`;
-        li.addEventListener("click", () => {
-          const child = filePath ? `${filePath}/${entry.name}` : entry.name;
-          if (entry.type === "dir") { fileOffset = 0; loadFiles(child); }
-          else window.location.href = `/api/files/download?path=${encodeURIComponent(child)}`;
-        });
-        // A directory is a drop target: dragging a file onto a folder puts it
-        // *in* that folder, which is what people expect from a file manager.
-        if (entry.type === "dir") {
-          li.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); li.classList.add("dir-over"); });
-          li.addEventListener("dragleave", () => li.classList.remove("dir-over"));
-          li.addEventListener("drop", (e) => {
-            e.preventDefault(); e.stopPropagation();
-            li.classList.remove("dir-over");
-            const child = filePath ? `${filePath}/${entry.name}` : entry.name;
-            uploadFiles(e.dataTransfer.files, child);
-          });
-        }
-        li.addEventListener("contextmenu", (e) => {
-          e.preventDefault();
-          openFileMenu(e.clientX, e.clientY, entry);
-        });
         els.fileList.appendChild(li);
       }
       if (data.truncated) els.fileStatus.textContent = `${total} 项（已过滤）`;
@@ -2534,9 +2950,62 @@
     } catch (err) { els.fileStatus.textContent = String(err.message || err); }
   }
 
+  // One listener per container, not one per row. A 200-entry directory used to
+  // install 200 click + 200 contextmenu + up to 200 drag handlers -- 800 live
+  // listeners rebuilt on every page turn and every keystroke of the filter.
+  // The row's identity comes from its dataset, so the list content is plain
+  // markup and nothing needs a closure per entry.
+  function fileEntryAt(target) {
+    const li = target && target.closest ? target.closest("#file-list li[data-name]") : null;
+    if (!li) return null;
+    return { name: li.dataset.name, type: li.dataset.type, el: li };
+  }
+
+  function fileEntryPath(entry) {
+    return filePath ? `${filePath}/${entry.name}` : entry.name;
+  }
+
+  els.fileList.addEventListener("click", (e) => {
+    const entry = fileEntryAt(e.target);
+    if (!entry) return;
+    const child = fileEntryPath(entry);
+    if (entry.type === "dir") { fileOffset = 0; loadFiles(child); }
+    else window.location.href = `/api/files/download?path=${encodeURIComponent(child)}`;
+  });
+
+  els.fileList.addEventListener("contextmenu", (e) => {
+    const entry = fileEntryAt(e.target);
+    if (!entry) return;
+    e.preventDefault();
+    menuEntry = { name: entry.name, type: entry.type };
+    openFileMenu(e.clientX, e.clientY);
+  });
+
+  // A directory is a drop target: dragging a file onto a folder puts it *in*
+  // that folder, which is what people expect from a file manager.
+  els.fileList.addEventListener("dragover", (e) => {
+    const entry = fileEntryAt(e.target);
+    els.fileList.classList.add("dragover");
+    if (!entry || entry.type !== "dir") return;
+    e.preventDefault();
+    e.stopPropagation();
+    entry.el.classList.add("dir-over");
+  });
+  els.fileList.addEventListener("dragleave", (e) => {
+    const entry = fileEntryAt(e.target);
+    if (entry) entry.el.classList.remove("dir-over");
+  });
+  els.fileList.addEventListener("drop", (e) => {
+    const entry = fileEntryAt(e.target);
+    e.preventDefault();
+    els.fileList.classList.remove("dragover");
+    if (entry) entry.el.classList.remove("dir-over");
+    const dest = entry && entry.type === "dir" ? fileEntryPath(entry) : filePath;
+    uploadFiles(e.dataTransfer.files, dest);
+  });
+
   // -- 上下文菜单 -------------------------------------------------------
-  function openFileMenu(x, y, entry) {
-    menuEntry = entry;
+  function openFileMenu(x, y) {
     els.fileMenu.style.left = `${x}px`;
     els.fileMenu.style.top = `${y}px`;
     els.fileMenu.classList.remove("hidden");
@@ -2708,7 +3177,9 @@
       uploadXhr = null;
       if (xhr.status === 409 && !overwrite) {
         // Never silently replace: ask first, then retry with overwrite=1.
-        const ok = await confirmDialog(`「${file.name}」已存在，是否覆盖？`, "覆盖文件");
+        const ok = await confirmDialog(
+          `「${file.name}」已存在，是否覆盖？`, "覆盖文件", { variant: "warn" },
+        );
         if (!ok) {
           tally.skipped += 1;
           queue.shift();
@@ -2750,7 +3221,7 @@
     } catch (err) { toast(String(err.message || err), "error"); }
   });
 
-  els.fileFilter.addEventListener("input", () => { fileOffset = 0; loadFiles(filePath); });
+  els.fileFilter.addEventListener("input", debounceFilter(() => { fileOffset = 0; loadFiles(filePath); }));
   els.fileKind.addEventListener("change", () => { fileOffset = 0; loadFiles(filePath); });
   els.filePrev.addEventListener("click", () => {
     fileOffset = Math.max(0, fileOffset - FILE_PAGE_SIZE);
@@ -2769,11 +3240,8 @@
   els.fileRefresh.addEventListener("click", () => loadFiles(filePath));
   els.fileUploadBtn.addEventListener("click", () => els.fileInput.click());
   els.fileInput.addEventListener("change", () => { uploadFiles(els.fileInput.files); els.fileInput.value = ""; });
-  els.fileList.addEventListener("dragover", (e) => { e.preventDefault(); els.fileList.classList.add("dragover"); });
   els.fileList.addEventListener("dragleave", () => els.fileList.classList.remove("dragover"));
-  els.fileList.addEventListener("drop", (e) => {
-    e.preventDefault(); els.fileList.classList.remove("dragover"); uploadFiles(e.dataTransfer.files);
-  });
+  els.fileRefresh.addEventListener("click", () => loadFiles(filePath));
 
   bootstrap();
 })();

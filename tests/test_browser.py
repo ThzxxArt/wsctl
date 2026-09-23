@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import signal
 import socket
@@ -124,6 +125,25 @@ def _headers_from(page: object) -> dict[str, str]:
 
 
 
+def _screen_text(page: object) -> str:
+    """What the terminal says, on any renderer.
+
+    WebGL and Canvas paint to a canvas and leave no ``.xterm-rows`` DOM behind,
+    so reading the page cannot answer this; ``window.__wsctlScreen`` reads
+    xterm's own buffer instead. Passing the marker in as an argument also keeps
+    the call sites short enough for the linter.
+    """
+    return str(page.evaluate("() => window.__wsctlScreen ? window.__wsctlScreen() : ''"))  # type: ignore[attr-defined]
+
+
+def _wait_screen_includes(page: object, marker: str) -> None:
+    page.wait_for_function(  # type: ignore[attr-defined]
+        "m => (window.__wsctlScreen ? window.__wsctlScreen() : '').includes(m)",
+        arg=marker,
+        timeout=WAIT_MS,
+    )
+
+
 def test_browser_flow(tmp_path: Path) -> None:
     data = tmp_path / "data"
     files = tmp_path / "files"
@@ -161,9 +181,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo BROWSER-OK")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('BROWSER-OK'); }",
+            _wait_screen_includes(page, 'BROWSER-OK'),
                 timeout=WAIT_MS,
             )
 
@@ -177,9 +195,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo ZMODEM-ON-OK")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('ZMODEM-ON-OK'); }",
+            _wait_screen_includes(page, 'ZMODEM-ON-OK'),
                 timeout=WAIT_MS,
             )
             page.click("#zmodem-btn")
@@ -263,7 +279,10 @@ def test_browser_flow(tmp_path: Path) -> None:
             stored = page.evaluate("() => JSON.parse(localStorage.getItem('wsctl-prefs'))")
             assert stored["termTheme"] == "dracula"
             # font family selection persists
-            page.select_option("#set-font", '"JetBrains Mono", ui-monospace, monospace')
+            # Select by *label*, not by the option's value string: 0.1.15 put
+            # the CJK monospace fallbacks into every preset, so pinning the
+            # value made this step fail the moment the font stack improved.
+            page.select_option("#set-font", label="JetBrains Mono")
             stored = page.evaluate("() => JSON.parse(localStorage.getItem('wsctl-prefs'))")
             assert "JetBrains" in stored["fontFamily"]
             # "follow system" page theme
@@ -368,9 +387,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo REPLAY-OK")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('REPLAY-OK'); }",
+            _wait_screen_includes(page, 'REPLAY-OK'),
                 timeout=WAIT_MS,
             )
             page.click("#record-btn")  # stop
@@ -401,9 +418,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             vpage.keyboard.type("echo SHOULD-NOT-APPEAR")
             vpage.keyboard.press("Enter")
             vpage.wait_for_timeout(800)
-            rows = vpage.eval_on_selector(
-                ".term-pane.active .xterm-rows", "el => el.innerText"
-            )
+            rows = vpage.evaluate("() => window.__wsctlScreen()")
             assert "SHOULD-NOT-APPEAR" not in rows
             viewer.close()
 
@@ -884,9 +899,7 @@ def test_browser_hotkey_help_and_search_options(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo MiXeD-case")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('MiXeD-case'); }",
+            _wait_screen_includes(page, 'MiXeD-case'),
                 timeout=15000,
             )
             page.click("#search-btn")
@@ -923,9 +936,7 @@ def test_browser_hotkey_help_and_search_options(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo Q?MARK")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('Q?MARK'); }",
+            _wait_screen_includes(page, 'Q?MARK'),
                 timeout=15000,
             )
             browser.close()
@@ -1097,9 +1108,7 @@ def test_browser_rate_limit_notice_is_a_toast_not_terminal_output(
 
                 # The notice must not be sitting in the buffer where the
                 # scrollback would replay it as if the shell had printed it.
-                rows = page.eval_on_selector(
-                    ".term-pane.active .xterm-rows", "el => el.innerText"
-                )
+                rows = page.evaluate("() => window.__wsctlScreen()")
                 assert "速率超限" not in rows, rows[-400:]
                 assert "[wsctl]" not in rows
 
@@ -1152,6 +1161,12 @@ def test_browser_admin_table_sorts_and_pages_without_duplicating(tmp_path: Path)
             )
             page.click("#admin-btn")
             page.wait_for_selector("#admin-overlay:not(.hidden)", timeout=10000)
+            # Since 0.1.15 the panel opens on 概览 (one source of truth for the
+            # highlight and the content), which renders three tables -- instance
+            # leases, recently finished sessions and recent audit events. This
+            # test is about *the user table*, so switch to it explicitly rather
+            # than relying on which tab happens to be selected.
+            page.click("#admin-overlay .tab2[data-tab='users']")
             page.wait_for_selector("#admin-body .admin-table", timeout=10000)
             assert page.locator("#admin-body .admin-table").count() == 1
 
@@ -1359,9 +1374,7 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo ALTC-TEST")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('ALTC-TEST'); }",
+            _wait_screen_includes(page, 'ALTC-TEST'),
                 timeout=15000,
             )
 
@@ -1386,9 +1399,7 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo Q?MARK")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('Q?MARK'); }",
+            _wait_screen_includes(page, 'Q?MARK'),
                 timeout=15000,
             ), "`?` must not be swallowed while typing in a terminal"
             browser.close()
@@ -1427,9 +1438,7 @@ def test_browser_ctrl_shift_c_is_either_ours_or_the_browsers(tmp_path: Path) -> 
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo SECRET-MARK")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('SECRET-MARK'); }",
+            _wait_screen_includes(page, 'SECRET-MARK'),
                 timeout=15000,
             )
             # Bring the page's own chord handling into play first, so a
@@ -1486,9 +1495,7 @@ def test_browser_alt_c_alt_v_are_the_working_copy_paste(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo ALTC-MARK")
             page.keyboard.press("Enter")
-            page.wait_for_function(
-                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
-                " return r && r.innerText.includes('ALTC-MARK'); }",
+            _wait_screen_includes(page, 'ALTC-MARK'),
                 timeout=15000,
             )
             page.wait_for_timeout(200)
@@ -1538,9 +1545,7 @@ def test_browser_full_screen_app_survives_a_flood(tmp_path: Path) -> None:
             page.keyboard.type("vi /tmp/wsctl-fs-probe.txt")
             page.keyboard.press("Enter")
             page.wait_for_timeout(1200)
-            rows = page.eval_on_selector(
-                ".term-pane.active .xterm-rows", "el => el.innerText"
-            )
+            rows = page.evaluate("() => window.__wsctlScreen()")
             assert rows.strip(), "vi never drew anything"
 
             # Now flood colour sequences from a second session -- the exact
@@ -1563,12 +1568,197 @@ def test_browser_full_screen_app_survives_a_flood(tmp_path: Path) -> None:
             # Back on the `vi` tab: the screen must still be *terminal output*,
             # not a wall of raw escape fragments or replacement glyphs.
             page.wait_for_timeout(800)
-            rows_after = page.eval_on_selector(
-                ".term-pane.active .xterm-rows", "el => el.innerText"
-            )
+            rows_after = page.evaluate("() => window.__wsctlScreen()")
             assert "\ufffd" not in rows_after, "the terminal rendered replacement glyphs"
             assert "[31m" not in rows_after, "a colour escape leaked through as text"
             assert "\x1b" not in rows_after
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+# -- 0.1.15 行为验证 ----------------------------------------------------
+#
+# The structural contracts live in ``tests/test_ui_contracts.py``; these verify
+# the same fixes where a user would notice them.
+
+
+def test_browser_admin_tab_matches_its_content(tmp_path: Path) -> None:
+    """The lit tab and the panel underneath must be the same tab.
+
+    ``index.html`` marked 概览 as selected while ``adminTab`` still said
+    ``"users"``, so the panel opened showing one tab highlighted and another's
+    content. The selectors are also scoped to ``#admin-overlay``: a bare
+    ``.tab2`` matches the session dialog's 运行中/已结束 tabs and used to
+    clear their highlight whenever an admin tab was clicked.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            # Open the session dialog first: its tabs must survive admin clicks.
+            page.click("#sessions-btn")
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=WAIT_MS)
+            page.wait_for_selector("[data-stab].active", timeout=WAIT_MS)
+            assert page.inner_text("[data-stab].active").strip() == "运行中"
+            # The session dialog is a full-screen overlay -- it would swallow
+            # clicks on the toolbar underneath. Reopen the admin panel the way a
+            # user would after closing it.
+            page.keyboard.press("Escape")
+            page.wait_for_selector("#sessions-overlay.hidden", state="attached", timeout=WAIT_MS)
+
+            page.click("#admin-btn")
+            page.wait_for_selector("#admin-overlay:not(.hidden)", timeout=WAIT_MS)
+            page.wait_for_selector("#admin-body .overview-card", timeout=WAIT_MS)
+            lit = page.inner_text("#admin-overlay .tab2.active").strip()
+            body = page.inner_text("#admin-body")
+            assert lit == "概览", f"lit tab is {lit!r} but the panel shows {body[:60]!r}"
+            assert "运行中会话" in body, "the overview content must be under the overview tab"
+
+            # Switching moves both halves together.
+            page.click("#admin-overlay .tab2[data-tab='users']")
+            page.wait_for_selector("#admin-body .admin-table", timeout=WAIT_MS)
+            assert page.inner_text("#admin-overlay .tab2.active").strip() == "用户"
+            assert "用户名" in page.inner_text("#admin-body")
+            # ...and the session dialog's own tabs are untouched.
+            assert page.inner_text("[data-stab].active").strip() == "运行中"
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_toasts_auto_dismiss_fold_and_dedupe(tmp_path: Path) -> None:
+    """No toast is permanent, the stack folds past four, repeats count.
+
+    Errors used to stay until clicked, which meant one batch operation left a
+    dozen of them pinned over the terminal. Everything ages out now; hovering
+    the stack pauses the clock so a message can still be read.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.click(".term-pane.active .xterm-screen")
+
+            # A distinct message per font step: 6 toasts, none repeated.
+            for _ in range(6):
+                page.keyboard.press("Alt+e")
+                page.wait_for_timeout(60)
+            page.wait_for_function(
+                "() => document.querySelectorAll('#toasts .toast:not(.toast-more)').length >= 5",
+                timeout=WAIT_MS,
+            )
+            visible = page.locator("#toasts .toast:not(.toast-more):not(.toast-folded)")
+            assert visible.count() <= 4, f"{visible.count()} toasts on screen covers the terminal"
+            more = page.locator("#toasts .toast-more")
+            assert more.count() == 1, "the overflow must be folded behind one chip"
+            assert "还有" in more.inner_text()
+
+            # Unfolding brings them all back, still capped in the DOM.
+            more.click()
+            page.wait_for_timeout(120)
+            assert page.locator("#toasts .toast-folded").count() == 0
+
+            # Auto-dismiss: an `info` toast lives ~4s. Hover the stack first and
+            # prove the clock pauses, then leave and let it expire.
+            # `#toasts` itself is pointer-events:none (so it never eats clicks
+            # on the terminal); hover a card -- the pause listeners are on the
+            # container and fire for the whole stack.
+            page.hover("#toasts .toast")
+            page.wait_for_timeout(4500)
+            assert page.locator("#toasts .toast:not(.toast-more)").count() > 0, (
+                "hovering must pause the dismiss clock"
+            )
+            page.mouse.move(10, 10)
+            page.wait_for_timeout(5000)
+            assert page.locator("#toasts .toast:not(.toast-more)").count() == 0, (
+                "toasts must age out; none may be permanent"
+            )
+
+            # Repeats collapse into one card with a count instead of stacking.
+            page.click(".term-pane.active .xterm-screen")
+            for _ in range(3):
+                page.keyboard.press("Alt+c")  # copy with no selection
+                page.wait_for_timeout(80)
+            cards = page.locator("#toasts .toast:not(.toast-more)")
+            assert cards.count() == 1, f"a repeated message stacked {cards.count()} cards"
+            assert "×3" in cards.first.inner_text(), cards.first.inner_text()
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_settings_dialog_is_wide_grouped_and_reports_the_renderer(
+    tmp_path: Path,
+) -> None:
+    """The settings dialog must fit its own content -- and say what it is using.
+
+    It sat in the 360px card alongside a theme gallery and fifteen key
+    bindings, which is a scroll inside a scroll with the labels squeezed. The
+    renderer note is not decoration: WebGL silently falls back on machines
+    without it, and "which one am I on" is the first question in any
+    performance report.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.click("#settings-btn")
+            page.wait_for_selector("#settings-overlay:not(.hidden)", timeout=WAIT_MS)
+
+            box = page.locator("#settings-overlay .modal-card").bounding_box()
+            assert box is not None and box["width"] >= 500, (
+                f"settings card is only {box and box['width']:.0f}px wide"
+            )
+            assert page.locator("#settings-overlay .field-group").count() >= 3, (
+                "settings must be grouped, not one wall of labels"
+            )
+            assert page.locator("#hotkey-list.grid").count() == 1, (
+                "the key-binding list must use the two-column grid"
+            )
+            note = page.inner_text("#renderer-note")
+            assert "当前：" in note, note
+            assert "Unicode" in note, note
+            assert re.search(r"Unicode\s+11", note), (
+                f"the Unicode 11 width table is not active: {note!r}"
+            )
+            assert re.search(r"当前：(WebGL|Canvas|DOM)", note), note
+
+            # And the confirm dialog's weight follows the risk.
+            page.click("#settings-done")
             browser.close()
     finally:
         _stop_server(server)

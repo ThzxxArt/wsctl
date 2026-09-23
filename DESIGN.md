@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.14 · 状态：0.1.0–0.1.13 已发布
+> 版本：0.1.15 · 状态：0.1.0–0.1.14 已发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -361,6 +361,19 @@ CLI 全线 `--json`、多 shell 补全。**验证深度提升**：ZMODEM 从「�
 > 说明：进程回收依赖 `start_new_session` + `killpg` 与 `TermSession` 结束时的
 > `wait()`（**有界等待，超时强杀**），未安装全局 SIGCHLD handler（避免与
 > `subprocess` 争抢 PID）；已跟踪会话不会残留僵尸进程。
+
+| **M55** | 渲染三件套：`@xterm/addon-webgl` 0.18.0（主）→ `@xterm/addon-canvas` 0.7.0（无 GPU 兜底）→ DOM 渲染器，三级探测逐级降级；`@xterm/addon-unicode11` 0.8.0 宽度表 + CJK 等宽字体栈；设置里新增渲染器实况 |
+| **M56** | 前端帧合批：`onmessage` 入队、每动画帧合并一次 `term.write`；合批次数经心跳回传为 `wsctl_ws_frames_coalesced_total` |
+| **M57** | 尺寸合流：`window.resize` / `term.onResize` 双向 debounce 120ms 且尺寸未变不发；`applyPrefs` 只重排活动会话 |
+| **M58** | 服务端丢帧 O(1)：出站拆「字节帧 + 控制帧」双 deque 带单调序号、`run()` 归并出队保序；淘汰从 O(n) 扫描变 `popleft()`；`_broadcast` 投递移出锁外（快照在锁内，顺序保证不变） |
+| **M59** | 花屏三修：ZMODEM 传输中禁用开关（协议字节不再被当文本渲染）；失步徽标 + 一键重新同步（`desync` / `resync` / `resynced`，重放期间丢弃重复帧）；标签切换同步 `fit()` 消除空白帧 |
+| **M60** | Toast 体系重做：四档定时消失（错误 10s）、悬停暂停、最多 4 条折叠、同类合并计数、`role=alert` |
+| **M61** | 弹框设计系统 v2：语义尺寸 `sm/md/lg/xl`、按钮四档（`primary`/`ghost`/`warn-btn`/`danger` 仅限不可逆）、字段分组卡片、两列表单网格、统一焦点环 |
+| **M62** | 管理弹框单一事实源：`adminTab` 驱动高亮，默认「概览」；选择器收窄 `#admin-overlay .tab2`（连带修掉误清会话弹窗高亮） |
+| **M63** | 设置弹框 560px + 四组卡片重排 + 快捷键两列网格 |
+| **M64** | 列表事件委托（每容器 1 监听替代每行 3-4 个）+ 筛选 debounce 250ms |
+| **M65** | 性能验收数值门入 `-m slow`：T1 `seq 1 200000` ≤ 8s · T2 8 会话并发 ≤ 20s 且零驱逐 · T3 事件循环延迟 < 50ms；完成标记用算术展开防回显误匹配 |
+| **M66** | 观测补齐：`wsctl_event_loop_lag_seconds` / `_peak`、`wsctl_ws_frames_coalesced_total`、`wsctl_shed_resync_requests_total`；`window.__wsctlScreen()` 渲染器无关读屏 |
 
 ## 11. Backlog（后续）
 

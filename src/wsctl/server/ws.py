@@ -560,7 +560,33 @@ async def _pump(
                 continue
             forward_input(chunk)
         elif kind == "ping":
+            # The heartbeat doubles as the client's write-batching report: the
+            # browser counts frames it merged and sends the saving here, so
+            # "is coalescing actually happening on real pages" is answerable
+            # from /metrics rather than only from a synthetic test.
+            coalesced = data.get("coalesced")
+            if metrics is not None and isinstance(coalesced, (int, float)) and coalesced > 0:
+                metrics.inc("wsctl_ws_frames_coalesced_total", float(coalesced))
             try:
                 client.put({"type": "pong"})
+            except ClientGone:
+                return
+        elif kind == "resync":
+            # The viewer has learned its screen is incomplete (frames were shed)
+            # and is asking for everything this server still holds, replayed into
+            # a buffer it has already cleared. The whole replay is enqueued in one
+            # synchronous stretch -- no ``await`` between the chunks -- so nothing
+            # can interleave and reorder it.
+            #
+            # A best effort *by construction*: bytes the server also shed are
+            # gone, and a full-screen application may still need its own repaint
+            # afterwards. The client says exactly that instead of claiming a
+            # restore it cannot deliver.
+            if metrics is not None:
+                metrics.inc("wsctl_shed_resync_requests_total")
+            try:
+                for chunk in session.scrollback_chunks():
+                    client.put(chunk)
+                client.put({"type": "resynced", "session": session.id})
             except ClientGone:
                 return

@@ -226,6 +226,15 @@ class TermSession:
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
 
+    def scrollback_chunks(self) -> tuple[bytes, ...]:
+        """Buffered output *as stored*, for a targeted replay.
+
+        A resync re-sends this into a screen the viewer has already cleared.
+        Going through :meth:`scrollback_snapshot` would join the whole buffer
+        first -- the exact per-attach copy the attach path stopped making.
+        """
+        return self._scrollback.chunks()
+
     def memory_usage(self) -> int:
         """Approximate bytes held by this session (scrollback + client backlogs)."""
         total = self._scrollback.size
@@ -457,16 +466,29 @@ class TermSession:
             self._scrollback.append(data)
             if self._recorder is not None:
                 self._recorder.output(data)
-            dead: list[int] = []
-            for key, entry in self._clients.items():
-                if entry.share is not None and not self.share_valid(entry.share):
-                    dead.append(key)
-                    continue
-                try:
-                    entry.client.put(data)
-                except ClientGone as exc:
-                    dead.append(key)
-                    self._report_slow_consumer(entry, exc)
+            targets = list(self._clients.items())
+        # Delivery is deliberately *outside* the session lock. ``put`` may shed
+        # frames, and shedding used to scan the whole outbound queue for the
+        # oldest terminal frame on every drop -- an O(n) pass per drop, running
+        # while the lock was held. Under a flood that stalled the read loop, the
+        # PTY backed up into the kernel, and the shell itself stopped writing:
+        # a server-side freeze, which is a different failure from the
+        # client-side one 0.1.12 fixed. The snapshot taken under the lock is
+        # what makes this safe: an attach that lands afterwards is not in
+        # ``targets``, so it cannot receive live bytes ahead of the replay it is
+        # queueing under that same lock -- and this chunk is already in the
+        # scrollback it will be replayed from.
+        dead: list[int] = []
+        for key, entry in targets:
+            if entry.share is not None and not self.share_valid(entry.share):
+                dead.append(key)
+                continue
+            try:
+                entry.client.put(data)
+            except ClientGone as exc:
+                dead.append(key)
+                self._report_slow_consumer(entry, exc)
+        async with self._lock:
             for key in dead:
                 self._clients.pop(key, None)
             self._enforce_memory_limit()
