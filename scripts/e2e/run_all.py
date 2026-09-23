@@ -590,7 +590,7 @@ def scenario_daemon() -> None:
         return result
 
     try:
-        run("start", "--admin-password", PASSWORD)
+        run("start", "--timeout", "90", "--admin-password", PASSWORD)
         wait_health(base)
 
         payload = json.loads(run("status", "--json").stdout)
@@ -613,7 +613,7 @@ def scenario_daemon() -> None:
             raise AssertionError("SIGHUP did not trigger a config reload")
 
         # restart keeps the instance reachable
-        run("restart", "--admin-password", PASSWORD)
+        run("restart", "--timeout", "90", "--admin-password", PASSWORD)
         wait_health(base)
 
         # A SIGKILLed instance leaves a stale pid file that status prunes.
@@ -623,7 +623,7 @@ def scenario_daemon() -> None:
         time.sleep(0.5)
         assert run("status", check=False).returncode != 0, "stale pid file not pruned"
 
-        run("start", "--admin-password", PASSWORD)
+        run("start", "--timeout", "90", "--admin-password", PASSWORD)
         wait_health(base)
         run("stop")
         assert not _health_ok(base), "server still answering after stop"
@@ -859,7 +859,8 @@ def scenario_selfrestart() -> None:
     try:
         started = subprocess.run(
             [PY, "-m", "wsctl", "start", "--host", "127.0.0.1", "--port", str(port),
-             "--reuse-port", "--log-level", "warning", "--admin-password", PASSWORD],
+             "--reuse-port", "--log-level", "warning", "--timeout", "90",
+             "--admin-password", PASSWORD],
             cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90,
         )
         assert started.returncode == 0, started.stdout + started.stderr
@@ -889,7 +890,7 @@ def scenario_selfrestart() -> None:
         watcher.start()
         rolled = subprocess.run(
             [PY, "-m", "wsctl", "restart", "--rolling", "--log-level", "warning",
-             "--port", str(port)],
+             "--timeout", "90", "--port", str(port)],
             cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
         )
         watcher.join(timeout=70)
@@ -919,7 +920,8 @@ def scenario_selfrestart() -> None:
     try:
         started = subprocess.run(
             [PY, "-m", "wsctl", "start", "--host", "127.0.0.1", "--port", str(port),
-             "--log-level", "warning", "--admin-password", PASSWORD],
+             "--log-level", "warning", "--timeout", "90",
+             "--admin-password", PASSWORD],
             cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90,
         )
         assert started.returncode == 0, started.stdout + started.stderr
@@ -947,7 +949,7 @@ def scenario_selfrestart() -> None:
         watcher.start()
         rolled = subprocess.run(
             [PY, "-m", "wsctl", "restart", "--rolling", "--log-level", "warning",
-             "--port", str(port)],
+             "--timeout", "90", "--port", str(port)],
             cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
         )
         stop_watch.set()
@@ -982,7 +984,7 @@ def scenario_selfrestart() -> None:
         watcher.start()
         rolled2 = subprocess.run(
             [PY, "-m", "wsctl", "restart", "--rolling", "--log-level", "warning",
-             "--port", str(port)],
+             "--timeout", "90", "--port", str(port)],
             cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
         )
         stop_watch.set()
