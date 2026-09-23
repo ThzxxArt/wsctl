@@ -635,10 +635,9 @@
   const WRITE_FLUSH_MS = 16;
 
   function enqueueWrite(s, bytes) {
-    // While a resync is in flight the replay supersedes whatever arrives: the
-    // server's scrollback already contains these bytes (it appended them before
-    // it snapshotted), so writing them as well would duplicate them. Drop, do
-    // not queue.
+    // Between asking for a resync and its ``resync-begin`` marker, live frames
+    // are duplicates of what the replay is about to repeat -- drop them. From
+    // ``resync-begin`` on, the frames *are* the replay and must be written.
     if (s.resyncing) return;
     s.writeFrames += 1;
     s.writeQueue.push(bytes);
@@ -698,6 +697,12 @@
     if (windowResizeTimer !== null) clearTimeout(windowResizeTimer);
     windowResizeTimer = setTimeout(() => {
       windowResizeTimer = null;
+      // Every hidden tab is now the wrong size too. Marking them dirty is what
+      // makes ``needsRefit`` load-bearing instead of decorative: without this
+      // a tab switched to after a window resize would keep its old geometry.
+      for (const other of sessions.values()) {
+        if (other.id !== activeId) other.needsRefit = true;
+      }
       const s = activeId && sessions.get(activeId);
       if (s) { try { s.fit.fit(); } catch { /* 隐藏时忽略 */ } }
     }, RESIZE_MS);
@@ -737,19 +742,22 @@
   const RESYNC_TIMEOUT_MS = 4000;
 
   function requestResync(s) {
-    if (!s) return;
+    if (!s || s.resyncing) return;  // a second click must not reset mid-replay
     flushWrite(s);
     s.writeQueue = [];
     s.resyncing = true;
     try { s.term.reset(); } catch { /* 忽略 */ }
-    clearDesync(s);
     sendControl(s, { type: "resync" });
-    // If the reply never comes -- the socket died between the request and the
-    // replay -- the terminal must not stay write-locked forever.
+    // The bar stays up until the replay actually lands. Clearing it on the
+    // *request* left a failed resync with a blank screen and no way to know
+    // what had happened -- the opposite of what this whole feature is for.
+    // If the reply never comes, the terminal must not stay write-locked and
+    // the bar must come back so the user can act.
     if (s.resyncTimer) clearTimeout(s.resyncTimer);
     s.resyncTimer = setTimeout(() => {
       s.resyncTimer = null;
       s.resyncing = false;
+      if (s.desynced) showDesyncBar("重新同步未完成，屏幕内容可能仍不完整");
     }, RESYNC_TIMEOUT_MS);
   }
 
@@ -778,6 +786,11 @@
     if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
     if (s.ws) { try { s.ws.close(); } catch { /* 忽略 */ } s.ws = null; }
     forgetLive(s.id);
+    // Unmounting frees the layout box. Never unmount the pane the user is
+    // actually looking at -- `.term-pane.mounted.active` is what makes it
+    // visible, so dropping `mounted` from the active tab blanks the screen.
+    if (s.id !== activeId) s.pane.classList.remove("mounted");
+    s.needsRefit = true;
     markTab(s, "standby");
     setConnectionFor(s, "空闲", "");
   }
@@ -823,6 +836,7 @@
       // Remember which rename generation this attach belongs to.
       s.attachNameVersion = s.nameVersion || 0;
       noteLive(s);
+      s.pane.classList.add("mounted");
       markTab(s, "connected");
       setConnectionFor(s, "已连接", "ok");
       sendControl(s, { type: "attach", session: s.id, cols: s.term.cols, rows: s.term.rows, share: s.share || undefined });
@@ -930,11 +944,19 @@
       case "notice":
         toast(msg.msg || "提示", msg.level === "error" ? "error" : msg.level === "warn" ? "warn" : "info");
         break;
+      case "resync-begin":
+        // The replay starts here. Everything before it was live output that the
+        // replay is about to repeat, so it was dropped; from here on the frames
+        // *are* the replay and must be written. (Asking for a resync and then
+        // dropping the answer is what the first version managed to do.)
+        s.resyncing = false;
+        break;
       case "resynced":
         // The replay has been fully enqueued behind this marker. Live output
         // resumes from here and only here, so nothing can land on top of it.
         s.resyncing = false;
         if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
+        clearDesync(s);
         flushWrite(s);
         break;
       case "desync":
@@ -1044,7 +1066,10 @@
       // and are handed to xterm once per animation frame instead of once per
       // WebSocket message.
       writeQueue: [], writeTimer: null, writeBatches: 0, writeFrames: 0,
-      needsRefit: false,
+      // A pane that has never been laid out must be measured before its first
+      // show; after that ``needsRefit`` is what decides whether anything
+      // actually changed (a theme tweak must not re-measure every hidden tab).
+      needsRefit: false, everShown: false,
       // Set while a resync replay is in flight; live frames are dropped, not
       // queued, because the replay is a superset of them.
       resyncing: false, resyncTimer: null,
@@ -1135,6 +1160,12 @@
     }
     const s = sessions.get(id);
     if (!s) return;
+    // Mount *before* measuring. `.term-pane` is `display:none` until then, and
+    // `.term-pane.mounted.active` is what makes it visible at all -- so a tab
+    // activated before its socket finished opening (a standby tab, or the
+    // moment between `createTab` and `onopen`) would otherwise be measured at
+    // zero size and painted as nothing.
+    s.pane.classList.add("mounted");
     els.recordBtn.classList.toggle("rec-on", Boolean(s.recording));
     // Opening a tab is the user saying "show me this one": bring it online.
     ensureConnected(s);
@@ -1146,8 +1177,15 @@
     // which point the terminal still had the hidden pane's zero size, so every
     // switch showed one blank frame and then jumped. Reading the layout here
     // forces the measurement before that paint can happen.
-    try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
-    s.needsRefit = false;
+    // Only measure when something could have changed. A mounted pane keeps its
+    // layout box while hidden (see ``.term-pane.mounted``), so a plain tab
+    // switch does not need a re-measure -- and re-measuring is what used to
+    // produce the blank frame.
+    if (s.needsRefit || !s.everShown) {
+      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
+      s.needsRefit = false;
+      s.everShown = true;
+    }
     try { s.term.refresh(0, Math.max(0, s.term.rows - 1)); } catch { /* 忽略 */ }
     scheduleResize(s, s.term.cols, s.term.rows);
     if (s.desynced) showDesyncBar(); else hideDesyncBar();
@@ -1184,6 +1222,26 @@
       if (line) lines.push(line.translateToString(true));
     }
     return lines.join("\n");
+  };
+
+  // Per-cell characters and widths for one row. Text alone cannot answer "do
+  // the columns line up": ``translateToString`` gives one entry per *character*,
+  // while a wide CJK glyph occupies two *cells*. Comparing where a marker
+  // column lands in a CJK row against an ASCII row is what actually proves the
+  // width table is right -- and it is renderer-independent, because it reads
+  // xterm's buffer rather than anything that was painted.
+  window.__wsctlRowCells = (row) => {
+    const s = activeId && sessions.get(activeId);
+    if (!s || !s.term || !s.term.buffer) return [];
+    const line = s.term.buffer.active.getLine(row);
+    if (!line) return [];
+    const cells = [];
+    for (let x = 0; x < line.length; x += 1) {
+      const cell = line.getCell(x);
+      if (!cell) break;
+      cells.push({ x, ch: cell.getChars(), w: cell.getWidth() });
+    }
+    return cells;
   };
 
   function detachTab(id) {
@@ -1655,7 +1713,7 @@
       sessionRowData.clear();
       const shown = list.filter((i) =>
         !filter || i.name.toLowerCase().includes(filter) || i.id.toLowerCase().includes(filter));
-      if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty">暂无会话</li>'; return; }
+      if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty state-block"><span class="state-icon">🗂</span>暂无会话</li>'; return; }
       for (const info of shown) {
         sessionRowData.set(info.id, info);
         const li = document.createElement("li");
@@ -1695,7 +1753,7 @@
       const shown = rows.filter((r) =>
         !filter || String(r.name || "").toLowerCase().includes(filter)
           || String(r.id || "").toLowerCase().includes(filter));
-      if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty">暂无已结束的会话</li>'; return; }
+      if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty state-block"><span class="state-icon">🗂</span>暂无已结束的会话</li>'; return; }
       const STATUS_LABELS = { killed: "已终止", expired: "已过期", stopped: "已停止", interrupted: "已中断" };
       for (const r of shown) {
         sessionRowData.set(r.id, r);
@@ -2140,7 +2198,7 @@
         const rows = await api("GET", `/api/audit?${query()}`);
         if (offset === 0) tb.innerHTML = "";
         if (!rows.length && offset === 0) {
-          tb.innerHTML = '<tr><td colspan="6" class="empty">暂无记录</td></tr>';
+          tb.innerHTML = '<tr><td colspan="6" class="empty state-block"><span class="state-icon">🗒</span>暂无记录</td></tr>';
         }
         for (const r of rows) {
           const tr = document.createElement("tr");
@@ -2164,7 +2222,7 @@
     const rows = await api("GET", "/api/recordings");
     const host = document.createElement("div");
     els.adminBody.appendChild(host);
-    if (!rows.length) { host.innerHTML = '<div class="empty">暂无录制</div>'; return; }
+    if (!rows.length) { host.innerHTML = '<div class="empty state-block"><span class="state-icon">🎬</span>暂无录制</div>'; return; }
     buildTable(
       host,
       "recordings",
@@ -2933,7 +2991,7 @@
       els.filePrev.disabled = fileOffset <= 0;
       els.fileNext.disabled = fileOffset + shown >= total;
       if (!shown) {
-        els.fileList.innerHTML = `<li class="empty">${filter ? "没有匹配的条目" : "空目录"}</li>`;
+        els.fileList.innerHTML = `<li class="empty state-block"><span class="state-icon">📁</span>${filter ? "没有匹配的条目" : "空目录"}</li>`;
       }
       for (const entry of data.entries) {
         const li = document.createElement("li");

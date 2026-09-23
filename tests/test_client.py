@@ -40,6 +40,30 @@ def test_queue_limit_sheds_oldest_instead_of_killing_the_link() -> None:
     assert client.dropped_bytes == 1, "exactly the oldest frame should go"
 
 
+def test_every_drop_path_says_so_not_just_the_first_one() -> None:
+    """A frame too big for the whole budget is dropped too -- and must say so.
+
+    ``put`` has two ways to lose bytes: shed the oldest frames to make room,
+    and give up on the incoming frame when even an empty queue cannot hold it.
+    The second one is not rare -- a budget smaller than one PTY read (64 KiB)
+    puts *every* frame there -- and it used to bump the counter and return
+    without a word. The viewer then sat in front of a screen that was quietly
+    wrong, with no `desync` bar and no resync to offer, which is precisely the
+    "a loss must be reported" rule the rest of this class follows.
+
+    The client starts empty on purpose: with a frame already queued, the
+    *other* path (shed the oldest) would fire first and announce for it, and
+    this test would pass without ever exercising the one it is about.
+    """
+    client = WsClient(_StubWs(), max_pending=64, max_bytes=8)  # type: ignore[arg-type]
+    client.put(b"x" * 32)  # cannot fit even into an empty 8-byte budget
+    assert client.dropped_bytes >= 32, "the oversized frame must be dropped"
+    assert client.dropped_events > 0
+    assert any(
+        i.get("type") == "desync" for i in client.queued_controls()
+    ), "the silent drop path must announce itself like the others"
+
+
 async def test_pending_drains_after_send() -> None:
     client = WsClient(_StubWs(), max_bytes=100)  # type: ignore[arg-type]
     client.put(b"abc")

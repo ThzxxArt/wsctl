@@ -239,8 +239,18 @@ class WsClient:
             if self._max_bytes > 0 and self._pending_bytes + len(item) > self._max_bytes:
                 # Nothing left to evict and the frame still does not fit: lose
                 # *this* frame rather than the connection.
+                #
+                # This path sheds too, so it has to say so. It used to bump
+                # ``dropped_events`` and return in silence, and a frame larger
+                # than the whole byte budget lands here every time -- which is
+                # the common case whenever the budget is set lower than a PTY
+                # read (64 KiB). Every frame then vanished without a word and
+                # the viewer sat in front of a screen that was quietly wrong:
+                # the exact "loss must be reported" rule the other two drop
+                # paths already follow.
                 self.dropped_bytes += len(item)
                 self.dropped_events += 1
+                self._announce_shed()
                 return
             self._pending_bytes += len(item)
             self._seq += 1

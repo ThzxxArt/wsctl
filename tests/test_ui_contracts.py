@@ -141,10 +141,14 @@ def test_a_transfer_cannot_unload_the_zmodem_sentry() -> None:
 def test_a_resync_drops_live_frames_rather_than_duplicating_them() -> None:
     """The replay is a superset of whatever arrives while it is in flight.
 
-    Queueing those frames would draw them twice on top of the replay.
+    Queueing those frames would draw them twice on top of the replay -- and
+    dropping *everything* until the replay ends would drop the replay itself,
+    which is what the first version did: it asked for a resync and threw the
+    answer away. ``resync-begin`` is what separates the two.
     """
     js = _js()
     assert "if (s.resyncing) return;" in js
+    assert 'case "resync-begin":' in js
     assert 'case "resynced":' in js
     assert "RESYNC_TIMEOUT_MS" in js, "a resync must not write-lock the terminal forever"
 
@@ -160,3 +164,35 @@ def test_screen_text_is_readable_on_every_renderer() -> None:
     js = _js()
     assert "window.__wsctlScreen" in js
     assert "translateToString" in js
+
+
+def test_a_hidden_tab_keeps_its_layout_box_until_it_is_really_done() -> None:
+    """Unmount only tabs nobody is looking at, and re-measure only on change.
+
+    Two guards, one feature. ``.term-pane.mounted`` is what stops a hidden pane
+    from collapsing to 0x0 (and painting a blank frame on every switch), so
+    unmounting the *active* tab would blank the screen the user is reading. And
+    the point of keeping the box is to skip the re-measure -- which is only
+    true if ``needsRefit`` is actually consulted rather than always fitting.
+    """
+    js = _js()
+    css = (ROOT / "src" / "wsctl" / "static" / "app.css").read_text(encoding="utf-8")
+    assert "if (s.id !== activeId) s.pane.classList.remove(\"mounted\");" in js, (
+        "suspending the visible tab would blank it"
+    )
+    assert "if (s.needsRefit || !s.everShown)" in js, (
+        "a tab switch must not re-measure when nothing changed"
+    )
+    # On the rule *body*, not the whole file: the comment above this rule says
+    # "``visibility: hidden``, not ``display: none``" and would satisfy a naive
+    # substring check even after the rule had been changed back to
+    # ``display: none``. A guard that the code can pass while being wrong is
+    # not a guard.
+    body = re.search(r"\.term-pane\.mounted\s*\{[^}]*\}", css)
+    assert body is not None, ".term-pane.mounted rule disappeared"
+    assert "visibility: hidden" in body.group(0), (
+        "a mounted pane must keep its layout box (visibility, not display: none)"
+    )
+    assert "display: none" not in body.group(0), (
+        "display:none collapses the box and brings the blank frame back"
+    )

@@ -585,6 +585,13 @@ async def _pump(
             if metrics is not None:
                 metrics.inc("wsctl_shed_resync_requests_total")
             try:
+                # ``resync-begin`` marks where the replay starts. The viewer
+                # drops live frames up to this point (they are duplicates of
+                # what is about to be replayed) and accepts everything from
+                # here on -- without the marker it cannot tell the replay apart
+                # from the live stream and would either drop the replay it just
+                # asked for or draw the same bytes twice.
+                client.put({"type": "resync-begin", "session": session.id})
                 for chunk in session.scrollback_chunks():
                     client.put(chunk)
                 client.put({"type": "resynced", "session": session.id})

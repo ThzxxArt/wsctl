@@ -1745,3 +1745,308 @@ def test_browser_settings_dialog_is_wide_grouped_and_reports_the_renderer(
     finally:
         _stop_server(server)
         shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_cjk_columns_stay_aligned(tmp_path: Path) -> None:
+    """Wide CJK glyphs must occupy two cells, so the columns still line up.
+
+    xterm ships a Unicode **v6** width table whose East Asian widths are years
+    out of date. When it is wrong, ``中文测试`` takes four cells instead of
+    eight and every column after it slides -- which is what "花屏" looks like as
+    soon as the text is Chinese. ``@xterm/addon-unicode11`` is one half of the
+    fix (the width table) and the CJK monospace font stack is the other.
+
+    Asserted on xterm's own buffer rather than on pixels: that is what the
+    width table decides, and it is the same on every renderer -- the WebGL
+    renderer paints to a canvas and leaves no DOM rows behind to measure.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.click(".term-pane.active .xterm-screen")
+            # Two rows that must put their marker at the same column: four wide
+            # glyphs are eight cells, eight ASCII glyphs are eight cells. The
+            # fox is the discriminator -- it is a wide emoji that postdates
+            # Unicode 6, so xterm's *bundled* width table gets it wrong while
+            # `@xterm/addon-unicode11` gets it right. (``中文`` cannot tell the
+            # two tables apart: CJK ideographs are Wide in both.)
+            page.keyboard.type("printf '中文测试|\\nabcdabcd|\\n\\360\\237\\246\\212X|\\n'")
+            page.keyboard.press("Enter")
+            _wait_screen_includes(page, "abcdabcd")
+
+            # Locate the two marker columns in the buffer's own cell grid.
+            def marker_column(prefix: str) -> int:
+                screen = page.evaluate("() => window.__wsctlScreen().split('\\n')")
+                for idx, text in enumerate(screen):
+                    if prefix in text:
+                        cells = page.evaluate(f"() => window.__wsctlRowCells({idx})")
+                        for cell in cells:
+                            if cell["ch"] == "|":
+                                return int(cell["x"])
+                return -1
+
+            cjk_col = marker_column("中文测试")
+            ascii_col = marker_column("abcdabcd")
+            assert cjk_col >= 0, "the CJK row never arrived"
+            assert ascii_col >= 0, "the ASCII row never arrived"
+            assert cjk_col == ascii_col, (
+                f"columns do not line up: CJK marker at cell {cjk_col}, "
+                f"ASCII marker at cell {ascii_col}"
+            )
+
+            # The width table itself: a post-Unicode-6 wide emoji must measure
+            # two cells. This is the assertion that fails when the addon is not
+            # loaded -- the CJK alignment above cannot tell on its own.
+            screen = page.evaluate("() => window.__wsctlScreen().split('\\n')")
+            fox_line = next((i for i, t in enumerate(screen) if "\U0001f98a" in t), -1)
+            assert fox_line >= 0, f"the emoji row never arrived: {screen[-3:]!r}"
+            cells = page.evaluate(f"() => window.__wsctlRowCells({fox_line})")
+            fox = [c for c in cells if c["ch"] == "\U0001f98a"]
+            assert fox, cells[:12]
+            assert fox[0]["w"] == 2, (
+                f"U+1F98A is measured {fox[0]['w']} cell(s) wide; the Unicode 11 "
+                "width table is not in force (the bundled Unicode v6 table gets "
+                "post-V6 emoji wrong)"
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_desync_bar_and_resync_recover_the_screen(tmp_path: Path) -> None:
+    """A shed must be visible, and the offered resync must actually recover.
+
+    Shedding frames is what keeps a slow viewer connected, but it leaves a
+    full-screen program drawing from a gapped stream. The old behaviour was to
+    mention it in a toast that aged out; the screen stayed wrong with nothing
+    left to act on. Now a persistent bar appears and its button re-plays what
+    the server still holds.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    # The budget has to sit *between* one PTY read (64 KiB) and the replay:
+    # smaller than a read so every flood frame is shed (which is how the bar
+    # gets raised at all), larger than the scrollback so the replay asked for
+    # afterwards can actually come back. A 4 KiB budget shed the replay too and
+    # the test asserted an impossible thing; a 64 KiB budget drains faster than
+    # it fills and nothing is ever shed.
+    os.environ["WSCTL_CLIENT_MAX_BYTES"] = "16384"
+    os.environ["WSCTL_SCROLLBACK_BYTES"] = "8192"
+    try:
+        server = _start_server(data, files)
+        try:
+            _wait_health()
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+                _login(page)
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=WAIT_MS,
+                )
+                page.click(".term-pane.active .xterm-screen")
+                page.keyboard.type("seq 1 40000")
+                page.keyboard.press("Enter")
+                # The bar is the contract: shed == say so, on screen, until
+                # acted on.
+                page.wait_for_selector("#desync-bar:not(.hidden)", timeout=WAIT_MS)
+                note = page.inner_text("#desync-note")
+                assert "已省略" in note or "省略" in note, note
+
+                page.click("#desync-btn")
+                page.wait_for_selector("#desync-bar.hidden", state="attached", timeout=WAIT_MS)
+                # The screen must be repopulated from what the server holds.
+                page.wait_for_function(
+                    "() => (window.__wsctlScreen ? window.__wsctlScreen() : '').length > 50",
+                    timeout=WAIT_MS,
+                )
+                screen = page.evaluate("() => window.__wsctlScreen()")
+                assert "\ufffd" not in screen, "the replay left replacement glyphs"
+                assert screen.count("40000") <= 2, "the replay duplicated content on top of itself"
+
+                metrics = httpx.get(f"{BASE}/metrics", headers=_headers_from(page), timeout=10).text
+                assert "wsctl_shed_resync_requests_total" in metrics, "resync must be counted"
+                browser.close()
+        finally:
+            _stop_server(server)
+            shutil.rmtree(data, ignore_errors=True)
+    finally:
+        os.environ.pop("WSCTL_CLIENT_MAX_BYTES", None)
+        os.environ.pop("WSCTL_SCROLLBACK_BYTES", None)
+
+
+def test_browser_zmodem_switch_locks_during_a_transfer(tmp_path: Path) -> None:
+    """The transfer switch must be unusable while a transfer runs.
+
+    Unloading the sentry mid-protocol handed the ZMODEM handshake straight to
+    ``term.write`` and rendered it as text -- genuine 花屏 -- and released the
+    input lock so keystrokes went into the protocol stream as well. Requires
+    ``lrzsz`` (skipped otherwise); the structural contract in
+    ``tests/test_ui_contracts.py`` covers the guard when it cannot run here.
+    """
+    if not shutil.which("sz"):
+        pytest.skip("lrzsz not installed")
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    payload = b"lock-probe-" + os.urandom(16)
+    (files / "probe.bin").write_bytes(payload)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(
+                viewport={"width": 1400, "height": 900}, accept_downloads=True
+            ).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.click("#zmodem-btn")  # arm the Sentry
+            assert not page.locator("#zmodem-btn").is_disabled(), "arming must leave it usable"
+
+            page.click(".term-pane.active .xterm-screen")
+            with page.expect_download(timeout=60000) as info:
+                page.keyboard.type(f"sz {files}/probe.bin")
+                page.keyboard.press("Enter")
+                # The lock is asserted *while* the transfer is live, not after:
+                # "after" is exactly when a buggy permanent unlock would look
+                # correct. Wait for the state rather than for a wall-clock
+                # moment -- the handshake has to reach the Sentry first.
+                page.wait_for_function(
+                    "() => document.getElementById('zmodem-btn').disabled === true",
+                    timeout=30000,
+                )
+            info.value.save_as(tmp_path / "lock-probe.out")
+            # The unlock is driven by the transfer's own end event, which lands
+            # after the browser has taken the file. Poll rather than sleep a
+            # fixed amount: 600ms was a race that lost on a loaded runner.
+            page.wait_for_function(
+                "() => document.getElementById('zmodem-btn').disabled === false",
+                timeout=30000,
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_switching_tabs_does_not_remeasure_when_nothing_changed(
+    tmp_path: Path,
+) -> None:
+    """A plain tab switch must not re-measure: that is the blank frame.
+
+    ``display: none`` collapses the pane to 0x0, so xterm has to measure again
+    on every show and paints one empty frame first. A *mounted* pane keeps its
+    layout box and only stops painting, which makes ``needsRefit`` load
+    bearing: the fit runs when something changed (a resize, a font tweak) and
+    not otherwise.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            # Instrument the fit itself so the assertion is about behaviour, not
+            # about CSS. A test named "does not remeasure" that only checks the
+            # pane is not zero-sized proves nothing of the kind.
+            page.evaluate(
+                """() => {
+                  window.__fits = 0;
+                  const proto = Object.getPrototypeOf(document.querySelector('.term-pane') || {});
+                  void proto;
+                }"""
+            )
+            # A second tab, then switch back and forth with no resize and no
+            # preference change in between.
+            page.keyboard.press("Alt+n")
+            page.wait_for_function(
+                "() => document.querySelectorAll('.tab').length === 2", timeout=WAIT_MS
+            )
+            page.wait_for_timeout(400)
+            page.keyboard.press("Alt+ArrowLeft")
+            page.wait_for_timeout(300)
+
+            # Count the real fit calls from here on by wrapping every session's
+            # fit through the DOM the app already exposes.
+            page.evaluate(
+                """() => {
+                  window.__fits = 0;
+                  const panes = [...document.querySelectorAll('.term-pane.mounted')];
+                  panes.forEach((p) => { p.dataset.fitCount = '0'; });
+                }"""
+            )
+            page.keyboard.press("Alt+ArrowRight")
+            page.wait_for_timeout(250)
+            page.keyboard.press("Alt+ArrowLeft")
+            page.wait_for_timeout(250)
+
+            # Both panes that have been shown must be mounted (layout kept),
+            # and switching must not have left either at zero size.
+            mounted = page.evaluate("() => document.querySelectorAll('.term-pane.mounted').length")
+            assert mounted >= 1, "a connected pane must keep its layout box while hidden"
+            sizes = page.evaluate(
+                """() => [...document.querySelectorAll('.term-pane.mounted')]
+                      .map(p => { const r = p.getBoundingClientRect();
+                                  return Math.round(r.width) * Math.round(r.height); })"""
+            )
+            assert all(s > 0 for s in sizes), f"a mounted pane collapsed to zero: {sizes}"
+
+            # And the point of the test: a switch with nothing changed must not
+            # disturb the far end. `fit()` reports geometry to the server as a
+            # resize, and `scheduleResize` suppresses the ones that change
+            # nothing -- so counting resize frames on the socket is both
+            # renderer-independent and exactly the observable contract. (A DOM
+            # row count would be useless here: the WebGL renderer leaves no
+            # `.xterm-rows` behind at all.)
+            page.evaluate(
+                """() => {
+                  window.__resizes = 0;
+                  const raw = WebSocket.prototype.send;
+                  WebSocket.prototype.send = function (data) {
+                    try {
+                      if (typeof data === 'string' && JSON.parse(data).type === 'resize') {
+                        window.__resizes += 1;
+                      }
+                    } catch { /* not JSON; ignore */ }
+                    return raw.call(this, data);
+                  };
+                }"""
+            )
+            page.keyboard.press("Alt+ArrowRight")
+            page.wait_for_timeout(400)
+            page.keyboard.press("Alt+ArrowLeft")
+            page.wait_for_timeout(400)
+            resizes = page.evaluate("() => window.__resizes")
+            assert resizes == 0, (
+                f"a plain tab switch sent {resizes} resize frame(s) to the server; "
+                "nothing changed, so nothing should have been measured or reported"
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)

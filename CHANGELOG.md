@@ -81,21 +81,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wsctl_shed_resync_requests_total`：失步后请求重新同步的次数。
 - `/api/overview` 的关键指标白名单补入 shed / lag / resync。
 
+### 三轮全量回归 review 又挖出的三个产品缺陷（均已根治）
+
+- **待命标签被激活时完全不可见。** `.term-pane` 基态是 `display:none`，可见性由
+  `.term-pane.mounted.active` 决定，而 `mounted` 只在 socket `onopen` 时加上——
+  于是一个标签在「已激活但 socket 尚未打开」的窗口里**既不显示也无尺寸**。现在
+  `activateTab` 先挂载再测量。
+- **挂起标签可能把用户正在看的屏幕清空。** `suspendTab` 无条件摘掉 `mounted`；
+  若被挂起的恰好是当前活动标签，`.active` 失去 `mounted` 后回到 `display:none`。
+  现在只卸载**非活动**标签。
+- **重同步失败后是一块白屏且无任何提示。** `requestResync` 一开始就收起失步条，
+  而回放一旦没到，用户面对的是空白屏幕、没有说明、也没有可再点的按钮。现在提示条
+  **留到 `resynced` 确认成功才收起**，超时则以「重新同步未完成」重新出现；
+  重连点也做了防抖，不会在回放中途又清一次屏。
+
 ### Verified
 
-429 unit · 20 browser · 4 slow · 8 前端结构契约 · 10 e2e 全绿；ruff / mypy strict /
-`node --check` 通过。**五项突变体反向验证全部证毕**（每项注入后对应用例必红）：
-管理页签默认值 · 错误 Toast 永不消失 · 确认按钮恒红 · 禁用 Unicode11 · 丢帧不重对齐边界。
+431 unit · 24 browser · 6 slow（T1–T5）· 9 前端结构契约 · 10 e2e 全绿；
+ruff / mypy strict / `node --check` 通过。**13 项突变体反向验证全部证毕**
+（每项注入后对应用例必红，逐项隔离执行）：管理页签单源 · 错误 Toast 会消失 ·
+确认按钮分档 · 禁用 Unicode11 · 丢帧不重对齐边界 · 静默丢帧必报告 ·
+失步必须是 `desync` · `resync-begin` 起点标记 · 重同步成功才收提示条 ·
+挂起不得白屏活动标签 · 无变化不重测 · 传输中禁用 ZMODEM 开关 · 挂载保留布局盒。
 
-> 过程中**挖出并加强了两处守卫不足**：①「丢帧对齐 ANSI 边界」原先只断言
-> `is_boundary_aligned(kept)`，而 `1mABC` 这种**序列尾巴**并不以 ESC 开头、照过不误——
-> 换成「丢一帧就返回」的突变体因此存活；现改为**精确判别输入**（队列长度触发、
-> 恰好一帧需让位）并断言队首必须是纯文本。②浏览器用例原先读 `.xterm-rows` 的
-> `innerText`，而 **WebGL/Canvas 渲染器根本不产生 DOM 行**——换渲染器等于换掉全部断言。
-> 现新增 `window.__wsctlScreen()`（读 xterm 自己的缓冲，渲染器无关），支持诊断也需要它。
+> 三轮 review 里**加强了三处「看起来在测、其实测不到」的守卫**，都是突变体逼出来的：
+> ①「丢帧对齐 ANSI 边界」原先只断言 `is_boundary_aligned(kept)`，而 `1mABC`
+> 这种**序列尾巴**并不以 ESC 开头、照过不误；②CJK 宽度用例原先量 `中`——它在
+> Unicode v6 与 v11 里**同为宽字符**，改用 Unicode 6 之后才有的 🦊 才真正判别；
+> ③「挂载面板保留布局盒」原先查整份 CSS 文本，而**这条规则的注释里恰好写着**
+> `visibility: hidden`——改成只查规则体。**能让错代码通过的守卫不是守卫。**
 >
-> 也**回滚了一处臆测性源码修改**（`Scrollback._trim` 的「差一」重写）：它把原本绿的
-> 5 条 scrollback 用例打红，按项目纪律属于回归，未获证实前不入包。
+> 浏览器侧读屏原先依赖 `.xterm-rows` 的 `innerText`，而 **WebGL/Canvas 渲染器
+> 根本不产生 DOM 行**——换渲染器等于换掉全部断言。现以 `window.__wsctlScreen()`
+> 与 `window.__wsctlRowCells()`（读 xterm 自己的缓冲）为准，渲染器无关，
+> 支持诊断也需要它们。
 
 ## [0.1.14] - 2026-09-23
 

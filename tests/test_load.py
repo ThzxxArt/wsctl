@@ -15,6 +15,7 @@ import pytest
 
 from conftest import FakeClient
 from wsctl.core.session import SessionManager, SessionSpec
+from wsctl.server.client import WsClient
 
 SHELL = "/bin/sh"
 pytestmark = pytest.mark.skipif(not os.path.exists(SHELL), reason="requires /bin/sh")
@@ -263,3 +264,125 @@ async def test_t3_event_loop_stays_responsive_under_a_flood() -> None:
         await guard
         await manager.shutdown()
     assert worst < T3_LAG_LIMIT, f"event loop stalled for {worst * 1000:.0f}ms"
+
+
+@pytest.mark.slow
+async def test_t4_sustained_flood_loses_no_viewers() -> None:
+    """``yes`` for ten seconds: nobody is dropped, and it really did flood.
+
+    The other gates measure a bounded burst. This one measures a *sustained*
+    one -- the shape of a runaway build log -- where the pressure never lets
+    up and every eviction decision is taken under load rather than at the end.
+
+    The completion marker is arithmetic (see :func:`_done_marker`): a literal
+    would match the terminal's echo of the command and the assertion would pass
+    having proved nothing, which is exactly how the first version of T1 fooled
+    itself.
+    """
+    from wsctl.core.session import evicted_clients_total, slow_consumer_drops
+
+    marker = _done_marker(950)  # 902500
+    factor = 950
+    manager = SessionManager()
+    drops_before = slow_consumer_drops()
+    evict_before = evicted_clients_total()
+    sessions = []
+    clients: list[FakeClient] = []
+    try:
+        for index in range(8):
+            s = await manager.create(SessionSpec(name=f"t4-{index}", argv=[SHELL]))
+            sessions.append(s)
+            c = FakeClient()
+            await s.attach(c)
+            clients.append(c)
+        # Bounded twice over: `head -c` caps the *volume* (an unbounded `yes`
+        # pushed a gigabyte into eight in-memory sinks and the test died of its
+        # own success) and `timeout` caps the *wall clock*. Whichever trips
+        # first ends the storm.
+        #
+        # The extra `echo` is load-bearing: `head -c` cuts `yes` mid-line, so
+        # without it the marker is glued onto the flood -- ``WSCTL-FL902500`` --
+        # and a marker that starts with a line break never matches. (Same family
+        # as the echo-of-the-command trap in :func:`_done_marker`.)
+        cmd = (
+            f"timeout 10 {SHELL} -c 'yes WSCTL-FLOOD | head -c 2000000'; "
+            f"echo; echo $(({factor}*{factor}))\n"
+        ).encode("ascii")
+        for s in sessions:
+            s.write_input(cmd)
+
+        def finished() -> bool:
+            # Only the tail: ``c.output()`` joins the whole buffer, and calling
+            # it every 50ms against megabytes of flood made the *test* the
+            # bottleneck (O(n^2) copying) rather than the code under test.
+            return all(
+                any(isinstance(i, bytes) and marker in i for i in c.items[-4:])
+                for c in clients
+            )
+
+        ok = await wait_for(finished, timeout=25.0)
+        assert ok, "a sustained flood never finished inside the budget"
+        assert all(s.client_count == 1 for s in sessions), "a viewer was dropped"
+        assert slow_consumer_drops() == drops_before, "backpressure dropped a viewer"
+        assert evicted_clients_total() == evict_before, "memory pressure evicted a viewer"
+        # Proof it was a real storm rather than a quiet success: a megabyte of
+        # output must have crossed the wire.
+        assert sum(len(c.output()) for c in clients) >= 8 * 500_000, (
+            "the flood produced almost no output; the gate proved nothing"
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.slow
+async def test_t5_colour_flood_sheds_on_a_sequence_boundary() -> None:
+    """200KB of colour escapes through a *forced* shed stays a valid stream.
+
+    This is the 花屏 contract at the byte level: dropping anywhere but a
+    sequence boundary hands a terminal the tail of ``ESC[31m`` to read as text,
+    and a full-screen program then draws garbage until its next full repaint.
+    The budget here is deliberately tiny so eviction is certain to run.
+    """
+    from wsctl.core.ansi import AnsiTracker, is_boundary_aligned
+
+    class Capture:
+        def __init__(self) -> None:
+            self.parts: list[bytes] = []
+
+        async def send_bytes(self, data: bytes) -> None:
+            self.parts.append(data)
+
+        async def send_json(self, obj: object) -> None:  # pragma: no cover
+            pass
+
+    client = WsClient(Capture(), max_pending=64, max_bytes=4096)  # type: ignore[arg-type]
+    cycle = b"\x1b[31mRED-TEXT\x1b[0m \x1b[32mGREEN\x1b[0m \x1b[1mBOLD\x1b[0m\r\n"
+    payload = cycle * (200_000 // len(cycle) + 1)
+    assert len(payload) >= 200_000, "the flood must actually be 200KB"
+    # Split at arbitrary points so frames routinely begin mid-sequence, which
+    # is the case a stateless scan gets wrong and a streaming tracker does not.
+    offset = 0
+    sizes = (3, 5, 7, 11, 13, 17, 19)
+    i = 0
+    while offset < len(payload):
+        n = sizes[i % len(sizes)]
+        client.put(payload[offset : offset + n])
+        offset += n
+        i += 1
+
+    assert client.dropped_bytes > 0, "the point of the test is what survives a shed"
+    kept = client.queued_binary()
+    assert is_boundary_aligned(kept), "the surviving stream starts mid-escape"
+    assert payload.endswith(kept), "shedding must only ever drop a prefix"
+
+    # The strong form: where the kept stream begins, the discarded prefix must
+    # have left the parser *outside* a sequence. Checking ``kept`` on its own
+    # is the weaker property -- a stream that opens ``1mABC`` does not start
+    # with ESC and so passes ``is_boundary_aligned`` while being exactly the
+    # tail of a colour sequence about to be read as text.
+    cut = len(payload) - len(kept)
+    tracker = AnsiTracker()
+    tracker.feed(payload[:cut])
+    assert not tracker.inside, (
+        f"the cut at offset {cut} landed inside a sequence; kept opens {kept[:12]!r}"
+    )
