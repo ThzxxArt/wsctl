@@ -26,7 +26,8 @@
     sessionFilter: $("session-filter"), sessionsDetachAll: $("sessions-detach-all"),
     adminBtn: $("admin-btn"), adminOverlay: $("admin-overlay"), adminBody: $("admin-body"),
     adminClose: $("admin-close"), adminNote: $("admin-note"),
-    tabMenu: $("tab-menu"), moreBtn: $("more-btn"), moreMenu: $("more-menu"),
+    tabMenu: $("tab-menu"), termMenu: $("term-menu"), setRightclick: $("set-rightclick"),
+    moreBtn: $("more-btn"), moreMenu: $("more-menu"),
     settingsBtn: $("settings-btn"), settingsOverlay: $("settings-overlay"),
     setTheme: $("set-theme"), setFontsize: $("set-fontsize"), setFont: $("set-font"),
     settingsClose: $("settings-close"), settingsDone: $("settings-done"),
@@ -55,12 +56,58 @@
     nsSshIdentity: $("ns-ssh-identity"), nsSshOptions: $("ns-ssh-options"),
   };
 
+  // Copy/paste live on Alt+C / Alt+V, not Ctrl+Shift+C / Ctrl+Shift+V.
+  // Chrome, Edge and Firefox reserve Ctrl+Shift+C for the DevTools inspector
+  // and handle it at the browser level -- `preventDefault()` in the page never
+  // gets the chance, so the terminal's copy silently became "open the console".
+  // Alt+C / Alt+V are unclaimed by every browser and complete the mnemonic set
+  // this product already uses (Alt+N/W/F/S/H/L).
   const DEFAULT_KEYS = {
     new_session: "alt+n", close_session: "alt+w", kill_session: "alt+shift+w",
     next_tab: "alt+ArrowRight", prev_tab: "alt+ArrowLeft", toggle_files: "alt+f",
     toggle_sessions: "alt+l", toggle_settings: "alt+s", toggle_share: "alt+h",
     search: "ctrl+shift+f",
+    copy_selection: "alt+c", paste_clipboard: "alt+v",
+    font_inc: "alt+e", font_dec: "alt+d", clear_screen: "alt+r",
+    show_help: "alt+?",
   };
+
+  // Which chords a browser may swallow before the page ever sees them. The
+  // help sheet says so out loud instead of advertising a shortcut that opens
+  // the developer console.
+  function prettyCombo(combo) {
+    // ``alt+c`` is how the binding is stored; "Alt+C" is how a human reads it.
+    // The help sheet used to print the raw key, which is why it looked like the
+    // shortcuts were shouting at random.
+    if (!combo || combo === "未绑定") return combo;
+    return combo
+      .split("+")
+      .map((part) => {
+        if (part === "ArrowRight") return "→";
+        if (part === "ArrowLeft") return "←";
+        if (part === "ArrowUp") return "↑";
+        if (part === "ArrowDown") return "↓";
+        if (part.length === 1) return part.toUpperCase();
+        return part.charAt(0).toUpperCase() + part.slice(1);
+      })
+      .join("+");
+  }
+
+  const CHORD_RELIABILITY = {
+    copy_selection: "warn",   // Alt+C is ours; Ctrl+Shift+C is the browser's
+    paste_clipboard: "warn",
+  };
+
+  // Chords a browser claims before the page ever sees them. Binding one of
+  // these looks fine in Settings and silently does nothing at runtime -- which
+  // is how people ended up opening the DevTools inspector instead of copying.
+  const BROWSER_RESERVED = new Set([
+    "ctrl+shift+c", "ctrl+shift+j", "ctrl+shift+i", "ctrl+shift+p",
+    "ctrl+shift+n", "ctrl+shift+t", "ctrl+shift+w", "ctrl+shift+o",
+    "ctrl+shift+delete", "ctrl+w", "ctrl+t", "ctrl+n", "ctrl+r",
+    "ctrl+u", "ctrl+h", "ctrl+d", "ctrl+l", "ctrl+p", "f5", "f12",
+    "ctrl+tab", "ctrl+shift+tab", "alt+ArrowLeft", "alt+ArrowRight",
+  ]);
 
   const params = new URLSearchParams(location.search);
   const sharedSession = params.get("session");
@@ -167,7 +214,10 @@
   };
 
   const prefs = Object.assign(
-    { theme: "auto", termTheme: "dark", fontSize: 14, fontFamily: "", keybindings: {}, customThemes: {} },
+    {
+      theme: "auto", termTheme: "dark", fontSize: 14, fontFamily: "",
+      keybindings: {}, customThemes: {}, rightClickMode: "menu",
+    },
     readPrefs(),
   );
   prefs.keybindings = Object.assign({}, DEFAULT_KEYS, prefs.keybindings);
@@ -728,13 +778,22 @@
     });
     term.onResize(({ cols, rows }) => sendControl(s, { type: "resize", cols, rows }));
 
-    // 右键：有选区则复制，否则粘贴剪贴板（终端常见习惯）
+    // Terminal right-click. The old behaviour ("copy if there is a selection,
+    // otherwise paste") is still available, but it was completely undiscoverable
+    // and it is not what every user wants -- so it is one of three modes and
+    // the default is a real menu.
     pane.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      if (s.writable === false) return;
-      const sel = s.term.getSelection && s.term.getSelection();
-      if (sel) { navigator.clipboard.writeText(sel).then(() => toast("已复制", "ok")).catch(() => {}); return; }
-      navigator.clipboard.readText().then((text) => { if (text) sendInput(s, text); }).catch(() => {});
+      const mode = prefs.rightClickMode || "menu";
+      if (mode === "quick") {
+        quickCopyOrPaste(s);
+        return;
+      }
+      if (mode === "paste") {
+        doPaste(s);
+        return;
+      }
+      openTermMenu(e.clientX, e.clientY, s);
     });
 
     if (s.autoConnect) ensureConnected(s);
@@ -797,6 +856,84 @@
     if (!els.sessionsOverlay.classList.contains("hidden")) refreshSessions();
   }
 
+  // -- 终端右键菜单 -----------------------------------------------------
+
+  function hasSelection(s) {
+    return Boolean(s && s.term && s.term.getSelection && s.term.getSelection());
+  }
+
+  function doCopy(s) {
+    const sel = s.term.getSelection && s.term.getSelection();
+    if (!sel) { toast("没有选中内容", ""); return; }
+    navigator.clipboard.writeText(sel)
+      .then(() => toast("已复制", "ok"))
+      .catch(() => toast("复制失败：浏览器拒绝了剪贴板访问", "error"));
+  }
+
+  function doPaste(s) {
+    if (s.writable === false) { toast("会话为只读", ""); return; }
+    navigator.clipboard.readText()
+      .then((text) => { if (text) sendInput(s, text); else toast("剪贴板为空", ""); })
+      .catch(() => toast("粘贴失败：浏览器拒绝了剪贴板访问", "error"));
+  }
+
+  function quickCopyOrPaste(s) {
+    if (hasSelection(s)) doCopy(s);
+    else doPaste(s);
+  }
+
+  function changeFont(s, delta) {
+    prefs.fontSize = Math.min(24, Math.max(9, prefs.fontSize + delta));
+    applyPrefs();
+    toast(`字号 ${prefs.fontSize}`, "");
+  }
+
+  function clearScreen(s) {
+    // term.clear() wipes the scrollback too; what an operator usually wants is
+    // a clean screen with history intact, which is Ctrl+L's job.
+    sendInput(s, "\x0c");
+  }
+
+  let menuSession = null;
+  function openTermMenu(x, y, s) {
+    menuSession = s;
+    const sel = hasSelection(s);
+    els.termMenu.querySelectorAll("button").forEach((b) => {
+      const act = b.dataset.taction;
+      if (act === "copy") b.disabled = !sel;
+      if (act === "paste") b.disabled = s.writable === false;
+      if (act === "detach" || act === "kill") b.disabled = sharedMode;
+    });
+    els.termMenu.style.left = `${x}px`;
+    els.termMenu.style.top = `${y}px`;
+    els.termMenu.classList.remove("hidden");
+  }
+  function closeTermMenu() { els.termMenu.classList.add("hidden"); menuSession = null; }
+
+  els.termMenu.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const s = menuSession;
+      const act = btn.dataset.taction;
+      closeTermMenu();
+      if (!s) return;
+      switch (act) {
+        case "copy": doCopy(s); break;
+        case "paste": doPaste(s); break;
+        case "selectall":
+          try { s.term.selectAll(); } catch { /* 忽略 */ }
+          break;
+        case "find": toggleSearch(true); break;
+        case "clear": clearScreen(s); break;
+        case "font+": changeFont(s, +1); break;
+        case "font-": changeFont(s, -1); break;
+        case "zmodem": els.zmodemBtn.click(); break;
+        case "detach": detachTab(s.id); break;
+        case "kill": killTab(s.id); break;
+        default: break;
+      }
+    });
+  });
+
   function openTabMenu(x, y, id) {
     menuSid = id; menuOpenedAt = Date.now();
     els.tabMenu.style.left = `${x}px`;
@@ -817,6 +954,7 @@
   document.addEventListener("click", () => {
     if (Date.now() - menuOpenedAt < 350) return;
     closeTabMenu();
+    closeTermMenu();
     els.moreMenu.classList.add("hidden");
   });
 
@@ -1981,6 +2119,12 @@
         activateTab(ids[(idx + step + ids.length) % ids.length]);
         break;
       }
+      case "copy_selection": if (activeId) doCopy(sessions.get(activeId)); break;
+      case "paste_clipboard": if (activeId) doPaste(sessions.get(activeId)); break;
+      case "font_inc": if (activeId) changeFont(sessions.get(activeId), +1); break;
+      case "font_dec": if (activeId) changeFont(sessions.get(activeId), -1); break;
+      case "clear_screen": if (activeId) clearScreen(sessions.get(activeId)); break;
+      case "show_help": toggleHotkeyHelp(); break;
       case "toggle_files": {
         const hidden = els.filePanel.classList.toggle("hidden");
         if (!hidden) loadFiles(filePath);
@@ -2010,29 +2154,65 @@
   document.addEventListener("keydown", (event) => {
     if (sharedMode) return;
     const s = activeId && sessions.get(activeId);
-    // 复制/粘贴：Ctrl+Shift+C / Ctrl+Shift+V，以及有选区时的 Ctrl+C
-    if (s) {
-      const sel = s.term.getSelection && s.term.getSelection();
-      if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "c") {
-        if (sel) { navigator.clipboard.writeText(sel).then(() => toast("已复制", "ok")).catch(() => {}); }
-        event.preventDefault(); return;
-      }
-      if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "v") {
-        navigator.clipboard.readText().then((text) => { if (text) sendInput(s, text); }).catch(() => {});
-        event.preventDefault(); return;
-      }
-      if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "c" && sel) {
-        navigator.clipboard.writeText(sel).then(() => toast("已复制", "ok")).catch(() => {});
-        event.preventDefault(); return;
-      }
+    const sel = s && s.term && s.term.getSelection ? s.term.getSelection() : "";
+
+    // Ctrl+C with a selection is the terminal convention and is safe.
+    if (s && sel && event.ctrlKey && !event.shiftKey && !event.altKey
+        && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      doCopy(s);
+      return;
     }
-    // `?` opens the shortcut cheatsheet. Deliberately not rebindable: it is
-    // the one chord whose whole purpose is telling you what the others are.
-    if (event.key === "?" && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    // Ctrl+Shift+C / Ctrl+Shift+V are handled here on a best-effort basis.
+    // Chrome, Edge and Firefox reserve Ctrl+Shift+C for the DevTools inspector
+    // *at the browser level*, so this code often never runs -- which is why the
+    // defaults moved to Alt+C / Alt+V and the help sheet marks these unreliable.
+    if (s && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      doCopy(s);
+      return;
+    }
+    if (s && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "v") {
+      event.preventDefault();
+      doPaste(s);
+      return;
+    }
+    // The traditional xterm pair. Unclaimed by every browser, so this is the
+    // one keyboard path DevTools cannot steal.
+    if (s && event.ctrlKey && event.key === "Insert") {
+      event.preventDefault();
+      doCopy(s);
+      return;
+    }
+    if (s && event.shiftKey && !event.ctrlKey && event.key === "Insert") {
+      event.preventDefault();
+      doPaste(s);
+      return;
+    }
+
+    // Escape closes any open context menu. This lives in the *capture* phase
+    // on purpose: xterm.js handles Escape itself and calls stopPropagation,
+    // so a bubble-phase listener here never sees the key and the menus would
+    // not close.
+    if (event.key === "Escape") {
+      closeFileMenu();
+      closeTermMenu();
+      closeTabMenu();
+    }
+
+    // `?` opens the cheatsheet -- but only when the user is not typing into a
+    // terminal. It used to swallow the keystroke unconditionally, so `?` never
+    // reached the shell (`ls ?` became an overlay).
+    const typingInTerminal = Boolean(
+      event.target && event.target.closest && event.target.closest(".xterm"),
+    );
+    if (event.key === "?" && !event.ctrlKey && !event.altKey && !event.metaKey
+        && !typingInTerminal) {
       event.preventDefault(); event.stopPropagation();
       toggleHotkeyHelp();
       return;
     }
+
     const combo = comboOf(event);
     if (!combo) return;
     for (const [action, binding] of Object.entries(prefs.keybindings)) {
@@ -2045,7 +2225,11 @@
   const HOTKEY_LABELS = {
     new_session: "新建会话", close_session: "关闭标签（保持会话）", kill_session: "终止会话",
     next_tab: "下一个标签", prev_tab: "上一个标签", toggle_files: "文件面板",
-    toggle_sessions: "会话列表", toggle_settings: "设置", toggle_share: "分享会话", search: "搜索终端",
+    toggle_sessions: "会话列表", toggle_settings: "设置", toggle_share: "分享会话",
+    search: "搜索终端",
+    copy_selection: "复制选区", paste_clipboard: "粘贴剪贴板",
+    font_inc: "字号 +", font_dec: "字号 −", clear_screen: "清屏",
+    show_help: "快捷键帮助",
   };
 
   // Discoverability: the bindings existed and were editable, but there was no
@@ -2060,23 +2244,42 @@
     els.hotkeyOverlay.classList.toggle("hidden", hidden);
     if (hidden) return;
     els.hotkeyHelp.innerHTML = "";
+    // Say which chords a browser may swallow. Advertising Ctrl+Shift+C as the
+    // copy shortcut is how people ended up opening the DevTools inspector.
+    const legend = document.createElement("p");
+    legend.className = "legend";
+    legend.innerHTML =
+      "<span><b>✅</b> 可靠</span>" +
+      "<span><b>⚠️</b> 部分浏览器可用</span>" +
+      "<span><b>❌</b> 浏览器占用，请改用其它键</span>";
+    els.hotkeyHelp.appendChild(legend);
     const fixed = [
-      ["?", "打开 / 关闭本帮助"],
-      ["Esc", "关闭最上层弹窗或搜索"],
-      ["Ctrl+Shift+C", "复制选区"],
-      ["Ctrl+Shift+V", "粘贴剪贴板"],
-      ["Ctrl+C（有选区时）", "复制选区"],
+      ["Alt+?", "打开 / 关闭本帮助（打字时用它，不抢 ? 键）", "ok"],
+      ["?", "打开 / 关闭本帮助（仅在终端未聚焦时）", "ok"],
+      ["Esc", "关闭最上层弹窗或搜索", "ok"],
+      ["Ctrl+C（有选区时）", "复制选区", "ok"],
+      ["Ctrl+Shift+C", "复制选区", "bad"],
+      ["Ctrl+Shift+V", "粘贴剪贴板", "bad"],
+      ["Ctrl+Insert / Shift+Insert", "复制 / 粘贴（传统终端）", "ok"],
+      ["终端右键", "弹出操作菜单（可在设置里改为快捷复制粘贴）", "ok"],
     ];
     const rows = Object.entries(prefs.keybindings)
-      .map(([action, binding]) => [binding || "未绑定", HOTKEY_LABELS[action] || action])
+      .map(([action, binding]) => [
+        prettyCombo(binding) || "未绑定",
+        HOTKEY_LABELS[action] || action,
+        CHORD_RELIABILITY[action] ? "warn" : "ok",
+      ])
       .concat(fixed);
-    for (const [combo, label] of rows) {
+    for (const [combo, label, grade] of rows) {
       const row = document.createElement("div");
       row.className = "hotkey-row";
       const name = document.createElement("span");
       name.textContent = label;
       const kbd = document.createElement("kbd");
-      kbd.textContent = combo;
+      kbd.textContent =
+        (grade === "bad" ? "❌ " : grade === "warn" ? "⚠️ " : "") + combo;
+      if (grade === "bad") kbd.title = "该组合键被浏览器占用（例如 DevTools），页面拦不住";
+      else if (grade === "warn") kbd.title = "已尽力接管，但部分浏览器会抢先处理";
       // The help sheet is for reading *and* for taking away: click a chord to
       // copy it (someone pastes these into their own notes or a wiki).
       kbd.title = "点击复制";
@@ -2120,6 +2323,15 @@
         if (clash) {
           toast(`快捷键与「${HOTKEY_LABELS[clash[0]] || clash[0]}」冲突`, "error");
           input.value = prefs.keybindings[action] || "";
+          return;
+        }
+        // Also warn when the chord is one the browser claims first. Without
+        // this the setting accepted it happily and the shortcut never worked.
+        if (value && BROWSER_RESERVED.has(value.toLowerCase())) {
+          toast(
+            `⚠️ ${value} 被浏览器占用（例如 DevTools / 关闭标签页），实际会拦不住。建议换一组键`,
+            "error",
+          );
           return;
         }
         prefs.keybindings[action] = value;
@@ -2182,6 +2394,11 @@
   els.settingsBtn.addEventListener("click", () => els.settingsOverlay.classList.remove("hidden"));
   els.settingsClose.addEventListener("click", () => els.settingsOverlay.classList.add("hidden"));
   els.settingsDone.addEventListener("click", () => els.settingsOverlay.classList.add("hidden"));
+  els.setRightclick.value = prefs.rightClickMode || "menu";
+  els.setRightclick.addEventListener("change", () => {
+    prefs.rightClickMode = els.setRightclick.value;
+    applyPrefs();
+  });
   els.setTheme.addEventListener("change", () => { prefs.theme = els.setTheme.value; applyPrefs(); });
   els.setFontsize.addEventListener("change", () => { prefs.fontSize = Number(els.setFontsize.value); applyPrefs(); });
   els.setFont.addEventListener("change", () => { prefs.fontFamily = els.setFont.value; applyPrefs(); });
@@ -2362,7 +2579,7 @@
     });
   });
   document.addEventListener("click", () => closeFileMenu());
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeFileMenu(); });
+
 
   // -- 预览 / 编辑 ------------------------------------------------------
   async function openPreview(rel) {

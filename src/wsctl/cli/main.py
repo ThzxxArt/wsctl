@@ -601,11 +601,12 @@ def restore(
 # combined, so a contradictory command line fails before any process is spawned.
 SERVE_RULES = [
     vmod.exclusive("daemon", "foreground"),
-    vmod.exclusive(
-        "daemon",
-        "reuse_port",
-        message="--daemon 与 --reuse-port 不兼容：多实例热切换请用 --foreground（或 systemd）管理",
-    ),
+    # ``--daemon`` and ``--reuse-port`` used to be mutually exclusive, which
+    # made a zero-downtime restart impossible under the managed lifecycle --
+    # exactly the operation "restart the terminal from inside itself" needs.
+    # They are now allowed together: the pid file records ``reuse_port`` so the
+    # lifecycle can manage such an instance, and a rolling restart relies on
+    # it. Plain multi-instance handover still skips the pid file entirely.
     vmod.exclusive(
         "no_auth",
         "admin_password",
@@ -643,6 +644,10 @@ def _serve_child_argv(options: vmod.Options) -> list[str]:
         argv.append("--no-auth")
     if options.has("log_json"):
         argv.append("--log-json")
+    # Boolean switches: they take no value, so they must not go through the
+    # value map above (which would emit `--reuse-port True`).
+    if options.has("reuse_port"):
+        argv.append("--reuse-port")
     return argv
 
 
@@ -724,6 +729,26 @@ def _start_background(
         console.print("[dim]若为首次启动，admin 随机密码打印在日志中。[/]")
 
 
+def _bind_reuse_with_retry(settings: Settings) -> Any:
+    """Bind a ``SO_REUSEPORT`` socket, waiting out a non-sharing predecessor."""
+    import time as _time
+
+    from wsctl.core.net import make_reuse_socket
+
+    rolling = os.environ.get("WSCTL_ROLLING_FROM_PID")
+    deadline = _time.monotonic() + (float(os.environ.get("WSCTL_ROLLING_BIND_TIMEOUT", "40")))
+    last: OSError | None = None
+    while True:
+        try:
+            return make_reuse_socket(settings.host, settings.port)
+        except OSError as exc:
+            if not rolling or _time.monotonic() >= deadline:
+                raise
+            last = exc
+            _time.sleep(0.15)
+    raise last  # pragma: no cover - unreachable
+
+
 def _serve_foreground(
     settings: Settings, *, admin_password: str | None, startup_command: str | None
 ) -> None:
@@ -742,12 +767,25 @@ def _serve_foreground(
         _fail("当前平台不支持 SO_REUSEPORT，无法使用 --reuse-port")
 
     instance: Instance | None = None
-    if settings.reuse_port:
+    rolling_from = os.environ.get("WSCTL_ROLLING_FROM_PID")
+    # ``--reuse-port`` means two different things depending on how we got here:
+    #   * an interactive `serve --reuse-port` is a deliberate handover, several
+    #     processes briefly sharing a port, and stays outside the lifecycle;
+    #   * `wsctl start --reuse-port` (or a rolling successor) is a *managed*
+    #     instance that merely happens to be shareable -- and that is exactly
+    #     what makes a later zero-downtime restart possible. Skipping the pid
+    #     file here silently demoted it to the first kind.
+    managed = os.environ.get("WSCTL_DAEMON") == "1" or bool(rolling_from)
+    if settings.reuse_port and not managed:
         console.print("[dim]SO_REUSEPORT：多实例共享端口，后台生命周期命令不可用[/]")
     else:
         try:
-            instance = daemon_mod.claim_pidfile(settings)
-        except daemon_mod.DaemonError as exc:
+            instance = daemon_mod.claim_pidfile(
+                settings,
+                takeover_from=int(rolling_from) if rolling_from else None,
+                reuse_port=settings.reuse_port,
+            )
+        except (daemon_mod.DaemonError, ValueError) as exc:
             _fail(str(exc))
 
     import uvicorn
@@ -765,7 +803,6 @@ def _serve_foreground(
 
     try:
         if settings.reuse_port:
-            from wsctl.core.net import make_reuse_socket
 
             uv_config = uvicorn.Config(
                 application,
@@ -774,8 +811,14 @@ def _serve_foreground(
                 ssl_keyfile=ssl_keyfile,
             )
             server = uvicorn.Server(uv_config)
+            # SO_REUSEPORT only lets two sockets share a port when *both* set
+            # the option. A predecessor started without it still owns the port
+            # alone, so a rolling successor that binds at once would fail with
+            # EADDRINUSE and the handover would never happen. Retry until the
+            # predecessor's socket goes away -- the gap then shrinks from "the
+            # restart never completed" to the milliseconds between the two.
             try:
-                sock = make_reuse_socket(settings.host, settings.port)
+                sock = _bind_reuse_with_retry(settings)
             except OSError as exc:
                 _fail(f"无法以 SO_REUSEPORT 绑定 {settings.host}:{settings.port}：{exc}")
             console.print("[dim]SO_REUSEPORT enabled: a new instance can take over this port[/]")
@@ -905,6 +948,13 @@ def start(
     force: Annotated[
         bool, typer.Option("--force", help="已在运行时先停止再启动。")
     ] = False,
+    reuse_port: Annotated[
+        bool,
+        typer.Option(
+            "--reuse-port",
+            help="以 SO_REUSEPORT 绑定：此后 `restart --rolling` 可零停机。",
+        ),
+    ] = False,
 ) -> None:
     """在后台启动 wsctl（非 systemd；配合 stop/status/logs/restart）。"""
     options = vmod.Options(
@@ -920,6 +970,7 @@ def start(
             "log_json": log_json,
             "new": new,
             "backend": backend,
+            "reuse_port": reuse_port,
         }
     )
     try:
@@ -934,7 +985,7 @@ def start(
         ssl_cert=ssl_cert,
         ssl_key=ssl_key,
         backend=backend,
-        reuse_port=False,
+        reuse_port=reuse_port,
         no_auth=no_auth,
         log_json=log_json,
         log_level=log_level,
@@ -957,10 +1008,29 @@ def stop(
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     timeout: Annotated[float, typer.Option("--timeout", help="优雅退出的等待秒数。")] = 15.0,
     force: Annotated[bool, typer.Option("--force", help="超时后强制 SIGKILL。")] = False,
+    drop_my_connection: Annotated[
+        bool,
+        typer.Option(
+            "--i-know-this-drops-my-connection",
+            help="确认你正在该实例托管的终端里执行，并接受连接被切断。",
+        ),
+    ] = False,
 ) -> None:
-    """停止后台运行的 wsctl（未指定 --host/--port 时自动跟随正在运行的实例）。"""
-    settings = _settings_from(config, host=host, port=port)
-    settings = _resolve_target(settings, port, host, what="停止")
+    """停止后台运行的 wsctl（未指定 --host/--port 时自动跟随正在运行的实例）。
+
+    在该实例自己的终端里执行时会**拒绝**：停止会话会连带你这条命令的 shell 一起
+    结束，`&&` 后面的部分多半永远跑不到。请改用 `wsctl restart --rolling`。
+    """
+    base = _settings_from(config, host=host, port=port)
+    resolved = daemon_mod.resolve_instance(
+        base, port_explicit=port is not None, host_explicit=host is not None
+    )
+    target = _resolve_target(base, port, host, what="停止", missing_ok=True)
+    if target is None:
+        return  # 本就未运行：幂等成功，让 `stop && start` 能继续走下去
+    if resolved.instance is not None:
+        _refuse_self_stop("停止", resolved.instance, drop_my_connection)
+    settings: Settings = target
     try:
         instance = daemon_mod.stop(settings, timeout=timeout, force=force)
     except daemon_mod.DaemonError as exc:
@@ -982,8 +1052,27 @@ def restart(
     new: Annotated[str | None, typer.Option("--new")] = None,
     backend: Annotated[str | None, typer.Option("--backend")] = None,
     timeout: Annotated[float, typer.Option("--timeout", help="等待就绪的秒数。")] = 20.0,
+    rolling: Annotated[
+        bool,
+        typer.Option(
+            "--rolling",
+            help="零停机滚动重启：新实例先接管端口，健康检查通过后再停旧实例。",
+        ),
+    ] = False,
+    drop_my_connection: Annotated[
+        bool,
+        typer.Option(
+            "--i-know-this-drops-my-connection",
+            help="确认你正在该实例托管的终端里执行，并接受连接被切断。",
+        ),
+    ] = False,
 ) -> None:
-    """重启后台运行的 wsctl。"""
+    """重启后台运行的 wsctl。
+
+    ``--rolling`` 先起后停，**不切断任何连接**，可以在 wsctl 自己的终端里安全执行
+    （这也是升级 `pipx upgrade wsctl` 之后推荐的重启方式）。默认的 ``stop`` 再
+    ``start`` 会有停机窗口，且在自家终端里执行等于锯断自己坐的树枝。
+    """
     options = vmod.Options(
         {
             "host": host,
@@ -1041,8 +1130,36 @@ def restart(
             err_console.print(f"[dim]  pid {other.pid}  {other.host}:{other.port}[/]")
         raise typer.Exit(code=1)
     _warn_ignored_admin_password(settings, admin_password)
+    argv = _serve_child_argv(options)
+
+    if rolling:
+        if running.instance is not None:
+            err_console.print(
+                f"[dim]滚动重启：先起替代实例接管 {running.instance.host}:"
+                f"{running.instance.port}，健康检查通过后再停旧实例（不切断连接）[/]"
+            )
+            preflight = daemon_mod.describe_handover(settings, running.instance)
+            if preflight:
+                err_console.print(f"[yellow]{preflight}[/]")
+        try:
+            old, successor = daemon_mod.rolling_restart(settings, argv, timeout=timeout)
+        except daemon_mod.DaemonError as exc:
+            _fail(str(exc))
+        note = daemon_mod.HANDOVER_NOTES.get("note")
+        if note:
+            err_console.print(f"[yellow]{note}[/]")
+        console.print(
+            f"[green]已滚动重启[/] 旧 pid {old.pid} → 新 pid {successor.pid}  "
+            f"[cyan]{successor.host}:{successor.port}[/]"
+        )
+        if not settings.auth_required:
+            err_console.print("[bold yellow]warning:[/] authentication is disabled")
+        return
+
+    if running.instance is not None:
+        _refuse_self_stop("重启", running.instance, drop_my_connection)
     try:
-        instance = daemon_mod.restart(settings, _serve_child_argv(options), timeout=timeout)
+        instance = daemon_mod.restart(settings, argv, timeout=timeout)
     except daemon_mod.DaemonError as exc:
         _fail(str(exc))
     console.print(f"[green]已重启[/] pid {instance.pid}  [cyan]{instance.host}:{instance.port}[/]")
@@ -1110,7 +1227,9 @@ def logs(
 ) -> None:
     """查看后台 wsctl 的日志（未指定 --host/--port 时自动跟随正在运行的实例）。"""
     settings = _settings_from(config, host=host, port=port)
-    settings = _resolve_target(settings, port, host, what="查看")
+    # ``missing_ok`` is False here, so this is never ``None``; the option
+    # exists only for ``stop`` (stopping nothing is a success, not an error).
+    settings = cast("Settings", _resolve_target(settings, port, host, what="查看"))
     try:
         daemon_mod.tail_log(settings, lines=max(lines, 0), follow=follow)
     except daemon_mod.DaemonError as exc:
@@ -1125,7 +1244,7 @@ def reload(
 ) -> None:
     """请求运行中的 wsctl 重载配置（发送 SIGHUP；未指定 --port 时自动跟随实例）。"""
     settings = _settings_from(config, host=host, port=port)
-    settings = _resolve_target(settings, port, host, what="重载")
+    settings = cast("Settings", _resolve_target(settings, port, host, what="重载"))
     try:
         instance = daemon_mod.reload_(settings)
     except daemon_mod.DaemonError as exc:
@@ -1133,9 +1252,53 @@ def reload(
     console.print(f"[green]已请求重载配置[/]（pid {instance.pid}）")
 
 
+SELF_STOP_REFUSAL = (
+    "你正在 wsctl 自己托管的终端里执行此命令。\n"
+    "  继续会[bold]切断你当前的连接[/]，而且命令的后半段（例如 && 后面的 start）\n"
+    "  [bold]很可能永远不会执行[/]——服务停了，承载这条命令的 shell 也一起没了。"
+)
+
+
+def _refuse_self_stop(action: str, instance: Instance, override: bool) -> None:
+    """Refuse to kill the session we are running in, unless told otherwise.
+
+    This is the exact failure that locked a remote user out of their own box:
+    ``wsctl stop && wsctl start`` typed inside a wsctl terminal. ``stop`` works,
+    ``manager.shutdown()`` tears down the session, ``killpg`` takes the shell
+    with it, and ``start`` never runs. Say so instead of doing it silently.
+    """
+    from wsctl.core import selfwatch
+
+    inside = selfwatch.inside_instance(instance.pid)
+    if inside is False:
+        return
+    if override:
+        if inside is None:
+            err_console.print(
+                "[yellow]注意：[/]无法确认当前 shell 是否由该实例托管（此平台不支持检测），"
+                "你已显式要求继续。"
+            )
+        return
+    err_console.print(f"[bold yellow]已取消{action}。[/]{SELF_STOP_REFUSAL}")
+    err_console.print("")
+    err_console.print("  请改用下列任一方式：")
+    err_console.print("    1) 在 [bold]SSH / 物理终端[/]里执行同样的命令")
+    err_console.print(
+        "    2) 使用 [bold]wsctl restart --rolling[/]（先起后停，不切断连接，"
+        "可在本终端内安全执行）"
+    )
+    err_console.print("    3) 明确接受后果，追加 [bold]--i-know-this-drops-my-connection[/]")
+    raise typer.Exit(code=3)
+
+
 def _resolve_target(
-    settings: Settings, port: int | None, host: str | None, *, what: str
-) -> Settings:
+    settings: Settings,
+    port: int | None,
+    host: str | None,
+    *,
+    what: str,
+    missing_ok: bool = False,
+) -> Settings | None:
     """Point ``settings`` at the instance this command should act on.
 
     Without an explicit ``--host``/``--port`` the instance that is actually
@@ -1160,6 +1323,24 @@ def _resolve_target(
         err_console.print(
             f"[yellow]发现 {len(resolved.found)} 个实例，请用 --port 指定要{what}哪一个：[/]"
         )
+    elif resolved.found:
+        # Lead with the fix, not with "not running": the operator clearly meant
+        # to act on something, and "未在运行" reads like nothing is installed.
+        first = resolved.found[0]
+        err_console.print(
+            f"[yellow]{settings.port} 端口上没有实例[/]；"
+            f"但发现 pid {first.pid} 正在 {first.host}:{first.port} 运行。"
+        )
+        err_console.print(
+            f"[green]你是想找它吗？[/]  wsctl "
+            f"--port {first.port} …"
+        )
+    elif missing_ok:
+        # Idempotent, like `rm -f`: stopping something that is not running has
+        # reached the requested end state. A non-zero exit here is what silently
+        # broke `wsctl stop … && wsctl start …`.
+        err_console.print("[dim]本就未在运行（无需操作）。[/]")
+        return None
     else:
         err_console.print(f"[yellow]未在运行[/]（{settings.host}:{settings.port}）")
     for other in resolved.found:

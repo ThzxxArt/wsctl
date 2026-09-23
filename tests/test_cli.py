@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -103,12 +104,73 @@ def _missing_config(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setenv("WSCTL_CONFIG", str(tmp_path / "missing.toml"))  # type: ignore[attr-defined]
 
 
-def test_serve_rejects_daemon_with_reuse_port(tmp_path: Path, monkeypatch: object) -> None:
-    _missing_config(tmp_path, monkeypatch)
-    result = runner.invoke(app, ["serve", "--daemon", "--reuse-port"])
-    assert result.exit_code == 2
-    assert "--daemon" in result.output
+def test_serve_allows_daemon_with_reuse_port(tmp_path, monkeypatch) -> None:
+    """The two are allowed together now -- that is what makes a rolling restart
+    possible under the managed lifecycle.
 
+    They used to be mutually exclusive, which meant the only zero-downtime
+    path was outside the lifecycle entirely and the only managed path had a
+    refused-connection window. Exactly the gap that made "restart the terminal
+    from inside itself" impossible.
+    """
+    from typer.testing import CliRunner
+
+    from wsctl.cli.main import app
+
+    result = CliRunner().invoke(app, ["serve", "--daemon", "--reuse-port", "--help"])
+    assert result.exit_code == 0, result.output
+    # and the combination is not named as a usage error anywhere in the help
+    assert "不兼容" not in result.output
+
+
+def test_rolling_restart_replaces_the_instance_without_a_gap(tmp_path) -> None:
+    """Start-before-stop: the successor takes the pid file, then the
+    predecessor is retired by pid and must not delete its successor's record.
+    """
+    from wsctl.cli import daemon as d
+    from wsctl.core.config import load_settings
+
+    settings = load_settings(data_dir=tmp_path, host="127.0.0.1", port=7699)
+    run = d.run_dir(settings)
+    run.mkdir(parents=True, exist_ok=True)
+
+    # A "predecessor" record written the way the real code does.
+    old = d.Instance(
+        pid=999999, host="127.0.0.1", port=7699,
+        started_at=0.0, version="0.0.0", identity="", reuse_port=False,
+    )
+    (run / "wsctl-7699.pid").write_text(
+        __import__("json").dumps(old.__dict__), encoding="utf-8"
+    )
+
+    # A successor claims the file with an explicit takeover of that pid.
+    successor = d.claim_pidfile(settings, takeover_from=999999, reuse_port=True)
+    try:
+        assert successor.reuse_port is True
+        assert d.read_instance(settings).pid == successor.pid
+
+        # The retiring instance must NOT delete the successor's record.
+        d.release_pidfile(settings, old)
+        assert d.read_instance(settings).pid == successor.pid
+    finally:
+        d.release_pidfile(settings, successor)
+    assert d.read_instance(settings) is None
+
+
+def test_claim_pidfile_still_refuses_an_unrelated_live_instance(tmp_path) -> None:
+    """Takeover only works for the pid that was named."""
+    from wsctl.cli import daemon as d
+    from wsctl.core.config import load_settings
+
+    settings = load_settings(data_dir=tmp_path, host="127.0.0.1", port=7698)
+    holder = d.claim_pidfile(settings)
+    try:
+        import pytest
+
+        with pytest.raises(d.DaemonError):
+            d.claim_pidfile(settings, takeover_from=holder.pid + 1, reuse_port=True)
+    finally:
+        d.release_pidfile(settings, holder)
 
 def test_serve_requires_ssl_pair(tmp_path: Path, monkeypatch: object) -> None:
     _missing_config(tmp_path, monkeypatch)
@@ -631,3 +693,122 @@ def test_doctor_does_not_create_the_database(tmp_path, monkeypatch) -> None:
     rows = json.loads(result.output)
     database = next(r for r in rows if r["check"] == "数据库")
     assert "尚未初始化" in database["result"], database
+
+
+def test_stop_is_idempotent_when_nothing_is_running(tmp_path, monkeypatch) -> None:
+    """Stopping nothing reaches the requested end state -- exit 0, not 1.
+
+    A non-zero exit here is what silently broke `wsctl stop … && wsctl start …`:
+    the shell's `&&` skipped the start half and the service stayed down.
+    """
+    from typer.testing import CliRunner
+
+    from wsctl.cli.main import app
+
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(conf))
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path / "data"))
+    result = CliRunner().invoke(app, ["stop", "--port", "7999"])
+    assert result.exit_code == 0, result.output
+    assert "本就未在运行" in result.output
+
+
+def test_stop_on_the_wrong_port_leads_with_the_fix(tmp_path, monkeypatch) -> None:
+    """"未在运行" alone reads like nothing is installed."""
+    from typer.testing import CliRunner
+
+    from wsctl.cli import daemon as d
+    from wsctl.cli.main import app
+    from wsctl.core.config import load_settings
+
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(conf))
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path / "data"))
+
+    settings = load_settings(data_dir=tmp_path / "data", host="127.0.0.1", port=7998)
+    d.run_dir(settings).mkdir(parents=True, exist_ok=True)
+    holder = d.Instance(
+        pid=os.getpid(), host="127.0.0.1", port=7998,
+        started_at=time.time(), version="0.0.0", identity="", reuse_port=False,
+    )
+    (d.run_dir(settings) / "wsctl-7998.pid").write_text(
+        __import__("json").dumps(holder.__dict__), encoding="utf-8"
+    )
+    try:
+        result = CliRunner().invoke(app, ["stop", "--port", "7997"])
+        assert result.exit_code == 1, result.output
+        assert "7997 端口上没有实例" in result.output
+        assert "7998" in result.output, "must name where the instance actually is"
+        assert "你是想找它吗" in result.output
+    finally:
+        (d.run_dir(settings) / "wsctl-7998.pid").unlink(missing_ok=True)
+
+
+def test_stop_refuses_to_kill_the_session_it_is_running_in(monkeypatch) -> None:
+    """Sawing off the branch you are sitting on must be refused by default."""
+
+    from wsctl.cli import daemon as d
+    from wsctl.cli.main import _refuse_self_stop
+
+    inst = d.Instance(
+        pid=4242, host="127.0.0.1", port=7996,
+        started_at=0.0, version="0.0.0", identity="", reuse_port=False,
+    )
+    monkeypatch.setattr("wsctl.core.selfwatch.inside_instance", lambda pid: True)
+    try:
+        _refuse_self_stop("停止", inst, override=False)
+    except Exception as exc:
+        assert getattr(exc, "exit_code", None) == 3
+    else:
+        raise AssertionError("refusing to kill your own shell must raise")
+
+
+def test_rolling_restart_says_upfront_whether_sessions_survive(tmp_path) -> None:
+    """The handover must announce the cost before paying it.
+
+    Only a tmux-backed session outlives an instance swap. Learning that after
+    the fact is the kind of surprise this whole release is about removing.
+    """
+    from wsctl.cli import daemon as d
+    from wsctl.core.config import load_settings
+    from wsctl.core.store import Store
+
+    data = tmp_path / "data"
+    data.mkdir()
+    settings = load_settings(data_dir=data, host="127.0.0.1", port=7995)
+    store = Store(settings.db_path)
+    try:
+        store.user_create("admin", "testpass123", role="admin")
+        store.term_session_upsert(
+            "aaaa", name="doomed", owner_id=None, backend="local", instance_id="x"
+        )
+        store.term_session_upsert(
+            "bbbb", name="keeper", owner_id=None, backend="tmux", instance_id="x"
+        )
+    finally:
+        store.close()
+
+    old = d.Instance(
+        pid=os.getpid(), host="127.0.0.1", port=7995,
+        started_at=time.time(), version="0.0.0", identity="", reuse_port=True,
+    )
+    text = d.describe_handover(settings, old)
+    assert "2 个运行中的会话" in text
+    assert "tmux" in text and "可跨重启存活" in text
+    assert "非 tmux" in text and "会随本次重启结束" in text
+
+
+def test_rolling_preflight_is_empty_when_nothing_is_running(tmp_path) -> None:
+    from wsctl.cli import daemon as d
+    from wsctl.core.config import load_settings
+
+    data = tmp_path / "data"
+    data.mkdir()
+    settings = load_settings(data_dir=data, host="127.0.0.1", port=7994)
+    old = d.Instance(
+        pid=os.getpid(), host="127.0.0.1", port=7994,
+        started_at=time.time(), version="0.0.0", identity="", reuse_port=True,
+    )
+    assert "无运行中的会话" in d.describe_handover(settings, old)

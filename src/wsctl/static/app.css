@@ -627,3 +627,19 @@ body.shared .tab .close { display: none; }
     transition-duration: 0.001ms !important;
   }
 }
+
+/* 终端右键菜单 */
+.menu-sep {
+  height: 1px; margin: 4px 6px; border: 0;
+  background: var(--border);
+}
+.context-menu .kbd {
+  margin-left: auto; padding-left: 14px;
+  font-family: var(--font-mono); font-size: 10px; color: var(--muted);
+}
+.context-menu button { display: flex; align-items: center; gap: 8px; }
+.legend {
+  display: flex; gap: var(--sp-3); flex-wrap: wrap;
+  font-size: 11px; color: var(--muted); margin: 0;
+}
+.legend b { color: var(--fg); font-weight: 600; }

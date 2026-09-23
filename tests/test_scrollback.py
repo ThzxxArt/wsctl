@@ -43,3 +43,32 @@ def test_trim_does_not_leave_an_orphaned_utf8_continuation() -> None:
 def test_invalid_capacity() -> None:
     with pytest.raises(ValueError):
         Scrollback(0)
+
+
+def test_replay_start_is_re_anchored_after_eviction() -> None:
+    """A replay must not begin in the middle of a colour sequence.
+
+    The head of the buffer becomes the head of the replay after eviction. If
+    the evicted bytes ended mid-escape, a reconnecting client replays a broken
+    stream into its terminal -- which is how a full-screen program ended up
+    showing garbage instead of its screen.
+    """
+    from wsctl.core.scrollback import Scrollback
+
+    red = b"\x1b[31m"
+    tail = b"VISIBLE"
+    buf = Scrollback(max_bytes=40)
+    # Enough bytes that eviction cuts into the middle of `ESC[31m`.
+    for _ in range(10):
+        buf.append(b"x" * 30 + red[:3])
+        buf.append(red[3:] + tail + b"\x1b[0m")
+
+    head = buf.chunks()[0]
+    from wsctl.core.ansi import AnsiTracker
+
+    # The property that matters is the *streaming* one: the replay, taken as a
+    # stream, must not begin inside an escape sequence. A stateless scan of the
+    # first chunk cannot tell -- a chunk may legitimately start mid-sequence.
+    tracker = AnsiTracker()
+    tracker.feed(head)
+    assert not tracker.inside, f"replay starts mid-escape: {head[:12]!r}"

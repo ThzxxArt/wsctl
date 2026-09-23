@@ -237,6 +237,8 @@ async def test_recording_captures_output(tmp_path: Path) -> None:
 
 
 class PendingClient:
+    close_code: int | None = None
+
     def __init__(self, pending: int = 0) -> None:
         self.pending_bytes = pending
         self.items: list[object] = []
@@ -260,14 +262,20 @@ async def test_memory_limit_drops_largest_backlog() -> None:
         await session.attach(big)
         await session.attach(small)
         session.write_input(b"echo mem\n")
+        # The greediest backlog is evicted, and -- unlike the slow-consumer
+        # path -- this one really does end the connection, so it must say so
+        # (4410) rather than close as if nothing happened.
         assert await wait_for(lambda: big.closed, timeout=5.0)
         assert not small.closed
+        assert getattr(big, "close_code", None) == 4410
     finally:
         await manager.shutdown()
 
 
 class FailingClient:
     """A client whose sink rejects everything immediately."""
+    close_code: int | None = None
+
 
     def put(self, item: object) -> None:
         raise ClientGone("sink is gone")
@@ -435,3 +443,42 @@ async def test_stop_missing_with_a_stale_snapshot_is_a_trap() -> None:
         await manager.shutdown()
         store.close()
         Path(store.path).unlink(missing_ok=True)
+
+
+async def test_memory_pressure_sheds_backlog_before_dropping_anyone() -> None:
+    """A session over its own cap gives up queued bytes before it gives up a viewer."""
+    manager = SessionManager()
+    session = await manager.create(
+        SessionSpec(name="sh", argv=[SHELL], memory_limit=5_000, scrollback_bytes=5_000)
+    )
+
+    class SheddingClient:
+        close_code: int | None = None
+
+        def __init__(self) -> None:
+            self.pending_bytes = 20_000
+            self.items: list[object] = []
+            self.closed = False
+            self.shed_calls = 0
+
+        def put(self, item: object) -> None:
+            self.items.append(item)
+
+        def shed_oldest(self, target: int) -> int:
+            self.shed_calls += 1
+            freed = min(self.pending_bytes, max(target, 1000))
+            self.pending_bytes -= freed
+            return freed
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = SheddingClient()
+    try:
+        await session.attach(client)
+        assert session.memory_usage() > 5_000
+        session._enforce_memory_limit()
+        assert client.shed_calls > 0, "backlog must be given up first"
+        assert client.closed is False, "nobody should be evicted over backlog alone"
+    finally:
+        await manager.shutdown()

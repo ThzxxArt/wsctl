@@ -343,6 +343,11 @@ def create_app(
     # counts it with ``metrics.inc``, which already puts it in the exposition
     # as a counter. Registering a collector too would print the series twice.
     metrics.collect_counter(
+        "wsctl_client_frames_shed_total",
+        "Terminal frames discarded to keep a slow viewer connected (never a disconnect)",
+        lambda: float(session_mod.shed_frames_total(app.state.manager)),
+    )
+    metrics.collect_counter(
         "wsctl_clients_backpressure_dropped_total",
         "Clients dropped because output outran them (queue full / byte budget)",
         lambda: float(session_mod.slow_consumer_drops()),

@@ -87,6 +87,8 @@ def _close_stores(tmp_path: Any) -> Iterator[None]:
 class FakeClient:
     """In-memory client sink used by the tests."""
 
+    close_code: int | None = None
+
     def __init__(self) -> None:
         self.items: list[bytes | dict[str, Any]] = []
 

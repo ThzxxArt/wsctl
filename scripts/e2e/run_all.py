@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Backend end-to-end scenarios for wsctl.
 
-Runs nine scenarios, each against a freshly started server on its own port and
+Runs ten scenarios, each against a freshly started server on its own port and
 data directory:
 
 1. server    — health, login, WebSocket attach/exec, reconnect replay, metrics,
                file panel (list/upload/download), traversal guard, auth guard
 1b. files    — the file panel surface: mkdir, upload (atomic), rename, preview,
                edit, paging, type filter, delete guards
+1c. selfrestart — restarting from inside your own session: `stop` is refused,
+               `stop` of nothing is idempotent, `restart --rolling` never drops
+               a /healthz probe
 2. cli       — wsctl login / session new|list|kill
 3. connect   — the CLI thin client over a real pseudo-terminal
 4. tmux      — a tmux-backed session survives a full server restart
@@ -50,6 +53,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PY = sys.executable
 ADMIN = "admin"
 PASSWORD = "testpass123"
+# A carriage return, spelled out. Escape sequences inside a shell heredoc
+# that writes these tests have already bitten three times: b"\\r" lands in
+# the source as a literal backslash and the shell never sees a line ending.
+CR = bytes([13])
 
 
 def free_port() -> int:
@@ -60,9 +67,48 @@ def free_port() -> int:
     return port
 
 
+def local_http():
+    """An ``httpx`` client that cannot be hijacked by the developer's proxy.
+
+    A shell that exports ``https_proxy`` makes ``httpx`` send even
+    ``http://127.0.0.1:.../healthz`` to the proxy, which answers 502 -- and a
+    perfectly healthy local instance looks dead. ``core/net.opener_for`` exists
+    because wsctl already learned this lesson about its own CLI; the tests had
+    not, and one of them failed with exactly those 502s.
+    """
+    import httpx as _httpx
+
+    return _httpx.Client(trust_env=False, timeout=10)
+
+
+def _clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The subprocess environment, with any inherited ``WSCTL_*`` stripped.
+
+    This suite once failed because the developer's shell happened to export
+    ``WSCTL_DAEMON=1`` (a value ``wsctl`` itself sets for the children it
+    spawns). Every server started here then believed it was a managed daemon
+    and went for the pid file -- so the second of two ``--reuse-port``
+    instances died with "已有实例在运行". Same class of defect as the test-suite
+    isolation work: a test that reads the developer's shell is not a test.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("WSCTL_")
+        # A developer's shell proxy must not reach these servers either -- it
+        # turns a healthy 127.0.0.1 probe into a 502 from the proxy.
+        and k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
 def spawn(port: int, data: Path, *, extra_env: dict[str, str] | None = None,
           reuse_port: bool = False) -> subprocess.Popen[bytes]:
-    env = {**os.environ, "WSCTL_DATA_DIR": str(data), **(extra_env or {})}
+    extra = dict(extra_env or {})
+    extra["WSCTL_DATA_DIR"] = str(data)
+    env = _clean_env(extra)
     cmd = [PY, "-m", "wsctl", "serve", "--port", str(port), "--host", "127.0.0.1",
            "--admin-password", PASSWORD, "--log-level", "warning"]
     if reuse_port:
@@ -113,7 +159,7 @@ def wait_health(base: str, proc: subprocess.Popen[bytes] | None = None,
                 f"server exited early ({proc.returncode})\n{_server_log_tail(port)}"
             )
         try:
-            if httpx.get(f"{base}/healthz", timeout=1).status_code == 200:
+            if local_http().get(f"{base}/healthz", timeout=1).status_code == 200:
                 return
         except httpx.HTTPError:
             time.sleep(0.2)
@@ -143,13 +189,19 @@ def login(base: str) -> str:
 
 
 def ws_recv_until(ws: object, marker: bytes, timeout: float = 10.0) -> bytes:
+    """Collect terminal output until ``marker`` shows up or the deadline passes.
+
+    A single ``recv`` timeout must not end the wait -- doing that meant any
+    quiet gap (a command that takes a moment to start, say) truncated the
+    capture and the caller only ever saw the echoed command line.
+    """
     out = b""
     end = time.time() + timeout
     while time.time() < end and marker not in out:
         try:
-            msg = ws.recv(timeout=5)  # type: ignore[attr-defined]
+            msg = ws.recv(timeout=2)  # type: ignore[attr-defined]
         except TimeoutError:
-            break
+            continue
         if isinstance(msg, bytes):
             out += msg
     return out
@@ -180,6 +232,26 @@ def _tmux_ls() -> list[str]:
 
 
 # -- scenarios --------------------------------------------------------
+
+
+def ws_drain(ws: object, seconds: float = 5.0) -> bytes:
+    """Collect terminal output for a fixed wall-clock, then stop.
+
+    ``ws_recv_until`` stops at the first match of its marker -- but the marker
+    is usually a substring of the *command we typed*, so the terminal's own echo
+    satisfies it instantly and the caller tests nothing. Draining for a fixed
+    duration and asserting on content afterwards cannot be fooled that way.
+    """
+    out = b""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            msg = ws.recv(timeout=1)  # type: ignore[attr-defined]
+        except TimeoutError:
+            continue
+        if isinstance(msg, bytes):
+            out += msg
+    return out
 
 
 def scenario_server() -> None:
@@ -219,11 +291,9 @@ def scenario_cli() -> None:
         with server() as (base, data, _):
             # `wsctl user` talks to the local store, so it must be pointed at the
             # same data directory the server under test is using.
-            env = {
-                **os.environ,
-                "XDG_CONFIG_HOME": str(conf),
-                "WSCTL_DATA_DIR": str(data),
-            }
+            env = _clean_env(
+                {"XDG_CONFIG_HOME": str(conf), "WSCTL_DATA_DIR": str(data)}
+            )
 
             def run(*args: str) -> str:
                 r = subprocess.run([PY, "-m", "wsctl", *args], cwd=str(ROOT), env=env,
@@ -322,7 +392,7 @@ def scenario_tmux() -> None:
     data = Path(tempfile.mkdtemp(prefix="wsctl-tmux-"))
     tmux_mod.set_namespace(data)  # the server namespaces by data dir
     name = tmux_mod.session_name  # bound after namespace is set
-    env = {"WSCTL_DEFAULT_BACKEND": "tmux"}
+    env = _clean_env({"WSCTL_DATA_DIR": str(data), "WSCTL_DEFAULT_BACKEND": "tmux"})
     first = spawn(port, data, extra_env=env)
     second: subprocess.Popen[bytes] | None = None
     sid = ""
@@ -396,7 +466,7 @@ def scenario_crash() -> None:
     base = f"http://127.0.0.1:{port}"
     data = Path(tempfile.mkdtemp(prefix="wsctl-crash-"))
     tmux_mod.set_namespace(data)
-    env = {"WSCTL_DEFAULT_BACKEND": "tmux"}
+    env = _clean_env({"WSCTL_DATA_DIR": str(data), "WSCTL_DEFAULT_BACKEND": "tmux"})
     first = spawn(port, data, extra_env=env)
     second: subprocess.Popen[bytes] | None = None
     sid = ""
@@ -504,7 +574,7 @@ def scenario_daemon() -> None:
     config.write_text(
         f'port = {port}\ndata_dir = "{data}"\nmax_sessions = 5\n', encoding="utf-8"
     )
-    env = {**os.environ, "WSCTL_CONFIG": str(config)}
+    env = _clean_env({"WSCTL_CONFIG": str(config)})
 
     def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -696,9 +766,242 @@ def scenario_files() -> None:
     print("  files: ok")
 
 
+def scenario_selfrestart() -> None:
+    """Restarting the terminal *from inside itself* must not saw off the branch.
+
+    Three things, and the first is the exact accident that locked a remote user
+    out of their own box: ``wsctl stop && wsctl start`` typed into a wsctl
+    terminal. ``stop`` worked, ``manager.shutdown()`` tore down the session,
+    ``killpg`` took the shell with it, and ``start`` never ran.
+
+    1. ``wsctl stop`` issued from inside one of the instance's own sessions is
+       **refused**, with an explanation and a way out.
+    2. ``wsctl stop`` on a port with nothing running exits 0 (idempotent), so a
+       hand-written ``stop && start`` chain cannot silently skip the start.
+    3. ``wsctl restart --rolling`` replaces the instance with **no** gap in
+       ``/healthz`` -- the operation that should have been used.
+    """
+    if sys.platform == "win32":
+        print("  selfrestart: skipped (POSIX only)")
+        return
+
+    # ---- 1. stop from inside the session must be refused --------------------
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    data = Path(tempfile.mkdtemp(prefix="wsctl-self-"))
+    proc = spawn(port, data)
+    try:
+        wait_health(base, proc)
+        token = login(base)
+        headers = {"Cookie": f"wsctl_session={token}"}
+        ws_url = base.replace("http", "ws") + "/ws"
+        sid = httpx.post(f"{base}/api/sessions", headers=headers, json={}, timeout=10).json()["id"]
+
+        # A plain newline, not a raw CR: this file is written through a
+        # shell heredoc and "\\r" would land in the source as a literal
+        # backslash, leaving the shell waiting for the rest of the command.
+        # Every marker below is un-echoable: it is produced by the shell
+        # (`$?`, `$((6*7))`) and cannot appear in the command we typed, so a
+        # passing assertion is proof of execution rather than of terminal echo.
+        with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
+            ws.send(json.dumps({"type": "attach", "session": sid, "cols": 160, "rows": 40}))
+            ws.send(b"echo PROBE-$((6*7))" + CR)
+            probe = ws_drain(ws, 3.0)
+            assert b"PROBE-42" in probe, (
+                "the shell never executed anything -- only echoed it: " + repr(probe[:200])
+            )
+            cmd = (
+                f"echo GATE-$((2*2)); "
+                f"{PY} -m wsctl stop --port {port} 2>&1; "
+                f"echo SELFSTOP-EXIT-$?; echo TAIL-$((3*3))"
+            )
+            ws.send(cmd.encode() + CR)
+            out = ws_drain(ws, 12.0)
+            assert b"GATE-4" in out, "the real command never started: " + repr(out[:300])
+        decoded = out.decode("utf-8", "replace")
+        assert "wsctl restart --rolling" in decoded, (
+            f"the refusal must name the way out:\n{decoded}"
+        )
+        assert "--i-know-this-drops-my-connection" in decoded
+
+        # The instance is still serving: the refusal really did nothing.
+        assert local_http().get(f"{base}/healthz", timeout=5).status_code == 200
+    finally:
+        stop(proc)
+        shutil.rmtree(data, ignore_errors=True)
+    print("  selfrestart/stop-in-own-session: ok")
+
+    # ---- 2. stopping nothing is a success ------------------------------------
+    conf = Path(tempfile.mkdtemp(prefix="wsctl-selfconf-"))
+    empty = Path(tempfile.mkdtemp(prefix="wsctl-selfempty-"))
+    try:
+        env = _clean_env({"XDG_CONFIG_HOME": str(conf), "WSCTL_DATA_DIR": str(empty)})
+        result = subprocess.run(
+            [PY, "-m", "wsctl", "stop", "--port", str(free_port())],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"`stop` of nothing must be idempotent (exit 0) so `stop && start` works: "
+            f"{result.stdout}\n{result.stderr}"
+        )
+    finally:
+        shutil.rmtree(conf, ignore_errors=True)
+        shutil.rmtree(empty, ignore_errors=True)
+    print("  selfrestart/stop-idempotent: ok")
+
+    # ---- 3a. rolling restart is gap-free when the port is shareable ----------
+    # SO_REUSEPORT only shares a port when *both* sockets set the option, so
+    # this case is the one that can honestly be called zero-downtime.
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    data = Path(tempfile.mkdtemp(prefix="wsctl-roll-"))
+    env = _clean_env({"WSCTL_DATA_DIR": str(data)})
+    try:
+        started = subprocess.run(
+            [PY, "-m", "wsctl", "start", "--host", "127.0.0.1", "--port", str(port),
+             "--reuse-port", "--log-level", "warning", "--admin-password", PASSWORD],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90,
+        )
+        assert started.returncode == 0, started.stdout + started.stderr
+        wait_health(base)
+        pidfile = data / "run" / f"wsctl-{port}.pid"
+        old_pid = int(json.loads(pidfile.read_text())["pid"])
+        assert json.loads(pidfile.read_text()).get("reuse_port") is True
+
+        gaps = []
+        polled = {"n": 0}
+
+        def watch() -> None:
+            end = time.time() + 60
+            while time.time() < end:
+                polled["n"] += 1
+                try:
+                    got = local_http().get(f"{base}/healthz", timeout=1)
+                    if got.status_code != 200:
+                        gaps.append(time.time())
+                except httpx.HTTPError:
+                    gaps.append(time.time())
+                time.sleep(0.05)
+
+        import threading
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        rolled = subprocess.run(
+            [PY, "-m", "wsctl", "restart", "--rolling", "--log-level", "warning",
+             "--port", str(port)],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
+        )
+        watcher.join(timeout=70)
+
+        assert rolled.returncode == 0, rolled.stdout + rolled.stderr
+        assert polled["n"] > 10, f"the watcher barely ran ({polled['n']} probes)"
+        assert not gaps, f"the swap dropped connections: {gaps[:5]}"
+        new_pid = int(json.loads(pidfile.read_text())["pid"])
+        assert new_pid != old_pid, "the successor must be a different process"
+        assert local_http().get(f"{base}/healthz", timeout=5).json()["pid"] == new_pid
+    finally:
+        subprocess.run(
+            [PY, "-m", "wsctl", "stop", "--port", str(port), "--i-know-this-drops-my-connection"],
+            cwd=str(ROOT), env=env, capture_output=True, timeout=60,
+        )
+        shutil.rmtree(data, ignore_errors=True)
+    print("  selfrestart/rolling-gapless: ok")
+
+    # ---- 3b. migrating an instance that cannot share its port ----------------
+    # A predecessor without --reuse-port owns the port alone (SO_REUSEPORT only
+    # shares when both ends set it), so the first switch has a bounded -- and
+    # *announced* -- window. Every rolling restart afterwards is gap-free.
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    data = Path(tempfile.mkdtemp(prefix="wsctl-mig-"))
+    env = _clean_env({"WSCTL_DATA_DIR": str(data)})
+    try:
+        started = subprocess.run(
+            [PY, "-m", "wsctl", "start", "--host", "127.0.0.1", "--port", str(port),
+             "--log-level", "warning", "--admin-password", PASSWORD],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90,
+        )
+        assert started.returncode == 0, started.stdout + started.stderr
+        wait_health(base)
+        pidfile = data / "run" / f"wsctl-{port}.pid"
+        old_pid = int(json.loads(pidfile.read_text())["pid"])
+
+        gaps = []
+        end = time.time() + 60
+        import threading
+
+        stop_watch = threading.Event()
+
+        def watch() -> None:
+            while not stop_watch.is_set():
+                try:
+                    got = local_http().get(f"{base}/healthz", timeout=1)
+                    if got.status_code != 200:
+                        gaps.append(time.time())
+                except httpx.HTTPError:
+                    gaps.append(time.time())
+                time.sleep(0.05)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        rolled = subprocess.run(
+            [PY, "-m", "wsctl", "restart", "--rolling", "--log-level", "warning",
+             "--port", str(port)],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
+        )
+        stop_watch.set()
+        watcher.join(timeout=5)
+        del end
+
+        assert rolled.returncode == 0, rolled.stdout + rolled.stderr
+        # The gap is allowed here -- but it must be small, and the CLI must have
+        # said so rather than presenting it as zero-downtime.
+        # The bound is measured, not guessed: this window is exactly "how long
+        # the predecessor holds the port while shutting down" plus one bind
+        # retry (0.15s). A session gets 3s to wind down, so 8s is the honest
+        # ceiling -- and the number is printed rather than assumed.
+        window = (max(gaps) - min(gaps)) if gaps else 0.0
+        print(f"      一次性迁移窗口实测: {window:.2f}s（{len(gaps)} 次探测未连通）")
+        assert window <= 8.0, f"the one-off switch was not bounded: {window:.2f}s"
+        assert gaps, "the migrate path must show a real (announced) window"
+        assert "一次性迁移" in (rolled.stdout + rolled.stderr), (
+            "a non-zero gap must be announced up front"
+        )
+        new_pid = int(json.loads(pidfile.read_text())["pid"])
+        assert new_pid != old_pid
+        assert json.loads(pidfile.read_text()).get("reuse_port") is True, (
+            "after the migration the instance must be shareable"
+        )
+        assert local_http().get(f"{base}/healthz", timeout=5).json()["pid"] == new_pid
+
+        # And now it is gap-free.
+        gaps.clear()
+        stop_watch.clear()
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        rolled2 = subprocess.run(
+            [PY, "-m", "wsctl", "restart", "--rolling", "--log-level", "warning",
+             "--port", str(port)],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
+        )
+        stop_watch.set()
+        watcher.join(timeout=5)
+        assert rolled2.returncode == 0, rolled2.stdout + rolled2.stderr
+        assert not gaps, f"after the migration rolling restart must be gapless: {gaps[:5]}"
+    finally:
+        subprocess.run(
+            [PY, "-m", "wsctl", "stop", "--port", str(port), "--i-know-this-drops-my-connection"],
+            cwd=str(ROOT), env=env, capture_output=True, timeout=60,
+        )
+        shutil.rmtree(data, ignore_errors=True)
+    print("  selfrestart/rolling-migrate: ok")
+
+
 SCENARIOS = {
     "server": scenario_server,
     "files": scenario_files,
+    "selfrestart": scenario_selfrestart,
     "cli": scenario_cli,
     "connect": scenario_connect,
     "tmux": scenario_tmux,

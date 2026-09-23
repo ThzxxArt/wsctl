@@ -1596,7 +1596,6 @@ def test_slow_consumer_is_told_why_it_was_dropped(tmp_path: Path) -> None:
     for a replay it then lost again. The user saw a black screen and the log
     said nothing at all.
     """
-    from wsctl.core.session import ClientGone
     from wsctl.server.client import WsClient
 
     # Drive the sink directly: filling a real 8 MiB budget over a socket is
@@ -1612,11 +1611,13 @@ def test_slow_consumer_is_told_why_it_was_dropped(tmp_path: Path) -> None:
             self.sent.append(obj)
 
     client = WsClient(FakeWS(), max_pending=4, max_bytes=10)
-    with pytest.raises(ClientGone):
-        client.put(b"x" * 50)  # blows the byte budget in one go
+    # Overflow must NOT raise: a slow viewer is shed, not executed.
+    client.put(b"x" * 50)
+    assert client.dropped_bytes > 0, "the frame should have been shed, not queued"
+    assert client.closed is False, "shedding must never close the connection"
 
-    # The one message that matters still fits: control frames are not counted
-    # against the byte budget.
+    # And the one message that matters still fits: control frames are not
+    # counted against the byte budget.
     assert client.final_notice({"type": "evicted", "reason": "backpressure"}) is True
 
 
@@ -1640,8 +1641,6 @@ def test_slow_consumer_is_closed_with_4410_not_a_clean_1000() -> None:
     documented while the wire still carried 1000. That is exactly the reading
     that made the browser think everything was fine and blank its screen.
     """
-    from wsctl.core.closecodes import CLOSE_SLOW_CONSUMER
-    from wsctl.core.session import ClientGone
     from wsctl.server.client import WsClient
 
     class FakeWS:
@@ -1652,11 +1651,12 @@ def test_slow_consumer_is_closed_with_4410_not_a_clean_1000() -> None:
             pass
 
     client = WsClient(FakeWS(), max_pending=4, max_bytes=10)
-    with pytest.raises(ClientGone):
-        client.put(b"x" * 50)
-    assert client.close_code == CLOSE_SLOW_CONSUMER, (
-        "a slow-consumer drop must self-report 4410 so the endpoint can send it"
-    )
+    # A slow consumer is no longer *dropped* at all -- frames are shed and the
+    # link stays up. The 4410 close code now belongs to the one case that still
+    # throws a viewer out: a session over its own memory limit.
+    client.put(b"x" * 50)
+    assert client.close_code is None, "shedding is not a disconnection"
+    assert client.closed is False
 
 
 def test_final_notice_is_delivered_before_the_writer_stops() -> None:
@@ -1669,7 +1669,6 @@ def test_final_notice_is_delivered_before_the_writer_stops() -> None:
     """
     import asyncio
 
-    from wsctl.core.session import ClientGone
     from wsctl.server.client import WsClient
 
     sent: list[object] = []
@@ -1683,9 +1682,8 @@ def test_final_notice_is_delivered_before_the_writer_stops() -> None:
 
     async def run() -> None:
         client = WsClient(FakeWS(), max_pending=8, max_bytes=10)
-        # Self-close exactly like a blown byte budget does.
-        with pytest.raises(ClientGone):
-            client.put(b"x" * 50)
+        # Blow the byte budget: frames are shed, nothing is raised.
+        client.put(b"x" * 50)
         assert client.final_notice({"type": "evicted", "reason": "backpressure"}) is True
         client.close()
         await asyncio.wait_for(client.run(), timeout=1.0)  # must terminate
@@ -1706,6 +1704,8 @@ def test_broadcast_reports_a_dropped_slow_client(tmp_path: Path) -> None:
 
     class SlowClient:
         """Accepts nothing: every put fails like a blown byte budget."""
+        close_code: int | None = None
+
 
         def __init__(self) -> None:
             self.notices: list[dict] = []
@@ -1785,3 +1785,60 @@ def test_revoked_share_stops_text_input_immediately(tmp_path: Path) -> None:
             assert time.time() - started < 3.0, "revocation took a recheck cycle"
 
 
+
+
+def test_a_slow_viewer_is_shed_not_disconnected(tmp_path: Path) -> None:
+    """Falling behind must shorten the history, never cut the cord.
+
+    This is what "内容一跳一跳" looked like from the far end: a burst of output
+    blew the byte budget, the connection was dropped, the browser reconnected
+    and cleared its terminal to make room for a replay -- and the next burst
+    did it again. A terminal is a *current view*, not an archive: shedding the
+    oldest frames is correct, executing the viewer for being slow is not.
+    """
+    from wsctl.server.client import WsClient
+
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent: list[object] = []
+
+        async def send_bytes(self, data: bytes) -> None:
+            self.sent.append(data)
+
+        async def send_json(self, obj: object) -> None:
+            self.sent.append(obj)
+
+    client = WsClient(FakeWS(), max_pending=8, max_bytes=100)
+    for _ in range(200):
+        client.put(b"y" * 40)
+
+    assert client.closed is False, "a slow viewer must keep its connection"
+    assert client.close_code is None
+    assert client.dropped_bytes > 0, "frames should have been shed"
+    assert client.dropped_events > 0
+    # The newest frames survive; the oldest are what went.
+    assert client.pending_bytes <= 100
+    # ...and the shed is announced rather than silently swallowed.
+    assert any(
+        isinstance(i, dict) and i.get("type") == "notice" for i in client._items
+    ), "shedding must be reported to the viewer"
+
+
+def test_control_frames_survive_the_shed(tmp_path: Path) -> None:
+    """The one message explaining the loss is the one that must get through."""
+    from wsctl.server.client import WsClient
+
+    class FakeWS:
+        async def send_bytes(self, data: bytes) -> None:  # pragma: no cover
+            pass
+
+        async def send_json(self, obj: object) -> None:  # pragma: no cover
+            pass
+
+    client = WsClient(FakeWS(), max_pending=6, max_bytes=50)
+    client.put({"type": "attached", "session": "s"})
+    for _ in range(100):
+        client.put(b"z" * 30)
+    assert any(
+        isinstance(i, dict) and i.get("type") == "attached" for i in client._items
+    ), "a control message was evicted by the shed"

@@ -56,6 +56,21 @@ def evicted_clients_total() -> int:
     return _evicted_clients_total
 
 
+def shed_frames_total(manager: SessionManager | None = None) -> int:
+    """Frames discarded across every attached client, for the metrics page.
+
+    Shedding is the *good* outcome now -- it is what keeps a slow viewer
+    connected instead of cycling them through reconnect/clear/replay -- so it
+    is worth watching. A high number with low ``wsctl_clients_evicted_total``
+    is healthy; the two rising together is not.
+    """
+    total = 0
+    for session in (manager.list_sessions() if manager is not None else []):
+        for entry in session.clients():
+            total += int(entry.get("dropped_events", 0))
+    return total
+
+
 def _bump_evicted() -> None:
     global _evicted_clients_total
     _evicted_clients_total += 1
@@ -74,6 +89,11 @@ class ClientGone(Exception):
 @runtime_checkable
 class Client(Protocol):
     """A consumer attached to a session (browser tab or CLI client)."""
+
+    #: Why this client ended, when the sink decided for itself. ``None`` means
+    #: nothing unusual; the transport otherwise reports this instead of a plain
+    #: 1000 ("normal closure"), which would be a lie for "we threw you out".
+    close_code: int | None
 
     def put(self, item: bytes | dict[str, Any]) -> None:
         """Queue an item for delivery without blocking.
@@ -197,6 +217,8 @@ class TermSession:
                 "writable": entry.writable,
                 "share": entry.share,
                 "pending_bytes": int(getattr(entry.client, "pending_bytes", 0)),
+                "dropped_events": int(getattr(entry.client, "dropped_events", 0)),
+                "dropped_bytes": int(getattr(entry.client, "dropped_bytes", 0)),
             }
             for entry in list(self._clients.values())
         ]
@@ -221,6 +243,20 @@ class TermSession:
         """
         if self._memory_limit <= 0:
             return
+        # Give up queued terminal data before giving up on a viewer. The
+        # previous behaviour evicted the greediest client outright, which is
+        # the same over-punishment this project just spent a release removing
+        # from the per-client path -- a session over *its* cap should shed
+        # backlog first and only then, if it is still over, let someone go.
+        if self.memory_usage() > self._memory_limit:
+            excess = self.memory_usage() - self._memory_limit
+            for entry in list(self._clients.values()):
+                shed = getattr(entry.client, "shed_oldest", None)
+                if callable(shed):
+                    with contextlib.suppress(Exception):
+                        shed(excess)
+                if self.memory_usage() <= self._memory_limit:
+                    return
         while self._clients and self.memory_usage() > self._memory_limit:
             key, entry = max(
                 self._clients.items(),
@@ -228,6 +264,12 @@ class TermSession:
             )
             self._clients.pop(key, None)
             _bump_evicted()
+            # Say why on the wire, not just in the close code: the endpoint
+            # reports ``client.close_code`` and 1000 ("normal closure") is a
+            # lie for "we threw you out over memory". ``setattr`` because not
+            # every ``Client`` implementation carries the attribute.
+            if entry.client.close_code is None:
+                entry.client.close_code = 4410  # CLOSE_SLOW_CONSUMER
             with contextlib.suppress(ClientGone):
                 entry.client.put(
                     {
@@ -513,16 +555,29 @@ class TermSession:
     # -- lifecycle -----------------------------------------------------
 
     async def stop(
-        self, *, sig: int | None = None, timeout: float = 3.0, preserve: bool = False
+        self,
+        *,
+        sig: int | None = None,
+        timeout: float = 3.0,
+        preserve: bool = False,
+        reason: str | None = None,
     ) -> None:
         """Terminate the session and wait for its read loop to finish.
 
         With ``preserve=True`` a tmux-backed session's shell is left running so
         it can be reattached after a server restart; only the local attach
         client is closed.
+
+        ``reason`` is announced to every attached client *before* the terminal
+        goes away. Without it a stop is indistinguishable from a crash at the
+        far end -- the screen simply dies -- and a remote operator has no way
+        to tell "I asked for this" from "the box fell over".
         """
         if self.closed:
             return
+        if reason and not preserve:
+            with contextlib.suppress(Exception):
+                await self._notify({"type": "notice", "level": "warn", "msg": reason})
         if self._tmux_name is not None and not preserve:
             await tmux.kill_session_async(self._tmux_name)
         if sig is None:
@@ -588,8 +643,9 @@ class SessionManager:
         """Stop and remove sessions past their idle/max lifetime."""
         expired = [s for s in self.list_sessions() if s.is_expired(now)]
         if expired:
+            reason = "会话已超过空闲/最长寿命，正在回收"
             await asyncio.gather(
-                *(s.stop() for s in expired), return_exceptions=True
+                *(s.stop(reason=reason) for s in expired), return_exceptions=True
             )
         return [s.id for s in expired]
 
@@ -598,14 +654,20 @@ class SessionManager:
             session = self._sessions.get(sid)
         if session is None:
             return False
-        await session.stop(sig=sig)
+        await session.stop(sig=sig, reason="会话已被终止")
         return True
 
     async def shutdown(self, *, preserve: bool = False) -> None:
-        """Stop every session. ``preserve`` keeps tmux sessions alive."""
+        """Stop every session. ``preserve`` keeps tmux sessions alive.
+
+        The reason is announced first so an operator watching the terminal sees
+        "服务正在停止" instead of a screen that simply dies.
+        """
         sessions = list(self._sessions.values())
+        reason = None if preserve else "服务正在停止，会话即将结束"
         await asyncio.gather(
-            *(s.stop(preserve=preserve) for s in sessions), return_exceptions=True
+            *(s.stop(preserve=preserve, reason=reason) for s in sessions),
+            return_exceptions=True,
         )
         self._sessions.clear()
 

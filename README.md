@@ -190,7 +190,7 @@ pip install ".[dev]"        # 含开发/测试工具；仅使用可改为 pip in
 ### 验证安装
 
 ```bash
-wsctl --version             # 例如 wsctl 0.1.10
+wsctl --version             # 例如 wsctl 0.1.11
 wsctl doctor                # 环境/配置/运行状态自检（--json 便于脚本消费）
 ```
 
@@ -241,12 +241,20 @@ docker rm -f wsctl && docker run -d ...  # 用新镜像重建容器（数据在 
 cd wsctl && git pull && pip install -U ".[dev]"
 ```
 
-**升级后重启服务**（二选一）：
+**升级后重启服务**：
 
 ```bash
-wsctl restart                # 后台生命周期
+wsctl restart --rolling      # 推荐：先起后停，不切断连接，可在 wsctl 自己的终端里执行
 sudo systemctl restart wsctl # systemd
 ```
+
+> ⚠️ **不要在 wsctl 网页终端里执行 `wsctl stop` / `wsctl restart`（不带 `--rolling`）**。
+> 停止实例会结束它托管的会话——**执行命令的这个 shell 也在会话里**，命令的后半段
+> （例如 `&& wsctl start`）永远不会执行，服务停了就没人再拉起来。现在 CLI 会**拒绝**
+> 并说明后果；请改用 `wsctl restart --rolling`，或在 SSH / 物理终端执行。
+>
+> **首次部署建议带上 `wsctl start --reuse-port`**：之后 `restart --rolling` 为**零停机**。
+> 未带时第一次滚动切换会有已告知的毫秒级窗口，此后同样零停机。
 
 **回退到旧版本**：
 
@@ -375,9 +383,21 @@ WSCTL_TOTP=123456 wsctl login http://host:7681        # 脚本里用环境变量
 - 断线后前端自动重连并回放屏幕，无需重新登录。
 
 > 默认快捷键：`Alt+N` 新建、`Alt+W` 断开标签、`Alt+Shift+W` 终止会话、
-> `Alt+→/←` 切换标签、`Alt+L` 会话列表、`Alt+F` 文件、`Alt+S` 设置、`Alt+H` 分享。
-> 按 **`?`** 随时打开快捷键一览表（点任意组合键可复制该行，或「复制全部」）；
-> 全部快捷键可在「设置」中修改。
+> `Alt+→/←` 切换标签、`Alt+L` 会话列表、`Alt+F` 文件、`Alt+S` 设置、`Alt+H` 分享、
+> **`Alt+C` 复制选区、`Alt+V` 粘贴**、`Alt+E`/`Alt+D` 字号 ±、`Alt+R` 清屏。
+> 按 **`Alt+?`** 随时打开快捷键一览表（终端未聚焦时单按 **`?`** 也可以）；
+> 表中会用 ✅/⚠️/❌ 标出每个组合键是否会被浏览器占用；全部快捷键可在「设置」中修改。
+>
+>
+> **取舍说明**：`Alt+C` / `Alt+V` 会从 shell 手里接过这两个键。bash/readline 的
+> `Alt+C` 是「首字母大写」、`Alt+V` 另有绑定，改用本组合键后这些就用不了了。
+> 这与既有 `Alt+N`/`Alt+W`/`Alt+F` 是同一取舍；若不能接受，**全部快捷键可在
+> 「设置」里改回**，或改用**终端右键菜单**与 `Ctrl/Shift+Insert`——它们不抢任何键。
+>
+> 复制粘贴**不用 `Ctrl+Shift+C`**——那是 Chrome/Edge/Firefox 的 DevTools 检查器，
+> 浏览器在页面之前就截获了，拦不住。终端里**右键**会弹出操作菜单（复制/粘贴/全选/
+> 查找/清屏/字号/断开/终止），右键行为可在设置里改为「快捷复制粘贴」或「始终粘贴」。
+> 传统终端的 `Ctrl+Insert` / `Shift+Insert` 也可用。
 
 ### 2. 从命令行使用
 

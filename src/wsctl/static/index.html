@@ -73,6 +73,22 @@
     <button id="search-close" class="icon-btn" title="关闭" aria-label="关闭搜索"><svg class="ico"><use href="#i-close"/></svg></button>
   </div>
 
+  <div id="term-menu" class="context-menu hidden">
+    <button data-taction="copy">复制选区<span class="kbd">Alt+C</span></button>
+    <button data-taction="paste">粘贴<span class="kbd">Alt+V</span></button>
+    <button data-taction="selectall">全选</button>
+    <hr class="menu-sep" />
+    <button data-taction="find">查找…<span class="kbd">Ctrl+Shift+F</span></button>
+    <button data-taction="clear">清屏<span class="kbd">Alt+R</span></button>
+    <hr class="menu-sep" />
+    <button data-taction="font+">字号 +<span class="kbd">Alt+E</span></button>
+    <button data-taction="font-">字号 −<span class="kbd">Alt+D</span></button>
+    <button data-taction="zmodem">切换 ZMODEM 传输</button>
+    <hr class="menu-sep" />
+    <button data-taction="detach">断开（保持会话）<span class="kbd">Alt+W</span></button>
+    <button data-taction="kill" class="danger">终止会话<span class="kbd">Alt+Shift+W</span></button>
+  </div>
+
   <div id="tab-menu" class="context-menu hidden">
     <button data-action="detach">关闭标签（保持会话）</button>
     <button data-action="kill" class="danger">终止会话</button>
@@ -280,6 +296,13 @@
         <textarea id="custom-theme-json" rows="3" placeholder='{"background":"#000","foreground":"#fff"}'></textarea>
         <button id="custom-theme-add" type="button" class="text-btn">添加主题</button>
       </details>
+      <label>终端右键行为
+        <select id="set-rightclick">
+          <option value="menu">弹出菜单（推荐）</option>
+          <option value="quick">快捷复制粘贴（有选区复制，否则粘贴）</option>
+          <option value="paste">始终粘贴</option>
+        </select>
+      </label>
       <div class="section-title">快捷键</div>
       <div id="hotkey-list" class="hotkey-list"></div>
       <button id="hotkeys-reset" type="button" class="text-btn">恢复默认快捷键</button>

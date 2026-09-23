@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,9 +26,20 @@ async def index() -> FileResponse:
 
 @router.get("/healthz")
 async def healthz(request: Request) -> dict[str, Any]:
+    """Liveness **and** identity.
+
+    The pid is not decoration: during a rolling restart two instances share
+    the port for a moment, and a plain 200 on this endpoint cannot tell the
+    orchestrator which one answered. Without it the gate passed as soon as the
+    *predecessor* replied, the predecessor was retired, and the successor was
+    not yet serving -- a refused-connection window, which is the entire thing a
+    rolling restart exists to avoid.
+    """
     return {
         "status": "ok",
         "version": __version__,
+        "pid": os.getpid(),
+        "instance_id": getattr(request.app.state, "instance_id", None),
         "sessions": len(request.app.state.manager.list_sessions()),
     }
 

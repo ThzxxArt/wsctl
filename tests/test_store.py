@@ -355,3 +355,47 @@ def test_delete_auth_session_drops_the_cache_entry(tmp_path: Path) -> None:
         assert store.resolve_auth_session(token) is None
     finally:
         store.close()
+
+
+def test_schema_migration_is_safe_under_two_concurrent_instances(tmp_path) -> None:
+    """Two stores on one data directory must both open.
+
+    This is the documented multi-instance mode (SO_REUSEPORT handover shares a
+    data directory), and the migration used `PRAGMA table_info` then `ALTER
+    TABLE`. Two processes starting together both saw "the column is absent"
+    and both tried to add it -- the loser failed the entire open with
+    `duplicate column name`. Adding `end_reason` is what finally made the race
+    reproducible.
+    """
+    import threading
+
+    from wsctl.core.store import Store
+
+    db = tmp_path / "wsctl.db"
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8)
+
+    def open_one() -> None:
+        try:
+            barrier.wait(timeout=20)
+            store = Store(db)
+            store.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_one) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=40)
+    assert not errors, f"concurrent open failed: {errors}"
+
+    # And the column is there exactly once.
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    try:
+        names = [r[1] for r in conn.execute("PRAGMA table_info(term_sessions)").fetchall()]
+    finally:
+        conn.close()
+    assert names.count("end_reason") == 1

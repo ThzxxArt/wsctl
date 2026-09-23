@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.10 · 状态：0.1.0–0.1.9 已发布
+> 版本：0.1.12 · 状态：0.1.0–0.1.11 已发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -291,6 +291,11 @@ pyotp  segno  websockets
 | **M47** | 界面顺手：`?` 快捷键帮助浮层；终端搜索三开关（大小写/全词/正则）+ 无效正则明确报错 + 修 `translateToString` 吃行尾空格；`api()` 15s 超时与错误分类；Toast 可关闭、错误常驻；管理面板重绘保留滚动与焦点；会话重命名广播给所有已连接客户端；a11y（`prefers-reduced-motion`、触控目标 ≥44px）|
 | **M48** | 工程底座：`create_app` 942 行 → 358 行。30 个路由移入 `server/routes/`（10 个关注点模块）、请求体进 `models.py`、DI 进 `deps.py`、跨实例对账进 `maintenance.py`。**行为零变化**，拆分前后全量回归对拍 |
 | **M49** | 测试与文档：新增配置三档分类不变量、关闭码三方一致、上传原子性、doctor 无副作用、文件管理 API、会话历史/详情/概览、重命名广播、快捷键浮层与搜索三开关等用例；README/DESIGN/CHANGELOG/SECURITY 同步 |
+| **M50** | 「能重启自身」：`wsctl stop`/`restart` 检测是否运行在被管理会话内（沿 `/proc` ppid 链上溯），默认**拒绝**并给出两条出路；`stop` 未运行时幂等退出 0（`stop && start` 不再被 `&&` 静默截断）；`stop` 找错端口时首句给可复制的修正命令；新增 **`restart --rolling`**（先起后停）——`/healthz` 自报 pid 让闸门认得继任者身份；解除 `daemon`/`reuse-port` 互斥使零停机可在托管生命周期内使用 |
+| **M51** | 终端**右键菜单**（复制/粘贴/全选/查找/清屏/字号±/ZMODEM/断开/终止）+ 右键行为三模式（菜单 / 快捷复制粘贴 / 始终粘贴）|
+| **M52** | 快捷键改 `Alt+C`/`Alt+V`（`Ctrl+Shift+C` 被浏览器 DevTools 占用，页面拦不住）+ `Ctrl/Shift+Insert` 传统通道 + 帮助浮层**可靠性图例**（✅/⚠️/❌）+ `?` 不再抢终端输入（打字时 `?` 到达 shell，`Alt+?` 随时唤帮助）|
+| **M53** | 停止/回收/终止前先广播原因（`session.stop(reason=)`），界面不再是无预警黑屏 |
+| **M54** | e2e 新增 `selfrestart` 场景（会话内执行 stop 被拒 / stop 幂等 / 零停机滚动重启 / 受控迁移后零停机）；e2e 环境剥离继承的 `WSCTL_*`（开发者 shell 泄漏曾让双 `--reuse-port` 实例误抢 pidfile）|
 | **M42** | 0.1.7 `doctor` 补齐实例语义：`--host`/`--port` 收窄选实例（与 status/logs/stop 同源），「服务器」项改为**探测本机实例**而非 `wsctl login` 的陈旧缓存地址（此前把健康机器报成失败），回退到缓存地址时标明来源与 `wsctl logout` 清理方式；**测试封闭性结构性根治**——autouse fixture 默认隔离 `WSCTL_*` 与 `XDG_CONFIG_HOME`，杜绝同类第三次复发（含 `tests/test_isolation.py` 金丝雀：关闭隔离则红、开启则绿）|
 
 

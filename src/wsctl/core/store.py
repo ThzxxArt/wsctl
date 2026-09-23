@@ -176,8 +176,20 @@ class Store:
                     for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
                 }
                 for name, decl in columns.items():
-                    if name not in existing:
+                    if name in existing:
+                        continue
+                    try:
                         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    except sqlite3.OperationalError as exc:
+                        # Two instances sharing one data directory both open
+                        # the store at startup and both run this migration: each
+                        # sees "the column is absent" and both try to add it,
+                        # and the loser used to fail the whole open. That is the
+                        # documented multi-instance mode (SO_REUSEPORT handover),
+                        # so the end state is what matters -- and it is now the
+                        # same column either way.
+                        if "duplicate column name" not in str(exc).lower():
+                            raise
             # Indexes on migrated columns must be created after the ALTER TABLE.
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_term_sessions_instance"
