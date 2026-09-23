@@ -600,3 +600,31 @@ def test_settings_from_does_not_leak_wsctl_config(tmp_path) -> None:
     # A later call with no --config must not keep reading `first`.
     assert _settings_from(second).max_sessions == 9
     assert _settings_from(None).max_sessions != 5
+
+
+def test_doctor_does_not_create_the_database(tmp_path, monkeypatch) -> None:
+    """A diagnostic command must not mutate the data directory it inspects.
+
+    Building a ``Store`` to count users created an empty database, so
+    ``wsctl doctor`` run to find out why the directory was broken made it
+    "initialised" and muddied every later diagnosis.
+    """
+
+    from typer.testing import CliRunner
+
+    from wsctl.cli.main import app
+
+    data = tmp_path / "brand-new"
+    conf = tmp_path / "config"
+    conf.mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(conf))
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(data))
+
+    # Assert through ``--json``: Rich truncates long table cells to "…" and a
+    # long ``tmp_path`` ate the very sentence under test. JSON is exact.
+    result = CliRunner().invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 0, result.output
+    assert not (data / "wsctl.db").exists(), "doctor created the database"
+    rows = json.loads(result.output)
+    database = next(r for r in rows if r["check"] == "数据库")
+    assert "尚未初始化" in database["result"], database

@@ -5,6 +5,136 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-09-23
+
+**主题：状态可见、操作完整、故障不静默。** 一次「补全」型发布——修掉六处
+「系统知道，但用户看不见 / 行为与声明不符」，并把文件面板与会话历史这两块
+「能用但不完整」补齐。无 schema 变更。
+
+### Fixed
+
+- **【事故修复】终端「卡住变黑」的完整链路已断开。** 一条超大输出（跑测试套件这类）
+  就能让浏览器终端假死并黑屏，且**日志、指标、界面三处都无痕迹**。链路是：
+  出站队列 512 条 / 积压 8MB 触发 `ClientGone` → `_broadcast` **静默吞掉**（无日志无
+  指标无提示）→ 以 **1000「正常关闭」**收尾 → 浏览器认为一切正常、自动重连 →
+  `term.reset()` **先清屏**再等回放 → 回放途中再次被打断 → **持续黑屏**。
+  四处根治：慢消费者掉线**先告知再断**（`final_notice`，控制帧不占字节预算）、
+  **记日志 + `wsctl_clients_backpressure_dropped_total` 指标**、新增**专用关闭码 4410**
+  `CLOSE_SLOW_CONSUMER`（可恢复，进 FATAL 会阻止正确重连）、**清屏推迟到回放首字节**
+  （重连失败保留旧画面，而不是留下一块黑；空回放时在 `attached` 兜底清理，避免下一次
+  真实输出冲掉仍然准确的旧画面）。
+  > 发布前最后一轮 review 复查发现此处**修得不彻底**：`4410` 当时只定义、分类、写进
+  > 文档，**线上发的仍是 1000**——「客户端以为一切正常」这一环没断。现在由 `WsClient`
+  > 自报死因、收尾如实上报；同时 `WsClient.close()` 此前在已关闭时提前返回、不放终止
+  > 哨兵，导致写协程永久阻塞、每次掉线白等 2 秒，且其后排队的提示永远发不出去。
+- **【事故修复】关闭原因不再被 socket 抢先关掉吞掉。** `deny()` 原本先 `put(解释)` 再
+  立刻 `websocket.close()`，出站写协程来不及发出就断了——**关闭码送到了，人话没送到**。
+  分享被撤销、登录失效、空闲超时、限速断开**全部**走这条路，全部都会丢解释。现在
+  关闭推迟到写协程排空之后。
+- **【0.1.7 遗留】分享撤销后，文本输入路径不立即拒绝。** `share_revoked()` 只在二进制
+  帧和 5 秒周期复查处检查，`{"type":"input"}` 完全跳过——被撤销的可写分享**还能继续
+  敲命令最长 5 秒**。现在 input / resize / 二进制三路一致即时生效。
+- **【0.1.7 遗留】API 类命令不跟随正在运行的实例。** `wsctl session list` 等仍盲目信任
+  `wsctl login` 的陈旧缓存地址，于是对着下线端口报「cannot reach」而健康实例就在旁边
+  ——这正是 0.1.7 给 `doctor` 修过的同一缺陷，只是漏了其余命令。现在 `--url` 显式优先，
+  否则跟随正在运行的实例并明说缓存地址未使用。
+- **输入限速不再踢断连接。** 超限的一段输入是**丢弃并提示**（与只读分支同语义），
+  只有持续轰炸（连续 3 次）才断开，且用专用关闭码 `4429`。此前一超限就 `return`
+  关掉整条 WebSocket——而令牌桶是**每连接独立**的，于是粘贴一大段 → 断线 →
+  自动重连拿到新桶 → 再超限 → **重连风暴**。
+- **关闭码集合只有一份定义。** `core/closecodes.py` 是唯一来源；浏览器无法
+  import Python，`static/app.js` 镜像同一份**并由 `tests/test_closecodes.py`
+  断言两者相等**。此前三处各写一份，`4401` 在 CLI 里算致命、在浏览器里不算，
+  没有任何机制发现这种分叉。
+- **会话重命名会广播给所有已连接客户端。** 此前只写库与内存，两个开着同一会话
+  的标签页会一直显示不同名字，直到各自恰好重连。
+- **内存背压释放连接时会先告知。** 先发 `{"type":"evicted"}` 再断开。产品早已
+  承诺「丢弃的按键必须报给用户」（`pty.py`），却没把同一条原则贯彻到客户端驱逐。
+- **运营提示不再写进终端缓冲。** 「会话为只读」「输入速率超限」这类提示走 Toast
+  与状态条。写进屏幕意味着它们进入 scrollback，并在**每次重连回放时再出现一遍**，
+  像是 shell 自己打印的。
+- **`wsctl doctor` 不再创建数据库。** 用只读连接（`file:...?mode=ro`）探测，
+  库不存在时报告「尚未初始化」。一个体检命令改写它正在检查的目录是陷阱。
+- **上传是原子的。** 先写 `.<name>.wsctl-upload` 侧车再 `os.replace`。此前用
+  `O_TRUNC` 直写目标，上传 80MB 的过程中**并发下载会读到半截文件**。
+
+### Changed
+
+- **「热更新」拆成三档，八项此前标注不准确。** 现在是 `立即生效` / `新建时生效` /
+  `需重启`。`scrollback_bytes`、`session_memory_limit`、`session_max_clients`、
+  `idle_timeout`、`max_life`、`input_rate_limit`、`input_rate_burst`、`audit_input`
+  此前标着「热更新」，实际只影响**此后新建**的会话/录制/连接——改了
+  `session_memory_limit` 的人以为生效了，其实没有。
+  `tests/test_config.py::test_every_setting_is_classified_exactly_once` 现在
+  强制每个配置项都被归类且只归一类，新配置无法再悄悄落进错的档。
+- **`session_sliding_ttl` 热重载真正生效。** 它的生效点是 `Store.sliding_ttl`
+  而不是 `Settings`，此前 reload 只改了 Settings，那个字段一直没被重载触及。
+- **会话列表的 owner 查询批量并出事件循环。** 此前 `_serialize` 对每个会话调一次
+  `user_get_by_id`——64 个会话 = 64 次同步 SQLite 往返**在 event loop 里**。
+- **会话结束有原因，不只是一个枚举。** `status` 说「发生了什么」（killed），新增的
+  `ended_reason` 说「为什么」（被管理员终止）；`/api/sessions/{sid}/detail` 附带完整
+  **时间线**（创建 / 连接 / 断开 / 终止…，来自审计表）。
+- **管理员概览给出关键指标**而不是把 `/metrics` 文本截前 40 行——那会在一个序列中间
+  断掉，比不给更糟。
+- **上传先 `fsync` 再 `os.replace`。** 只做 rename 的话，紧接着崩溃可能留下一个名字
+  正常、内容为空的文件，看起来像是完整的。
+- **`term_session_upsert` / `set_status` 全部移到工作线程。** 0.1.2/0.1.4 声称
+  「数据库读写全部出事件循环」，这几处漏了。
+- **回放缓冲按块发送。** 此前每次 attach 都 `b"".join(整个缓冲)`，4 MiB 缓冲
+  就是每次重连 4 MiB 的纯拷贝。
+
+### Added
+
+- **文件面板补全为完整文件管理。** 新建目录、重命名、删除、右键上下文菜单、
+  按名称过滤、分页（此前硬停在 2000 条，第 2001 条永远够不着）、文本预览与
+  就地编辑、拖放到**具体目录**、**上传进度条与取消**（`fetch` 没有上传进度，
+  这里特意用 `XMLHttpRequest`）。删除只允许文件或空目录——递归删除是**刻意不提供**
+  的，一次误点不能清空家目录。
+- **会话历史不再凭空消失。** `term_sessions` 表一直写着 `status`（running /
+  stopped / expired / killed）和保留策略，却没有任何地方读过它。新增
+  `GET /api/sessions/history`、`GET /api/sessions/{sid}/detail`，Web「会话」弹窗
+  分「运行中 / 已结束」两个页签。管理员看全部，普通用户只看自己的（`argv`/`cwd`
+  可能含敏感路径，见 SECURITY.md）。
+- **管理员「概览」页签。** 实例列表、会话/客户端/缓冲统计、最近 20 条审计、
+  最近结束的会话。「这台机器健康吗」此前要打四个接口。
+- **`?` 快捷键帮助浮层。** 快捷键一直可编辑，但没有任何地方告诉用户它们是什么。
+- **终端搜索升级**：**全部命中高亮**（新增 vendored `@xterm/addon-search` 0.16.0，MIT）、
+  实时命中计数、区分大小写 / 全词 / 正则三个开关、无效正则明确报「无效模式」、
+  修掉 `translateToString(true)` 吃掉行尾空格导致 `"foo "` 永远搜不到的问题。
+- **`api()` 加 15 秒超时**并区分超时/网络/鉴权/服务端错误；Toast 可点击关闭，
+  错误类**常驻直到用户关**（此前 3.2 秒自己消失）；管理面板重绘保留滚动位置与输入焦点。
+- **管理表排序/翻页改为替换式重绘。** 原本每次点击表头/翻页都是 `appendChild`，
+  点一次就**多堆一张表**；现在重绘前先清空，且只清表格容器、不动旁边的工具栏。
+- **`/api/sessions/{sid}/detail` 两条路径字段同形。** live 缺 `argv`/`cwd`/`duration`，
+  history 缺 `pid`/`bytes`/`shared`——消费方不得不按「是否存活」分支。计划点名的
+  字段现在两边都有。
+- **历史「重新打开」按 `argv` 原样重建。** 原本用 `command + backend` 拼装，SSH 会话会
+  400（缺 `ssh` 结构），而「顺手把 backend 去掉」的修法会把**远端命令当本地命令执行**。
+  现在走 `POST /api/sessions/{sid}/reopen` 复用记录的 argv；SSH 项在界面上明示需重新
+  填写目标，而不是假装能重开。
+- **删除等不可逆操作需输入名称确认。** 删除文件、录制、用户都不再是「确定 / 取消」——
+  必须照着提示把条目名称敲回去，确认按钮才解锁。递归删除本就刻意不提供，这是第二道闸。
+- **用户表与录制表支持排序 + 分页**（点击表头切换升/降序，25 条一页）；此前只有审计有
+  「加载更多」，上百行的用户表是一堵没有顺序的文字墙。
+- **配置徽章带 tooltip**：三档各自的含义悬停可见——「新建时生效」那条尤其重要，否则
+  它看起来只是「热更新」的弱化版，用户会以为改动已经落地。
+- **文件面板支持按类型过滤**（全部 / 仅目录 / 仅文件）。
+- **快捷键一览可复制**：点任意组合键复制该行，或「复制全部」。
+- **a11y 达 WCAG AA（已实测并固化为测试）**：`prefers-reduced-motion`、触控目标 ≥ 44px；
+  表单控件边界改用专用的 `--border-input`。审计实测发现两套主题的控件边框只有 1.5:1，
+  远低于 1.4.11 要求的 3:1——纯装饰分隔线可豁免，但**控件边界就是辨识控件的依据**。
+  `tests/test_contrast.py` 现在逐对比值断言，改色再退化会直接红。
+- **`wsctl_pty_input_dropped_total` 之外新增** `wsctl_input_rate_limited_total`
+  与 `wsctl_clients_evicted_total` 两个指标。
+
+### Internal
+
+- 新增 vendored 第三方资产：`@xterm/addon-search` 0.16.0（MIT），许可全文已并入
+  `src/wsctl/static/vendor/THIRD_PARTY_NOTICES.txt`。
+- **`create_app` 从 942 行拆到 291 行。** 30 个路由移入 `server/routes/`（10 个
+  关注点模块），请求体进 `server/models.py`，DI 进 `server/deps.py`，跨实例对账进
+  `server/maintenance.py`。行为零变化，拆分前后 337 + 4 + 1 + 8 全绿对拍。
+
 ## [0.1.7] - 2026-09-22
 
 Follow-up to 0.1.6 for `wsctl doctor`, the one lifecycle command that had no

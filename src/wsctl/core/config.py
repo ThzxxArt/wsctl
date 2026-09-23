@@ -165,53 +165,104 @@ def load_settings(**overrides: Any) -> Settings:
     return Settings(**filtered)
 
 
-# Fields that can be changed at runtime without restarting the server.
-HOT_FIELDS = frozenset(
+# How a reload reaches each setting. Three tiers, because "hot reloadable" was
+# doing too much work: eight of these used to be labelled 热更新 while only
+# applying to sessions/connections created *after* the edit, so a user who
+# raised ``session_memory_limit`` believed it had taken effect and it had not.
+#
+#   HOT_IMMEDIATE   -- the very next request / connection / maintenance tick
+#   HOT_NEW_OBJECTS -- sessions, recordings or sockets created from now on
+#   RESTART_FIELDS  -- only a restart
+#
+# Every field is classified; ``tests/test_config.py`` fails if one is missing
+# or appears twice, so a new setting cannot sneak in unlabelled.
+HOT_IMMEDIATE = frozenset(
     {
-        "session_ttl",
-        "session_sliding_ttl",
-        "cookie_secure",
-        "trust_proxy",
-        "allowed_origins",
+        # Read on every request and every WebSocket handshake, so a reload
+        # flips the boundary at once. Toggling authentication at runtime is a
+        # security event and deserves a deliberate edit -- but labelling it
+        # "needs restart" would be the same kind of lie this release removes,
+        # because the server really does honour it immediately.
+        "auth_required",
         "allowed_ips",
-        "security_headers",
+        "allowed_origins",
+        "audit_retention_days",
+        "cookie_secure",
+        "file_max_upload",
+        "file_root",
+        "instance_ttl",
         "login_rate_limit",
         "login_rate_window",
-        "audit_input",
-        "default_shell",
-        "default_cwd",
-        "default_backend",
-        "tmux_preserve_on_shutdown",
-        "idle_timeout",
-        "max_life",
         "max_sessions",
         "max_sessions_per_user",
-        "instance_ttl",
-        "audit_retention_days",
-        "term_session_retention_days",
-        "recordings_retention_days",
-        "recordings_max_bytes",
-        "session_max_clients",
-        "session_memory_limit",
-        "client_max_bytes",
-        "input_rate_limit",
-        "input_rate_burst",
-        "scrollback_bytes",
-        "file_root",
-        "file_max_upload",
         "metrics_enabled",
         "metrics_require_auth",
+        "recordings_max_bytes",
+        "recordings_retention_days",
+        "security_headers",
+        "session_sliding_ttl",
+        "session_ttl",
+        "term_session_retention_days",
+        "tmux_preserve_on_shutdown",
+        "trust_proxy",
+    }
+)
+
+HOT_NEW_OBJECTS = frozenset(
+    {
+        "audit_input",
         "auto_record",
+        "client_max_bytes",
+        "default_backend",
+        "default_cwd",
+        "default_shell",
+        "idle_timeout",
+        "input_rate_burst",
+        "input_rate_limit",
+        "max_life",
         "record_input",
+        "scrollback_bytes",
+        "session_max_clients",
+        "session_memory_limit",
         "totp_issuer",
     }
 )
 
-# Fields that require a restart to take effect.
 RESTART_FIELDS = frozenset(
-    {"host", "port", "ssl_cert", "ssl_key", "reuse_port", "data_dir", "config_path",
-     "log_level", "log_json", "log_file", "log_max_bytes", "log_backup_count", "webhook_url"}
+    {
+        "config_path",
+        "data_dir",
+        "host",
+        "log_backup_count",
+        "log_file",
+        "log_json",
+        "log_level",
+        "log_max_bytes",
+        "port",
+        "reuse_port",
+        "ssl_cert",
+        "ssl_key",
+        "webhook_url",
+    }
 )
+
+#: Union of the two reloadable tiers: what ``reload_settings_file`` copies over.
+HOT_FIELDS = HOT_IMMEDIATE | HOT_NEW_OBJECTS
+
+#: Stable identifiers the API returns as ``kind``. The UI renders one label and
+#: colour per tier; renaming one here is a breaking change for the config tab.
+KIND_IMMEDIATE = "hot"
+KIND_NEW_OBJECTS = "new"
+KIND_RESTART = "restart"
+
+
+def kind_of(key: str) -> str:
+    """Which tier ``key`` belongs to (``"restart"`` for anything else)."""
+    if key in HOT_IMMEDIATE:
+        return KIND_IMMEDIATE
+    if key in HOT_NEW_OBJECTS:
+        return KIND_NEW_OBJECTS
+    return KIND_RESTART
 
 
 def reload_settings_file(settings: Settings) -> tuple[list[str], list[str]]:

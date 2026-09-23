@@ -14,6 +14,11 @@
   --accent-soft: rgba(79, 156, 249, 0.15);
   --border: #232a36;
   --border-strong: #313b4b;
+  /* WCAG 2.1 1.4.11 "non-text contrast": a form control's boundary is what
+     identifies it, so it must clear 3:1 against its own background. The two
+     greys above are decorative separators (modal edges, scrollbars, row
+     rules) and are exempt; every interactive control uses this one instead. */
+  --border-input: #697383;
   --ok: #46c97a;
   --warn: #e0a24f;
   --danger: #ef5f6b;
@@ -46,6 +51,7 @@ html[data-theme="light"] {
   --accent-soft: rgba(47, 111, 208, 0.12);
   --border: #dce1e8;
   --border-strong: #c6ced9;
+  --border-input: #7d8590;
   --ok: #1f9d55;
   --warn: #b7791f;
   --danger: #c0392b;
@@ -249,7 +255,7 @@ body { display: flex; flex-direction: column; }
 .admin-toolbar input {
   padding: 7px 9px;
   background: var(--bg);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius);
   color: var(--fg);
   font-size: 13px;
@@ -315,7 +321,7 @@ body { display: flex; flex-direction: column; }
   flex: 1; min-width: 84px;
   padding: 9px;
   background: var(--bg-3);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius);
   color: var(--fg); cursor: pointer; font-size: 13px;
   transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
@@ -337,7 +343,7 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
 .modal-card input, .modal-card select, .modal-card textarea {
   padding: 9px 10px;
   background: var(--bg);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius);
   color: var(--fg);
   font-size: 14px;
@@ -486,7 +492,7 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
 .custom-theme { font-size: 12px; color: var(--muted); }
 .custom-theme input, .custom-theme textarea {
   width: 100%; margin: var(--sp-1) 0; padding: 6px 8px; font-size: 12px;
-  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg); border: 1px solid var(--border-input); border-radius: var(--radius-sm);
   color: var(--fg);
 }
 
@@ -514,13 +520,14 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
   font-size: 10px; color: var(--muted); font-family: var(--font-sans);
 }
 .kind-badge.hot { color: var(--ok); border-color: var(--ok); }
+.kind-badge.new { color: var(--accent); border-color: var(--accent); }
 .kind-badge.restart { color: var(--warn); border-color: var(--warn); }
 .hotkey-list { display: flex; flex-direction: column; gap: var(--sp-1); max-height: 200px; overflow-y: auto; }
 .hotkey-row { display: flex; align-items: center; gap: var(--sp-2); font-size: 12px; }
 .hotkey-row span { flex: 1; color: var(--muted); }
 .hotkey-row input {
   width: 140px; padding: 5px 7px; background: var(--bg);
-  border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--fg); font-size: 12px;
+  border: 1px solid var(--border-input); border-radius: var(--radius-sm); color: var(--fg); font-size: 12px;
 }
 
 /* 响应式 */
@@ -553,3 +560,70 @@ body.shared #zmodem-btn,
 body.shared #search-btn,
 body.shared #logout { display: none !important; }
 body.shared .tab .close { display: none; }
+
+/* 管理 · 概览 */
+.overview-stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: var(--sp-2); margin-bottom: var(--sp-3);
+}
+.overview-card {
+  padding: var(--sp-3);
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.overview-card .oc-value { font-size: 20px; font-weight: 650; }
+.overview-card .oc-label { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+/* 文件面板 · 上传进度与预览 */
+.upload-progress { padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border); }
+.up-bar {
+  height: 6px; border-radius: 999px; background: var(--bg-4); overflow: hidden;
+}
+.up-fill { height: 100%; width: 0; background: var(--accent); transition: width .12s linear; }
+.up-row { display: flex; align-items: center; gap: var(--sp-2); margin-top: 6px; }
+#file-filter {
+  flex: 1; padding: 5px 8px; font-size: 12px;
+  background: var(--bg); border: 1px solid var(--border-input); border-radius: var(--radius-sm);
+  color: var(--fg);
+}
+#preview-body {
+  width: 100%; min-height: 45vh; resize: vertical;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-2);
+}
+.file-list li.dir-over { background: var(--accent-soft); outline: 2px dashed var(--accent); }
+
+/* 搜索选项开关 */
+.search-bar .opt {
+  padding: 3px 7px; font-size: 11px; font-family: var(--font-mono);
+  border: 1px solid var(--border-input); border-radius: var(--radius-sm);
+}
+.search-bar .opt[aria-pressed="true"] {
+  color: var(--accent); border-color: var(--accent); background: var(--accent-soft);
+}
+.xterm-search-hit {
+  background: rgba(224, 162, 79, 0.35);
+  outline: 1px solid var(--warn);
+}
+.xterm-search-hit.active { background: rgba(79, 156, 249, 0.45); outline-color: var(--accent); }
+
+/* 快捷键帮助 */
+#hotkey-help .hotkey-row kbd {
+  font-family: var(--font-mono); font-size: 11px;
+  padding: 2px 7px; border: 1px solid var(--border-strong); border-radius: 5px;
+  background: var(--bg-3); color: var(--fg);
+}
+
+/* 触控目标与动效偏好 */
+@media (pointer: coarse) {
+  .icon-btn, .text-btn, .tab, .context-menu button {
+    min-height: 44px; min-width: 44px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

@@ -22,14 +22,16 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from wsctl.cli.client import ApiClient, ApiError, load_credentials
 
+# Imported, never re-listed: the fatal set used to be maintained in three
+# places and 4401 was fatal here but not in the browser.
+from wsctl.core.closecodes import FATAL_CLOSE_CODES as FATAL_CODES
+
 DEFAULT_SIZE = (80, 24)
 READ_SIZE = 4096
 INITIAL_DELAY = 0.5
 MAX_DELAY = 30.0
 PING_INTERVAL = 25.0
 
-# Close codes the server uses for permanent failures; retrying cannot help.
-FATAL_CODES = frozenset({4400, 4401, 4403, 4404, 4409, 4500})
 
 
 class ConnectError(RuntimeError):

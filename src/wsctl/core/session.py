@@ -9,6 +9,8 @@ clients can rebuild their screen.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import os
 import secrets
 import subprocess
@@ -22,6 +24,42 @@ from . import tmux
 from .pty import DEFAULT_TERM_SIGNAL, Pty, create_pty
 from .recording import Recorder
 from .scrollback import DEFAULT_MAX_BYTES, Scrollback
+
+log = logging.getLogger("wsctl.session")
+
+# Process-wide, monotonic count of clients dropped because output outran them
+# (their send queue filled, or blew the per-client byte budget). Distinct from
+# the memory-limit eviction: this one is about one slow *viewer*, not one
+# greedy session. Reported to the user and to Prometheus because it used to be
+# invisible -- the socket just closed "normally" and the browser blanked its
+# terminal with no explanation.
+_slow_consumer_drops = 0
+
+
+def slow_consumer_drops() -> int:
+    return _slow_consumer_drops
+
+
+def _bump_slow_consumer() -> None:
+    global _slow_consumer_drops
+    _slow_consumer_drops += 1
+
+
+# Process-wide, monotonic count of clients dropped by a memory limit. Kept
+# monotonic for the same reason ``pty.dropped_input_total`` is: a sum of
+# per-session counters would go *down* when a session ends and a Prometheus
+# ``rate()`` would see resets.
+_evicted_clients_total = 0
+
+
+def evicted_clients_total() -> int:
+    return _evicted_clients_total
+
+
+def _bump_evicted() -> None:
+    global _evicted_clients_total
+    _evicted_clients_total += 1
+
 
 #: How long ``_finalize`` waits for the child before escalating to ``kill``.
 FINALIZE_WAIT_TIMEOUT = 3.0
@@ -148,6 +186,21 @@ class TermSession:
         """Write calls dropped because the child stopped draining its terminal."""
         return int(getattr(self._pty, "dropped_input", 0))
 
+    def clients(self) -> list[dict[str, Any]]:
+        """A read-only view of who is attached (for the detail endpoint).
+
+        Returns copies: callers must not be able to reach into the live
+        ``_ClientEntry`` objects and close or mutate another client.
+        """
+        return [
+            {
+                "writable": entry.writable,
+                "share": entry.share,
+                "pending_bytes": int(getattr(entry.client, "pending_bytes", 0)),
+            }
+            for entry in list(self._clients.values())
+        ]
+
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
 
@@ -159,6 +212,13 @@ class TermSession:
         return total
 
     def _enforce_memory_limit(self) -> None:
+        """Drop the greediest client once the session is over its memory cap.
+
+        The client is *told* before it is dropped. A silently vanishing
+        terminal is indistinguishable from a network failure, and the product
+        already promises the same thing for a dropped keystroke ("report it
+        rather than leave a keyboard that appears dead").
+        """
         if self._memory_limit <= 0:
             return
         while self._clients and self.memory_usage() > self._memory_limit:
@@ -167,6 +227,15 @@ class TermSession:
                 key=lambda kv: int(getattr(kv[1].client, "pending_bytes", 0)),
             )
             self._clients.pop(key, None)
+            _bump_evicted()
+            with contextlib.suppress(ClientGone):
+                entry.client.put(
+                    {
+                        "type": "evicted",
+                        "reason": "memory",
+                        "msg": "会话缓冲已达上限，本连接被释放（会话仍在运行）",
+                    }
+                )
             close = getattr(entry.client, "close", None)
             if callable(close):
                 close()
@@ -204,13 +273,13 @@ class TermSession:
                 raise ClientGone("会话已关闭")
             if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
                 raise ClientGone("会话连接数已达上限")
-            replay = self._scrollback.snapshot()
+            replay = self._scrollback.chunks()
             key = id(client)
             self._clients[key] = _ClientEntry(client, writable=writable, share=share)
             self.last_active = time.time()
             try:
-                if replay:
-                    client.put(replay)
+                for chunk in replay:
+                    client.put(chunk)
                 client.put(
                     {
                         "type": "attached",
@@ -353,11 +422,41 @@ class TermSession:
                     continue
                 try:
                     entry.client.put(data)
-                except ClientGone:
+                except ClientGone as exc:
                     dead.append(key)
+                    self._report_slow_consumer(entry, exc)
             for key in dead:
                 self._clients.pop(key, None)
             self._enforce_memory_limit()
+
+    def _report_slow_consumer(self, entry: _ClientEntry, exc: ClientGone) -> None:
+        """Tell a client why it is being dropped, and leave a trace.
+
+        Silent here meant three things at once: the operator's log said
+        nothing, the metrics said nothing, and the user saw a terminal that
+        simply stopped and then went black on reconnect.
+        """
+        _bump_slow_consumer()
+        log.warning(
+            "dropped a slow client from session %s: %s", self.id, exc
+        )
+        with contextlib.suppress(ClientGone):
+            getattr(entry.client, "final_notice", entry.client.put)(
+                {
+                    "type": "evicted",
+                    "reason": "backpressure",
+                    "msg": "输出过快，本连接已被释放（会话仍在运行，重连即可恢复）",
+                }
+            )
+
+    async def notify(self, message: dict[str, Any]) -> None:
+        """Broadcast a control message to every attached client.
+
+        Public because a rename (issued over HTTP) must reach the tabs already
+        attached over WebSocket; without it two clients on one session keep
+        showing different names until each happens to reconnect.
+        """
+        await self._notify(message)
 
     async def _notify(self, message: dict[str, Any]) -> None:
         async with self._lock:

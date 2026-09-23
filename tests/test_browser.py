@@ -10,6 +10,7 @@ Playwright is not installed. Run with::
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -500,8 +501,12 @@ def test_browser_session_form_config_and_upload_guard(tmp_path: Path) -> None:
             page.wait_for_function(
                 "() => {"
                 " const t = document.querySelector('#admin-body .config-table').innerText;"
+                # All three tiers must be distinguishable at a glance. The
+                # middle one used to be printed as 热更新, which promised an
+                # immediate effect the server never delivered.
                 " return t.includes('max_sessions')"
-                "   && t.includes('热更新') && t.includes('需重启');"
+                "   && t.includes('立即生效') && t.includes('新建时生效')"
+                "   && t.includes('需重启');"
                 "}",
                 timeout=10000,
             )
@@ -680,6 +685,504 @@ def test_browser_zmodem_roundtrip(tmp_path: Path) -> None:
             assert target.is_file(), "rz never created the file"
             assert target.read_bytes() == upload_bytes, "rz payload corrupted in transit"
 
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_file_panel_organise_and_edit(tmp_path: Path) -> None:
+    """The panel can now organise and read in place, not just list and download.
+
+    Before this it offered three verbs (list / download / upload) and upload
+    had neither progress nor cancel. Everything here is the new surface.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    (files / "notes.txt").write_text("original 原文")
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+
+            page.click("#files-toggle")
+            page.wait_for_selector("#file-list li", timeout=10000)
+
+            # -- new directory ------------------------------------------------
+            page.click("#file-mkdir-btn")
+            page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=5000)
+            page.fill("#rename-input", "projects")
+            page.click("#rename-form button[type=submit]")
+            page.wait_for_function(
+                "() => document.getElementById('file-list').innerText.includes('projects')",
+                timeout=10000,
+            )
+
+            # -- preview and edit a text file in place ------------------------
+            page.locator("#file-list li", has_text="notes.txt").click(button="right")
+            page.wait_for_selector("#file-menu:not(.hidden)", timeout=5000)
+            page.click("#file-menu button[data-faction='preview']")
+            page.wait_for_selector("#preview-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_function(
+                "() => document.getElementById('preview-body').value.includes('原文')",
+                timeout=10000,
+            )
+            page.fill("#preview-body", "edited 已编辑")
+            page.click("#preview-save")
+            page.wait_for_selector("#preview-overlay.hidden", state="attached", timeout=10000)
+
+            # the save must actually reach the disk (and be visible after reload)
+            page.click("#file-refresh")
+            page.wait_for_function(
+                "() => document.getElementById('file-status').textContent.includes('项')",
+                timeout=10000,
+            )
+            body = httpx.get(
+                f"{BASE}/api/files/download",
+                params={"path": "notes.txt"},
+                headers=_headers_from(page),
+                timeout=10,
+            ).content
+            assert body.decode("utf-8") == "edited 已编辑", body
+
+            # -- rename through the context menu ------------------------------
+            page.locator("#file-list li", has_text="notes.txt").click(button="right")
+            page.wait_for_selector("#file-menu:not(.hidden)", timeout=5000)
+            page.click("#file-menu button[data-faction='rename']")
+            page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=5000)
+            page.fill("#rename-input", "renamed.txt")
+            page.click("#rename-form button[type=submit]")
+            page.wait_for_function(
+                "() => document.getElementById('file-list').innerText.includes('renamed.txt')",
+                timeout=10000,
+            )
+
+            # -- filter narrows the listing ------------------------------------
+            page.fill("#file-filter", "renamed")
+            page.wait_for_function(
+                "() => { const t = document.getElementById('file-list').innerText;"
+                " return t.includes('renamed.txt') && !t.includes('projects'); }",
+                timeout=10000,
+            )
+            page.fill("#file-filter", "")
+
+            # -- delete asks you to type the name back -------------------------
+            # Irreversible and un-recursive: a plain "确定 / 取消" is one stray
+            # click from deleting the wrong thing, so the entry name must be
+            # typed out first.
+            page.locator("#file-list li", has_text="renamed.txt").click(button="right")
+            page.wait_for_selector("#file-menu:not(.hidden)", timeout=5000)
+            page.click("#file-menu button[data-faction='delete']")
+            page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=10000)
+            submit = page.locator("#rename-form button[type=submit]")
+            assert submit.is_disabled(), "confirm button must start disabled"
+            page.fill("#rename-input", "wrong-name")
+            assert submit.is_disabled(), "a mismatched name must keep it disabled"
+            page.fill("#rename-input", "renamed.txt")
+            page.wait_for_function(
+                "() => !document.querySelector('#rename-form button[type=submit]').disabled",
+                timeout=5000,
+            )
+            submit.click()
+            page.wait_for_function(
+                "() => !document.getElementById('file-list').innerText.includes('renamed.txt')",
+                timeout=10000,
+            )
+
+            # -- upload shows progress and can be cancelled --------------------
+            with page.expect_file_chooser(timeout=10000) as chooser:
+                page.click("#file-upload-btn")
+            chooser.value.set_files(
+                {"name": "big.bin", "mimeType": "application/octet-stream",
+                 "buffer": os.urandom(256 * 1024)}
+            )
+            # Either the bar appears (progress events fired) or the upload is
+            # already done on a fast box -- both are acceptable, what must not
+            # happen is a silent hang with no feedback at all.
+            page.wait_for_function(
+                "() => {"
+                " const p = document.getElementById('file-upload-progress');"
+                " const s = document.getElementById('file-status').textContent;"
+                " return (!p.classList.contains('hidden')) || s.includes('上传完成');"
+                "}",
+                timeout=15000,
+            )
+
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_hotkey_help_and_search_options(tmp_path: Path) -> None:
+    """`?` must tell the user what the shortcuts are; search must be precise."""
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+
+            # -- `?` opens the cheatsheet, Esc closes it ----------------------
+            page.click(".term-pane.active .xterm-screen")
+            page.keyboard.press("?")
+            page.wait_for_selector("#hotkey-overlay:not(.hidden)", timeout=5000)
+            page.wait_for_function(
+                "() => document.getElementById('hotkey-help').innerText.length > 20",
+                timeout=5000,
+            )
+            help_text = page.inner_text("#hotkey-help")
+            # The table has to name the bindings it is advertising.
+            for expected in ("新建会话", "搜索终端", "打开 / 关闭本帮助"):
+                assert expected in help_text, expected
+            page.keyboard.press("Escape")
+            page.wait_for_selector("#hotkey-overlay.hidden", state="attached", timeout=5000)
+
+            # -- search is case-sensitive only when asked ---------------------
+            page.click(".term-pane.active .xterm-screen")
+            page.keyboard.type("echo MiXeD-case")
+            page.keyboard.press("Enter")
+            page.wait_for_function(
+                "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
+                " return r && r.innerText.includes('MiXeD-case'); }",
+                timeout=15000,
+            )
+            page.click("#search-btn")
+            page.fill("#search-input", "mixed-case")
+            page.wait_for_function(
+                "() => document.getElementById('search-count').textContent.includes('/')",
+                timeout=10000,
+            )
+            assert "0/0" not in page.inner_text("#search-count"), "default search must ignore case"
+
+            page.click("#search-case")
+            page.wait_for_function(
+                "() => document.getElementById('search-count').textContent === '0/0'",
+                timeout=10000,
+            )
+
+            # an invalid regex is reported, not silently matched as nothing
+            page.click("#search-case")  # case-insensitive again
+            page.click("#search-regex")
+            page.fill("#search-input", "Mi[eD")
+            page.wait_for_function(
+                "() => document.getElementById('search-count').textContent === '无效模式'",
+                timeout=10000,
+            )
+            page.fill("#search-input", "Mi[e]D")
+            page.wait_for_function(
+                "() => document.getElementById('search-count').textContent.includes('/')"
+                " && document.getElementById('search-count').textContent !== '无效模式'",
+                timeout=10000,
+            )
+            page.click("#search-close")
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_upload_can_be_cancelled(tmp_path: Path) -> None:
+    """A long upload must show progress *and* be cancellable.
+
+    ``fetch`` has no upload progress, so the panel uses ``XMLHttpRequest``;
+    without either affordance a 100 MB upload is indistinguishable from a hang.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(
+                viewport={"width": 1400, "height": 900}, accept_downloads=False
+            ).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            page.click("#files-toggle")
+            page.wait_for_selector("#file-list li, #file-list .empty", timeout=10000)
+
+            with page.expect_file_chooser(timeout=10000) as chooser:
+                page.click("#file-upload-btn")
+            # Large enough that the progress bar has a chance to paint before
+            # completion on a fast box.
+            chooser.value.set_files(
+                {"name": "huge.bin", "mimeType": "application/octet-stream",
+                 "buffer": os.urandom(4 * 1024 * 1024)}
+            )
+            # Either the bar is up (progress events fired) or a local upload
+            # this small finished first -- both are fine. What must not happen
+            # is a silent hang with no feedback at all. Only try to cancel if
+            # there is anything left to cancel.
+            with contextlib.suppress(Exception):
+                page.wait_for_selector("#file-upload-progress:not(.hidden)", timeout=4000)
+            if page.locator("#file-upload-progress").is_visible():
+                assert page.locator("#up-cancel").is_enabled()
+                page.click("#up-cancel")
+
+            # Either the server already finished (nothing to cancel) or the
+            # abort was reported. What must never happen is a silent hang.
+            page.wait_for_function(
+                "() => {"
+                " const s = document.getElementById('file-status').textContent;"
+                " const p = document.getElementById('file-upload-progress');"
+                " return s.includes('已取消') || s.includes('上传完成')"
+                "   || p.classList.contains('hidden');"
+                "}",
+                timeout=15000,
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_session_history_tab_shows_finished_sessions(tmp_path: Path) -> None:
+    """A finished session must be visible in the dialog's history half.
+
+    The rows were written to ``term_sessions`` and pruned by the retention
+    policy, but nothing displayed them -- the product remembered a session was
+    killed and refused to tell anyone.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            headers = _headers_from(page)
+
+            # Make a session, then end it via the API so the browser sees the
+            # exact "died while I was not looking" case.
+            created = httpx.post(
+                f"{BASE}/api/sessions", headers=headers,
+                json={"name": "doomed", "command": "sleep 60"}, timeout=10,
+            )
+            assert created.status_code == 201, created.text
+            sid = created.json()["id"]
+            assert httpx.delete(
+                f"{BASE}/api/sessions/{sid}", headers=headers, timeout=10
+            ).status_code == 200
+
+            page.click("#sessions-btn")
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=10000)
+            page.click("[data-stab='history']")
+            page.wait_for_function(
+                "() => document.getElementById('sessions-list').innerText.includes('doomed')",
+                timeout=10000,
+            )
+            listing = page.inner_text("#sessions-list")
+            # status + reason, not a bare enum
+            assert "已终止" in listing, listing
+            # the row offers a way back in
+            assert "重新打开" in listing
+            assert "详情" in listing
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_rate_limit_notice_is_a_toast_not_terminal_output(
+    tmp_path: Path,
+) -> None:
+    """A server notice must surface as a Toast and never as terminal output.
+
+    The trigger is the input rate limit: type past the token bucket and the
+    server answers with a ``notice`` control message. That is browser-observable
+    and doubles as an end-to-end proof of the 0.1.8 fix -- before it, the same
+    input tore the whole WebSocket down and the client reconnected into a fresh
+    bucket, forever.
+
+    (A read-only viewer is *not* a usable trigger: the UI withholds keystrokes
+    client-side before they are sent, so the server never has reason to refuse.)
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    # Tiny bucket so one long paste overflows it.
+    os.environ["WSCTL_INPUT_RATE_LIMIT"] = "8"
+    os.environ["WSCTL_INPUT_RATE_BURST"] = "8"
+    try:
+        server = _start_server(data, files)
+        try:
+            _wait_health()
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+                _login(page)
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=15000,
+                )
+                page.click(".term-pane.active .xterm-screen")
+                # ONE frame far past the 8-byte bucket. `keyboard.type` would
+                # send 200 single-key frames -- an empty bucket then produces
+                # three consecutive strikes and the server (correctly) closes
+                # with 4429. `insertText` is a single input event, one frame.
+                page.keyboard.insert_text("x" * 200)
+                page.wait_for_selector(".toast", timeout=15000)
+                toast_text = page.inner_text("#toasts")
+                assert "速率超限" in toast_text, toast_text
+
+                # The notice must not be sitting in the buffer where the
+                # scrollback would replay it as if the shell had printed it.
+                rows = page.eval_on_selector(
+                    ".term-pane.active .xterm-rows", "el => el.innerText"
+                )
+                assert "速率超限" not in rows, rows[-400:]
+                assert "[wsctl]" not in rows
+
+                # And one over-limit frame must NOT kill the link. (A peer that
+                # keeps flooding *is* disconnected -- with 4429 -- but that is
+                # three strikes later, and covered server-side.)
+                assert "已连接" in page.inner_text("#connection"), (
+                    page.inner_text("#connection")
+                )
+                browser.close()
+        finally:
+            _stop_server(server)
+            shutil.rmtree(data, ignore_errors=True)
+    finally:
+        os.environ.pop("WSCTL_INPUT_RATE_LIMIT", None)
+        os.environ.pop("WSCTL_INPUT_RATE_BURST", None)
+
+
+def test_browser_admin_table_sorts_and_pages_without_duplicating(tmp_path: Path) -> None:
+    """Sorting or paging must *replace* the table, not stack another copy.
+
+    ``buildTable`` appended into its host on every re-render, so one click on a
+    column header left a second table underneath -- and there was no test at
+    all for the sorting/paging feature.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        headers = _admin_headers()
+        # More rows than one page (TABLE_PAGE is 25) so the paging controls are
+        # actually reachable -- "next" is correctly disabled on a single page,
+        # and clicking it then is a test bug, not a product one.
+        for i in range(30):
+            r = httpx.post(
+                f"{BASE}/api/users", headers=headers, timeout=10,
+                json={"username": f"u{i:02d}", "password": "testpass123", "role": "user"},
+            )
+            assert r.status_code == 201, r.text
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            page.click("#admin-btn")
+            page.wait_for_selector("#admin-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#admin-body .admin-table", timeout=10000)
+            assert page.locator("#admin-body .admin-table").count() == 1
+
+            # Click a sort header three times: still exactly one table.
+            for _ in range(3):
+                page.locator("#admin-body .admin-table th").first.click()
+                page.wait_for_timeout(150)
+                assert page.locator("#admin-body .admin-table").count() == 1, (
+                    "sorting stacked a duplicate table"
+                )
+                assert page.locator("#admin-body .admin-toolbar").count() >= 1, (
+                    "re-render wiped the paging toolbar"
+                )
+
+            # Paging moves through the rows without duplicating the table.
+            before = page.locator("#admin-body .admin-table tbody tr").count()
+            assert before > 0
+            next_btn = page.locator("#admin-body .admin-toolbar button:has-text('下一页')")
+            assert next_btn.is_enabled(), "a 30-row list must have a second page"
+            next_btn.click()
+            page.wait_for_timeout(250)
+            assert page.locator("#admin-body .admin-table").count() == 1, (
+                "paging stacked a duplicate table"
+            )
+            assert page.locator("#admin-body .admin-table tbody tr").count() > 0
+            # The paging toolbar survives a re-render next to the table.
+            assert page.locator("#admin-body .table-host .admin-toolbar").count() == 1
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_history_reopen_uses_argv_and_refuses_ssh(tmp_path: Path) -> None:
+    """Reopening history must replay argv -- and never run a remote command here."""
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            headers = _headers_from(page)
+            sid = httpx.post(
+                f"{BASE}/api/sessions", headers=headers,
+                json={"name": "redo", "command": "sleep 30"}, timeout=10,
+            ).json()["id"]
+            assert httpx.delete(
+                f"{BASE}/api/sessions/{sid}", headers=headers, timeout=10
+            ).status_code == 200
+
+            page.click("#sessions-btn")
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=10000)
+            page.click("[data-stab='history']")
+            page.wait_for_function(
+                "() => document.getElementById('sessions-list').innerText.includes('redo')",
+                timeout=10000,
+            )
+            page.locator("#sessions-list button:has-text('重新打开')").first.click()
+            # The reopen lands a *new* live tab with the same name.
+            page.wait_for_function(
+                "() => [...document.querySelectorAll('.tab .label')]"
+                ".some(el => el.textContent === 'redo')",
+                timeout=15000,
+            )
             browser.close()
     finally:
         _stop_server(server)

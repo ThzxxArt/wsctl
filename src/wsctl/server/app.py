@@ -1,71 +1,62 @@
-"""FastAPI application factory."""
+"""FastAPI application factory.
+
+This module only *assembles*: request bodies live in :mod:`~wsctl.server.models`,
+per-request helpers in :mod:`~wsctl.server.deps`, endpoints under
+``server/routes/``, and cross-instance reconciliation in
+:mod:`~wsctl.server.maintenance`. Keeping the wiring here thin is what stops
+the factory from turning into a second monolith.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
-import json
 import logging
 import os
-import shlex
 import signal
 import socket
-import sqlite3
 import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
 
-import segno
-from fastapi import (
-    Depends,
-    FastAPI,
-    File,
-    Form,
-    HTTPException,
-    Request,
-    Response,
-    UploadFile,
-    WebSocket,
-    status,
-)
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, Response, WebSocket
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 from starlette.middleware.base import RequestResponseEndpoint
 
 from wsctl import __version__
-from wsctl.core import fs as fs_mod
 from wsctl.core import logrotate as logrotate_mod
 from wsctl.core import pty as pty_mod
 from wsctl.core import recording as recording_mod
-from wsctl.core import ssh, tmux, totp, user_admin
+from wsctl.core import session as session_mod
 from wsctl.core.audit import AuditWriter
 from wsctl.core.authcache import AuthCache
 from wsctl.core.config import (
-    HOT_FIELDS,
-    RESTART_FIELDS,
     Settings,
     reload_settings_file,
 )
 from wsctl.core.metrics import Metrics
 from wsctl.core.pty import PtyError
 from wsctl.core.ratelimit import RateLimiter
-from wsctl.core.session import SessionManager, SessionSpec, TermSession, within_user_quota
-from wsctl.core.store import Store, User
+from wsctl.core.session import SessionManager, SessionSpec
+from wsctl.core.store import Store
 from wsctl.core.webhook import WebhookDispatcher
 
+from . import routes
+from .maintenance import (
+    active_recording_paths,
+    dead_instance_ids,
+    prune_recordings,
+    reconcile_instances,
+    retention_cutoffs,
+)
 from .security import (
-    COOKIE_NAME,
     SECURITY_HEADERS,
-    can_access,
     client_ip,
     ip_allowed,
-    is_origin_allowed,
 )
 from .ws import terminal_endpoint
 
@@ -73,152 +64,6 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 MAINTENANCE_INTERVAL = 5.0
 
 log = logging.getLogger("wsctl.app")
-
-
-class _UploadTooLarge(Exception):
-    """Raised when an upload exceeds ``file_max_upload``."""
-
-
-def _copy_upload(src: Any, fd: int, limit: int, chunk_size: int = 1 << 20) -> int:
-    """Copy an uploaded file to ``fd`` on a worker thread (blocking I/O).
-
-    ``fd`` is always closed. Raises :class:`_UploadTooLarge` past ``limit``.
-    """
-    size = 0
-    out = os.fdopen(fd, "wb")
-    try:
-        while True:
-            chunk = src.read(chunk_size)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > limit:
-                raise _UploadTooLarge
-            out.write(chunk)
-        return size
-    finally:
-        out.close()
-
-
-def _scan_recordings(directory: Path) -> list[dict[str, Any]]:
-    """List ``*.cast`` files (blocking; call via ``asyncio.to_thread``)."""
-    if not directory.is_dir():
-        return []
-    items: list[dict[str, Any]] = []
-    for entry in sorted(directory.glob("*.cast")):
-        try:
-            stat = entry.stat()
-        except OSError:
-            continue
-        items.append({"name": entry.name, "size": stat.st_size, "mtime": stat.st_mtime})
-    return items
-
-
-def _prune_recordings(directory: Path, cutoff: float, active: set[str]) -> None:
-    """Delete recordings older than ``cutoff`` (blocking; runs in a thread)."""
-    for entry in directory.glob("*.cast"):
-        if str(entry) in active:
-            continue
-        try:
-            if entry.stat().st_mtime < cutoff:
-                entry.unlink(missing_ok=True)
-        except OSError:
-            continue
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    totp: str | None = None
-
-
-class SessionCreate(BaseModel):
-    name: str | None = None
-    command: str | None = None
-    cwd: str | None = None
-    backend: str | None = None
-    ssh: SshConfig | None = None
-    cols: int = Field(default=80, ge=1, le=1000)
-    rows: int = Field(default=24, ge=1, le=1000)
-
-
-class SessionRename(BaseModel):
-    name: str
-
-
-class SessionShare(BaseModel):
-    ttl: int | None = None
-    writable: bool = False
-
-
-class SshConfig(BaseModel):
-    host: str
-    user: str | None = None
-    port: int | None = None
-    identity: str | None = None
-    options: list[str] = Field(default_factory=list)
-    command: str | None = None
-
-
-class RecordingStart(BaseModel):
-    record_input: bool = False
-
-
-class UserCreate(BaseModel):
-    username: str
-    password: str
-    role: str = "user"
-
-
-class UserUpdate(BaseModel):
-    role: str | None = None
-    disabled: bool | None = None
-    password: str | None = None
-
-
-def _qr_svg(text: str) -> str:
-    """Render ``text`` as a standalone SVG QR code (for TOTP provisioning)."""
-    buffer = io.BytesIO()
-    segno.make(text, error="m").save(buffer, kind="svg")
-    return buffer.getvalue().decode("utf-8")
-
-
-def _render_setting(value: Any) -> str:
-    """Render a setting for display without leaking a raw Python repr."""
-    if value is None:
-        return ""
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, list):
-        return json.dumps(value, ensure_ascii=False)
-    return str(value)
-
-
-def _token_from_request(request: Request) -> str | None:
-    auth = request.headers.get("authorization")
-    if auth and auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return request.cookies.get(COOKIE_NAME)
-
-
-def current_user(request: Request) -> User:
-    settings: Settings = request.app.state.settings
-    store: Store = request.app.state.store
-    if not settings.auth_required:
-        return User(id=0, username="anonymous", role="admin", disabled=False, created_at=0.0)
-    token = _token_from_request(request)
-    user = store.resolve_auth_session(token) if token else None
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="需要登录"
-        )
-    return user
-
-
-def require_admin(user: User = Depends(current_user)) -> User:
-    if user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="需要管理员权限")
-    return user
 
 
 def _config_mtime(settings: Settings) -> float:
@@ -242,114 +87,6 @@ def _install_sighup(app: FastAPI) -> None:
         loop.add_signal_handler(signal.SIGHUP, _request_reload, app)
 
 
-def _pid_alive(pid: int | None) -> bool:
-    """Whether a local pid is still running (best-effort, POSIX only).
-
-    On Windows ``os.kill(pid, 0)`` is not a liveness probe -- CPython maps it
-    to ``TerminateProcess`` -- so we never probe there and fall back to the
-    heartbeat TTL instead.
-    """
-    if sys.platform == "win32":
-        return True
-    if not pid or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    except OSError:
-        return False
-    return True
-
-
-def _prune_dead_local_leases(store: Store, me: str, host: str) -> None:
-    """Immediately drop leases of crashed same-host instances.
-
-    Heartbeat TTL alone would make crash recovery wait up to ``instance_ttl``;
-    a same-host pid check lets a restarted server adopt orphaned sessions at
-    once instead of after the lease expires.
-    """
-    for inst in store.instance_all():
-        if inst["id"] == me or inst["host"] != host:
-            continue
-        if not _pid_alive(inst["pid"]):
-            store.instance_remove(str(inst["id"]))
-
-
-async def _reconcile_instances(app: FastAPI) -> None:
-    """Adopt sessions abandoned by dead instances; leave live peers alone.
-
-    Runs at startup and on every maintenance tick so that a session becomes
-    adoptable as soon as its owning instance goes away (rather than only on the
-    next restart). tmux sessions are namespaced per data directory, so a peer
-    using a different data directory on the same host is never mistaken for an
-    orphan.
-    """
-    settings: Settings = app.state.settings
-    store: Store = app.state.store
-    manager: SessionManager = app.state.manager
-    me = app.state.instance_id
-    host = socket.gethostname()
-    _prune_dead_local_leases(store, me, host)
-
-    rows = store.term_session_list()
-    tick = int(getattr(app.state, "_reconcile_tick", 0))
-    app.state._reconcile_tick = tick + 1
-    has_tmux_rows = any(row.get("backend") == "tmux" for row in rows)
-    # Probing tmux spawns a subprocess; only scan for orphans when there are
-    # tmux-backed rows, and otherwise just occasionally.
-    if tmux.is_available() and (has_tmux_rows or tick % 12 == 0):
-        known = {str(row["id"]) for row in rows}
-        for name in await tmux.list_sessions_async():
-            if tmux.owns(name) and tmux.sid_from_name(name) not in known:
-                await tmux.kill_session_async(name)
-                log.info("reaped orphan tmux session %s", name)
-
-    live = store.instance_alive_ids(settings.instance_ttl) - {me}
-    for row in rows:
-        if row.get("status") not in ("running", "interrupted"):
-            continue
-        if row.get("instance_id") in live:
-            continue  # a live peer still owns this session
-        sid = str(row["id"])
-        if manager.get(sid) is not None:
-            continue  # already held in this process
-        if row.get("backend") != "tmux":
-            # A local session died together with its instance.
-            store.term_session_set_status(sid, "stopped")
-            continue
-        if not await tmux.has_session_async(tmux.session_name(sid)):
-            store.term_session_set_status(sid, "stopped")
-            continue
-        spec = SessionSpec(
-            name=str(row["name"]),
-            argv=[settings.shell],
-            cwd=row.get("cwd") or settings.default_cwd,
-            backend="tmux",
-            idle_timeout=settings.idle_timeout,
-            max_life=settings.max_life,
-            max_clients=settings.session_max_clients,
-            memory_limit=settings.session_memory_limit,
-            scrollback_bytes=settings.scrollback_bytes,
-        )
-        try:
-            session = await manager.create(spec, sid=sid, owner_id=row.get("owner_id"))
-        except (ValueError, OSError, tmux.TmuxError):
-            continue
-        # A share link outlives a restart too: the token is rehydrated verbatim
-        # so a QR code already handed out keeps working.
-        session.restore_share(
-            row.get("share_token"),
-            row.get("share_expires"),
-            bool(row.get("share_writable")),
-        )
-        store.term_session_set_instance(sid, me)
-        store.term_session_set_status(sid, "running")
-        log.info("adopted tmux session %s", sid)
-
-
 def create_app(
     settings: Settings,
     *,
@@ -357,6 +94,8 @@ def create_app(
     manager: SessionManager | None = None,
     startup_command: str | None = None,
 ) -> FastAPI:
+    import shlex
+
     instance_id = uuid.uuid4().hex
     config_clock = {"mtime": _config_mtime(settings)}
 
@@ -365,6 +104,12 @@ def create_app(
         if changed or errors:
             limiter.limit = settings.login_rate_limit
             limiter.window = float(settings.login_rate_window)
+            # ``session_sliding_ttl`` is read from the store on every
+            # resolution, not from ``settings``. Without this the field was
+            # listed as hot-reloadable while a reload never reached the code
+            # that honours it -- the exact "label says one thing, behaviour
+            # does another" defect this release is about.
+            app.state.store.sliding_ttl = settings.session_sliding_ttl
             if errors:
                 # Never silent: a broken edit must be visible in the log, the
                 # API response and the CLI, otherwise it looks like the reload
@@ -382,26 +127,17 @@ def create_app(
         """
         now = time.time()
         store_ = app.state.store
-        if settings.audit_retention_days > 0:
+        cutoffs = retention_cutoffs(now, settings)
+        if cutoffs["audit"] is not None:
+            await asyncio.to_thread(store_.purge_audit, cutoffs["audit"])
+        if cutoffs["term_sessions"] is not None:
             await asyncio.to_thread(
-                store_.purge_audit, now - settings.audit_retention_days * 86400
+                store_.purge_term_sessions, cutoffs["term_sessions"]
             )
-        if settings.term_session_retention_days > 0:
+        if cutoffs["recordings"] is not None:
+            active = active_recording_paths(app.state.manager)
             await asyncio.to_thread(
-                store_.purge_term_sessions,
-                now - settings.term_session_retention_days * 86400,
-            )
-        if settings.recordings_retention_days > 0:
-            cutoff = now - settings.recordings_retention_days * 86400
-            # Read the live set on the loop (touching the manager from a thread
-            # would race with session creation/removal).
-            active = {
-                str(s.recording_path)
-                for s in app.state.manager.list_sessions()
-                if s.recording_path is not None
-            }
-            await asyncio.to_thread(
-                _prune_recordings, settings.recordings_dir, cutoff, active
+                prune_recordings, settings.recordings_dir, cutoffs["recordings"], active
             )
 
     def _maintenance_db_writes(instance_id_: str, ttl: float) -> None:
@@ -418,9 +154,8 @@ def create_app(
         )
         store_.purge_expired_sessions()
         store_.term_session_clear_expired_shares()
-        for dead in store_.instance_dead_ids(ttl):
-            if dead != instance_id_:
-                store_.instance_remove(dead)
+        for dead in dead_instance_ids(store_, ttl, instance_id_):
+            store_.instance_remove(dead)
 
     async def _maintenance_db_tick() -> None:
         """Collect on the loop, persist off it -- with one deliberate exception.
@@ -435,7 +170,7 @@ def create_app(
         """
         expired = await app.state.manager.reap_expired()
         for sid in expired:
-            app.state.store.term_session_set_status(sid, "expired")
+            app.state.store.term_session_set_status(sid, "expired", "超过空闲或最长寿命")
         alive = {s.id for s in app.state.manager.list_sessions()}
         app.state.store.term_session_stop_missing(alive, instance_id=instance_id)
         limiter.sweep()
@@ -465,7 +200,7 @@ def create_app(
                 # Re-register (idempotent upsert) rather than a bare heartbeat:
                 # if a peer pruned our lease while we were paused, this restores it.
                 await _maintenance_db_tick()
-                await _reconcile_instances(app)
+                await reconcile_instances(app)
                 await _purge_retention()
                 if app.state.reload_requested:
                     app.state.reload_requested = False
@@ -485,6 +220,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        from wsctl.core import tmux
+
         log.info("wsctl %s listening on %s:%s", __version__, settings.host, settings.port)
         tmux.set_namespace(settings.data_dir)
         app.state.store.instance_register(
@@ -495,7 +232,7 @@ def create_app(
         audit.start()
         if webhook is not None:
             webhook.start()
-        await _reconcile_instances(app)
+        await reconcile_instances(app)
         if startup_command:
             argv = shlex.split(startup_command)
             spec = SessionSpec(
@@ -602,6 +339,19 @@ def create_app(
         "Input writes dropped because a session's child stopped reading",
         lambda: float(pty_mod.dropped_input_total()),
     )
+    # ``wsctl_input_rate_limited_total`` is not registered here: ``ws.py``
+    # counts it with ``metrics.inc``, which already puts it in the exposition
+    # as a counter. Registering a collector too would print the series twice.
+    metrics.collect_counter(
+        "wsctl_clients_backpressure_dropped_total",
+        "Clients dropped because output outran them (queue full / byte budget)",
+        lambda: float(session_mod.slow_consumer_drops()),
+    )
+    metrics.collect_counter(
+        "wsctl_clients_evicted_total",
+        "Clients dropped by a session's memory limit (session itself survives)",
+        lambda: float(session_mod.evicted_clients_total()),
+    )
     metrics.collect_counter(
         "wsctl_recording_failures_total",
         "Recorders stopped by a write failure (cast may be truncated)",
@@ -609,13 +359,14 @@ def create_app(
     )
 
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
+    app.state.limiter = limiter
 
     @app.middleware("http")
     async def _guard(request: Request, call_next: RequestResponseEndpoint) -> Response:
         ip = client_ip(request, settings)
         if not ip_allowed(ip, settings.allowed_ips):
             app.state.audit.enqueue("ip_rejected", ip=ip, payload=request.url.path)
-            return JSONResponse({"detail": "forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
         response = await call_next(request)
         if settings.security_headers:
             for key, value in SECURITY_HEADERS.items():
@@ -624,668 +375,8 @@ def create_app(
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-    @app.get("/", include_in_schema=False)
-    async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
-
-    @app.get("/healthz")
-    async def healthz() -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "version": __version__,
-            "sessions": len(app.state.manager.list_sessions()),
-        }
-
-    @app.get("/metrics", include_in_schema=False)
-    async def metrics_endpoint(request: Request) -> PlainTextResponse:
-        if not settings.metrics_enabled:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="指标已禁用")
-        if settings.metrics_require_auth:
-            current_user(request)
-        return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
-
-    # -- auth ----------------------------------------------------------
-
-    @app.post("/api/login")
-    async def login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
-        store_: Store = request.app.state.store
-        ip = client_ip(request, settings)
-        key = f"{ip or '-'}:{body.username}"
-
-        if limiter.is_blocked(key):
-            retry_after = int(limiter.retry_after(key)) + 1
-            metrics.inc("wsctl_logins_total", result="blocked")
-            audit.enqueue("login_blocked", ip=ip, payload=body.username)
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="尝试次数过多，请稍后再试",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-        # Argon2 verification is CPU-bound (~tens of ms): keep it off the event
-        # loop so a login storm cannot stall every terminal.
-        user = await asyncio.to_thread(store_.user_authenticate, body.username, body.password)
-        if user is None:
-            limiter.record_failure(key)
-            metrics.inc("wsctl_logins_total", result="failed")
-            audit.enqueue("login_failed", ip=ip, payload=body.username)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
-            )
-
-        secret = await asyncio.to_thread(store_.user_totp_secret, body.username)
-        if secret is not None and not totp.verify(secret, body.totp or ""):
-            limiter.record_failure(key)
-            metrics.inc("wsctl_logins_total", result="totp_failed")
-            audit.enqueue("login_totp_failed", user_id=user.id, ip=ip, payload=body.username)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="一次性验证码错误"
-            )
-
-        limiter.reset(key)
-        metrics.inc("wsctl_logins_total", result="ok")
-        token = await asyncio.to_thread(
-            store_.create_auth_session,
-            user.id,
-            ttl=settings.session_ttl,
-            ip=ip,
-            user_agent=request.headers.get("user-agent"),
-        )
-        response.set_cookie(
-            COOKIE_NAME,
-            token,
-            max_age=settings.session_ttl,
-            httponly=True,
-            secure=settings.cookie_secure,
-            samesite="lax",
-            path="/",
-        )
-        audit.enqueue("login", user_id=user.id, ip=ip)
-        return {"username": user.username, "role": user.role}
-
-    @app.post("/api/logout")
-    async def logout(request: Request, response: Response) -> dict[str, bool]:
-        token = _token_from_request(request)
-        if token:
-            def revoke() -> int | None:
-                store_ = app.state.store
-                user = store_.resolve_auth_session(token)
-                store_.delete_auth_session(token)
-                return user.id if user else None
-
-            user_id = await asyncio.to_thread(revoke)
-            app.state.audit.enqueue(
-                "logout",
-                user_id=user_id,
-                ip=client_ip(request, settings),
-            )
-        response.delete_cookie(COOKIE_NAME, path="/")
-        return {"ok": True}
-
-    @app.get("/api/me")
-    async def me(user: User = Depends(current_user)) -> dict[str, Any]:
-        return {"username": user.username, "role": user.role}
-
-    # -- sessions ------------------------------------------------------
-
-    def _serialize(session: TermSession) -> dict[str, Any]:
-        owner_name: str | None = None
-        if session.owner_id is not None:
-            owner = app.state.store.user_get_by_id(session.owner_id)
-            owner_name = owner.username if owner is not None else None
-        return {
-            "id": session.id,
-            "name": session.spec.name,
-            "pid": session.pid,
-            "owner_id": session.owner_id,
-            "owner": owner_name,
-            "backend": session.backend,
-            "shared": session.is_shared,
-            "share_writable": session.share_writable,
-            "recording": session.is_recording,
-            "clients": session.client_count,
-            "alive": session.is_alive,
-            "created_at": session.created_at,
-            "last_active": session.last_active,
-            "bytes": session.memory_usage(),
-        }
-
-    @app.get("/api/sessions")
-    async def list_sessions(user: User = Depends(current_user)) -> list[dict[str, Any]]:
-        sessions = app.state.manager.list_sessions()
-        return [_serialize(s) for s in sessions if can_access(user, s)]
-
-    @app.post("/api/sessions", status_code=status.HTTP_201_CREATED)
-    async def create_session(
-        body: SessionCreate, user: User = Depends(current_user)
-    ) -> dict[str, Any]:
-        manager: SessionManager = app.state.manager
-        if len(manager.list_sessions()) >= settings.max_sessions:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="会话数量已达上限"
-            )
-        if not within_user_quota(manager, settings.max_sessions_per_user, user.id):
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="该用户的会话数量已达上限",
-            )
-        backend = body.backend or settings.default_backend
-        if backend not in ("local", "tmux", "ssh"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail=f"未知后端：{backend}"
-            )
-        if backend == "tmux" and not tmux.is_available():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="未安装 tmux"
-            )
-        if backend == "ssh":
-            if body.ssh is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, detail="需要提供 ssh 配置"
-                )
-            if not ssh.ssh_available():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, detail="未安装 ssh 客户端"
-                )
-            try:
-                target = ssh.SshTarget(
-                    host=body.ssh.host,
-                    user=body.ssh.user,
-                    port=body.ssh.port,
-                    identity=body.ssh.identity,
-                    options=body.ssh.options,
-                    remote_command=body.ssh.command or body.command,
-                )
-            except ssh.SshError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-                ) from exc
-            argv = target.argv()
-            name = body.name or f"ssh:{target.destination()}"
-        else:
-            if body.command is not None:
-                argv = shlex.split(body.command)
-                if not argv:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST, detail="命令为空"
-                    )
-            else:
-                argv = [settings.shell]
-            name = body.name or (Path(argv[0]).name if argv else "终端")
-        spec = SessionSpec(
-            name=name,
-            argv=argv,
-            cwd=body.cwd or settings.default_cwd,
-            backend=backend,
-            cols=body.cols,
-            rows=body.rows,
-            idle_timeout=settings.idle_timeout,
-            max_life=settings.max_life,
-            max_clients=settings.session_max_clients,
-            memory_limit=settings.session_memory_limit,
-            scrollback_bytes=settings.scrollback_bytes,
-        )
-        try:
-            session = await manager.create(spec, owner_id=user.id)
-        except (OSError, PtyError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"无法启动命令：{exc}",
-            ) from exc
-        try:
-            if settings.auto_record and await asyncio.to_thread(
-                recording_mod.has_room,
-                settings.recordings_dir,
-                settings.recordings_max_bytes,
-            ):
-                await session.start_recording(
-                    settings.recordings_dir / f"{session.id}.cast",
-                    record_input=settings.record_input,
-                )
-            app.state.store.term_session_upsert(
-                session.id,
-                name=name,
-                owner_id=user.id,
-                backend=backend,
-                command=body.command,
-                argv=spec.argv,
-                env=spec.env,
-                cwd=spec.cwd,
-                idle_timeout=spec.idle_timeout,
-                max_life=spec.max_life,
-                instance_id=instance_id,
-            )
-            app.state.audit.enqueue(
-                "session_create", user_id=user.id, term_session_id=session.id, payload=name
-            )
-        except Exception as exc:
-            await manager.remove(session.id)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="创建会话失败",
-            ) from exc
-        metrics.inc("wsctl_sessions_created_total")
-        return _serialize(session)
-
-    @app.delete("/api/sessions/{sid}")
-    async def delete_session(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
-        session = app.state.manager.get(sid)
-        if session is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
-        if not can_access(user, session):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该会话")
-        await app.state.manager.remove(sid)
-        app.state.store.term_session_set_status(sid, "killed")
-        app.state.audit.enqueue("session_kill", user_id=user.id, term_session_id=sid)
-        return {"ok": True}
-
-    @app.patch("/api/sessions/{sid}")
-    async def rename_session(
-        sid: str, body: SessionRename, user: User = Depends(current_user)
-    ) -> dict[str, Any]:
-        session = app.state.manager.get(sid)
-        if session is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
-        if not can_access(user, session):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该会话")
-        name = session.rename(body.name)
-        app.state.store.term_session_upsert(
-            sid,
-            name=name,
-            owner_id=session.owner_id,
-            cwd=session.spec.cwd,
-            instance_id=instance_id,
-        )
-        return _serialize(session)
-
-    # -- sharing -------------------------------------------------------
-
-    def _owned(sid: str, user: User) -> TermSession:
-        manager: SessionManager = app.state.manager
-        session = manager.get(sid)
-        if session is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
-        if not can_access(user, session):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该会话")
-        return session
-
-    @app.get("/api/sessions/{sid}/share")
-    async def get_share(sid: str, user: User = Depends(current_user)) -> dict[str, Any]:
-        """Return the active share token so the UI can reuse an existing link."""
-        session = _owned(sid, user)
-        token = session.peek_share()
-        if token is None:
-            return {"shared": False}
-        return {"shared": True, "token": token, "writable": session.share_writable}
-
-    @app.post("/api/sessions/{sid}/share")
-    async def create_share(
-        sid: str, body: SessionShare, user: User = Depends(current_user)
-    ) -> dict[str, Any]:
-        session = _owned(sid, user)
-        token = session.create_share(
-            ttl=float(body.ttl) if body.ttl else None, writable=body.writable
-        )
-        # Persist so the link survives a restart (the same promise the session
-        # itself makes on the tmux backend).
-        await asyncio.to_thread(
-            app.state.store.term_session_set_share,
-            sid,
-            token=token,
-            expires=session.share_expiry,
-            writable=body.writable,
-        )
-        app.state.audit.enqueue(
-            "session_share",
-            user_id=user.id,
-            term_session_id=sid,
-            payload="write" if body.writable else "read",
-        )
-        return {
-            "token": token,
-            "ttl": body.ttl,
-            "writable": body.writable,
-            "expires_at": session.share_expiry,
-        }
-
-    @app.delete("/api/sessions/{sid}/share")
-    async def revoke_share(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
-        session = _owned(sid, user)
-        session.revoke_share()
-        await asyncio.to_thread(app.state.store.term_session_set_share, sid, token=None)
-        app.state.audit.enqueue("session_unshare", user_id=user.id, term_session_id=sid)
-        return {"ok": True}
-
-    @app.get("/api/sessions/{sid}/qr.svg")
-    async def share_qr(
-        request: Request, sid: str, origin: str = "", user: User = Depends(current_user)
-    ) -> Response:
-        session = _owned(sid, user)
-        token = session.peek_share()
-        if token is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该会话未分享")
-        allowed = is_origin_allowed(origin, request.headers.get("host"), settings.allowed_origins)
-        base = origin if (origin and allowed) else str(request.base_url).rstrip("/")
-        url = f"{base}/?session={sid}&share={token}"
-        # A standalone SVG document (with xmlns) so it renders inside an <img>.
-        buffer = io.BytesIO()
-        segno.make(url, error="m").save(buffer, kind="svg")
-        return Response(content=buffer.getvalue(), media_type="image/svg+xml")
-
-    # -- recordings ----------------------------------------------------
-
-    @app.post("/api/sessions/{sid}/recording/start")
-    async def start_recording(
-        sid: str, body: RecordingStart, user: User = Depends(current_user)
-    ) -> dict[str, str]:
-        session = _owned(sid, user)
-        if session.is_recording:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="已在录制中")
-        path = await session.start_recording(
-            settings.recordings_dir / f"{sid}.cast", record_input=body.record_input
-        )
-        app.state.audit.enqueue("recording_start", user_id=user.id, term_session_id=sid)
-        return {"path": str(path)}
-
-    @app.post("/api/sessions/{sid}/recording/stop")
-    async def stop_recording(sid: str, user: User = Depends(current_user)) -> dict[str, bool]:
-        session = _owned(sid, user)
-        await session.stop_recording()
-        app.state.audit.enqueue("recording_stop", user_id=user.id, term_session_id=sid)
-        return {"ok": True}
-
-    @app.get("/api/sessions/{sid}/recording")
-    async def download_recording(sid: str, user: User = Depends(current_user)) -> FileResponse:
-        session = _owned(sid, user)
-        path = session.recording_path
-        if path is None or not path.is_file():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
-        return FileResponse(
-            path, media_type="application/x-asciicast", filename=f"{sid}.cast"
-        )
-
-    @app.get("/api/recordings")
-    async def list_recordings(_: User = Depends(require_admin)) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(_scan_recordings, settings.recordings_dir)
-
-    def _recording_path(name: str) -> Path:
-        safe = Path(name).name
-        if safe != name or not safe.endswith(".cast"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件名无效")
-        return settings.recordings_dir / safe
-
-    @app.get("/api/recordings/{name}")
-    async def download_recording_by_name(
-        name: str, _: User = Depends(require_admin)
-    ) -> FileResponse:
-        path = _recording_path(name)
-        if not path.is_file():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
-        return FileResponse(path, media_type="application/x-asciicast", filename=name)
-
-    @app.delete("/api/recordings/{name}")
-    async def delete_recording_by_name(
-        name: str, actor: User = Depends(require_admin)
-    ) -> dict[str, bool]:
-        path = _recording_path(name)
-        if not path.is_file():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
-        path.unlink(missing_ok=True)
-        audit.enqueue("recording_delete", user_id=actor.id, payload=name)
-        return {"ok": True}
-
-    # -- users (admin only) --------------------------------------------
-
-    @app.get("/api/users")
-    async def list_users(_: User = Depends(require_admin)) -> list[dict[str, Any]]:
-        def snapshot() -> list[dict[str, Any]]:
-            store_ = app.state.store
-            return [
-                {
-                    "id": u.id,
-                    "username": u.username,
-                    "role": u.role,
-                    "disabled": u.disabled,
-                    "totp": store_.user_totp_secret(u.username) is not None,
-                }
-                for u in store_.user_list()
-            ]
-
-        return await asyncio.to_thread(snapshot)
-
-    @app.post("/api/users", status_code=status.HTTP_201_CREATED)
-    async def create_user(body: UserCreate, actor: User = Depends(require_admin)) -> dict[str, Any]:
-        try:
-            user = await asyncio.to_thread(
-                user_admin.create,
-                app.state.store,
-                body.username,
-                body.password,
-                body.role,
-            )
-        except user_admin.UserAdminError as exc:
-            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="用户已存在"
-            ) from exc
-        app.state.audit.enqueue(
-            "user_create", user_id=actor.id, payload=f"{user.username}:{user.role}"
-        )
-        return {"id": user.id, "username": user.username, "role": user.role}
-
-    @app.delete("/api/users/{username}")
-    async def delete_user(
-        username: str, actor: User = Depends(require_admin)
-    ) -> dict[str, bool]:
-        try:
-            await asyncio.to_thread(
-                user_admin.delete, app.state.store, username, actor=actor
-            )
-        except user_admin.UserAdminError as exc:
-            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
-        audit.enqueue("user_delete", user_id=actor.id, payload=username)
-        return {"ok": True}
-
-    @app.patch("/api/users/{username}")
-    async def update_user(
-        username: str, body: UserUpdate, actor: User = Depends(require_admin)
-    ) -> dict[str, bool]:
-        if body.role is None and body.disabled is None and body.password is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="没有需要更新的字段"
-            )
-        store_ = app.state.store
-        changed: list[str] = []
-        try:
-            if body.role is not None:
-                await asyncio.to_thread(
-                    user_admin.set_role, store_, username, body.role, actor=actor
-                )
-                changed.append(f"role={body.role}")
-            if body.disabled is not None:
-                await asyncio.to_thread(
-                    user_admin.set_disabled, store_, username, body.disabled, actor=actor
-                )
-                changed.append(f"disabled={body.disabled}")
-            if body.password is not None:
-                # Password hashing is CPU-bound; revokes existing logins.
-                await asyncio.to_thread(
-                    user_admin.set_password, store_, username, body.password, actor=actor
-                )
-                changed.append("password")
-        except user_admin.UserAdminError as exc:
-            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
-        audit.enqueue("user_update", user_id=actor.id, payload=f"{username}:{','.join(changed)}")
-        return {"ok": True}
-
-    @app.post("/api/users/{username}/totp")
-    async def enable_totp(
-        username: str, actor: User = Depends(require_admin)
-    ) -> dict[str, str]:
-        if app.state.store.user_get(username) is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-        secret = totp.generate_secret()
-        app.state.store.user_set_totp(username, secret)
-        audit.enqueue("user_totp_on", user_id=actor.id, payload=username)
-        uri = totp.provisioning_uri(secret, username, issuer=settings.totp_issuer)
-        return {"secret": secret, "uri": uri, "qr_svg": _qr_svg(uri)}
-
-    @app.delete("/api/users/{username}/totp")
-    async def disable_totp(
-        username: str, actor: User = Depends(require_admin)
-    ) -> dict[str, bool]:
-        if not app.state.store.user_clear_totp(username):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-        audit.enqueue("user_totp_off", user_id=actor.id, payload=username)
-        return {"ok": True}
-
-    @app.get("/api/audit")
-    async def get_audit(
-        _: User = Depends(require_admin),
-        limit: int = 100,
-        offset: int = 0,
-        event: str | None = None,
-        user_id: int | None = None,
-        ip: str | None = None,
-    ) -> list[dict[str, Any]]:
-        # Flush the async writer so the read reflects events just produced.
-        await app.state.audit.flush()
-        store_: Store = app.state.store
-        return await asyncio.to_thread(
-            store_.recent_audit,
-            min(max(limit, 1), 1000),
-            offset=max(offset, 0),
-            event=event,
-            user_id=user_id,
-            ip=ip,
-        )
-
-    @app.post("/api/config/reload")
-    async def reload_config(actor: User = Depends(require_admin)) -> dict[str, Any]:
-        changed, errors = await asyncio.to_thread(_reload_config)
-        app.state.audit.enqueue(
-            "config_reload",
-            user_id=actor.id,
-            payload=",".join(changed) if changed else (";".join(errors) or None),
-        )
-        return {"changed": changed, "errors": errors}
-
-    @app.get("/api/config")
-    async def get_config(_: User = Depends(require_admin)) -> dict[str, Any]:
-        """Effective configuration, labelled by whether a reload can apply it."""
-        values = await asyncio.to_thread(lambda: settings.model_dump())
-        fields = [
-            {
-                "key": key,
-                "value": _render_setting(values.get(key)),
-                "kind": "restart" if key in RESTART_FIELDS else "hot",
-            }
-            for key in sorted(set(HOT_FIELDS) | set(RESTART_FIELDS))
-        ]
-        return {
-            "config_path": str(settings.config_path),
-            "data_dir": str(settings.data_dir),
-            "fields": fields,
-        }
-
-    # -- files (rooted at settings.files_root) -------------------------
-
-    @app.get("/api/files")
-    async def list_files(
-        user: User = Depends(current_user), path: str = ""
-    ) -> dict[str, Any]:
-        root = settings.files_root
-        try:
-            entries, truncated = await asyncio.to_thread(fs_mod.list_dir, root, path)
-        except fs_mod.FsError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        return {
-            "path": path.strip().lstrip("/"),
-            "root": str(root),
-            "entries": entries,
-            "truncated": truncated,
-            "limit": fs_mod.DEFAULT_LIST_LIMIT,
-        }
-
-    @app.get("/api/files/download")
-    async def download_file(user: User = Depends(current_user), path: str = "") -> FileResponse:
-        root = settings.files_root
-        try:
-            target = fs_mod.safe_resolve(root, path)
-        except fs_mod.FsError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        if not target.is_file():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="不是文件")
-        return FileResponse(target, filename=target.name)
-
-    @app.post("/api/files/upload", status_code=status.HTTP_201_CREATED)
-    async def upload_file(
-        user: User = Depends(current_user),
-        file: UploadFile = File(...),
-        path: str = Form(""),
-        overwrite: bool = Form(False),
-    ) -> dict[str, Any]:
-        root = settings.files_root
-        name = Path(file.filename or "").name
-        if not name or name in (".", ".."):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件名无效")
-        try:
-            directory = fs_mod.safe_resolve(root, path)
-        except fs_mod.FsError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        if not directory.is_dir():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="不是目录")
-
-        dest = directory / name
-        # A symlink at the destination is a security problem (it would redirect
-        # the write), so it is refused outright rather than offered for
-        # "overwrite"; the O_NOFOLLOW open below re-checks against a race.
-        if dest.is_symlink():
-            await file.close()
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="拒绝覆盖符号链接或非法路径",
-            )
-        if dest.exists() and not overwrite:
-            await file.close()
-            # Never silently destroy an existing file: the client must opt in.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"文件已存在：{name}（确认后可覆盖）",
-            )
-        # O_NOFOLLOW refuses to follow a symlink planted at the destination.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(dest, flags, 0o644)
-        except OSError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="拒绝覆盖符号链接或非法路径",
-            ) from exc
-        size = 0
-        try:
-            loop = asyncio.get_running_loop()
-            size = await loop.run_in_executor(
-                None, _copy_upload, file.file, fd, settings.file_max_upload
-            )
-        except _UploadTooLarge as exc:
-            dest.unlink(missing_ok=True)
-            raise HTTPException(status_code=413, detail="文件过大") from exc
-        except Exception:
-            # Do not leave a half-written file behind on any other failure.
-            dest.unlink(missing_ok=True)
-            raise
-        finally:
-            await file.close()
-
-        metrics.inc("wsctl_uploads_total")
-        app.state.audit.enqueue(
-            "file_upload",
-            user_id=user.id,
-            payload=fs_mod.relative_to(root, dest)[:256],
-        )
-        return {"name": name, "size": size}
+    for router, _prefix in routes.ROUTERS:
+        app.include_router(router)
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

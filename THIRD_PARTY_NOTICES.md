@@ -13,6 +13,7 @@ and are included in the published wheel.
 | @xterm/addon-fit | 0.10.0 | MIT |
 | @xterm/addon-web-links | 0.11.0 | MIT |
 | @xterm/addon-image | 0.9.0 | MIT |
+| @xterm/addon-search | 0.16.0 | MIT |
 | asciinema-player | 3.17.0 | Apache-2.0 |
 | zmodem.js | 0.1.10 | Apache-2.0 |
 

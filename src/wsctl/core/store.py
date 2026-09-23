@@ -160,6 +160,7 @@ class Store:
             "term_sessions": {
                 "argv": "TEXT",
                 "env": "TEXT",
+                "end_reason": "TEXT",
                 "idle_timeout": "REAL",
                 "max_life": "REAL",
                 "instance_id": "TEXT",
@@ -230,6 +231,23 @@ class Store:
         with self._lock:
             row = self._conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return self._row_to_user(row) if row else None
+
+    def users_by_ids(self, ids: set[int]) -> dict[int, User]:
+        """Resolve many owners in one query.
+
+        The session list used to call :meth:`user_get_by_id` once per row --
+        64 sessions meant 64 synchronous SQLite round trips *on the event
+        loop*. One ``IN`` query replaces them.
+        """
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM users WHERE id IN ({placeholders})", tuple(sorted(ids))
+            ).fetchall()
+        users = {int(row["id"]): self._row_to_user(row) for row in rows}
+        return users
 
     def user_list(self) -> list[User]:
         with self._lock:
@@ -507,11 +525,20 @@ class Store:
                 ),
             )
 
-    def term_session_set_status(self, sid: str, status: str) -> None:
+    def term_session_set_status(
+        self, sid: str, status: str, reason: str | None = None
+    ) -> None:
+        """Record how a session ended.
+
+        ``reason`` is the human half of ``status``: "killed" says *what*
+        happened, "被管理员终止" says *why*. Without it the history list showed
+        a bare enum value and left the user to guess.
+        """
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE term_sessions SET status = ?, last_active = ? WHERE id = ?",
-                (status, time.time(), sid),
+                "UPDATE term_sessions SET status = ?, end_reason = ?, last_active = ?"
+                " WHERE id = ?",
+                (status, reason, time.time(), sid),
             )
 
     def term_session_set_instance(self, sid: str, instance_id: str | None) -> None:
@@ -557,6 +584,52 @@ class Store:
                     (owner_id,),
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    def term_session_history(
+        self, *, owner_id: int | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Finished session rows (newest first).
+
+        These rows were always written -- ``status``, ``created_at`` and the
+        retention policy all exist -- but nothing ever read them, so a session
+        that ended left no trace anywhere in the product. ``owner_id=None``
+        means "everyone" (admin view).
+        """
+        clauses = ["status != 'running'"]
+        params: list[Any] = []
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            params.append(owner_id)
+        params.append(max(1, min(limit, 1000)))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM term_sessions WHERE {' AND '.join(clauses)}"
+                " ORDER BY last_active DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def term_session_timeline(self, sid: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Audit events for one session, oldest first -- the session's story.
+
+        The events were always written (``session_create`` / ``session_attach``
+        / ``session_detach`` / ``session_kill`` …); nothing joined them to the
+        session they describe.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, event, user_id, ip, payload FROM audit_logs"
+                " WHERE term_session_id = ? ORDER BY ts ASC, id ASC LIMIT ?",
+                (sid, max(1, min(limit, 500))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def term_session_get(self, sid: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM term_sessions WHERE id = ?", (sid,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def term_session_set_share(
         self,

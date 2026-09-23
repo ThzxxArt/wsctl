@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wsctl"
-version = "0.1.7"
+version = "0.1.8"
 description = "单机部署的 Web 在线终端：多会话、多用户 RBAC、审计、分享、录制与可观测，ttyd 的现代 Python 超集。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -97,7 +97,7 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
 # FastAPI dependency injection uses call expressions in defaults by design.
-"src/wsctl/server/app.py" = ["B008"]
+"src/wsctl/server/**.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.11"

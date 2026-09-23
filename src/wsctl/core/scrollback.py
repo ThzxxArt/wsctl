@@ -45,6 +45,16 @@ class Scrollback:
         """Return all buffered bytes, oldest first."""
         return b"".join(self._chunks)
 
+    def chunks(self) -> tuple[bytes, ...]:
+        """The buffered chunks as stored, oldest first.
+
+        Replaying through :meth:`snapshot` copied the whole buffer on every
+        attach -- a 4 MiB scrollback was a 4 MiB ``join`` per reconnect, which
+        is pure waste when the caller is only going to push the bytes out over
+        a socket one chunk at a time.
+        """
+        return tuple(self._chunks)
+
     def clear(self) -> None:
         self._chunks.clear()
         self._size = 0

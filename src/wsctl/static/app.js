@@ -9,6 +9,14 @@
     filesToggle: $("files-toggle"), filePanel: $("file-panel"), fileCrumbs: $("file-crumbs"),
     fileClose: $("file-close"), fileList: $("file-list"), fileUploadBtn: $("file-upload-btn"),
     fileRefresh: $("file-refresh"), fileInput: $("file-input"), fileStatus: $("file-status"),
+    fileFilter: $("file-filter"), fileKind: $("file-kind"), filePage: $("file-page"), filePrev: $("file-prev"),
+    fileNext: $("file-next"), fileMkdir: $("file-mkdir-btn"),
+    upProgress: $("file-upload-progress"), upFill: $("up-fill"), upLabel: $("up-label"),
+    upCancel: $("up-cancel"),
+    fileMenu: $("file-menu"), previewOverlay: $("preview-overlay"), previewTitle: $("preview-title"),
+    previewNote: $("preview-note"), previewBody: $("preview-body"),
+    previewClose: $("preview-close"), previewCancel: $("preview-cancel"),
+    previewSave: $("preview-save"), previewDownload: $("preview-download"),
     shareBtn: $("share-btn"), shareOverlay: $("share-overlay"), shareQr: $("share-qr"),
     shareWrite: $("share-write"), shareTtl: $("share-ttl"), shareUrl: $("share-url"),
     shareCopy: $("share-copy"), shareRegenerate: $("share-regenerate"),
@@ -29,6 +37,8 @@
     customThemeJson: $("custom-theme-json"), customThemeAdd: $("custom-theme-add"),
     searchBtn: $("search-btn"), searchBar: $("search-bar"), searchInput: $("search-input"),
     searchCount: $("search-count"), searchNext: $("search-next"), searchClose: $("search-close"),
+    searchCase: $("search-case"), searchWord: $("search-word"), searchRegex: $("search-regex"),
+    hotkeyOverlay: $("hotkey-overlay"), hotkeyClose: $("hotkey-close"), hotkeyHelp: $("hotkey-help"),
     renameOverlay: $("rename-overlay"), renameForm: $("rename-form"), renameInput: $("rename-input"),
     renameTitle: $("rename-title"), renameCancel: $("rename-cancel"),
     confirmOverlay: $("confirm-overlay"), confirmTitle: $("confirm-title"),
@@ -59,7 +69,14 @@
 
   // Application close codes that mean "do not reconnect": the failure is
   // permanent and the reason was already delivered as a control message.
-  const FATAL_CLOSE_CODES = new Set([4400, 4403, 4404, 4409, 4500]);
+  //
+  // This is a *mirror* of `wsctl.core.closecodes.FATAL_CLOSE_CODES`. The
+  // browser cannot import Python, so the two are kept equal by
+  // `tests/test_closecodes.py`, which parses this literal. Before that check
+  // existed the CLI listed 4401 as fatal and this set did not, and nothing
+  // complained. 4408 (half-open link) is deliberately absent: reconnecting
+  // and replaying the screen is exactly the right response there.
+  const FATAL_CLOSE_CODES = new Set([4400, 4401, 4403, 4404, 4409, 4429, 4500]);
 
   // How many sessions keep a live socket automatically. Opening every session
   // at once (the old behaviour) means N WebSockets and N xterm instances before
@@ -196,12 +213,19 @@
     const el = document.createElement("div");
     el.className = "toast" + (kind ? " " + kind : "");
     el.textContent = message;
+    // Every toast can be dismissed by clicking it; errors stay until then, so
+    // a failure the user was not looking at is not swallowed by a timer.
+    el.title = "点击关闭";
+    el.addEventListener("click", () => el.remove());
     els.toasts.appendChild(el);
-    setTimeout(() => {
-      el.style.transition = "opacity .3s";
-      el.style.opacity = "0";
-      setTimeout(() => el.remove(), 300);
-    }, 3200);
+    if (kind !== "error") {
+      setTimeout(() => {
+        if (!el.isConnected) return;
+        el.style.transition = "opacity .3s";
+        el.style.opacity = "0";
+        setTimeout(() => el.remove(), 300);
+      }, 3200);
+    }
   }
 
   // Dialogs are singletons: a second call while one is open would overwrite
@@ -228,6 +252,53 @@
       const onCancel = () => done(false);
       els.confirmOk.addEventListener("click", onOk);
       els.confirmCancel.addEventListener("click", onCancel);
+    });
+  }
+
+  // Dangerous actions ask for the *name* typed back, the way a hosting panel
+  // makes you type the repository name before deleting it. "确定 / 取消" alone
+  // is one stray click away from an irreversible delete.
+  function confirmByName(message, expected, title) {
+    if (renamePromptOpen) return Promise.resolve(false);
+    renamePromptOpen = true;
+    return new Promise((resolve) => {
+      els.renameTitle.textContent = title || "确认";
+      els.renameInput.type = "text";
+      els.renameInput.value = "";
+      els.renameInput.placeholder = `请输入「${expected}」以确认`;
+      els.renameOverlay.classList.remove("hidden");
+      els.renameInput.focus();
+      const submit = els.renameForm.querySelector("button[type=submit]");
+      const originalLabel = submit.textContent;
+      submit.textContent = "确认删除";
+      submit.disabled = true;
+      const note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = message;
+      els.renameForm.insertBefore(note, els.renameInput);
+      const onInput = () => { submit.disabled = els.renameInput.value.trim() !== expected; };
+      els.renameInput.addEventListener("input", onInput);
+      const done = (value) => {
+        renamePromptOpen = false;
+        els.renameOverlay.classList.add("hidden");
+        submit.disabled = false;
+        submit.textContent = originalLabel;
+        els.renameInput.placeholder = "";
+        note.remove();
+        els.renameInput.removeEventListener("input", onInput);
+        els.renameForm.removeEventListener("submit", onSubmit);
+        els.renameCancel.removeEventListener("click", onCancel);
+        resolve(value);
+      };
+      const onSubmit = (e) => {
+        e.preventDefault();
+        if (els.renameInput.value.trim() !== expected) return;
+        done(true);
+      };
+      const onCancel = () => done(false);
+      els.renameForm.addEventListener("submit", onSubmit);
+      els.renameCancel.addEventListener("click", onCancel);
+      onInput();
     });
   }
 
@@ -268,6 +339,8 @@
     "confirm-overlay": () => els.confirmCancel.click(),
     "qr-overlay": () => closeQrDialog(true),
     "new-session-overlay": () => closeNewSession(),
+    "preview-overlay": () => closePreview(),
+    "hotkey-overlay": () => toggleHotkeyHelp(false),
   };
   // Esc closes the *topmost* visible modal (they can be nested, e.g. the QR
   // dialog opened from the admin panel).
@@ -330,12 +403,31 @@
     return ["已断开", s.intentional ? "" : "bad"];
   }
 
+  // How long a request may hang before the UI gives up and says so. Without
+  // this a single wedged request left the admin panel on its skeleton forever.
+  const API_TIMEOUT_MS = 15000;
+
+  function apiError(message, kind) {
+    const err = new Error(message);
+    err.kind = kind || "server";
+    return err;
+  }
+
   async function api(method, path, body) {
-    const res = await fetch(path, {
-      method,
-      headers: body ? { "Content-Type": "application/json" } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    let res;
+    try {
+      res = await fetch(path, {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
+    } catch (err) {
+      if (err && (err.name === "TimeoutError" || err.name === "AbortError")) {
+        throw apiError("请求超时，请检查网络或服务状态", "timeout");
+      }
+      throw apiError("网络错误，无法连接到服务", "network");
+    }
     if (res.status === 401) {
       if (!sharedMode) showLogin("请先登录");
       throw new Error("未授权");
@@ -343,7 +435,7 @@
     if (!res.ok) {
       let detail = res.statusText;
       try { detail = (await res.json()).detail || detail; } catch { /* 忽略 */ }
-      throw new Error(detail);
+      throw apiError(detail, res.status === 401 ? "auth" : "server");
     }
     if (res.status === 204) return null;
     return res.json();
@@ -414,10 +506,17 @@
     const ws = new WebSocket(wsUrl(s));
     ws.binaryType = "arraybuffer";
     s.ws = ws;
+    s.attached = false;
 
     ws.onopen = () => {
       s.delay = 500;
-      if (s.everConnected) { try { s.term.reset(); } catch { /* 忽略 */ } }
+      // Do NOT clear the screen here. ``onopen`` only means the socket is up;
+      // the replay that justifies clearing arrives afterwards. Clearing
+      // eagerly turned every reconnect that then failed -- a slow consumer
+      // being dropped again mid-replay is exactly that case -- into a terminal
+      // that stayed black with no way back. The screen is wiped on the first
+      // replayed byte instead (see handleBinary).
+      s.pendingReplayClear = s.everConnected;
       s.everConnected = true;
       s.standby = false;
       // Remember which rename generation this attach belongs to.
@@ -437,6 +536,13 @@
         handleControl(s, msg);
       } else {
         const bytes = new Uint8Array(event.data);
+        // The replay is arriving: *now* the old screen can go. Between the
+        // socket opening and here the previous screen is left intact, so a
+        // reconnect that never completes still shows what was there.
+        if (s.pendingReplayClear) {
+          s.pendingReplayClear = false;
+          try { s.term.reset(); } catch { /* 忽略 */ }
+        }
         if (s.sentry) {
           try { s.sentry.consume(bytes); } catch { s.term.write(bytes); }
           // Any traffic counts as transfer progress; re-arm the watchdog that
@@ -477,6 +583,15 @@
   function handleControl(s, msg) {
     switch (msg.type) {
       case "attached":
+        s.attached = true;
+        // ``attached`` is queued *after* the scrollback replay. If the flag is
+        // still set here the replay was empty (an idle session), and the old
+        // screen is stale rather than current -- clear it now instead of
+        // letting the next real output wipe a still-accurate display.
+        if (s.pendingReplayClear) {
+          s.pendingReplayClear = false;
+          try { s.term.reset(); } catch { /* 忽略 */ }
+        }
         s.writable = msg.writable !== false;
         // `attached` echoes the name the session had when this socket attached.
         // A rename issued after that must win, otherwise the tab silently
@@ -493,11 +608,43 @@
         }
         break;
       case "exit":
+        // The only control message that belongs on screen: the session itself
+        // is over, so this line is part of its story and is replayed with the
+        // scrollback on reconnect.
         s.exited = true; markTab(s, "exited");
         s.term.write(`\r\n\x1b[33m[wsctl] 会话已退出（退出码 ${msg.code}）\x1b[0m\r\n`);
         break;
+      case "renamed":
+        // A rename issued over HTTP (another tab, or the CLI) must reach the
+        // sockets already attached. Without this two clients on one session
+        // kept showing different names until each happened to reconnect.
+        s.name = msg.name;
+        s.nameVersion = (s.nameVersion || 0) + 1;
+        s.tabEl.querySelector(".label").textContent = msg.name;
+        break;
+      case "notice":
+        toast(msg.msg || "提示", msg.level === "error" ? "error" : "");
+        break;
+      case "evicted":
+        // A notice, not terminal output: writing it into the buffer would make
+        // it show up again on every reconnect replay. ``backpressure`` used to
+        // arrive as nothing at all -- the socket simply closed "normally".
+        toast(
+          msg.msg || (msg.reason === "backpressure"
+            ? "输出过快，连接已释放（会话仍在运行，重连即可恢复）"
+            : "连接已被释放（会话仍在运行）"),
+          "error",
+        );
+        s.standby = true;
+        markTab(s, "standby");
+        setConnectionFor(s, "未连接", "");
+        break;
       case "error":
-        s.term.write(`\r\n\x1b[31m[wsctl] ${msg.msg}\x1b[0m\r\n`);
+        // Terminal output is for what the *shell* printed. An operational
+        // notice written here used to be replayed to every reconnect as if the
+        // program had said it -- and it scrolled the prompt away mid-command.
+        toast(msg.msg || "会话错误", "error");
+        if (!s.attached) setConnectionFor(s, msg.msg || "连接失败", "bad");
         break;
       default: break;
     }
@@ -529,13 +676,14 @@
     const s = {
       id, name, term, fit, pane, tabEl,
       ws: null, heartbeat: null, reconnectTimer: null, delay: 500,
-      intentional: false, exited: false, standby: false,
+      intentional: false, exited: false, standby: false, attached: false,
+      pendingReplayClear: false,
       nameVersion: 0, attachNameVersion: 0,
       share: options.share || null,
       writable: options.writable !== false,
       recording: Boolean(options.recording),
       sentry: null, zmodemActive: false, zmodemWatchdog: null, everConnected: false,
-      searchHits: [], searchPos: -1,
+      searchAddon: null, searchHits: [], searchPos: -1,
       autoConnect: options.autoConnect !== false,
     };
     sessions.set(id, s);
@@ -931,8 +1079,14 @@
     return `${seconds}秒`;
   }
 
+  // Which half of the session dialog is showing. The finished half used to be
+  // unreachable: the rows were written to `term_sessions` and pruned by the
+  // retention policy, but never displayed anywhere.
+  let sessionTab = "live";
+
   async function refreshSessions() {
     els.sessionsList.innerHTML = '<li class="sk"></li><li class="sk"></li><li class="sk"></li>';
+    if (sessionTab === "history") return refreshSessionHistory();
     let list;
     try { list = await api("GET", "/api/sessions"); }
     catch (err) { toast(String(err.message || err), "error"); return; }
@@ -985,6 +1139,86 @@
     }
   }
 
+  async function refreshSessionHistory() {
+    let rows;
+    try { rows = await api("GET", "/api/sessions/history"); }
+    catch (err) { toast(String(err.message || err), "error"); return; }
+    const filter = (els.sessionFilter.value || "").trim().toLowerCase();
+    els.sessionsList.innerHTML = "";
+    const shown = rows.filter((r) =>
+      !filter || String(r.name || "").toLowerCase().includes(filter)
+        || String(r.id || "").toLowerCase().includes(filter));
+    if (!shown.length) { els.sessionsList.innerHTML = '<li class="empty">暂无已结束的会话</li>'; return; }
+    const STATUS_LABELS = { killed: "已终止", expired: "已过期", stopped: "已停止", interrupted: "已中断" };
+    for (const r of shown) {
+      const li = document.createElement("li");
+      li.className = "session-row";
+      const label = document.createElement("span");
+      label.className = "session-name";
+      label.textContent = r.name || r.id;
+      const meta = document.createElement("span");
+      meta.className = "session-meta";
+      meta.textContent = [
+        STATUS_LABELS[r.status] || r.status,
+        `运行 ${formatDuration(r.duration)}`,
+        r.backend && r.backend !== "local" ? r.backend : "",
+      ].filter(Boolean).join(" · ");
+      li.title = `命令：${r.command || (r.argv ? JSON.parse(r.argv).join(" ") : "默认 shell")}`;
+      const detail = document.createElement("button");
+      detail.className = "text-btn";
+      detail.textContent = "详情";
+      detail.addEventListener("click", async () => {
+        try {
+          const info = await api("GET", `/api/sessions/${encodeURIComponent(r.id)}/detail`);
+          toast(`${info.name}：${info.status}，运行 ${formatDuration(info.duration)}`, "");
+        } catch (err) { toast(String(err.message || err), "error"); }
+      });
+      const reopen = document.createElement("button");
+      reopen.className = "text-btn";
+      reopen.textContent = "重新打开";
+      // An SSH session needs its structured target (host/user/port/identity)
+      // which history does not keep. Reopening it as a local shell would run
+      // the remote command on this machine -- so the button says why instead.
+      if (r.backend === "ssh") {
+        reopen.disabled = true;
+        reopen.title = "SSH 会话需在「新建会话」中重新填写目标后打开";
+      }
+      reopen.addEventListener("click", async () => {
+        try {
+          // Replay the recorded argv, not "command + backend name". For an SSH
+          // session the old shape sent backend=ssh with no ssh block (400),
+          // and the tempting fix -- dropping the backend -- would have run the
+          // *remote* command on the *local* shell.
+          let argv = [];
+          try { argv = typeof r.argv === "string" ? JSON.parse(r.argv) : (r.argv || []); }
+          catch { argv = []; }
+          if (!argv.length) {
+            toast("该会话未记录启动命令，无法原样重开", "error");
+            return;
+          }
+          const backend = r.backend === "tmux" ? "tmux" : "local";
+          const info = await api("POST", `/api/sessions/${encodeURIComponent(r.id)}/reopen`, {
+            argv, name: r.name, cwd: r.cwd || undefined, backend,
+          });
+          els.sessionsOverlay.classList.add("hidden");
+          sessionTab = "live";
+          createTab(info.id, info.name || "终端", { recording: info.recording });
+        } catch (err) { toast(String(err.message || err), "error"); }
+      });
+      li.append(label, meta, detail, reopen);
+      els.sessionsList.appendChild(li);
+    }
+  }
+
+  document.querySelectorAll("[data-stab]").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll("[data-stab]").forEach((t) => t.classList.toggle("active", t === tab));
+      sessionTab = tab.dataset.stab;
+      els.sessionsDetachAll.classList.toggle("hidden", sessionTab !== "live");
+      refreshSessions();
+    });
+  });
+
   els.sessionFilter.addEventListener("input", () => refreshSessions());
   els.sessionsDetachAll.addEventListener("click", () => {
     for (const id of Array.from(sessions.keys())) detachTab(id);
@@ -1002,6 +1236,91 @@
     els.sessionsOverlay.classList.add("hidden");
     openNewSession();
   });
+
+
+  // -- 表格排序 + 分页 --------------------------------------------------
+  // Every admin table gets the same affordances: click a header to sort,
+  // page through long lists. Users and recordings had neither (only audit had
+  // a "load more"), so a hundred-row table was one unsorted wall of text.
+  const TABLE_PAGE = 25;
+  const tableState = {};
+
+  function sortRows(rows, key, spec) {
+    const { field, numeric } = spec[key] || {};
+    if (!field) return rows.slice();
+    const dir = (spec._dir && spec._dir.key === key && spec._dir.dir === -1) ? -1 : 1;
+    return rows.slice().sort((a, b) => {
+      const x = a[field]; const y = b[field];
+      if (numeric) return ((Number(x) || 0) - (Number(y) || 0)) * dir;
+      return String(x ?? "").localeCompare(String(y ?? ""), "zh-Hans-CN") * dir;
+    });
+  }
+
+  function buildTable(host, id, columns, rows, spec, renderRow) {
+    const state = tableState[id] || (tableState[id] = { offset: 0, sort: null });
+    const sorted = state.sort ? sortRows(rows, state.sort, spec) : rows.slice();
+    const page = sorted.slice(state.offset, state.offset + TABLE_PAGE);
+
+    // Re-render *replaces* the previous table. Appending left a second (third,
+    // fourth...) copy stacked underneath on every header click or page turn.
+    // Re-render callbacks must be given the *outer* host. Handing them
+    // ``container`` instead made ``querySelector(":scope > .table-host")``
+    // miss (it looks among the container's children), so each click nested a
+    // fresh .table-host inside the old one and left every previous table in
+    // place -- exactly the duplication this is meant to prevent.
+    const container = host.querySelector(":scope > .table-host") || (() => {
+      const div = document.createElement("div");
+      div.className = "table-host";
+      host.appendChild(div);
+      return div;
+    })();
+    container.replaceChildren();
+
+    const table = document.createElement("table");
+    table.className = "admin-table sortable";
+    const thead = document.createElement("thead");
+    const htr = document.createElement("tr");
+    for (const [key, label] of columns) {
+      const th = document.createElement("th");
+      th.textContent = label + (state.sort === key ? (state.dir === -1 ? " ↓" : " ↑") : " ↕");
+      th.title = "点击排序";
+      th.addEventListener("click", () => {
+        if (state.sort === key) state.dir = state.dir === -1 ? 1 : -1;
+        else { state.sort = key; state.dir = 1; }
+        buildTable(host, id, columns, rows, spec, renderRow);
+      });
+      htr.appendChild(th);
+    }
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    for (const row of page) tbody.appendChild(renderRow(row));
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    const bar = document.createElement("div");
+    bar.className = "admin-toolbar";
+    const info = document.createElement("span");
+    info.className = "file-status";
+    info.textContent = sorted.length
+      ? `${state.offset + 1}-${Math.min(state.offset + TABLE_PAGE, sorted.length)} / ${sorted.length}`
+      : "0 项";
+    const prev = document.createElement("button");
+    prev.className = "text-btn"; prev.textContent = "上一页"; prev.disabled = state.offset <= 0;
+    prev.addEventListener("click", () => {
+      state.offset = Math.max(0, state.offset - TABLE_PAGE);
+      buildTable(host, id, columns, rows, spec, renderRow);
+    });
+    const next = document.createElement("button");
+    next.className = "text-btn"; next.textContent = "下一页";
+    next.disabled = state.offset + TABLE_PAGE >= sorted.length;
+    next.addEventListener("click", () => {
+      state.offset += TABLE_PAGE;
+      buildTable(host, id, columns, rows, spec, renderRow);
+    });
+    bar.append(info, prev, next);
+    container.appendChild(bar);
+  }
 
   // -- 管理面板 ---------------------------------------------------------
 
@@ -1028,13 +1347,116 @@
   });
 
   async function renderAdmin() {
+    // Rebuilding the whole body used to throw away scroll position and focus,
+    // so a filter typed into the audit box vanished the moment anything
+    // refreshed. Both are restored across the rebuild.
+    const scrollTop = els.adminBody.scrollTop;
+    const active = document.activeElement;
+    const focusKey = active && active.id ? active.id : null;
+    const caret = active && typeof active.selectionStart === "number" ? active.selectionStart : null;
     els.adminBody.innerHTML = "";
     try {
-      if (adminTab === "users") await renderUsers();
+      if (adminTab === "overview") await renderOverview();
+      else if (adminTab === "users") await renderUsers();
       else if (adminTab === "audit") await renderAudit();
       else if (adminTab === "config") await renderConfig();
       else await renderRecordings();
     } catch (err) { adminNote(String(err.message || err), true); }
+    els.adminBody.scrollTop = scrollTop;
+    if (focusKey) {
+      const restored = document.getElementById(focusKey);
+      if (restored) {
+        restored.focus();
+        if (caret !== null && typeof restored.setSelectionRange === "function") {
+          try { restored.setSelectionRange(caret, caret); } catch { /* 忽略 */ }
+        }
+      }
+    }
+  }
+
+  async function renderOverview() {
+    // "Is this box healthy?" used to need four separate lookups
+    // (/healthz, /metrics, /api/audit, the instances table) and still left
+    // the finished sessions invisible.
+    const data = await api("GET", "/api/overview");
+    const host = document.createElement("div");
+    host.className = "overview";
+
+    const stat = document.createElement("div");
+    stat.className = "overview-stats";
+    const cards = [
+      ["运行中会话", `${data.sessions} / ${data.max_sessions}`],
+      ["已连接客户端", String(data.clients)],
+      ["会话缓冲", formatSize(data.bytes || 0)],
+      ["因内存释放的连接", String(data.evicted_clients || 0)],
+    ];
+    for (const [label, value] of cards) {
+      const card = document.createElement("div");
+      card.className = "overview-card";
+      card.innerHTML = `<div class="oc-value">${esc(value)}</div><div class="oc-label">${esc(label)}</div>`;
+      stat.appendChild(card);
+    }
+    host.appendChild(stat);
+
+    const instTitle = document.createElement("div");
+    instTitle.className = "section-title";
+    instTitle.textContent = "实例";
+    host.appendChild(instTitle);
+    const instTable = document.createElement("table");
+    instTable.className = "admin-table";
+    instTable.innerHTML = "<thead><tr><th>PID</th><th>主机</th><th>心跳</th><th>ID</th></tr></thead>";
+    const ib = document.createElement("tbody");
+    for (const inst of data.instances || []) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(inst.pid ?? "")}</td><td>${esc(inst.host || "")}</td>` +
+        `<td>${formatDuration(inst.age)}前</td><td>${esc(String(inst.id || "").slice(0, 8))}</td>`;
+      ib.appendChild(tr);
+    }
+    instTable.appendChild(ib);
+    host.appendChild(instTable);
+
+    const finTitle = document.createElement("div");
+    finTitle.className = "section-title";
+    finTitle.textContent = "最近结束的会话";
+    host.appendChild(finTitle);
+    if (!(data.recently_finished || []).length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "暂无";
+      host.appendChild(empty);
+    } else {
+      const finTable = document.createElement("table");
+      finTable.className = "admin-table";
+      finTable.innerHTML = "<thead><tr><th>名称</th><th>状态</th><th>时长</th></tr></thead>";
+      const fb = document.createElement("tbody");
+      for (const r of data.recently_finished) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${esc(r.name || r.id)}</td><td>${esc(r.status || "")}</td>` +
+          `<td>${formatDuration(r.duration)}</td>`;
+        fb.appendChild(tr);
+      }
+      finTable.appendChild(fb);
+      host.appendChild(finTable);
+    }
+
+    const auditTitle = document.createElement("div");
+    auditTitle.className = "section-title";
+    auditTitle.textContent = "最近事件";
+    host.appendChild(auditTitle);
+    const auditTable = document.createElement("table");
+    auditTable.className = "admin-table";
+    auditTable.innerHTML = "<thead><tr><th>时间</th><th>事件</th><th>用户</th><th>IP</th><th>详情</th></tr></thead>";
+    const ab = document.createElement("tbody");
+    for (const r of data.recent_audit || []) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${new Date(r.ts * 1000).toLocaleString()}</td><td>${esc(r.event)}</td>` +
+        `<td>${r.user_id ?? ""}</td><td>${esc(r.ip || "")}</td><td>${esc(r.payload || "")}</td>`;
+      ab.appendChild(tr);
+    }
+    auditTable.appendChild(ab);
+    host.appendChild(auditTable);
+
+    els.adminBody.appendChild(host);
   }
 
   function esc(text) {
@@ -1062,56 +1484,64 @@
       } catch (err) { adminNote(String(err.message || err), true); }
     });
 
-    const table = document.createElement("table");
-    table.className = "admin-table";
-    table.innerHTML = "<thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>两步验证</th><th>操作</th></tr></thead>";
-    const tbody = document.createElement("tbody");
-    for (const u of users) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${esc(u.username)}</td><td>${u.role === "admin" ? "管理员" : "用户"}</td>` +
-        `<td>${u.disabled ? "已禁用" : "正常"}</td><td>${u.totp ? "已启用" : "未启用"}</td>`;
-      const td = document.createElement("td");
-      td.className = "actions";
-      const mk = (label, fn, cls) => {
-        const b = document.createElement("button");
-        b.className = "text-btn" + (cls ? " " + cls : "");
-        b.textContent = label;
-        b.addEventListener("click", fn);
-        td.appendChild(b);
-      };
-      mk(u.role === "admin" ? "降为用户" : "升为管理员", async () => {
-        try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { role: u.role === "admin" ? "user" : "admin" }); renderAdmin(); }
-        catch (err) { adminNote(String(err.message || err), true); }
-      });
-      mk(u.disabled ? "启用" : "禁用", async () => {
-        try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { disabled: !u.disabled }); renderAdmin(); }
-        catch (err) { adminNote(String(err.message || err), true); }
-      });
-      mk("重置密码", async () => {
-        const pw = await promptDialog(`为 ${u.username} 设置新密码`, "", { masked: true });
-        if (!pw) return;
-        try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { password: pw }); adminNote("密码已更新（该用户登录态已失效）", false); }
-        catch (err) { adminNote(String(err.message || err), true); }
-      });
-      mk(u.totp ? "关闭 2FA" : "启用 2FA", async () => {
-        try {
-          if (u.totp) { await api("DELETE", `/api/users/${encodeURIComponent(u.username)}/totp`); renderAdmin(); }
-          else {
-            const info = await api("POST", `/api/users/${encodeURIComponent(u.username)}/totp`);
-            showQrDialog(u.username, info);
-          }
-        } catch (err) { adminNote(String(err.message || err), true); }
-      });
-      mk("删除", async () => {
-        if (!(await confirmDialog(`确定删除用户「${u.username}」？`, "删除用户"))) return;
-        try { await api("DELETE", `/api/users/${encodeURIComponent(u.username)}`); renderAdmin(); }
-        catch (err) { adminNote(String(err.message || err), true); }
-      }, "danger");
-      tr.appendChild(td);
-      tbody.appendChild(tr);
-    }
-    table.appendChild(tbody);
-    els.adminBody.appendChild(table);
+    const rows = users;
+    buildTable(
+      els.adminBody,
+      "users",
+      [["username", "用户名"], ["role", "角色"], ["disabled", "状态"], ["totp", "两步验证"], ["", "操作"]],
+      rows,
+      {
+        username: { field: "username" },
+        role: { field: "role" },
+        disabled: { field: "disabled", numeric: true },
+        totp: { field: "totp", numeric: true },
+      },
+      (u) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${esc(u.username)}</td><td>${u.role === "admin" ? "管理员" : "用户"}</td>` +
+          `<td>${u.disabled ? "已禁用" : "正常"}</td><td>${u.totp ? "已启用" : "未启用"}</td>`;
+        const td = document.createElement("td");
+        td.className = "actions";
+        const mk = (label, fn, cls) => {
+          const b = document.createElement("button");
+          b.className = "text-btn" + (cls ? " " + cls : "");
+          b.textContent = label;
+          b.addEventListener("click", fn);
+          td.appendChild(b);
+        };
+        mk(u.role === "admin" ? "降为用户" : "升为管理员", async () => {
+          try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { role: u.role === "admin" ? "user" : "admin" }); renderAdmin(); }
+          catch (err) { adminNote(String(err.message || err), true); }
+        });
+        mk(u.disabled ? "启用" : "禁用", async () => {
+          try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { disabled: !u.disabled }); renderAdmin(); }
+          catch (err) { adminNote(String(err.message || err), true); }
+        });
+        mk("重置密码", async () => {
+          const pw = await promptDialog(`为 ${u.username} 设置新密码`, "", { masked: true });
+          if (!pw) return;
+          try { await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { password: pw }); adminNote("密码已更新（该用户登录态已失效）", false); }
+          catch (err) { adminNote(String(err.message || err), true); }
+        });
+        mk(u.totp ? "关闭 2FA" : "启用 2FA", async () => {
+          try {
+            if (u.totp) { await api("DELETE", `/api/users/${encodeURIComponent(u.username)}/totp`); renderAdmin(); }
+            else {
+              const info = await api("POST", `/api/users/${encodeURIComponent(u.username)}/totp`);
+              showQrDialog(u.username, info);
+            }
+          } catch (err) { adminNote(String(err.message || err), true); }
+        });
+        mk("删除", async () => {
+          // Irreversible: type the name back.
+          if (!(await confirmByName(`删除用户「${u.username}」？该用户的会话与登录态会一并清理。`, u.username, "删除用户"))) return;
+          try { await api("DELETE", `/api/users/${encodeURIComponent(u.username)}`); renderAdmin(); }
+          catch (err) { adminNote(String(err.message || err), true); }
+        }, "danger");
+        tr.appendChild(td);
+        return tr;
+      },
+    );
   }
 
   function closeQrDialog(refresh) {
@@ -1192,34 +1622,40 @@
     const host = document.createElement("div");
     els.adminBody.appendChild(host);
     if (!rows.length) { host.innerHTML = '<div class="empty">暂无录制</div>'; return; }
-    const table = document.createElement("table");
-    table.className = "admin-table";
-    table.innerHTML = "<thead><tr><th>文件</th><th>大小</th><th>时间</th><th>操作</th></tr></thead>";
-    const tb = document.createElement("tbody");
-    for (const r of rows) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${esc(r.name)}</td><td>${formatSize(r.size)}</td><td>${new Date(r.mtime * 1000).toLocaleString()}</td>`;
-      const td = document.createElement("td");
-      td.className = "actions";
-      const play = document.createElement("button");
-      play.className = "text-btn"; play.textContent = "回放";
-      play.addEventListener("click", () => startReplay(`/api/recordings/${encodeURIComponent(r.name)}`));
-      const dl = document.createElement("button");
-      dl.className = "text-btn"; dl.textContent = "下载";
-      dl.addEventListener("click", () => { window.location.href = `/api/recordings/${encodeURIComponent(r.name)}`; });
-      const del = document.createElement("button");
-      del.className = "text-btn danger"; del.textContent = "删除";
-      del.addEventListener("click", async () => {
-        if (!(await confirmDialog(`确定删除录制「${r.name}」？`, "删除录制"))) return;
-        try { await api("DELETE", `/api/recordings/${encodeURIComponent(r.name)}`); renderAdmin(); }
-        catch (err) { adminNote(String(err.message || err), true); }
-      });
-      td.append(play, dl, del);
-      tr.appendChild(td);
-      tb.appendChild(tr);
-    }
-    table.appendChild(tb);
-    host.appendChild(table);
+    buildTable(
+      host,
+      "recordings",
+      [["name", "文件"], ["size", "大小"], ["mtime", "时间"], ["", "操作"]],
+      rows,
+      {
+        name: { field: "name" },
+        size: { field: "size", numeric: true },
+        mtime: { field: "mtime", numeric: true },
+      },
+      (r) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${esc(r.name)}</td><td>${formatSize(r.size)}</td><td>${new Date(r.mtime * 1000).toLocaleString()}</td>`;
+        const td = document.createElement("td");
+        td.className = "actions";
+        const play = document.createElement("button");
+        play.className = "text-btn"; play.textContent = "回放";
+        play.addEventListener("click", () => startReplay(`/api/recordings/${encodeURIComponent(r.name)}`));
+        const dl = document.createElement("button");
+        dl.className = "text-btn"; dl.textContent = "下载";
+        dl.addEventListener("click", () => { window.location.href = `/api/recordings/${encodeURIComponent(r.name)}`; });
+        const del = document.createElement("button");
+        del.className = "text-btn danger"; del.textContent = "删除";
+        del.addEventListener("click", async () => {
+          // Irreversible: type the name back.
+          if (!(await confirmByName(`删除录制「${r.name}」？该操作不可撤销。`, r.name, "删除录制"))) return;
+          try { await api("DELETE", `/api/recordings/${encodeURIComponent(r.name)}`); renderAdmin(); }
+          catch (err) { adminNote(String(err.message || err), true); }
+        });
+        td.append(play, dl, del);
+        tr.appendChild(td);
+        return tr;
+      },
+    );
   }
 
   async function renderConfig() {
@@ -1265,13 +1701,24 @@
     table.className = "config-table";
     table.innerHTML = "<thead><tr><th>配置项</th><th>生效值</th><th>生效方式</th></tr></thead>";
     const tbody = document.createElement("tbody");
+    // Three tiers, not two. `new` used to be shown as 热更新, which promised
+    // an immediate effect the server never delivered (those settings only
+    // reach sessions/recordings/sockets created after the edit).
+    const KIND_LABELS = { hot: "立即生效", new: "新建时生效", restart: "需重启" };
+    const KIND_TIPS = {
+      hot: "保存配置后，下一个请求 / 连接 / 维护周期就用新值，无需任何额外操作。",
+      // The tooltip is the whole point of the middle tier: without it the
+      // badge reads like a weaker form of "hot" and the user assumes it landed.
+      new: "只影响此后新建的会话、录制或连接。已存在的不受影响，想让旧会话用上新值需重建。",
+      restart: "需要重启服务才生效（网络、TLS、数据目录、日志、Webhook 等）。",
+    };
     for (const field of data.fields || []) {
       const tr = document.createElement("tr");
-      const kindLabel = field.kind === "restart" ? "需重启" : "热更新";
+      const kindLabel = KIND_LABELS[field.kind] || "需重启";
       tr.innerHTML =
         `<td>${esc(field.key)}</td>` +
         `<td class="val">${esc(field.value === "" ? "（空）" : field.value)}</td>` +
-        `<td><span class="kind-badge ${field.kind}">${kindLabel}</span></td>`;
+        `<td><span class="kind-badge ${field.kind}" title="${esc(KIND_TIPS[field.kind] || KIND_TIPS.restart)}">${kindLabel}</span></td>`;
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -1340,29 +1787,92 @@
 
   // -- 终端搜索 ---------------------------------------------------------
 
+  const searchOpts = { caseSensitive: false, wholeWord: false, regex: false };
+
+  // All-match highlighting needs real decorations (a single selection can only
+  // ever show one hit). That is what `@xterm/addon-search` provides, so search
+  // runs through it rather than hand-rolled buffer scanning -- which could
+  // count matches but never light them up.
+  function hex(color, fallback) {
+    // The addon requires `#RRGGBB`; CSS variables here may be rgba().
+    return /^#[0-9a-fA-F]{6}$/.test(color || "") ? color : fallback;
+  }
+
+  function searchDecorations(theme) {
+    return {
+      matchBackground: hex(theme.selectionBackground, "#2a3446"),
+      matchBorder: hex(theme.cursor, "#4f9cf9"),
+      matchOverviewRuler: hex(theme.cursor, "#4f9cf9"),
+      activeMatchBackground: hex(theme.cursor, "#4f9cf9"),
+      activeMatchBorder: hex(theme.background, "#0e1117"),
+      activeMatchColorOverviewRuler: hex(theme.cursor, "#4f9cf9"),
+    };
+  }
+
+  function ensureSearchAddon(s) {
+    if (s.searchAddon) return s.searchAddon;
+    if (!window.SearchAddon || !window.SearchAddon.SearchAddon) return null;
+    const addon = new window.SearchAddon.SearchAddon();
+    try { s.term.loadAddon(addon); } catch { return null; }
+    // ``onDidChangeResults`` is an xterm ``IEvent`` -- a *subscribe function*,
+    // not a settable callback. Assigning to it overwrites the subscription
+    // entry point and the counter never updates again.
+    addon.onDidChangeResults((e) => {
+      if (activeId !== s.id) return;
+      if (!e || e.resultCount <= 0) { els.searchCount.textContent = "0/0"; return; }
+      els.searchCount.textContent =
+        (e.resultIndex >= 0 ? `${e.resultIndex + 1}/` : "") + `${e.resultCount}`;
+    });
+    s.searchAddon = addon;
+    return addon;
+  }
+
   function runSearch(direction) {
     const s = activeId && sessions.get(activeId);
     if (!s) return;
     const query = els.searchInput.value;
-    if (!query) { els.searchCount.textContent = ""; return; }
-    const buf = s.term.buffer.active;
-    const lower = query.toLowerCase();
-    const hits = [];
-    for (let i = 0; i < buf.length; i++) {
-      const line = buf.getLine(i);
-      if (line && line.translateToString(true).toLowerCase().includes(lower)) hits.push(i);
+    if (!query) {
+      els.searchCount.textContent = "";
+      if (s.searchAddon) s.searchAddon.clearDecorations();
+      return;
     }
-    s.searchHits = hits;
-    if (!hits.length) { els.searchCount.textContent = "0/0"; return; }
-    if (s.searchPos < 0 || s.searchPos >= hits.length) s.searchPos = direction > 0 ? 0 : hits.length - 1;
-    else s.searchPos = (s.searchPos + (direction > 0 ? 1 : -1) + hits.length) % hits.length;
-    const line = hits[s.searchPos];
-    try { s.term.scrollToLine(line); } catch { /* 忽略 */ }
-    const text = buf.getLine(line).translateToString(true);
-    const col = text.toLowerCase().indexOf(lower);
-    try { s.term.select(col < 0 ? 0 : col, line, query.length); } catch { /* 忽略 */ }
-    els.searchCount.textContent = `${s.searchPos + 1}/${hits.length}`;
+    const addon = ensureSearchAddon(s);
+    if (!addon) {
+      els.searchCount.textContent = "搜索组件不可用";
+      return;
+    }
+    const options = {
+      regex: searchOpts.regex,
+      wholeWord: searchOpts.wholeWord,
+      caseSensitive: searchOpts.caseSensitive,
+      // This is the "highlight every match" the manual scanner could never do.
+      decorations: searchDecorations(resolveTheme()),
+    };
+    let found;
+    try {
+      found = direction > 0 ? addon.findNext(query, options) : addon.findPrevious(query, options);
+    } catch {
+      els.searchCount.textContent = "无效模式";
+      return;
+    }
+    if (!found && els.searchCount.textContent === "") els.searchCount.textContent = "0/0";
   }
+
+  function bindSearchToggle(button, key, label) {
+    if (!button) return;
+    button.setAttribute("aria-pressed", String(searchOpts[key]));
+    button.addEventListener("click", () => {
+      searchOpts[key] = !searchOpts[key];
+      button.setAttribute("aria-pressed", String(searchOpts[key]));
+      button.title = `${searchOpts[key] ? "关闭" : "开启"}${label}`;
+      const s = activeId && sessions.get(activeId);
+      if (s && s.searchAddon) s.searchAddon.clearDecorations();
+      if (els.searchInput.value) runSearch(1);
+    });
+  }
+  bindSearchToggle(els.searchCase, "caseSensitive", "区分大小写");
+  bindSearchToggle(els.searchWord, "wholeWord", "全词匹配");
+  bindSearchToggle(els.searchRegex, "regex", "正则表达式");
 
   function toggleSearch(show) {
     const visible = show === undefined ? els.searchBar.classList.contains("hidden") : show;
@@ -1370,7 +1880,11 @@
     if (visible) { els.searchInput.focus(); els.searchInput.select(); }
     else {
       const s = activeId && sessions.get(activeId);
-      if (s) { s.searchHits = []; s.searchPos = -1; try { s.term.clearSelection(); } catch { /* 忽略 */ } }
+      if (s) {
+        s.searchHits = []; s.searchPos = -1;
+        if (s.searchAddon) s.searchAddon.clearDecorations();
+        try { s.term.clearSelection(); } catch { /* 忽略 */ }
+      }
     }
   }
   els.searchBtn.addEventListener("click", () => toggleSearch());
@@ -1512,6 +2026,13 @@
         event.preventDefault(); return;
       }
     }
+    // `?` opens the shortcut cheatsheet. Deliberately not rebindable: it is
+    // the one chord whose whole purpose is telling you what the others are.
+    if (event.key === "?" && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      event.preventDefault(); event.stopPropagation();
+      toggleHotkeyHelp();
+      return;
+    }
     const combo = comboOf(event);
     if (!combo) return;
     for (const [action, binding] of Object.entries(prefs.keybindings)) {
@@ -1526,6 +2047,61 @@
     next_tab: "下一个标签", prev_tab: "上一个标签", toggle_files: "文件面板",
     toggle_sessions: "会话列表", toggle_settings: "设置", toggle_share: "分享会话", search: "搜索终端",
   };
+
+  // Discoverability: the bindings existed and were editable, but there was no
+  // way to find out what they were without opening Settings and reading a
+  // table of inputs.
+  function toggleHotkeyHelp(show) {
+    // No argument means "flip it". The first version derived `hidden` from
+    // `classList.contains("hidden")` and then forced that same value back, so
+    // the overlay could never open -- and the browser test caught it.
+    const currentlyHidden = els.hotkeyOverlay.classList.contains("hidden");
+    const hidden = show === undefined ? !currentlyHidden : !show;
+    els.hotkeyOverlay.classList.toggle("hidden", hidden);
+    if (hidden) return;
+    els.hotkeyHelp.innerHTML = "";
+    const fixed = [
+      ["?", "打开 / 关闭本帮助"],
+      ["Esc", "关闭最上层弹窗或搜索"],
+      ["Ctrl+Shift+C", "复制选区"],
+      ["Ctrl+Shift+V", "粘贴剪贴板"],
+      ["Ctrl+C（有选区时）", "复制选区"],
+    ];
+    const rows = Object.entries(prefs.keybindings)
+      .map(([action, binding]) => [binding || "未绑定", HOTKEY_LABELS[action] || action])
+      .concat(fixed);
+    for (const [combo, label] of rows) {
+      const row = document.createElement("div");
+      row.className = "hotkey-row";
+      const name = document.createElement("span");
+      name.textContent = label;
+      const kbd = document.createElement("kbd");
+      kbd.textContent = combo;
+      // The help sheet is for reading *and* for taking away: click a chord to
+      // copy it (someone pastes these into their own notes or a wiki).
+      kbd.title = "点击复制";
+      kbd.style.cursor = "pointer";
+      kbd.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(`${combo}\t${label}`);
+          toast(`已复制：${combo}`, "ok");
+        } catch { /* 剪贴板不可用时忽略 */ }
+      });
+      row.append(name, kbd);
+      els.hotkeyHelp.appendChild(row);
+    }
+    const copyAll = document.createElement("button");
+    copyAll.className = "text-btn";
+    copyAll.textContent = "复制全部";
+    copyAll.addEventListener("click", async () => {
+      const text = rows.map(([combo, label]) => `${combo}\t${label}`).join("\n");
+      try { await navigator.clipboard.writeText(text); toast("已复制全部快捷键", "ok"); }
+      catch { /* 剪贴板不可用时忽略 */ }
+    });
+    els.hotkeyHelp.appendChild(copyAll);
+    els.hotkeyClose.focus();
+  }
+  els.hotkeyClose.addEventListener("click", () => toggleHotkeyHelp(false));
 
   function renderHotkeys() {
     els.hotkeyList.innerHTML = "";
@@ -1612,8 +2188,19 @@
   applyPrefs();
 
   // -- 文件面板 ---------------------------------------------------------
+  //
+  // The panel used to offer exactly three verbs (list / download / upload) and
+  // upload had no progress and no cancel. Everything below completes the
+  // file-management surface: organise (mkdir / rename / delete), read in place
+  // (preview / edit), find (filter + paging) and see what a long upload is
+  // doing.
 
+  const FILE_PAGE_SIZE = 200;
   let filePath = "";
+  let fileOffset = 0;
+  let menuEntry = null;
+  let previewPath = null;
+  let uploadXhr = null;
 
   function formatSize(bytes) {
     if (bytes < 1024) return `${bytes} B`;
@@ -1624,6 +2211,8 @@
   }
 
   function renderCrumbs(path) {
+    // Clickable crumbs *and* an editable path: clicking is faster for the
+    // common case, typing wins when the tree is deep.
     const parts = path ? path.split("/") : [];
     let acc = "";
     let html = '<button data-path="">根目录</button>';
@@ -1633,74 +2222,296 @@
     }
     els.fileCrumbs.innerHTML = html;
     els.fileCrumbs.querySelectorAll("button").forEach((btn) => {
-      btn.addEventListener("click", () => loadFiles(btn.dataset.path));
+      btn.addEventListener("click", () => { fileOffset = 0; loadFiles(btn.dataset.path); });
     });
+    els.fileCrumbs.title = path ? `${path}（回车跳转到任意子路径）` : "根目录";
+    els.fileCrumbs.onclick = (e) => {
+      if (e.target.tagName !== "SPAN" || !e.target.isContentEditable) return;
+    };
+    els.fileCrumbs.ondblclick = () => {
+      els.fileCrumbs.contentEditable = "true";
+      els.fileCrumbs.focus();
+      document.getSelection().selectAllChildren(els.fileCrumbs);
+    };
+    els.fileCrumbs.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        els.fileCrumbs.contentEditable = "false";
+        const target = els.fileCrumbs.textContent.trim().replace(/^\/+|\/+$/g, "");
+        fileOffset = 0;
+        loadFiles(target);
+      } else if (e.key === "Escape") {
+        els.fileCrumbs.contentEditable = "false";
+        renderCrumbs(filePath);
+      }
+    };
   }
 
   async function loadFiles(path) {
     filePath = path || "";
     els.fileStatus.textContent = "加载中…";
     els.fileList.innerHTML = '<li class="sk"></li><li class="sk"></li><li class="sk"></li>';
+    const filter = (els.fileFilter.value || "").trim();
+    const params = new URLSearchParams({
+      path: filePath,
+      offset: String(fileOffset),
+      limit: String(FILE_PAGE_SIZE),
+    });
+    if (filter) params.set("contains", filter);
+    if (els.fileKind && els.fileKind.value) params.set("kind", els.fileKind.value);
     try {
-      const data = await api("GET", `/api/files?path=${encodeURIComponent(filePath)}`);
+      const data = await api("GET", `/api/files?${params}`);
       renderCrumbs(filePath);
       els.fileList.innerHTML = "";
-      if (!data.entries.length) els.fileList.innerHTML = '<li class="empty">空目录</li>';
+      const total = data.total ?? data.entries.length;
+      const shown = data.entries.length;
+      els.filePage.textContent = total > FILE_PAGE_SIZE || fileOffset > 0
+        ? `${fileOffset + 1}-${fileOffset + shown} / ${total}`
+        : `${total} 项`;
+      els.filePrev.disabled = fileOffset <= 0;
+      els.fileNext.disabled = fileOffset + shown >= total;
+      if (!shown) {
+        els.fileList.innerHTML = `<li class="empty">${filter ? "没有匹配的条目" : "空目录"}</li>`;
+      }
       for (const entry of data.entries) {
         const li = document.createElement("li");
+        li.dataset.name = entry.name;
+        li.dataset.type = entry.type;
         const icon = entry.type === "dir" ? "📁" : "📄";
         const meta = entry.type === "dir" ? "" : formatSize(entry.size);
         li.innerHTML = `<span class="ficon">${icon}</span><span class="fname">${esc(entry.name)}</span><span class="fmeta">${meta}</span>`;
         li.addEventListener("click", () => {
           const child = filePath ? `${filePath}/${entry.name}` : entry.name;
-          if (entry.type === "dir") loadFiles(child);
+          if (entry.type === "dir") { fileOffset = 0; loadFiles(child); }
           else window.location.href = `/api/files/download?path=${encodeURIComponent(child)}`;
+        });
+        // A directory is a drop target: dragging a file onto a folder puts it
+        // *in* that folder, which is what people expect from a file manager.
+        if (entry.type === "dir") {
+          li.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); li.classList.add("dir-over"); });
+          li.addEventListener("dragleave", () => li.classList.remove("dir-over"));
+          li.addEventListener("drop", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            li.classList.remove("dir-over");
+            const child = filePath ? `${filePath}/${entry.name}` : entry.name;
+            uploadFiles(e.dataTransfer.files, child);
+          });
+        }
+        li.addEventListener("contextmenu", (e) => {
+          e.preventDefault();
+          openFileMenu(e.clientX, e.clientY, entry);
         });
         els.fileList.appendChild(li);
       }
-      els.fileStatus.textContent = data.truncated
-        ? `${data.entries.length}+ 项（已截断，仅显示前 ${data.limit} 项）`
-        : `${data.entries.length} 项`;
+      if (data.truncated) els.fileStatus.textContent = `${total} 项（已过滤）`;
+      else if (!filter) els.fileStatus.textContent = `${total} 项`;
+      else els.fileStatus.textContent = `${total} 项匹配`;
     } catch (err) { els.fileStatus.textContent = String(err.message || err); }
   }
 
-  async function uploadFiles(files) {
-    if (!files || !files.length) return;
-    try {
-      for (const file of files) {
-        let overwrite = false;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const form = new FormData();
-          form.append("path", filePath);
-          form.append("file", file);
-          if (overwrite) form.append("overwrite", "1");
-          els.fileStatus.textContent = `正在上传 ${file.name}…`;
-          const res = await fetch("/api/files/upload", { method: "POST", body: form });
-          if (res.status === 409 && !overwrite) {
-            // Never silently replace: ask first, then retry with overwrite=1.
-            const ok = await confirmDialog(
-              `「${file.name}」已存在，是否覆盖？`, "覆盖文件",
-            );
-            if (!ok) { els.fileStatus.textContent = "已跳过"; break; }
-            overwrite = true;
-            continue;
-          }
-          if (!res.ok) {
-            let detail = res.statusText;
-            try { detail = (await res.json()).detail || detail; } catch { /* 忽略 */ }
-            els.fileStatus.textContent = `失败：${detail}`;
-            return;
-          }
-          break;
+  // -- 上下文菜单 -------------------------------------------------------
+  function openFileMenu(x, y, entry) {
+    menuEntry = entry;
+    els.fileMenu.style.left = `${x}px`;
+    els.fileMenu.style.top = `${y}px`;
+    els.fileMenu.classList.remove("hidden");
+  }
+  function closeFileMenu() { els.fileMenu.classList.add("hidden"); menuEntry = null; }
+
+  function entryPath(entry) {
+    return filePath ? `${filePath}/${entry.name}` : entry.name;
+  }
+
+  els.fileMenu.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const entry = menuEntry;
+      const action = btn.dataset.faction;
+      closeFileMenu();
+      if (!entry) return;
+      const rel = entryPath(entry);
+      try {
+        if (action === "open") {
+          if (entry.type === "dir") { fileOffset = 0; loadFiles(rel); }
+          else window.location.href = `/api/files/download?path=${encodeURIComponent(rel)}`;
+        } else if (action === "preview") {
+          await openPreview(rel);
+        } else if (action === "rename") {
+          const name = await promptDialog(`重命名「${entry.name}」`, entry.name);
+          if (!name || name === entry.name) return;
+          await api("POST", "/api/files/rename", { path: rel, name });
+          toast("已重命名", "ok");
+          loadFiles(filePath);
+        } else if (action === "copy") {
+          await navigator.clipboard.writeText(rel);
+          toast("已复制路径", "ok");
+        } else if (action === "delete") {
+          // Irreversible and un-recursive: type the name back before it happens.
+          const ok = await confirmByName(
+            entry.type === "dir"
+              ? `删除空目录「${entry.name}」？非空目录无法删除。`
+              : `删除文件「${entry.name}」？该操作不可撤销。`,
+            entry.name,
+            "删除条目",
+          );
+          if (!ok) return;
+          await api("DELETE", `/api/files?path=${encodeURIComponent(filePath)}&name=${encodeURIComponent(entry.name)}`);
+          toast("已删除", "ok");
+          loadFiles(filePath);
         }
+      } catch (err) { toast(String(err.message || err), "error"); }
+    });
+  });
+  document.addEventListener("click", () => closeFileMenu());
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeFileMenu(); });
+
+  // -- 预览 / 编辑 ------------------------------------------------------
+  async function openPreview(rel) {
+    previewPath = rel;
+    els.previewTitle.textContent = rel.split("/").pop();
+    els.previewNote.textContent = "读取中…";
+    els.previewBody.value = "";
+    els.previewOverlay.classList.remove("hidden");
+    try {
+      const res = await fetch(`/api/files/preview?path=${encodeURIComponent(rel)}`);
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch { /* 忽略 */ }
+        els.previewNote.textContent = `无法预览：${detail}`;
+        els.previewSave.disabled = true;
+        return;
       }
-      // Reload first, then report: `loadFiles` writes its own status line and
-      // would otherwise immediately overwrite "上传完成".
+      const text = await res.text();
+      els.previewBody.value = text;
+      const encoding = res.headers.get("X-Wsctl-Encoding") || "utf-8";
+      els.previewNote.textContent = `编码 ${encoding} · ${formatSize(new Blob([text]).size)} · 修改后点「保存」`;
+      els.previewSave.disabled = false;
+      els.previewBody.focus();
+    } catch (err) {
+      els.previewNote.textContent = String(err.message || err);
+      els.previewSave.disabled = true;
+    }
+  }
+  function closePreview() {
+    els.previewOverlay.classList.add("hidden");
+    previewPath = null;
+    els.previewBody.value = "";
+    els.previewSave.disabled = false;
+  }
+  els.previewClose.addEventListener("click", closePreview);
+  els.previewCancel.addEventListener("click", closePreview);
+  els.previewDownload.addEventListener("click", () => {
+    if (!previewPath) return;
+    window.location.href = `/api/files/download?path=${encodeURIComponent(previewPath)}`;
+  });
+  els.previewSave.addEventListener("click", async () => {
+    if (!previewPath) return;
+    try {
+      await api("PUT", "/api/files/content", { path: previewPath, content: els.previewBody.value });
+      toast("已保存", "ok");
+      closePreview();
+      loadFiles(filePath);
+    } catch (err) { els.previewNote.textContent = String(err.message || err); }
+  });
+
+  // -- 上传（进度 + 可取消） -------------------------------------------
+  // ``fetch`` has no upload progress. XMLHttpRequest does, and a 100 MB
+  // upload with no feedback is indistinguishable from a hang -- so this path
+  // deliberately uses the older API.
+  function uploadFiles(files, targetPath) {
+    const dest = targetPath === undefined ? filePath : targetPath;
+    if (!files || !files.length) return;
+    const queue = Array.from(files);
+    uploadNext(queue, dest, false);
+  }
+
+  async function uploadNext(queue, dest, overwrite) {
+    if (!queue.length) {
+      els.upProgress.classList.add("hidden");
+      uploadXhr = null;
+      // Reload first, *then* report: `loadFiles` writes its own status line
+      // and would immediately overwrite "上传完成". The pre-refactor code had
+      // this ordering in a comment and it still got lost in the rewrite.
       await loadFiles(filePath);
       els.fileStatus.textContent = "上传完成";
       toast("上传完成", "ok");
-    } catch (err) { els.fileStatus.textContent = `失败：${err.message || err}`; }
+      return;
+    }
+    const file = queue[0];
+    const form = new FormData();
+    form.append("path", dest);
+    form.append("file", file);
+    if (overwrite) form.append("overwrite", "1");
+
+    const xhr = new XMLHttpRequest();
+    uploadXhr = xhr;
+    els.upProgress.classList.remove("hidden");
+    els.upLabel.textContent = `正在上传 ${file.name}…`;
+    els.upFill.style.width = "0%";
+    xhr.open("POST", "/api/files/upload");
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const pct = Math.round((e.loaded / e.total) * 100);
+      els.upFill.style.width = `${pct}%`;
+      els.upLabel.textContent = `正在上传 ${file.name}… ${pct}%（${formatSize(e.loaded)} / ${formatSize(e.total)}）`;
+    };
+    xhr.onerror = () => {
+      els.upProgress.classList.add("hidden");
+      els.fileStatus.textContent = "上传失败：网络错误";
+    };
+    xhr.onabort = () => {
+      els.upProgress.classList.add("hidden");
+      els.fileStatus.textContent = "已取消上传";
+      uploadXhr = null;
+    };
+    xhr.onload = async () => {
+      uploadXhr = null;
+      if (xhr.status === 409 && !overwrite) {
+        // Never silently replace: ask first, then retry with overwrite=1.
+        const ok = await confirmDialog(`「${file.name}」已存在，是否覆盖？`, "覆盖文件");
+        if (!ok) { queue.shift(); uploadNext(queue, dest, false); return; }
+        uploadNext(queue, dest, true);
+        return;
+      }
+      if (xhr.status >= 400) {
+        let detail = xhr.statusText;
+        try { detail = JSON.parse(xhr.responseText).detail || detail; } catch { /* 忽略 */ }
+        els.upProgress.classList.add("hidden");
+        els.fileStatus.textContent = `失败：${detail}`;
+        return;
+      }
+      els.upFill.style.width = "100%";
+      queue.shift();
+      uploadNext(queue, dest, false);
+    };
+    xhr.send(form);
   }
+
+  els.upCancel.addEventListener("click", () => {
+    // Cancelling must also drop the staged sidecar the server may hold open;
+    // aborting the request lets its error path unlink it.
+    if (uploadXhr) uploadXhr.abort();
+  });
+
+  els.fileMkdir.addEventListener("click", async () => {
+    const name = await promptDialog("新建目录", "");
+    if (!name) return;
+    try {
+      await api("POST", `/api/files/mkdir?path=${encodeURIComponent(filePath)}`, { name });
+      toast("已创建目录", "ok");
+      loadFiles(filePath);
+    } catch (err) { toast(String(err.message || err), "error"); }
+  });
+
+  els.fileFilter.addEventListener("input", () => { fileOffset = 0; loadFiles(filePath); });
+  els.fileKind.addEventListener("change", () => { fileOffset = 0; loadFiles(filePath); });
+  els.filePrev.addEventListener("click", () => {
+    fileOffset = Math.max(0, fileOffset - FILE_PAGE_SIZE);
+    loadFiles(filePath);
+  });
+  els.fileNext.addEventListener("click", () => {
+    fileOffset += FILE_PAGE_SIZE;
+    loadFiles(filePath);
+  });
 
   els.filesToggle.addEventListener("click", () => {
     const hidden = els.filePanel.classList.toggle("hidden");

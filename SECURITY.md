@@ -45,6 +45,15 @@ session can run commands as the server's user. Treat it like SSH:
   signalling a PID, so it never kills an unrelated process that reused the PID
 - Log rotation uses copy-and-truncate, so the daemon's inherited append-mode
   descriptor keeps writing to the live file across a rotation
+- Session history and detail expose ``argv`` and ``cwd``, which can contain
+  sensitive paths. An admin sees every row; a normal user sees only their own,
+  and the read path enforces that (403 otherwise). This is the same visibility
+  the session list already had -- it is called out here because the history is
+  retained for ``term_session_retention_days`` and therefore outlives the
+  session itself
+- The file panel refuses recursive delete on purpose: only a file, or a
+  directory that is already empty, can be removed. Emptying a tree is several
+  deliberate acts rather than one misplaced click
 - Share links are unguessable, optionally time-limited, revocable, and refused
   input when read-only. They are persisted alongside the session (schema v4), so
   a link keeps working across a server restart — the same promise the session

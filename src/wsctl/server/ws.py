@@ -22,6 +22,19 @@ from starlette.websockets import WebSocketState
 
 from wsctl.core import tmux
 from wsctl.core.audit import AuditWriter
+
+# Close codes live in one place (``core.closecodes``) so the server, the
+# browser and the CLI cannot drift apart about which failures are permanent.
+from wsctl.core.closecodes import (
+    CLOSE_BAD_REQUEST,
+    CLOSE_FORBIDDEN,
+    CLOSE_LIMIT,
+    CLOSE_NOT_FOUND,
+    CLOSE_RATE_LIMITED,
+    CLOSE_SERVER_ERROR,
+    CLOSE_TIMEOUT,
+    CLOSE_UNAUTHORIZED,
+)
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
 from wsctl.core.pty import PtyError
@@ -45,21 +58,14 @@ MAX_AUDIT_LINE = 512
 MAX_AUDIT_BUFFER = 8192
 ACCESS_RECHECK = 5.0
 
-# WebSocket close codes (4000-4999 is the application-defined range). They are
-# distinct so the client can tell "log in again" apart from "this session is
-# gone" and stop reconnecting on a permanent failure.
-CLOSE_BAD_REQUEST = 4400
-CLOSE_UNAUTHORIZED = 4401
-CLOSE_FORBIDDEN = 4403
-CLOSE_NOT_FOUND = 4404
-CLOSE_LIMIT = 4409
-CLOSE_SERVER_ERROR = 4500
-CLOSE_TIMEOUT = 4408
 
 # Close a connection that has sent nothing for this long. Both clients send a
 # `ping` every 25s, so this detects a half-open TCP connection (a peer that
 # vanished without a FIN) without ever tripping on a genuinely idle session.
 IDLE_TIMEOUT = 120.0
+
+#: Consecutive over-limit chunks before the peer is disconnected.
+MAX_RATE_STRIKES = 3
 
 
 def _auth_token(websocket: WebSocket) -> str | None:
@@ -166,6 +172,12 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         )
         on_line = _input_auditor(audit, settings, user_id, session.id)
         bucket = _input_bucket(settings)
+        # The reason a connection is being closed must reach the client *before*
+        # the socket goes away. ``deny`` used to ``websocket.close()`` inline,
+        # which raced the outbound writer and lost the explanation: the peer got
+        # the close code but never the sentence. Every denial path (share
+        # revoked, login expired, idle timeout, rate limit) shared the defect.
+        pending_close: list[int | None] = [None]
         recheck: Callable[[], Awaitable[bool]] | None = None
         if user is not None and auth_token is not None:
             token = auth_token
@@ -184,7 +196,11 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             writable=writable,
             share=share,
             recheck=recheck,
+            metrics=metrics,
+            close_code_out=pending_close,
         )
+        if pending_close[0] is not None:
+            close_code = int(pending_close[0])
     except _Denied as exc:
         close_code = exc.code
         with contextlib.suppress(ClientGone):
@@ -204,9 +220,14 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
             await asyncio.wait_for(writer, timeout=2.0)
         writer.cancel()
+        # A client that dropped itself (slow consumer) knows why. Reporting
+        # 1000 -- "normal closure" -- is what let the browser treat a drop as a
+        # clean shutdown and blank its own screen on the reconnect that
+        # followed.
+        final_code = getattr(client, "close_code", None) or close_code
         if websocket.application_state == WebSocketState.CONNECTED:
             with contextlib.suppress(Exception):
-                await websocket.close(code=close_code)
+                await websocket.close(code=final_code)
 
 
 def _access(user: User | None, session: TermSession, share: str | None) -> str | None:
@@ -276,7 +297,8 @@ async def _handshake(
                 )
             websocket.app.state.metrics.inc("wsctl_sessions_created_total")
             store: Store = websocket.app.state.store
-            store.term_session_upsert(
+            await asyncio.to_thread(
+                store.term_session_upsert,
                 session.id,
                 name=spec.name,
                 owner_id=user.id,
@@ -349,6 +371,8 @@ async def _pump(
     writable: bool = True,
     share: str | None = None,
     recheck: Callable[[], Awaitable[bool]] | None = None,
+    metrics: Metrics | None = None,
+    close_code_out: list[int | None] | None = None,
 ) -> None:
     line_buffer = bytearray()
     read_only_notice = False
@@ -359,17 +383,52 @@ async def _pump(
         return share is not None and not session.share_valid(share)
 
     async def deny(message: str, code: int = CLOSE_UNAUTHORIZED) -> None:
+        """Explain, then let the caller close -- after the writer has flushed.
+
+        Closing here used to race the outbound writer: the control message was
+        queued and the socket torn down underneath it, so the peer received the
+        close code and *none* of the words. Record the code and return; the
+        endpoint drains the writer first and then closes with it.
+        """
         with contextlib.suppress(ClientGone):
             client.put({"type": "error", "msg": message})
-        with contextlib.suppress(Exception):
-            await websocket.close(code=code)
+        if close_code_out is not None:
+            close_code_out[0] = code
+
+    # Rate limiting must not masquerade as a dead terminal. One over-limit
+    # chunk is *dropped* and reported, exactly like the read-only case; only a
+    # peer that keeps hammering past the limit is disconnected (and then with a
+    # dedicated code so the client stops retrying). Killing the link on the
+    # first over-limit paste used to produce a reconnect loop: every new
+    # connection got a fresh token bucket.
+    rate_strikes = 0
+    rate_notice = False
 
     def over_limit(size: int) -> bool:
-        return bucket is not None and not bucket.allow(size)
+        nonlocal rate_strikes, rate_notice
+        if bucket is None:
+            return False
+        if bucket.allow(size):
+            rate_strikes = 0
+            return False
+        rate_strikes += 1
+        if metrics is not None:
+            metrics.inc("wsctl_input_rate_limited_total")
+        # Same contract as ``reject_readonly`` / ``reject_backpressure``: report
+        # the problem **once per connection**, not once per dropped chunk. The
+        # strike that ends the connection is explained by ``deny`` alone, so a
+        # flood produces at most one notice and one closing reason.
+        if rate_strikes < MAX_RATE_STRIKES and not rate_notice:
+            rate_notice = True
+            reject()
+        return True
+
+    def persistently_over_limit() -> bool:
+        return rate_strikes >= MAX_RATE_STRIKES
 
     def reject() -> None:
         with contextlib.suppress(ClientGone):
-            client.put({"type": "error", "msg": "输入速率超限"})
+            client.put({"type": "notice", "level": "warn", "msg": "输入速率超限，部分按键已丢弃"})
 
     def reject_readonly() -> None:
         nonlocal read_only_notice
@@ -377,7 +436,7 @@ async def _pump(
             return
         read_only_notice = True
         with contextlib.suppress(ClientGone):
-            client.put({"type": "error", "msg": "会话为只读"})
+            client.put({"type": "notice", "level": "warn", "msg": "会话为只读"})
 
     def reject_backpressure() -> None:
         nonlocal backpressure_notice
@@ -385,7 +444,9 @@ async def _pump(
             return
         backpressure_notice = True
         with contextlib.suppress(ClientGone):
-            client.put({"type": "error", "msg": "终端输入过快，部分按键已丢弃"})
+            client.put(
+                {"type": "notice", "level": "warn", "msg": "终端输入过快，部分按键已丢弃"}
+            )
 
     def forward_input(data: bytes) -> None:
         """Feed input to the child; report a drop instead of hiding it.
@@ -455,8 +516,10 @@ async def _pump(
                 reject_readonly()
                 continue
             if over_limit(len(data_bytes)):
-                reject()
-                return
+                if persistently_over_limit():
+                    await deny("输入速率持续超限", CLOSE_RATE_LIMITED)
+                    return
+                continue
             forward_input(data_bytes)
             continue
         text = message.get("text")
@@ -468,6 +531,9 @@ async def _pump(
             continue
         kind = data.get("type")
         if kind == "resize":
+            if share_revoked():
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
+                return
             if writable:
                 try:
                     session.resize(
@@ -476,13 +542,22 @@ async def _pump(
                 except (TypeError, ValueError):
                     continue  # ignore a malformed resize rather than dropping the link
         elif kind == "input":
+            # The same revocation check as the binary path. Text ``input`` used
+            # to skip it entirely, so a revoked writable share kept working
+            # until the periodic recheck noticed -- up to ACCESS_RECHECK later.
+            # "Revoke" has to mean *now*, on every input path alike.
+            if share_revoked():
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
+                return
             if not writable:
                 reject_readonly()
                 continue
             chunk = str(data.get("data", "")).encode("utf-8")
             if over_limit(len(chunk)):
-                reject()
-                return
+                if persistently_over_limit():
+                    await deny("输入速率持续超限", CLOSE_RATE_LIMITED)
+                    return
+                continue
             forward_input(chunk)
         elif kind == "ping":
             try:

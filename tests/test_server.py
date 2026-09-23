@@ -491,10 +491,14 @@ def test_share_attach_readonly_without_login(tmp_path: Path) -> None:
             assert attached is not None and attached["type"] == "attached"
             assert attached["writable"] is False
 
-            # input from a read-only client is refused
+            # input from a read-only client is refused. The refusal is a
+            # *notice* (a Toast in the UI), never terminal output: writing it
+            # into the buffer used to make it reappear on every reconnect
+            # replay as if the shell had printed it.
             ws.send_text(json.dumps({"type": "input", "data": "echo NOPE\r"}))
-            err = _recv_control(ws, {"error"})
-            assert err is not None and "只读" in str(err["msg"])
+            notice = _recv_control(ws, {"notice"})
+            assert notice is not None and "只读" in str(notice["msg"])
+            assert notice.get("level") == "warn"
 
 
 def test_share_attach_writable(tmp_path: Path) -> None:
@@ -649,9 +653,32 @@ def test_duplicate_user_conflict(tmp_path: Path) -> None:
         assert r.status_code == 409
 
 
-def _recv_until_close(ws: object, timeout: float = 5.0) -> dict[str, object]:
+def _recv_bytes_until(ws: object, marker: bytes, timeout: float = 8.0) -> bytes:
+    """Collect binary frames (raw terminal output) until ``marker`` shows up."""
+    import time
+
+    out = b""
     end = time.time() + timeout
-    while time.time() < end:
+    while time.time() < end and marker not in out:
+        message = ws.receive()  # type: ignore[attr-defined]
+        if message.get("type") == "websocket.close":
+            break
+        data = message.get("bytes")
+        if data:
+            out += data
+    return out
+
+
+def _recv_until_close(ws: object, timeout: float = 5.0) -> dict[str, object]:
+    """Drain until the close frame arrives.
+
+    The deadline must not *swallow* the close: an earlier version looped
+    ``while time.time() < end`` and then raised "connection was not closed"
+    right after ``receive()`` handed it exactly that frame, because the denial
+    explanation arrived first and pushed the close past the deadline.
+    """
+    end = time.time() + timeout
+    while time.time() < end + 2.0:  # a little slack to land the close itself
         message = ws.receive()  # type: ignore[attr-defined]
         if message.get("type") == "websocket.close":
             return message
@@ -750,7 +777,40 @@ def test_session_row_records_owning_instance(tmp_path: Path) -> None:
         assert row["instance_id"] == app.state.instance_id  # type: ignore[attr-defined]
 
 
-def test_input_rate_limit_blocks_flood(tmp_path: Path) -> None:
+def test_input_rate_limit_drops_input_but_keeps_the_connection(
+    tmp_path: Path,
+) -> None:
+    """One over-limit chunk is dropped, not used as an excuse to disconnect.
+
+    Rate limiting that tears the link down is indistinguishable from a dead
+    terminal, and because the token bucket is per connection the client simply
+    reconnects into a fresh bucket and floods again -- a reconnect storm. The
+    new contract mirrors the read-only case: report the drop, keep the session.
+    """
+    # Burst 50 so the *rejected* 60-byte chunk leaves the follow-up write
+    # (16 bytes) inside the bucket without waiting a full refill second.
+    app = build_app(tmp_path, input_rate_limit=10, input_rate_burst=50)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            # 60 bytes in one frame exceeds the 50-byte token bucket.
+            ws.send_text(json.dumps({"type": "input", "data": "x" * 60}))
+            notice = _recv_control(ws, {"notice"})
+            assert notice is not None
+            assert "速率超限" in str(notice["msg"])
+
+            # The connection survived: a well-sized write must still reach the
+            # shell. If rate limiting killed the link this would never come.
+            ws.send_text(json.dumps({"type": "input", "data": "echo RATE-ALIVE\r"}))
+            out = _recv_bytes_until(ws, b"RATE-ALIVE")
+            assert b"RATE-ALIVE" in out, "connection was killed by one over-limit chunk"
+
+
+def test_input_rate_limit_disconnects_a_persistent_flood(tmp_path: Path) -> None:
+    """A peer that never backs off *is* disconnected -- with its own code."""
     app = build_app(tmp_path, input_rate_limit=10, input_rate_burst=10)
     with TestClient(app) as client:
         login(client, ADMIN)
@@ -758,11 +818,56 @@ def test_input_rate_limit_blocks_flood(tmp_path: Path) -> None:
         with client.websocket_connect("/ws") as ws:
             ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
             assert _recv_control(ws, {"attached"}) is not None
-            # 20 bytes in one frame exceeds the 10-byte token bucket.
-            ws.send_text(json.dumps({"type": "input", "data": "x" * 20}))
-            err = _recv_control(ws, {"error"})
-            assert err is not None
-            assert "速率超限" in str(err["msg"])
+            # Send the whole flood first. Reading between sends deadlocks the
+            # moment a strike produces no message -- the rate-limit notice is
+            # deliberately deduplicated to once per connection.
+            for _ in range(12):  # far past MAX_RATE_STRIKES
+                ws.send_text(json.dumps({"type": "input", "data": "x" * 20}))
+            close = _recv_until_close(ws, timeout=10)
+            assert close is not None, "a persistent flood was never disconnected"
+            assert close["code"] == 4429, close
+
+
+def test_ws_notices_never_enter_the_terminal_buffer(tmp_path: Path) -> None:
+    """Operational notices must not be replayed as if the shell printed them."""
+    from wsctl.core.session import TermSession
+
+    # One-shot stub: the first write is dropped (to provoke a notice), later
+    # writes are forwarded to the real implementation. A stub that just
+    # returned True would never reach the PTY, and the test would hang waiting
+    # for output the shell can never produce -- which is exactly what happened
+    # the first time this was written.
+    real_write_input = TermSession.write_input
+    drops = {"on": True}
+
+    def write_input(self: TermSession, data: bytes) -> bool:
+        if drops["on"]:
+            drops["on"] = False
+            return False
+        return real_write_input(self, data)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(TermSession, "write_input", write_input)
+        with TestClient(build_app(tmp_path)) as client:
+            login(client, ADMIN)
+            sid = client.post("/api/sessions", json={}).json()["id"]
+            with client.websocket_connect("/ws") as ws:
+                ws.send_text(
+                    json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24})
+                )
+                assert _recv_control(ws, {"attached"}) is not None
+                ws.send_text(json.dumps({"type": "input", "data": "0123456789"}))
+                notice = _recv_control(ws, {"notice"})
+                assert notice is not None and "丢弃" in str(notice["msg"])
+                # Nothing about the drop may reach the terminal as bytes: the
+                # scrollback is what a reconnect replays, and replaying an
+                # operational warning makes the shell appear to have printed it.
+                ws.send_text(json.dumps({"type": "input", "data": "echo CLEAN-BUFFER\r"}))
+                out = _recv_bytes_until(ws, b"CLEAN-BUFFER")
+                assert b"CLEAN-BUFFER" in out
+                assert "丢弃".encode() not in out
+                assert b"\x1b[31m[wsctl]" not in out
+            client.delete(f"/api/sessions/{sid}")
 
 
 def test_startup_reclaims_sessions_of_crashed_instance(tmp_path: Path) -> None:
@@ -793,14 +898,16 @@ def test_startup_reclaims_sessions_of_crashed_instance(tmp_path: Path) -> None:
 
 
 def test_pid_alive_helper() -> None:
-    from wsctl.server.app import _pid_alive
+    # Lives with the reconciliation helpers now (it decides which peer
+    # instances are already dead).
+    from wsctl.server.maintenance import pid_alive
 
-    assert _pid_alive(os.getpid())
-    assert not _pid_alive(0)
-    assert not _pid_alive(None)
+    assert pid_alive(os.getpid())
+    assert not pid_alive(0)
+    assert not pid_alive(None)
     dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
     dead.wait()
-    assert not _pid_alive(dead.pid)
+    assert not pid_alive(dead.pid)
 
 
 def test_disabling_a_user_closes_live_websocket(
@@ -1176,6 +1283,505 @@ def test_ws_input_backpressure_reports_the_drop(tmp_path: Path) -> None:
                 )
                 assert _recv_control(ws, {"attached"}) is not None
                 ws.send_text(json.dumps({"type": "input", "data": "0123456789"}))
-                err = _recv_control(ws, {"error"})
-                assert err is not None and "丢弃" in str(err["msg"])
+                notice = _recv_control(ws, {"notice"})
+                assert notice is not None and "丢弃" in str(notice["msg"])
             client.delete(f"/api/sessions/{sid}")
+
+
+def test_session_history_shows_finished_sessions(tmp_path: Path) -> None:
+    """A finished session must not vanish without a trace.
+
+    The rows were always written (``status``, timestamps, a retention policy
+    to prune them) and nothing ever read them -- the product remembered a
+    session was killed and refused to tell anyone.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={"name": "doomed"}).json()["id"]
+        assert client.get("/api/sessions/history").json() == []
+        client.delete(f"/api/sessions/{sid}")
+
+        rows = client.get("/api/sessions/history").json()
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row["id"] == sid
+        assert row["name"] == "doomed"
+        assert row["status"] == "killed"
+        assert row["duration"] >= 0
+
+
+def test_session_detail_reports_live_and_finished(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post(
+            "/api/sessions", json={"name": "probed", "command": "sleep 30"}
+        ).json()["id"]
+
+        live = client.get(f"/api/sessions/{sid}/detail").json()
+        assert live["state"] == "running"
+        assert live["name"] == "probed"
+        assert live["owner"] == ADMIN[0]
+        assert isinstance(live["attached"], list)
+
+        client.delete(f"/api/sessions/{sid}")
+        finished = client.get(f"/api/sessions/{sid}/detail").json()
+        assert finished["state"] == "finished"
+        assert finished["status"] == "killed"
+        assert finished["alive"] is False
+
+
+def test_session_detail_is_private_to_its_owner(tmp_path: Path) -> None:
+    """``argv``/``cwd`` can hold sensitive paths; only the owner sees them."""
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={"name": "secret"}).json()["id"]
+
+        client.cookies.clear()
+        login(client, BOB)  # a different, non-admin user
+        assert client.get(f"/api/sessions/{sid}/detail").status_code == 403
+        assert client.get("/api/sessions/history").json() == []
+
+
+def test_overview_reports_instances_and_recent_activity(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        client.post("/api/sessions", json={"name": "busy"})
+        payload = client.get("/api/overview").json()
+        assert payload["sessions"] == 1
+        assert payload["max_sessions"] >= 1
+        assert payload["instances"], "the running instance must list itself"
+        assert payload["recent_audit"], "the login that just happened must show up"
+        # Curated gauges, not a truncated text scrape.
+        assert isinstance(payload["metrics"], dict)
+        assert payload["metrics"].get("wsctl_up") == 1.0
+        assert payload["metrics"].get("wsctl_sessions") == 1.0
+
+        client.cookies.clear()
+        login(client, BOB)
+        assert client.get("/api/overview").status_code == 403
+
+
+def test_file_panel_endpoints(tmp_path: Path) -> None:
+    """mkdir / rename / preview / edit / delete round trip through the API."""
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "seed.txt").write_text("seed")
+    app = build_app(tmp_path, file_root=files)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+
+        # mkdir
+        made = client.post("/api/files/mkdir", json={"name": "notes"})
+        assert made.status_code == 201, made.text
+        assert (files / "notes").is_dir()
+
+        # illegal names are refused
+        for bad in ("..", "a/b", ".wsctl-upload", ""):
+            assert client.post("/api/files/mkdir", json={"name": bad}).status_code == 400
+
+        # rename
+        renamed = client.post("/api/files/rename", json={"path": "seed.txt", "name": "seeds.txt"})
+        assert renamed.status_code == 200, renamed.text
+        assert (files / "seeds.txt").is_file()
+
+        # preview + edit
+        assert client.get("/api/files/preview", params={"path": "seeds.txt"}).text == "seed"
+        saved = client.put(
+            "/api/files/content", json={"path": "seeds.txt", "content": "grown 成长"}
+        )
+        assert saved.status_code == 200, saved.text
+        assert (files / "seeds.txt").read_text() == "grown 成长"
+
+        # a binary cannot be previewed
+        (files / "blob.bin").write_bytes(b"\x00\x01")
+        assert client.get("/api/files/preview", params={"path": "blob.bin"}).status_code == 400
+
+        # delete (a file)
+        assert client.request(
+            "DELETE", "/api/files", params={"path": "", "name": "seeds.txt"}
+        ).status_code == 200
+        assert not (files / "seeds.txt").exists()
+
+        # delete refuses a non-empty directory
+        (files / "notes" / "keep.txt").write_text("x")
+        refused = client.request(
+        "DELETE", "/api/files", params={"path": "", "name": "notes"}
+    )
+        assert refused.status_code == 400
+        assert "非空" in refused.text
+        # ... and the root is never deletable
+        root_delete = client.request("DELETE", "/api/files", params={"path": "", "name": ""})
+        assert root_delete.status_code == 400
+
+
+def test_file_listing_pages_beyond_the_old_limit(tmp_path: Path) -> None:
+    files = tmp_path / "files"
+    files.mkdir()
+    for i in range(30):
+        (files / f"n{i:02d}.txt").write_text("x")
+    app = build_app(tmp_path, file_root=files)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        first = client.get("/api/files", params={"limit": 20, "offset": 0}).json()
+        assert len(first["entries"]) == 20
+        assert first["total"] == 30
+        second = client.get("/api/files", params={"limit": 20, "offset": 20}).json()
+        assert len(second["entries"]) == 10
+        seen = {e["name"] for e in first["entries"]} | {e["name"] for e in second["entries"]}
+        assert len(seen) == 30
+        filtered = client.get("/api/files", params={"contains": "n1"}).json()
+        assert filtered["total"] == 10  # n10..n19
+
+
+def test_rename_reaches_already_attached_clients(tmp_path: Path) -> None:
+    """A rename must move every attached tab, not just the one that renamed.
+
+    The rename was written to the store and the in-memory spec, but nothing
+    broadcast it: two tabs on one session kept showing different names until
+    each happened to reconnect.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={"name": "before"}).json()["id"]
+        with (
+            client.websocket_connect("/ws") as first,
+            client.websocket_connect("/ws") as second,
+        ):
+            for ws in (first, second):
+                ws.send_text(
+                    json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24})
+                )
+                attached = _recv_control(ws, {"attached"})
+                assert attached is not None and attached["name"] == "before"
+
+            assert client.patch(f"/api/sessions/{sid}", json={"name": "after"}).status_code == 200
+
+            for label, ws in (("first", first), ("second", second)):
+                renamed = _recv_control(ws, {"renamed"})
+                assert renamed is not None, f"{label} never heard about the rename"
+                assert renamed["name"] == "after"
+                assert renamed["session"] == sid
+
+
+def test_session_detail_shape_is_the_same_live_and_finished(tmp_path: Path) -> None:
+    """``/detail`` must not make consumers branch on "is it alive".
+
+    The live path lacked ``argv``/``cwd``/``duration``/``ended_reason`` and the
+    history path lacked ``pid``/``bytes``/``shared``, so every consumer had to
+    special-case both. The 0.1.8 plan named these fields explicitly.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post(
+            "/api/sessions", json={"name": "shape", "command": "sleep 30"}
+        ).json()["id"]
+        live = client.get(f"/api/sessions/{sid}/detail").json()
+
+        client.delete(f"/api/sessions/{sid}")
+        finished = client.get(f"/api/sessions/{sid}/detail").json()
+
+        # The plan named exactly these.
+        for key in ("pid", "argv", "cwd", "backend", "instance_id", "attached",
+                    "bytes", "recording_path", "share_active", "timeline"):
+            assert key in live, f"live missing {key}"
+            assert key in finished, f"history missing {key}"
+        # and the ones that used to differ between the two
+        for key in ("duration", "ended_reason", "status", "state", "command",
+                    "clients", "alive", "shared", "share_writable", "recording"):
+            assert key in live, f"live missing {key}"
+            assert key in finished, f"history missing {key}"
+
+        assert live["state"] == "running"
+        assert finished["state"] == "finished"
+        assert live["argv"] and finished["argv"]
+        assert live["duration"] >= 0 and finished["duration"] >= 0
+        assert finished["ended_reason"], "a finished session must say why"
+
+
+def test_reopen_replays_argv_so_an_ssh_session_never_becomes_local(
+    tmp_path: Path,
+) -> None:
+    """Reopening from history must not turn a remote command into a local one.
+
+    History used to rebuild a session from ``command`` + ``backend``. For SSH
+    that 400'd (no ``ssh`` block) and the tempting fix -- dropping the backend
+    -- would have executed the *remote* command on the *local* shell. Replaying
+    the recorded ``argv`` is what the plan actually asked for.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        # A recorded argv that is clearly "not a local shell": if it were run
+        # locally the marker below would appear in this test process's cwd.
+        created = client.post(
+            "/api/sessions", json={"name": "orig", "command": "sleep 30"}
+        ).json()["id"]
+        client.delete(f"/api/sessions/{created}")
+
+        again = client.post(
+            f"/api/sessions/{created}/reopen",
+            json={"argv": ["/bin/sh", "-c", "sleep 30"], "name": "orig", "backend": "local"},
+        )
+        assert again.status_code == 201, again.text
+        body = again.json()
+        assert body["name"] == "orig"
+
+        # The argv is preserved verbatim (this is the property that keeps an
+        # ``ssh`` an ``ssh``), and is visible on the detail endpoint.
+        detail = client.get(f"/api/sessions/{body['id']}/detail").json()
+        assert detail["argv"] == ["/bin/sh", "-c", "sleep 30"]
+
+        # An SSH-shaped argv is refused as a *backend*, never silently run
+        # as a local command.
+        refused = client.post(
+            f"/api/sessions/{body['id']}/reopen",
+            json={"argv": ["ssh", "-tt", "user@host"], "backend": "ssh"},
+        )
+        assert refused.status_code == 400
+        assert "local" in refused.text
+
+        # Garbage argv is refused rather than spawned.
+        for bad in ([], ["-evil"], ["ok", ""], ["ok", None]):
+            r = client.post(f"/api/sessions/{body['id']}/reopen", json={"argv": bad})
+            assert r.status_code in (400, 422), (bad, r.status_code)
+
+
+def test_rate_limit_disconnect_sends_exactly_one_reason(tmp_path: Path) -> None:
+    """One over-limit event, one message -- not a notice *and* an error."""
+    app = build_app(tmp_path, input_rate_limit=10, input_rate_burst=10)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            texts: list[str] = []
+            for _ in range(12):
+                ws.send_text(json.dumps({"type": "input", "data": "x" * 20}))
+            # Drain until the close. A strike that sends nothing must not be
+            # mistaken for a stuck connection.
+            import time as _time
+
+            end = _time.time() + 10
+            close = None
+            while _time.time() < end:
+                message = ws.receive()
+                if message.get("type") == "websocket.close":
+                    close = message
+                    break
+                text = message.get("text")
+                if text:
+                    texts.append(json.loads(text))
+            assert close is not None and close["code"] == 4429
+            # One *notice* for the whole connection (like the read-only and
+            # backpressure notices) plus exactly one closing reason. The old
+            # shape emitted a notice per dropped chunk and then an error, so a
+            # flood filled the screen with the same sentence.
+            notices = [m for m in texts if m.get("type") == "notice"]
+            errors = [m for m in texts if m.get("type") == "error"]
+            assert len(notices) == 1, notices
+            # The closing reason is the whole point: it used to be queued and
+            # then lost because the socket closed underneath the writer.
+            assert len(errors) == 1, f"closing reason lost: {texts}"
+            assert "速率" in str(notices[0].get("msg", ""))
+            assert "速率" in str(errors[0].get("msg", ""))
+            assert texts[-1]["type"] == "error", "the closing reason must be last"
+
+
+def test_slow_consumer_is_told_why_it_was_dropped(tmp_path: Path) -> None:
+    """A client that cannot keep up must not vanish silently.
+
+    This is the "terminal froze and went black" incident: a burst of output
+    blew the client's send budget, the socket closed with 1000 (a *clean*
+    shutdown), the browser reconnected and cleared its terminal to make room
+    for a replay it then lost again. The user saw a black screen and the log
+    said nothing at all.
+    """
+    from wsctl.core.session import ClientGone
+    from wsctl.server.client import WsClient
+
+    # Drive the sink directly: filling a real 8 MiB budget over a socket is
+    # both slow and timing-dependent.
+    class FakeWS:
+        def __init__(self) -> None:
+            self.sent: list[object] = []
+
+        async def send_bytes(self, data: bytes) -> None:  # pragma: no cover - not reached
+            self.sent.append(data)
+
+        async def send_json(self, obj: object) -> None:  # pragma: no cover
+            self.sent.append(obj)
+
+    client = WsClient(FakeWS(), max_pending=4, max_bytes=10)
+    with pytest.raises(ClientGone):
+        client.put(b"x" * 50)  # blows the byte budget in one go
+
+    # The one message that matters still fits: control frames are not counted
+    # against the byte budget.
+    assert client.final_notice({"type": "evicted", "reason": "backpressure"}) is True
+
+
+def test_slow_consumer_drop_is_counted_and_not_fatal() -> None:
+    """The drop is observable (metric) and recoverable (not a fatal close code)."""
+    from wsctl.core import closecodes
+    from wsctl.core.session import slow_consumer_drops
+
+    assert isinstance(slow_consumer_drops(), int)
+    assert closecodes.CLOSE_SLOW_CONSUMER in closecodes.ALL_CLOSE_CODES
+    assert closecodes.CLOSE_SLOW_CONSUMER not in closecodes.FATAL_CLOSE_CODES, (
+        "a slow viewer must be able to reconnect -- the session is fine"
+    )
+
+
+def test_slow_consumer_is_closed_with_4410_not_a_clean_1000() -> None:
+    """The close *code* must say "too slow", not "normal closure".
+
+    Asserting the constant exists is not the same as asserting it is sent --
+    and the first version of this fix shipped with 4410 defined, classified and
+    documented while the wire still carried 1000. That is exactly the reading
+    that made the browser think everything was fine and blank its screen.
+    """
+    from wsctl.core.closecodes import CLOSE_SLOW_CONSUMER
+    from wsctl.core.session import ClientGone
+    from wsctl.server.client import WsClient
+
+    class FakeWS:
+        async def send_bytes(self, data: bytes) -> None:  # pragma: no cover
+            pass
+
+        async def send_json(self, obj: object) -> None:  # pragma: no cover
+            pass
+
+    client = WsClient(FakeWS(), max_pending=4, max_bytes=10)
+    with pytest.raises(ClientGone):
+        client.put(b"x" * 50)
+    assert client.close_code == CLOSE_SLOW_CONSUMER, (
+        "a slow-consumer drop must self-report 4410 so the endpoint can send it"
+    )
+
+
+def test_final_notice_is_delivered_before_the_writer_stops() -> None:
+    """``close`` must terminate the writer, and not swallow a queued notice.
+
+    ``close`` used to return early once the client had marked itself closed --
+    the slow-consumer path -- which left ``run()`` blocked on the queue
+    forever (a two-second teardown stall per drop) and made any notice queued
+    afterwards unreachable.
+    """
+    import asyncio
+
+    from wsctl.core.session import ClientGone
+    from wsctl.server.client import WsClient
+
+    sent: list[object] = []
+
+    class FakeWS:
+        async def send_bytes(self, data: bytes) -> None:  # pragma: no cover
+            sent.append(data)
+
+        async def send_json(self, obj: object) -> None:
+            sent.append(obj)
+
+    async def run() -> None:
+        client = WsClient(FakeWS(), max_pending=8, max_bytes=10)
+        # Self-close exactly like a blown byte budget does.
+        with pytest.raises(ClientGone):
+            client.put(b"x" * 50)
+        assert client.final_notice({"type": "evicted", "reason": "backpressure"}) is True
+        client.close()
+        await asyncio.wait_for(client.run(), timeout=1.0)  # must terminate
+
+    asyncio.run(run())
+    assert {"type": "evicted", "reason": "backpressure"} in sent, (
+        f"the one message the user needs was never sent: {sent}"
+    )
+
+
+def test_broadcast_reports_a_dropped_slow_client(tmp_path: Path) -> None:
+    """``_broadcast`` must log the drop and hand the client a reason."""
+    import logging
+
+    from wsctl.core.session import ClientGone, SessionManager, SessionSpec
+
+    manager = SessionManager()
+
+    class SlowClient:
+        """Accepts nothing: every put fails like a blown byte budget."""
+
+        def __init__(self) -> None:
+            self.notices: list[dict] = []
+
+        def put(self, item) -> None:
+            if isinstance(item, dict):
+                self.notices.append(item)
+                return
+            raise ClientGone("客户端积压溢出")
+
+        def final_notice(self, message: dict) -> bool:
+            self.notices.append(message)
+            return True
+
+        def close(self) -> None:  # pragma: no cover - not reached
+            pass
+
+    import asyncio
+
+    async def run() -> tuple[list, str]:
+        session = await manager.create(
+            SessionSpec(name="slow", argv=["/bin/sh", "-c", "sleep 30"])
+        )
+        slow = SlowClient()
+        await session.attach(slow)
+        records: list[str] = []
+
+        class Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record.getMessage())
+
+        handler = Capture()
+        logging.getLogger("wsctl.session").addHandler(handler)
+        try:
+            await session._broadcast(b"output the client could not keep up with")
+        finally:
+            logging.getLogger("wsctl.session").removeHandler(handler)
+            await manager.remove(session.id)
+        return slow.notices, " ".join(records)
+
+    notices, logtext = asyncio.run(run())
+    # the client is gone from the session ...
+    # ... and it was told why, not left staring at a dead terminal
+    assert any(n.get("type") == "evicted" for n in notices), notices
+    assert any(n.get("reason") == "backpressure" for n in notices), notices
+    assert "slow client" in logtext, logtext
+
+
+def test_revoked_share_stops_text_input_immediately(tmp_path: Path) -> None:
+    """Revocation must bite on the *text* input path too, not just binary.
+
+    The binary path checked ``share_revoked()`` and the periodic recheck did,
+    but ``{"type":"input"}`` skipped it: a revoked writable share kept working
+    for up to ACCESS_RECHECK. "Revoke" has to mean now.
+    """
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": True}
+        ).json()["token"]
+        client.cookies.clear()
+
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            attached = _recv_control(ws, {"attached", "error"})
+            assert attached is not None and attached["writable"] is True
+
+            app.state.manager.get(sid).revoke_share()  # type: ignore[attr-defined]
+            # Text input, not binary -- the path that used to skip the check.
+            started = time.time()
+            ws.send_text(json.dumps({"type": "input", "data": "echo X\r"}))
+            close = _recv_until_close(ws, timeout=5)
+            assert close["code"] == 403 or close["code"] == 4403, close
+            # Immediate: not "sometime within the 5 s recheck window".
+            assert time.time() - started < 3.0, "revocation took a recheck cycle"
+
+

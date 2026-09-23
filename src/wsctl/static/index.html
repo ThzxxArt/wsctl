@@ -64,7 +64,10 @@
 
   <div id="search-bar" class="search-bar hidden">
     <svg class="ico"><use href="#i-search"/></svg>
-    <input id="search-input" placeholder="搜索终端内容（Enter 下一个）" />
+    <input id="search-input" placeholder="搜索终端内容（Enter 下一个，Shift+Enter 上一个）" />
+    <button id="search-case" class="text-btn opt" title="区分大小写" aria-pressed="false">Aa</button>
+    <button id="search-word" class="text-btn opt" title="全词匹配" aria-pressed="false">W</button>
+    <button id="search-regex" class="text-btn opt" title="正则表达式" aria-pressed="false">.*</button>
     <span id="search-count" class="search-count"></span>
     <button id="search-next" class="text-btn" title="下一个">↓</button>
     <button id="search-close" class="icon-btn" title="关闭" aria-label="关闭搜索"><svg class="ico"><use href="#i-close"/></svg></button>
@@ -82,12 +85,55 @@
     </header>
     <div class="file-toolbar">
       <button id="file-upload-btn" class="text-btn"><svg class="ico sm"><use href="#i-upload"/></svg>上传</button>
+      <button id="file-mkdir-btn" class="text-btn">新建目录</button>
       <button id="file-refresh" class="text-btn"><svg class="ico sm"><use href="#i-refresh"/></svg>刷新</button>
       <span id="file-status" class="file-status"></span>
       <input id="file-input" type="file" multiple hidden />
     </div>
+    <div class="file-toolbar">
+      <input id="file-filter" placeholder="按名称过滤" />
+      <select id="file-kind" title="按类型过滤">
+        <option value="">全部</option>
+        <option value="dir">仅目录</option>
+        <option value="file">仅文件</option>
+      </select>
+      <span id="file-page" class="file-status"></span>
+      <button id="file-prev" class="text-btn" title="上一页">‹</button>
+      <button id="file-next" class="text-btn" title="下一页">›</button>
+    </div>
+    <div id="file-upload-progress" class="upload-progress hidden">
+      <div class="up-bar"><div id="up-fill" class="up-fill"></div></div>
+      <div class="up-row">
+        <span id="up-label" class="file-status"></span>
+        <button id="up-cancel" class="text-btn danger" type="button">取消</button>
+      </div>
+    </div>
     <ul id="file-list" class="file-list"></ul>
   </aside>
+
+  <div id="file-menu" class="context-menu hidden">
+    <button data-faction="open">打开 / 下载</button>
+    <button data-faction="preview">预览 / 编辑</button>
+    <button data-faction="rename">重命名</button>
+    <button data-faction="copy">复制路径</button>
+    <button data-faction="delete" class="danger">删除</button>
+  </div>
+
+  <div id="preview-overlay" class="overlay hidden">
+    <div class="modal-card wide tall">
+      <div class="modal-head">
+        <h2 id="preview-title">预览</h2>
+        <button id="preview-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
+      </div>
+      <p id="preview-note" class="hint"></p>
+      <textarea id="preview-body" rows="18" spellcheck="false"></textarea>
+      <div class="modal-actions">
+        <button type="button" id="preview-cancel">取消</button>
+        <button type="button" id="preview-download">下载</button>
+        <button type="button" id="preview-save" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 统一弹窗 -->
   <div id="login-overlay" class="overlay hidden">
@@ -132,6 +178,10 @@
     <div class="modal-card wide">
       <div class="modal-head"><h2>会话列表</h2><button id="sessions-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button></div>
       <p class="hint">关闭标签只会断开连接，会话仍在服务器上运行。</p>
+      <div class="tabs2" role="tablist">
+        <button class="tab2 active" data-stab="live">运行中</button>
+        <button class="tab2" data-stab="history">已结束</button>
+      </div>
       <div class="admin-toolbar">
         <input id="session-filter" placeholder="筛选会话" />
         <button id="sessions-detach-all" type="button" class="text-btn">全部断开</button>
@@ -186,7 +236,8 @@
         <button id="admin-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
       </div>
       <div class="tabs2" role="tablist">
-        <button class="tab2 active" data-tab="users">用户</button>
+        <button class="tab2 active" data-tab="overview">概览</button>
+        <button class="tab2" data-tab="users">用户</button>
         <button class="tab2" data-tab="audit">审计</button>
         <button class="tab2" data-tab="recordings">录制</button>
         <button class="tab2" data-tab="config">配置</button>
@@ -281,12 +332,24 @@
     </div>
   </div>
 
+  <div id="hotkey-overlay" class="overlay hidden">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <h2>键盘快捷键</h2>
+        <button id="hotkey-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button>
+      </div>
+      <p class="hint">按 <b>?</b> 打开或关闭本表。快捷键可在「设置」中修改；<b>Esc</b> 关闭最上层弹窗。</p>
+      <div id="hotkey-help" class="hotkey-list"></div>
+    </div>
+  </div>
+
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
   <script src="/static/vendor/xterm.js"></script>
   <script src="/static/vendor/addon-fit.js"></script>
   <script src="/static/vendor/addon-web-links.js"></script>
   <script src="/static/vendor/addon-image.js"></script>
+  <script src="/static/vendor/addon-search.js"></script>
   <script src="/static/vendor/zmodem.js"></script>
   <script src="/static/vendor/asciinema-player.min.js"></script>
   <script src="/static/app.js"></script>

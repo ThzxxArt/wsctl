@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Backend end-to-end scenarios for wsctl.
 
-Runs eight scenarios, each against a freshly started server on its own port and
+Runs nine scenarios, each against a freshly started server on its own port and
 data directory:
 
 1. server    — health, login, WebSocket attach/exec, reconnect replay, metrics,
                file panel (list/upload/download), traversal guard, auth guard
+1b. files    — the file panel surface: mkdir, upload (atomic), rename, preview,
+               edit, paging, type filter, delete guards
 2. cli       — wsctl login / session new|list|kill
 3. connect   — the CLI thin client over a real pseudo-terminal
 4. tmux      — a tmux-backed session survives a full server restart
@@ -594,8 +596,109 @@ def scenario_restart() -> None:
     print("  restart: ok")
 
 
+def scenario_files() -> None:
+    """The file panel's whole surface: mkdir -> upload -> rename -> preview -> edit -> delete.
+
+    This is the acceptance scenario the 0.1.8 plan named. It exists because the
+    panel's verbs used to be exactly three (list / download / upload) and a
+    later "complete" rewrite could silently drop one of the new ones.
+    """
+    files = Path(tempfile.mkdtemp(prefix="wsctl-files-"))
+    (files / "seed.txt").write_text("seeded 原文")
+    try:
+        with server(extra_env={"WSCTL_FILE_ROOT": str(files)}) as (base, _, _):
+            token = login(base)
+            headers = {"Cookie": f"wsctl_session={token}"}
+            with httpx.Client(base_url=base, timeout=10, headers=headers) as http:
+                # mkdir
+                made = http.post("/api/files/mkdir", json={"name": "notes"})
+                assert made.status_code == 201, made.text
+                assert (files / "notes").is_dir()
+
+                # an illegal name is refused (traversal / reserved prefix)
+                for bad in ("..", "a/b", ".wsctl-upload"):
+                    assert http.post("/api/files/mkdir", json={"name": bad}).status_code == 400
+
+                # upload into the new directory (and drag-onto-folder is the
+                # same call with a different ``path``)
+                # Deliberately contains a NUL byte: an ASCII-only payload is
+                # *text*, and the preview would (correctly) accept it -- so
+                # "binary refuses to preview" would never be exercised below.
+                payload = b"pay\x00load-1"
+                up = http.post(
+                    "/api/files/upload",
+                    data={"path": "notes"},
+                    files={"file": ("up.bin", payload)},
+                )
+                assert up.status_code == 201, up.text
+
+                # atomic publish: a reader must see all-or-nothing
+                got = http.get("/api/files/download", params={"path": "notes/up.bin"})
+                assert got.content == payload
+
+                # rename
+                renamed = http.post(
+                    "/api/files/rename", json={"path": "notes/up.bin", "name": "done.bin"}
+                )
+                assert renamed.status_code == 200, renamed.text
+                assert (files / "notes" / "done.bin").is_file()
+
+                # preview
+                prev = http.get("/api/files/preview", params={"path": "seed.txt"})
+                assert prev.status_code == 200, prev.text
+                assert "原文" in prev.text
+
+                # binary refuses to preview (with a reason, not a 500)
+                binp = http.get("/api/files/preview", params={"path": "notes/done.bin"})
+                assert binp.status_code == 400
+                assert "二进制" in binp.text
+
+                # edit in place
+                saved = http.put(
+                    "/api/files/content",
+                    json={"path": "seed.txt", "content": "grown 成长"},
+                )
+                assert saved.status_code == 200, saved.text
+                assert (files / "seed.txt").read_text() == "grown 成长"
+
+                # paging reaches past the old 2000-entry hard stop
+                for i in range(30):
+                    (files / f"n{i:02d}.txt").write_text("x")
+                page1 = http.get("/api/files", params={"limit": 25, "offset": 0}).json()
+                page2 = http.get("/api/files", params={"limit": 25, "offset": 25}).json()
+                # seed.txt + notes/ + 30 n*.txt
+                assert page1["total"] == page2["total"] == 32
+                seen = {e["name"] for e in page1["entries"]} | {e["name"] for e in page2["entries"]}
+                assert len(seen) == 32
+
+                # type filter
+                only_dirs = http.get("/api/files", params={"kind": "dir"}).json()
+                assert {e["name"] for e in only_dirs["entries"]} == {"notes"}
+
+                # delete refuses a non-empty directory and the root
+                refused = http.request(
+                    "DELETE", "/api/files", params={"path": "", "name": "notes"}
+                )
+                assert refused.status_code == 400 and "非空" in refused.text
+                root = http.request("DELETE", "/api/files", params={"path": "", "name": ""})
+                assert root.status_code == 400
+
+                # delete a file, then an empty directory
+                assert http.request(
+                    "DELETE", "/api/files", params={"path": "notes", "name": "done.bin"}
+                ).status_code == 200
+                assert http.request(
+                    "DELETE", "/api/files", params={"path": "", "name": "notes"}
+                ).status_code == 200
+                assert not (files / "notes").exists()
+    finally:
+        shutil.rmtree(files, ignore_errors=True)
+    print("  files: ok")
+
+
 SCENARIOS = {
     "server": scenario_server,
+    "files": scenario_files,
     "cli": scenario_cli,
     "connect": scenario_connect,
     "tmux": scenario_tmux,

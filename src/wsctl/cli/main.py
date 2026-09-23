@@ -154,12 +154,53 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _api_client(url: str | None) -> ApiClient:
+    """Build a client for the instance the user is actually using.
+
+    An explicit ``--url`` always wins. Otherwise the cached ``wsctl login``
+    address used to be trusted blindly, so ``wsctl session list`` reported
+    "cannot reach http://127.0.0.1:7720" while a perfectly healthy instance
+    was serving on 7682 -- the same defect ``doctor`` was fixed for in 0.1.7,
+    still present in every API-backed command.
+    """
     creds = client_mod.load_credentials()
-    base = url or (str(creds["url"]) if creds.get("url") else None)
+    base: str | None
+    if url:
+        base = url
+    else:
+        running = _running_instance_base()
+        cached = str(creds["url"]) if creds.get("url") else None
+        if running and cached and not _same_endpoint(running, cached):
+            err_console.print(
+                f"[dim]已自动跟随正在运行的实例 {running}"
+                f"（缓存地址 {cached} 未使用，可用 wsctl logout 清除）[/]"
+            )
+        base = running or cached
     if not base:
         _fail("缺少服务器地址：请传入 --url，或先运行 'wsctl login <url>'")
     token = str(creds["token"]) if creds.get("token") else None
     return cast("ApiClient", client_mod.ApiClient(base, token))
+
+
+def _running_instance_base() -> str | None:
+    """The base URL of the instance running in this data directory, if any."""
+    with contextlib.suppress(Exception):
+        settings = _settings_from(None)
+        resolved = daemon_mod.resolve_instance(settings)
+        if resolved.instance is not None:
+            host = resolved.instance.host
+            if host in ("", "0.0.0.0", "::", "[::]"):
+                host = "127.0.0.1"
+            scheme = "https" if settings.ssl_cert else "http"
+            return f"{scheme}://{host}:{resolved.instance.port}"
+    return None
+
+
+def _same_endpoint(a: str, b: str) -> bool:
+    def parts(url: str) -> tuple[str, str]:
+        parsed = urllib.parse.urlsplit(url)
+        return (parsed.hostname or "").lower(), str(parsed.port or "")
+
+    return parts(a) == parts(b)
 
 
 @contextlib.contextmanager
@@ -339,15 +380,24 @@ def doctor(
     except OSError as exc:
         add("数据目录", f"{settings.data_dir}（{exc}）", bad)
 
-    try:
-        store = store_mod.Store(settings.db_path)
+    # A read-only probe. Constructing a ``Store`` here used to *create* an
+    # empty database -- a diagnostic command that mutates the data directory is
+    # a trap, especially when it is run to find out why the directory is broken.
+    if not settings.db_path.is_file():
+        add("数据库", f"{settings.db_path}（尚未初始化，服务首次启动时创建）", warn)
+    else:
+        import sqlite3 as _sqlite3
+
         try:
-            users = store.user_count()
-        finally:
-            store.close()
-        add("数据库", f"{settings.db_path}（{users} 个用户）", ok)
-    except Exception as exc:
-        add("数据库", f"（{exc}）", bad)
+            conn = _sqlite3.connect(f"file:{settings.db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+                users = int(row[0]) if row else 0
+            finally:
+                conn.close()
+            add("数据库", f"{settings.db_path}（{users} 个用户）", ok)
+        except Exception as exc:
+            add("数据库", f"（{exc}）", bad)
 
     cfg = settings.config_path
     if cfg.is_file():
