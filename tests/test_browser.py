@@ -182,8 +182,6 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.keyboard.type("echo BROWSER-OK")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'BROWSER-OK'),
-                timeout=WAIT_MS,
-            )
 
             # bundled addons are available
             assert page.evaluate("() => typeof window.ImageAddon") != "undefined"
@@ -196,8 +194,6 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.keyboard.type("echo ZMODEM-ON-OK")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'ZMODEM-ON-OK'),
-                timeout=WAIT_MS,
-            )
             page.click("#zmodem-btn")
 
             # create a second session and switch tabs. The "+" button now opens
@@ -388,8 +384,6 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.keyboard.type("echo REPLAY-OK")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'REPLAY-OK'),
-                timeout=WAIT_MS,
-            )
             page.click("#record-btn")  # stop
             page.wait_for_timeout(400)
             page.click("#replay-btn")
@@ -900,8 +894,6 @@ def test_browser_hotkey_help_and_search_options(tmp_path: Path) -> None:
             page.keyboard.type("echo MiXeD-case")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'MiXeD-case'),
-                timeout=15000,
-            )
             page.click("#search-btn")
             page.fill("#search-input", "mixed-case")
             page.wait_for_function(
@@ -937,8 +929,6 @@ def test_browser_hotkey_help_and_search_options(tmp_path: Path) -> None:
             page.keyboard.type("echo Q?MARK")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'Q?MARK'),
-                timeout=15000,
-            )
             browser.close()
     finally:
         _stop_server(server)
@@ -1375,8 +1365,6 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
             page.keyboard.type("echo ALTC-TEST")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'ALTC-TEST'),
-                timeout=15000,
-            )
 
             # Alt+? opens the cheatsheet from inside the terminal (a bare `?`
             # must reach the shell instead).
@@ -1399,9 +1387,7 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo Q?MARK")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'Q?MARK'),
-                timeout=15000,
-            ), "`?` must not be swallowed while typing in a terminal"
+            _wait_screen_includes(page, 'Q?MARK'),, "`?` must not be swallowed while typing in a terminal"
             browser.close()
     finally:
         _stop_server(server)
@@ -1439,8 +1425,6 @@ def test_browser_ctrl_shift_c_is_either_ours_or_the_browsers(tmp_path: Path) -> 
             page.keyboard.type("echo SECRET-MARK")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'SECRET-MARK'),
-                timeout=15000,
-            )
             # Bring the page's own chord handling into play first, so a
             # toast later is unambiguously ours.
             page.keyboard.press("Control+Shift+F")  # open search (ours)
@@ -1496,8 +1480,6 @@ def test_browser_alt_c_alt_v_are_the_working_copy_paste(tmp_path: Path) -> None:
             page.keyboard.type("echo ALTC-MARK")
             page.keyboard.press("Enter")
             _wait_screen_includes(page, 'ALTC-MARK'),
-                timeout=15000,
-            )
             page.wait_for_timeout(200)
             toasts_before = page.locator("#toasts .toast").count()
             page.keyboard.press("Alt+c")
