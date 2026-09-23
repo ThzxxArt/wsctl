@@ -1842,3 +1842,27 @@ def test_control_frames_survive_the_shed(tmp_path: Path) -> None:
     assert any(
         isinstance(i, dict) and i.get("type") == "attached" for i in client._items
     ), "a control message was evicted by the shed"
+
+
+def test_release_assets_cannot_go_stale(tmp_path: Path) -> None:
+    """`app.js` must never be served from a stale browser cache.
+
+    The symptom this prevents: a user upgrades, reloads, and gets the new
+    `index.html` with the new dropdown while the cached `app.js` is still the
+    previous release's -- so the control is on screen with nothing wired to it
+    and right-click keeps doing whatever it did before. `StaticFiles` sends no
+    `Cache-Control` at all, leaving the browser to cache heuristically.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        for path in ("/", "/static/app.js", "/static/app.css", "/static/index.html"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            cache = response.headers.get("cache-control", "")
+            assert "no-cache" in cache or "must-revalidate" in cache, (
+                f"{path} may go stale: cache-control={cache!r}"
+            )
+        # Version-pinned vendor bundles are the opposite: they never change in
+        # place, so caching them hard is both safe and desirable.
+        vendor = client.get("/static/vendor/xterm.js")
+        assert vendor.status_code == 200
+        assert "max-age=31536000" in vendor.headers.get("cache-control", "")

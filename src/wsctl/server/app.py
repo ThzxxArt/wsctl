@@ -21,6 +21,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
@@ -53,6 +54,7 @@ from .maintenance import (
     reconcile_instances,
     retention_cutoffs,
 )
+from .routes.health import NO_CACHE, VENDOR_CACHE, VOLATILE_ASSETS
 from .security import (
     SECURITY_HEADERS,
     client_ip,
@@ -378,7 +380,33 @@ def create_app(
                 response.headers.setdefault(key, value)
         return response
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    class _CachingStatic(StaticFiles):
+        """Static files that cannot go stale on the user.
+
+        ``StaticFiles`` sends no ``Cache-Control`` at all, so the browser
+        applies heuristic caching. For ``vendor/`` that is fine -- those files
+        are version-pinned and never change in place. For ``app.js`` and
+        ``app.css`` it is not: a stale bundle under a fresh ``index.html`` is
+        exactly how a new control appears on screen with nothing wired to it.
+        """
+
+        def file_response(
+            self,
+            full_path: Any,
+            stat_result: Any,
+            scope: Any,
+            status_code: int = 200,
+        ) -> Response:
+            response = super().file_response(full_path, stat_result, scope, status_code)
+            name = str(full_path).replace("\\", "/").rsplit("/", 1)[-1]
+            in_vendor = "/vendor/" in str(full_path).replace("\\", "/")
+            if in_vendor:
+                response.headers.setdefault("Cache-Control", VENDOR_CACHE)
+            elif name in VOLATILE_ASSETS or name.endswith((".js", ".css", ".html")):
+                response.headers["Cache-Control"] = NO_CACHE
+            return response
+
+    app.mount("/static", _CachingStatic(directory=STATIC_DIR), name="static")
 
     for router, _prefix in routes.ROUTERS:
         app.include_router(router)

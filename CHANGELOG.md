@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-09-23
+
+**升级后界面「设了不生效」的根因：浏览器把旧 `app.js` 缓存住了。**
+
+一位用户升级后右键仍是复制粘贴，把右键行为改成「弹出菜单」也毫无反应。代码与包都
+是对的（wheel 里 `openTermMenu`/`term-menu` 齐全，全新 profile 实测菜单正常弹出）；
+真正的原因是 `StaticFiles` **完全不发 `Cache-Control`**，浏览器于是按「启发式缓存」
+自行决定何时回源。结果是**新的 `index.html` 配旧的 `app.js`**——新的下拉框在页面上，
+而绑它的那份 JS 不在，于是怎么设都没用。
+
+这也是测试没拦住的原因：浏览器用例每次都是全新 profile，**从不经过缓存路径**。
+
+### Fixed
+
+- **可变资源强制再验证**：`index.html` / `app.js` / `app.css` / manifest 一律
+  `Cache-Control: no-cache, must-revalidate`。升级后刷新即拿到新前端，不可能再出现
+  「界面是新的、逻辑是旧的」。
+- **vendor 包改为长缓存**（`public, max-age=31536000, immutable`）：它们按版本号
+  发布、内容永不原地变更，硬缓存既安全又省流量。
+- 新增用例逐条断言两类资源的缓存头，防止将来被改回去。
+
+### Verified
+
+420 unit · 17 browser · 10 e2e 全绿；实测 `/`、`/static/app.js`、`/static/app.css`、
+`/static/index.html` 均为 `no-cache, must-revalidate`，`/static/vendor/*` 为
+`immutable`。
+
 ## [0.1.12] - 2026-09-23
 
 **根治「跑大量输出时终端一跳一跳」。** 一位用户在 wsctl 网页终端里跑一个输出极多的

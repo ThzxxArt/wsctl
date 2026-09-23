@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 
 from wsctl import __version__
 from wsctl.core.config import Settings
@@ -19,9 +19,23 @@ STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 router = APIRouter(tags=["health"])
 
 
+#: Assets whose *content* changes between releases. Without an explicit
+#: ``Cache-Control`` a browser caches them heuristically and revalidates only
+#: when it feels like it, which is how someone ends up running the previous
+#: release's ``app.js`` under the new ``index.html``: the dropdown for a new
+#: setting appears and does nothing, because the code that wires it up is not
+#: the code on the page. That is a correctness problem, not a performance one.
+VOLATILE_ASSETS = ("index.html", "app.js", "app.css", "manifest.webmanifest")
+NO_CACHE = "no-cache, must-revalidate"
+#: Version-pinned vendor bundles never change in place; they may be cached hard.
+VENDOR_CACHE = "public, max-age=31536000, immutable"
+
+
 @router.get("/", include_in_schema=False)
-async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+async def index() -> Response:
+    return FileResponse(
+        STATIC_DIR / "index.html", headers={"Cache-Control": NO_CACHE}
+    )
 
 
 @router.get("/healthz")
