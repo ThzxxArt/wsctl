@@ -937,9 +937,14 @@ def test_browser_upload_can_be_cancelled(tmp_path: Path) -> None:
             # there is anything left to cancel.
             with contextlib.suppress(Exception):
                 page.wait_for_selector("#file-upload-progress:not(.hidden)", timeout=4000)
-            if page.locator("#file-upload-progress").is_visible():
-                assert page.locator("#up-cancel").is_enabled()
-                page.click("#up-cancel")
+            # Clicking is racy by nature here: on a fast runner the upload can
+            # finish between the visibility check and the click, and the bar
+            # hides itself. Either outcome is correct -- what must never happen
+            # is a silent hang with no feedback at all.
+            with contextlib.suppress(Exception):
+                if page.locator("#file-upload-progress").is_visible():
+                    assert page.locator("#up-cancel").is_enabled()
+                    page.click("#up-cancel", timeout=3000)
 
             # Either the server already finished (nothing to cancel) or the
             # abort was reported. What must never happen is a silent hang.
@@ -1184,6 +1189,67 @@ def test_browser_history_reopen_uses_argv_and_refuses_ssh(tmp_path: Path) -> Non
                 timeout=15000,
             )
             browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+
+def test_browser_upload_cancel_really_cancels(tmp_path: Path) -> None:
+    """Cancelling must abort the transfer, deterministically.
+
+    Racing a real upload against a click is flaky (the bar hides itself the
+    moment the upload lands). Holding the request open with a route removes the
+    race entirely: the progress UI is guaranteed to be up, and cancelling must
+    actually abort rather than just hide the bar.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+
+            held = []
+
+            def hold(route):
+                held.append(route)
+
+            page.route("**/api/files/upload", hold)
+            try:
+                _login(page)
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=15000,
+                )
+                page.click("#files-toggle")
+                page.wait_for_selector("#file-list li, #file-list .empty", timeout=10000)
+
+                with page.expect_file_chooser(timeout=10000) as chooser:
+                    page.click("#file-upload-btn")
+                chooser.value.set_files(
+                    {"name": "held.bin", "mimeType": "application/octet-stream",
+                     "buffer": os.urandom(64 * 1024)}
+                )
+                # The request is held open, so the progress UI cannot have
+                # finished on us: no race left to lose.
+                page.wait_for_selector("#file-upload-progress:not(.hidden)", timeout=15000)
+                page.click("#up-cancel", timeout=5000)
+                page.wait_for_function(
+                    "() => document.getElementById('file-status')"
+                    ".textContent.includes('已取消')",
+                    timeout=15000,
+                )
+                # Nothing landed on disk.
+                assert not (files / "held.bin").exists()
+            finally:
+                for route in held:
+                    with contextlib.suppress(Exception):
+                        route.abort()
+                browser.close()
     finally:
         _stop_server(server)
         shutil.rmtree(data, ignore_errors=True)
