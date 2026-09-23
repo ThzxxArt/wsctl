@@ -41,9 +41,9 @@ def test_safe_resolve_rejects_symlink_escape(tmp_path: Path) -> None:
 
 
 def test_list_dir_sorted_dirs_first(tmp_path: Path) -> None:
-    (tmp_path / "z.txt").write_text("z")
+    (tmp_path / "z.txt").write_text("z", encoding="utf-8")
     (tmp_path / "sub").mkdir()
-    (tmp_path / "a.txt").write_text("a")
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
     entries, truncated = list_dir(tmp_path, "")
     names = [e["name"] for e in entries]
     assert names[0] == "sub"
@@ -53,14 +53,14 @@ def test_list_dir_sorted_dirs_first(tmp_path: Path) -> None:
 
 def test_list_dir_truncates_over_the_limit(tmp_path: Path) -> None:
     for index in range(10):
-        (tmp_path / f"f{index:02d}.txt").write_text("x")
+        (tmp_path / f"f{index:02d}.txt").write_text("x", encoding="utf-8")
     entries, truncated = list_dir(tmp_path, "", limit=4)
     assert len(entries) == 4
     assert truncated is True
 
 
 def test_list_dir_not_a_directory(tmp_path: Path) -> None:
-    (tmp_path / "file.txt").write_text("x")
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
     with pytest.raises(FsError):
         list_dir(tmp_path, "file.txt")
 
@@ -68,7 +68,7 @@ def test_list_dir_not_a_directory(tmp_path: Path) -> None:
 def test_relative_to(tmp_path: Path) -> None:
     child = tmp_path / "a" / "b.txt"
     child.parent.mkdir()
-    child.write_text("x")
+    child.write_text("x", encoding="utf-8")
     assert relative_to(tmp_path, child) == "a/b.txt"
 
 
@@ -127,7 +127,7 @@ def test_make_dir_rejects_names_that_escape(tmp_path: Path) -> None:
 
 
 def test_rename_is_scoped_to_one_directory(tmp_path: Path) -> None:
-    (tmp_path / "a.txt").write_text("x")
+    (tmp_path / "a.txt").write_text("x", encoding="utf-8")
     (tmp_path / "sub").mkdir()
     renamed = fs.rename_entry(tmp_path, "a.txt", "b.txt")
     assert renamed.name == "b.txt"
@@ -141,7 +141,7 @@ def test_rename_is_scoped_to_one_directory(tmp_path: Path) -> None:
 
 def test_delete_refuses_the_root_and_non_empty_directories(tmp_path: Path) -> None:
     (tmp_path / "sub").mkdir()
-    (tmp_path / "sub" / "inner.txt").write_text("x")
+    (tmp_path / "sub" / "inner.txt").write_text("x", encoding="utf-8")
     with pytest.raises(fs.FsError):
         fs.delete_entry(tmp_path, "")
     with pytest.raises(OSError):
@@ -154,7 +154,7 @@ def test_delete_refuses_the_root_and_non_empty_directories(tmp_path: Path) -> No
 
 
 def test_preview_refuses_binaries_and_oversized_files(tmp_path: Path) -> None:
-    (tmp_path / "text.txt").write_text("héllo 世界")
+    (tmp_path / "text.txt").write_text("héllo 世界", encoding="utf-8")
     (tmp_path / "binary.bin").write_bytes(b"\x00\x01\x02binary")
     (tmp_path / "big.txt").write_bytes(b"a" * (fs.PREVIEW_MAX_BYTES + 1))
 
@@ -169,20 +169,22 @@ def test_preview_refuses_binaries_and_oversized_files(tmp_path: Path) -> None:
 
 def test_write_text_file_is_atomic_and_bounded(tmp_path: Path) -> None:
     target = tmp_path / "edit.txt"
-    target.write_text("before")
+    target.write_text("before", encoding="utf-8")
     size = fs.write_text_file(tmp_path, "edit.txt", "after 内容")
     assert size == len("after 内容".encode())
-    assert target.read_text() == "after 内容"
+    assert target.read_text(encoding="utf-8") == "after 内容"
     assert list(tmp_path.glob(".*wsctl-edit")) == [], "staging sidecar left behind"
     with pytest.raises(fs.FsError, match="过大"):
         fs.write_text_file(tmp_path, "edit.txt", "x" * (fs.EDIT_MAX_BYTES + 1))
-    assert target.read_text() == "after 内容", "a rejected edit must not touch the file"
+    assert target.read_text(encoding="utf-8") == "after 内容", (
+        "a rejected edit must not touch the file"
+    )
 
 
 def test_list_dir_paged_reaches_past_the_old_hard_stop(tmp_path: Path) -> None:
     """Entry 2001 used to be unreachable: the endpoint cut at 2000 and stopped."""
     for i in range(2050):
-        (tmp_path / f"f{i:04d}.txt").write_text("x")
+        (tmp_path / f"f{i:04d}.txt").write_text("x", encoding="utf-8")
     first = fs.list_dir_paged(tmp_path, "", offset=0, limit=2000)
     assert len(first["entries"]) == 2000
     assert first["total"] == 2050
@@ -193,9 +195,9 @@ def test_list_dir_paged_reaches_past_the_old_hard_stop(tmp_path: Path) -> None:
 
 
 def test_list_dir_paged_filters_by_name_and_kind(tmp_path: Path) -> None:
-    (tmp_path / "keep.txt").write_text("x")
-    (tmp_path / "KEEP-log.txt").write_text("x")
-    (tmp_path / "other.md").write_text("x")
+    (tmp_path / "keep.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "KEEP-log.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "other.md").write_text("x", encoding="utf-8")
     (tmp_path / "folder").mkdir()
     only_txt = fs.list_dir_paged(tmp_path, "", contains="keep", kind="file")
     assert {e["name"] for e in only_txt["entries"]} == {"keep.txt", "KEEP-log.txt"}

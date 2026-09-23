@@ -216,7 +216,7 @@ def test_audit_endpoint_admin_only(tmp_path: Path) -> None:
 
 def test_files_list_download_upload(tmp_path: Path) -> None:
     app = build_app(tmp_path, file_root=tmp_path)
-    (tmp_path / "hello.txt").write_text("hi")
+    (tmp_path / "hello.txt").write_text("hi", encoding="utf-8")
     with TestClient(app) as client:
         login(client, ADMIN)
 
@@ -630,7 +630,7 @@ def test_out_of_range_dimensions_rejected(tmp_path: Path) -> None:
 def test_upload_rejects_symlink(tmp_path: Path) -> None:
     app = build_app(tmp_path, file_root=tmp_path)
     outside = tmp_path.parent / "outside-target.txt"
-    outside.write_text("secret")
+    outside.write_text("secret", encoding="utf-8")
     (tmp_path / "link").symlink_to(outside)
     try:
         with TestClient(app) as client:
@@ -641,7 +641,7 @@ def test_upload_rejects_symlink(tmp_path: Path) -> None:
                 files={"file": ("link", b"overwritten")},
             )
             assert r.status_code == 400
-            assert outside.read_text() == "secret"  # untouched
+            assert outside.read_text(encoding="utf-8") == "secret"  # untouched
     finally:
         outside.unlink(missing_ok=True)
 
@@ -1182,7 +1182,7 @@ def test_share_is_persisted_and_survives_a_restart(tmp_path: Path) -> None:
 
 def test_upload_refuses_to_clobber_without_overwrite(tmp_path: Path) -> None:
     app = build_app(tmp_path, file_root=tmp_path)
-    (tmp_path / "exists.txt").write_text("original")
+    (tmp_path / "exists.txt").write_text("original", encoding="utf-8")
     with TestClient(app) as client:
         login(client, ADMIN)
         r = client.post(
@@ -1191,7 +1191,7 @@ def test_upload_refuses_to_clobber_without_overwrite(tmp_path: Path) -> None:
             files={"file": ("exists.txt", b"replacement")},
         )
         assert r.status_code == 409
-        assert (tmp_path / "exists.txt").read_text() == "original"
+        assert (tmp_path / "exists.txt").read_text(encoding="utf-8") == "original"
 
         r = client.post(
             "/api/files/upload",
@@ -1210,7 +1210,7 @@ def test_file_listing_reports_truncation(tmp_path: Path) -> None:
     fs_mod.DEFAULT_LIST_LIMIT = 3
     try:
         for index in range(6):
-            (tmp_path / f"f{index}.txt").write_text("x")
+            (tmp_path / f"f{index}.txt").write_text("x", encoding="utf-8")
         with TestClient(app) as client:
             login(client, ADMIN)
             data = client.get("/api/files").json()
@@ -1365,7 +1365,7 @@ def test_file_panel_endpoints(tmp_path: Path) -> None:
     """mkdir / rename / preview / edit / delete round trip through the API."""
     files = tmp_path / "files"
     files.mkdir()
-    (files / "seed.txt").write_text("seed")
+    (files / "seed.txt").write_text("seed", encoding="utf-8")
     app = build_app(tmp_path, file_root=files)
     with TestClient(app) as client:
         login(client, ADMIN)
@@ -1390,7 +1390,7 @@ def test_file_panel_endpoints(tmp_path: Path) -> None:
             "/api/files/content", json={"path": "seeds.txt", "content": "grown 成长"}
         )
         assert saved.status_code == 200, saved.text
-        assert (files / "seeds.txt").read_text() == "grown 成长"
+        assert (files / "seeds.txt").read_text(encoding="utf-8") == "grown 成长"
 
         # a binary cannot be previewed
         (files / "blob.bin").write_bytes(b"\x00\x01")
@@ -1403,7 +1403,7 @@ def test_file_panel_endpoints(tmp_path: Path) -> None:
         assert not (files / "seeds.txt").exists()
 
         # delete refuses a non-empty directory
-        (files / "notes" / "keep.txt").write_text("x")
+        (files / "notes" / "keep.txt").write_text("x", encoding="utf-8")
         refused = client.request(
         "DELETE", "/api/files", params={"path": "", "name": "notes"}
     )
@@ -1418,7 +1418,7 @@ def test_file_listing_pages_beyond_the_old_limit(tmp_path: Path) -> None:
     files = tmp_path / "files"
     files.mkdir()
     for i in range(30):
-        (files / f"n{i:02d}.txt").write_text("x")
+        (files / f"n{i:02d}.txt").write_text("x", encoding="utf-8")
     app = build_app(tmp_path, file_root=files)
     with TestClient(app) as client:
         login(client, ADMIN)

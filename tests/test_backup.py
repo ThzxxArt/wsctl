@@ -97,7 +97,7 @@ def test_restore_keeps_a_backup_of_the_previous_db(tmp_path: Path) -> None:
 def test_restore_rejects_traversal_members(tmp_path: Path) -> None:
     evil = tmp_path / "evil.tar.gz"
     payload = tmp_path / "payload"
-    payload.write_text("x")
+    payload.write_text("x", encoding="utf-8")
     with tarfile.open(evil, "w:gz") as tar:
         tar.add(payload, arcname="../escape")
     with pytest.raises(backup.BackupError):
@@ -107,7 +107,7 @@ def test_restore_rejects_traversal_members(tmp_path: Path) -> None:
 def test_restore_rejects_non_sqlite_database(tmp_path: Path) -> None:
     bad = tmp_path / "bad.tar.gz"
     fake = tmp_path / "wsctl.db"
-    fake.write_text("not a database")
+    fake.write_text("not a database", encoding="utf-8")
     with tarfile.open(bad, "w:gz") as tar:
         tar.add(fake, arcname="wsctl.db")
     with pytest.raises(backup.BackupError):

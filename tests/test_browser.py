@@ -121,7 +121,7 @@ def test_browser_flow(tmp_path: Path) -> None:
     data = tmp_path / "data"
     files = tmp_path / "files"
     files.mkdir(parents=True)
-    (files / "seed.txt").write_text("hello from browser test")
+    (files / "seed.txt").write_text("hello from browser test", encoding="utf-8")
     server = _start_server(data, files)
     try:
         _wait_health()
@@ -437,7 +437,7 @@ def test_browser_session_form_config_and_upload_guard(tmp_path: Path) -> None:
     data = tmp_path / "data"
     files = tmp_path / "files"
     files.mkdir(parents=True)
-    (files / "exists.txt").write_text("original-content")
+    (files / "exists.txt").write_text("original-content", encoding="utf-8")
     server = _start_server(data, files)
     try:
         _wait_health()
@@ -700,7 +700,7 @@ def test_browser_file_panel_organise_and_edit(tmp_path: Path) -> None:
     data = tmp_path / "data"
     files = tmp_path / "files"
     files.mkdir(parents=True)
-    (files / "notes.txt").write_text("original 原文")
+    (files / "notes.txt").write_text("original 原文", encoding="utf-8")
     server = _start_server(data, files)
     try:
         _wait_health()

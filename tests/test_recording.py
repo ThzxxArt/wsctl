@@ -18,7 +18,7 @@ def test_cast_header_and_events(tmp_path: Path) -> None:
     recorder.input(b"x")
     recorder.close()
 
-    lines = (tmp_path / "a.cast").read_text().splitlines()
+    lines = (tmp_path / "a.cast").read_text(encoding="utf-8").splitlines()
     header = json.loads(lines[0])
     assert header["version"] == 2
     assert header["width"] == 100
@@ -37,7 +37,7 @@ def test_close_is_idempotent(tmp_path: Path) -> None:
     recorder.close()
     recorder.output(b"ignored after close")
     # only the header line remains
-    assert (tmp_path / "b.cast").read_text().count("\n") == 1
+    assert (tmp_path / "b.cast").read_text(encoding="utf-8").count("\n") == 1
 
 
 def test_creates_parent_directory(tmp_path: Path) -> None:
@@ -53,9 +53,9 @@ def test_recordings_usage_and_room(tmp_path: Path) -> None:
     assert has_room(directory, 0)  # unlimited
 
     directory.mkdir()
-    (directory / "a.cast").write_text("x" * 10)
-    (directory / "b.cast").write_text("y" * 5)
-    (directory / "ignored.txt").write_text("z" * 100)
+    (directory / "a.cast").write_text("x" * 10, encoding="utf-8")
+    (directory / "b.cast").write_text("y" * 5, encoding="utf-8")
+    (directory / "ignored.txt").write_text("z" * 100, encoding="utf-8")
 
     total, count = recordings_usage(directory)
     assert (total, count) == (15, 2)

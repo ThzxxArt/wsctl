@@ -61,11 +61,11 @@ def test_config_set_creates_and_updates(tmp_path: Path, monkeypatch: object) -> 
 
     first = runner.invoke(app, ["config", "set", "port", "9000"])
     assert first.exit_code == 0, first.output
-    assert "port = 9000" in config.read_text()
+    assert "port = 9000" in config.read_text(encoding="utf-8")
 
     second = runner.invoke(app, ["config", "set", "port", "9100"])
     assert second.exit_code == 0, second.output
-    text = config.read_text()
+    text = config.read_text(encoding="utf-8")
     assert text.count("port =") == 1
     assert "port = 9100" in text
 
@@ -91,7 +91,7 @@ def test_config_set_accepts_typed_values(tmp_path: Path, monkeypatch: object) ->
     assert runner.invoke(
         app, ["config", "set", "allowed_ips", '["10.0.0.0/8"]']
     ).exit_code == 0
-    text = config.read_text()
+    text = config.read_text(encoding="utf-8")
     assert "auth_required = false" in text
     assert 'allowed_ips = ["10.0.0.0/8"]' in text
 
@@ -514,7 +514,10 @@ def test_doctor_probes_the_running_instance_not_a_stale_credential(
     _missing_config(tmp_path, monkeypatch)
     creds = tmp_path / "wsctl" / "credentials.json"
     creds.parent.mkdir(parents=True, exist_ok=True)
-    creds.write_text(_json.dumps({"url": "http://127.0.0.1:7720", "token": "stale"}))
+    creds.write_text(
+        _json.dumps({"url": "http://127.0.0.1:7720", "token": "stale"}),
+        encoding="utf-8",
+    )
 
     inst = daemon.Instance(
         pid=os.getpid(), host="0.0.0.0", port=18111,
@@ -542,7 +545,7 @@ def test_doctor_falls_back_to_the_credential_and_says_so(tmp_path, monkeypatch) 
     _missing_config(tmp_path, monkeypatch)
     creds = tmp_path / "wsctl" / "credentials.json"
     creds.parent.mkdir(parents=True, exist_ok=True)
-    creds.write_text(_json.dumps({"url": "http://127.0.0.1:1", "token": "stale"}))
+    creds.write_text(_json.dumps({"url": "http://127.0.0.1:1", "token": "stale"}), encoding="utf-8")
 
     rows = _doctor_rows(runner.invoke(app, ["doctor", "--json"]))
     assert rows["运行状态"].startswith("未运行")
@@ -557,7 +560,7 @@ def test_doctor_explicit_url_wins(tmp_path, monkeypatch) -> None:
     _missing_config(tmp_path, monkeypatch)
     creds = tmp_path / "wsctl" / "credentials.json"
     creds.parent.mkdir(parents=True, exist_ok=True)
-    creds.write_text('{"url": "http://127.0.0.1:1", "token": "stale"}')
+    creds.write_text('{"url": "http://127.0.0.1:1", "token": "stale"}', encoding="utf-8")
 
     rows = _doctor_rows(
         runner.invoke(app, ["doctor", "--json", "--url", "http://127.0.0.1:2"])

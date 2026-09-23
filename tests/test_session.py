@@ -231,7 +231,7 @@ async def test_recording_captures_output(tmp_path: Path) -> None:
     finally:
         await session.stop_recording()
         await manager.shutdown()
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     assert '"o"' in text and "REC-MARK" in text
     assert '"i"' in text
 
