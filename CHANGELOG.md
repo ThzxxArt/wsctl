@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-09-23
+
+**零产品变更。** 这一版只做测试加固，把 0.1.8 发布后 CI 暴露的两个**测试缺陷**
+收进发布包。0.1.8 的产品代码经过逐行核对未受影响——`fs.write_text_file` 显式
+UTF-8 编码、`read_text_file` 显式命名解码，Windows 上功能正常。
+
+发这一版有两个理由：0.1.8 发布后落在 main 上的两条修复本就游离于任何发布之外；
+且 `v0.1.8` 这个 tag 的 CI 记录会永久停在 8/9。
+
+### Fixed（测试侧）
+
+- **测试套件的文本 I/O 全部显式指定编码**（8 个文件 46 处）。`Path.read_text()` /
+  `write_text()` 不传 `encoding` 时回落到 locale，而默认 Windows 控制台是 cp1252，
+  于是两处往返中文的断言失败：`write_text("héllo 世界")` 抛 `UnicodeEncodeError`，
+  `read_text() == "after 内容"` 读出乱码。
+  **这是本项目同一类缺陷的第四次复发**——0.1.5 修的是产品 stdio，测试里还留着。
+  因此按「修类不修实例」处理：不是补那 2 处，而是 46 处一起改。
+- **上传取消用例不再与真实上传赛跑。** 原用例先断言进度条可见、再点「取消」，而在
+  快的 runner 上上传会在两者之间完成，进度条随即自行收起，Playwright 对着消失的
+  元素重试点击直到超时。上一次的绿是运气。两处改动：竞态路径容忍「进度条已收起」
+  （这本就是它注释里写明的两种正确结果之一）；另加一条**确定性**用例，用路由拦截
+  把上传挂起，此时进度 UI 不可能自行结束，取消必然落点，并断言传输被中止、磁盘
+  无残留。
+
+### Verified
+
+378 unit · 12 browser · 9 e2e · 1 slow · 12 guards，以及 windows-smoke 实跑的那
+132 条；两条上传用例连跑 3 次 3/3 稳定。
+
 ## [0.1.8] - 2026-09-23
 
 **主题：状态可见、操作完整、故障不静默。** 一次「补全」型发布——修掉六处
