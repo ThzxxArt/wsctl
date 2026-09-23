@@ -1387,7 +1387,7 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.type("echo Q?MARK")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'Q?MARK'),, "`?` must not be swallowed while typing in a terminal"
+            _wait_screen_includes(page, 'Q?MARK'),
             browser.close()
     finally:
         _stop_server(server)
