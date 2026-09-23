@@ -278,16 +278,26 @@
     }
   }
 
-  // Dialogs are singletons: a second call while one is open would overwrite
-  // the input the user is typing into (this actually shipped as a rename that
-  // silently sent the *old* name back to the server).
+  // Dialogs must never overwrite the input the user is typing into (that
+  // actually shipped as a rename that silently sent the *old* name back to the
+  // server). The first guard answered every second caller with
+  // `Promise.resolve(null)`, which the caller reads as "the user cancelled" --
+  // so the operation silently did not happen and nothing anywhere said so.
+  // A rename opened twice therefore never reached the server at all.
+  // The fix is to serialise them: a second dialog waits its turn.
   let renamePromptOpen = false;
   let confirmDialogOpen = false;
+  let dialogQueue = Promise.resolve();
+
+  function afterCurrentDialog(fn) {
+    const run = dialogQueue.then(fn, fn);
+    dialogQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
 
   function confirmDialog(message, title) {
-    if (confirmDialogOpen) return Promise.resolve(false);
-    confirmDialogOpen = true;
-    return new Promise((resolve) => {
+    return afterCurrentDialog(() => new Promise((resolve) => {
+      confirmDialogOpen = true;
       els.confirmTitle.textContent = title || "确认";
       els.confirmMessage.textContent = message;
       els.confirmOverlay.classList.remove("hidden");
@@ -302,16 +312,15 @@
       const onCancel = () => done(false);
       els.confirmOk.addEventListener("click", onOk);
       els.confirmCancel.addEventListener("click", onCancel);
-    });
+    }));
   }
 
   // Dangerous actions ask for the *name* typed back, the way a hosting panel
   // makes you type the repository name before deleting it. "确定 / 取消" alone
   // is one stray click away from an irreversible delete.
   function confirmByName(message, expected, title) {
-    if (renamePromptOpen) return Promise.resolve(false);
-    renamePromptOpen = true;
-    return new Promise((resolve) => {
+    return afterCurrentDialog(() => new Promise((resolve) => {
+      renamePromptOpen = true;
       els.renameTitle.textContent = title || "确认";
       els.renameInput.type = "text";
       els.renameInput.value = "";
@@ -349,14 +358,13 @@
       els.renameForm.addEventListener("submit", onSubmit);
       els.renameCancel.addEventListener("click", onCancel);
       onInput();
-    });
+    }));
   }
 
   function promptDialog(title, value, opts) {
-    if (renamePromptOpen) return Promise.resolve(null);
-    renamePromptOpen = true;
-    const masked = Boolean(opts && opts.masked);
-    return new Promise((resolve) => {
+    return afterCurrentDialog(() => new Promise((resolve) => {
+      renamePromptOpen = true;
+      const masked = Boolean(opts && opts.masked);
       els.renameTitle.textContent = title || "重命名";
       els.renameInput.type = masked ? "password" : "text";
       els.renameInput.value = value || "";
@@ -374,7 +382,7 @@
       const onCancel = () => done(null);
       els.renameForm.addEventListener("submit", onSubmit);
       els.renameCancel.addEventListener("click", onCancel);
-    });
+    }));
   }
 
   // 统一弹窗：Esc 关闭最上层，点击遮罩关闭（登录框除外）

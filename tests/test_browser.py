@@ -27,6 +27,13 @@ playwright_api = pytest.importorskip("playwright.sync_api")
 sync_playwright = playwright_api.sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Every browser wait uses this. It used to be a scatter of 5s/10s/15s/30s
+# budgets, and on a cold CI runner one of them ran out while the page was
+# still fetching assets -- the suite is green locally and red on CI.
+# 60s is generous for a healthy machine and merely patient on a slow one.
+WAIT_MS = 60000
+
 PY = sys.executable
 
 
@@ -143,10 +150,10 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click("#login-form button[type=submit]")
 
             # a terminal tab appears and connects
-            page.wait_for_selector(".tab", timeout=15000)
+            page.wait_for_selector(".tab", timeout=WAIT_MS)
             page.wait_for_function(
                 "() => document.getElementById('connection').textContent === '已连接'",
-                timeout=15000,
+                timeout=WAIT_MS,
             )
             assert page.locator(".tab").count() == 1
 
@@ -157,7 +164,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.wait_for_function(
                 "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
                 " return r && r.innerText.includes('BROWSER-OK'); }",
-                timeout=15000,
+                timeout=WAIT_MS,
             )
 
             # bundled addons are available
@@ -173,7 +180,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.wait_for_function(
                 "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
                 " return r && r.innerText.includes('ZMODEM-ON-OK'); }",
-                timeout=15000,
+                timeout=WAIT_MS,
             )
             page.click("#zmodem-btn")
 
@@ -181,11 +188,11 @@ def test_browser_flow(tmp_path: Path) -> None:
             # a dialog (so a session can be named / pointed at ssh); Alt+N is
             # the one-keystroke path that still opens a default shell at once.
             page.click("#new-tab")
-            page.wait_for_selector("#new-session-overlay:not(.hidden)", timeout=5000)
+            page.wait_for_selector("#new-session-overlay:not(.hidden)", timeout=WAIT_MS)
             page.click("#new-session-quick")
-            page.wait_for_selector("#new-session-overlay.hidden", state="attached", timeout=5000)
+            page.wait_for_selector("#new-session-overlay.hidden", state="attached", timeout=WAIT_MS)
             page.wait_for_function(
-                "() => document.querySelectorAll('.tab').length === 2", timeout=15000
+                "() => document.querySelectorAll('.tab').length === 2", timeout=WAIT_MS
             )
             assert page.locator(".tab").count() == 2
             page.locator(".tab").first.click()
@@ -195,40 +202,40 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.keyboard.press("Alt+n")
             page.wait_for_function(
-                "() => document.querySelectorAll('.tab').length === 3", timeout=15000
+                "() => document.querySelectorAll('.tab').length === 3", timeout=WAIT_MS
             )
 
             # closing a tab detaches (the session must survive on the server)
             page.click(".term-pane.active .xterm-screen")
             page.click(".tab.active .close")
             page.wait_for_function(
-                "() => document.querySelectorAll('.tab').length === 2", timeout=15000
+                "() => document.querySelectorAll('.tab').length === 2", timeout=WAIT_MS
             )
             page.click("#sessions-btn")
-            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=WAIT_MS)
             page.wait_for_function(
                 "() => document.querySelectorAll('#sessions-list .session-row').length >= 3",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
             # reopen the detached session from the session list
             page.locator("#sessions-list .session-row button:has-text('打开')").first.click()
             page.wait_for_function(
-                "() => document.querySelectorAll('.tab').length === 3", timeout=15000
+                "() => document.querySelectorAll('.tab').length === 3", timeout=WAIT_MS
             )
 
             # file panel lists the seed file
             page.click("#files-toggle")
-            page.wait_for_selector("#file-list li", timeout=10000)
+            page.wait_for_selector("#file-list li", timeout=WAIT_MS)
             page.wait_for_function(
                 "() => document.getElementById('file-list').innerText.includes('seed.txt')",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
 
             # share dialog shows a QR image and a link
-            with page.expect_response(lambda r: "qr.svg" in r.url, timeout=10000) as info:
+            with page.expect_response(lambda r: "qr.svg" in r.url, timeout=WAIT_MS) as info:
                 page.click("#share-btn")
             assert info.value.status == 200, info.value.status
-            page.wait_for_selector("#share-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#share-overlay:not(.hidden)", timeout=WAIT_MS)
             share_url = page.input_value("#share-url")
             assert "share=" in share_url
             qr = page.locator("#share-qr")
@@ -236,13 +243,13 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.wait_for_function(
                 "() => { const i = document.getElementById('share-qr');"
                 " return i && i.complete && i.naturalWidth > 0; }",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
             page.click("#share-close")
 
             # reopening the share dialog must reuse the existing link
             page.click("#share-btn")
-            page.wait_for_selector("#share-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#share-overlay:not(.hidden)", timeout=WAIT_MS)
             assert page.input_value("#share-url") == share_url
             page.click("#share-close")
 
@@ -266,19 +273,19 @@ def test_browser_flow(tmp_path: Path) -> None:
 
             # Esc closes the topmost modal
             page.click("#settings-btn")
-            page.wait_for_selector("#settings-overlay:not(.hidden)", timeout=5000)
+            page.wait_for_selector("#settings-overlay:not(.hidden)", timeout=WAIT_MS)
             page.keyboard.press("Escape")
-            page.wait_for_selector("#settings-overlay.hidden", state="attached", timeout=5000)
+            page.wait_for_selector("#settings-overlay.hidden", state="attached", timeout=WAIT_MS)
 
             # admin panel: users / audit / recordings tabs
             page.click("#admin-btn")
-            page.wait_for_selector("#admin-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#admin-overlay:not(.hidden)", timeout=WAIT_MS)
             page.wait_for_function(
                 "() => document.querySelectorAll('#admin-body .admin-table tbody tr').length >= 1",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
             page.click(".tab2[data-tab='audit']")
-            page.wait_for_selector("#admin-body .admin-table", timeout=10000)
+            page.wait_for_selector("#admin-body .admin-table", timeout=WAIT_MS)
             page.click(".tab2[data-tab='recordings']")
             page.wait_for_timeout(300)
             # enabling 2FA opens the shared modal with a QR code; Esc closes the
@@ -286,15 +293,15 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click(".tab2[data-tab='users']")
             page.wait_for_function(
                 "() => document.querySelectorAll('#admin-body .admin-table tbody tr').length >= 1",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
             page.locator(
                 "#admin-body .admin-table tbody tr"
             ).first.locator("button:has-text('启用 2FA')").click()
-            page.wait_for_selector("#qr-overlay:not(.hidden)", timeout=10000)
-            page.wait_for_selector("#qr-image svg", timeout=10000)
+            page.wait_for_selector("#qr-overlay:not(.hidden)", timeout=WAIT_MS)
+            page.wait_for_selector("#qr-image svg", timeout=WAIT_MS)
             page.keyboard.press("Escape")
-            page.wait_for_selector("#qr-overlay.hidden", state="attached", timeout=5000)
+            page.wait_for_selector("#qr-overlay.hidden", state="attached", timeout=WAIT_MS)
             assert page.locator("#admin-overlay").is_visible()
             # Turn the 2FA back off (the row above is admin); leaving it on
             # would lock every later login behind a code nobody has.
@@ -306,29 +313,29 @@ def test_browser_flow(tmp_path: Path) -> None:
                 " const row = document.querySelector('#admin-body .admin-table tbody tr');"
                 " return row && !row.innerText.includes('已启用');"
                 "}",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
             page.click("#admin-close")
-            page.wait_for_selector("#admin-overlay.hidden", state="attached", timeout=5000)
+            page.wait_for_selector("#admin-overlay.hidden", state="attached", timeout=WAIT_MS)
 
             # terminal search over the buffer
             page.click(".term-pane.active .xterm-screen")
             page.click("#search-btn")
-            page.wait_for_selector("#search-bar:not(.hidden)", timeout=5000)
+            page.wait_for_selector("#search-bar:not(.hidden)", timeout=WAIT_MS)
             page.fill("#search-input", "BROWSER-OK")
             page.wait_for_function(
                 "() => document.getElementById('search-count').textContent.includes('/')",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
             page.click("#search-close")
 
             # inline rename dialog (double-click the tab label, not the close button)
             page.dblclick(".tab.active .label")
-            page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=5000)
-            page.wait_for_selector("#rename-input", state="visible", timeout=5000)
+            page.wait_for_selector("#rename-overlay:not(.hidden)", timeout=WAIT_MS)
+            page.wait_for_selector("#rename-input", state="visible", timeout=WAIT_MS)
             page.fill("#rename-input", "重命名标签")
             page.click("#rename-form button[type=submit]")
-            page.wait_for_selector("#rename-overlay.hidden", state="attached", timeout=5000)
+            page.wait_for_selector("#rename-overlay.hidden", state="attached", timeout=WAIT_MS)
             # Assert the *outcome*, not the request that produced it: binding to
             # "a PATCH must be in flight while this context manager is open" is
             # timing-sensitive and went green on a fast box while failing on CI.
@@ -338,7 +345,7 @@ def test_browser_flow(tmp_path: Path) -> None:
                 page.wait_for_function(
                     "() => document.querySelector('.tab.active .label')"
                     ".textContent === '重命名标签'",
-                    timeout=30000,
+                    timeout=WAIT_MS,
                 )
             except Exception:
                 print("RENAME-DEBUG labels=", page.evaluate(
@@ -350,7 +357,7 @@ def test_browser_flow(tmp_path: Path) -> None:
                 raise
             renamed = [
                 s for s in httpx.get(
-                    f"{BASE}/api/sessions", headers=_headers_from(page), timeout=10
+                    f"{BASE}/api/sessions", headers=_headers_from(page), timeout=WAIT_MS
                 ).json()
                 if s["name"] == "重命名标签"
             ]
@@ -364,30 +371,30 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.wait_for_function(
                 "() => { const r = document.querySelector('.term-pane.active .xterm-rows');"
                 " return r && r.innerText.includes('REPLAY-OK'); }",
-                timeout=15000,
+                timeout=WAIT_MS,
             )
             page.click("#record-btn")  # stop
             page.wait_for_timeout(400)
             page.click("#replay-btn")
-            page.wait_for_selector("#replay-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#replay-overlay:not(.hidden)", timeout=WAIT_MS)
             page.wait_for_function(
                 "() => document.getElementById('replay-host').children.length > 0",
-                timeout=15000,
+                timeout=WAIT_MS,
             )
             # the cast must actually load (regression: CSP blocked blob: fetches)
             assert not any(
                 "Content Security Policy" in e or "blob" in e.lower() for e in console_errors
             ), console_errors
             page.evaluate("() => document.getElementById('replay-close').click()")
-            page.wait_for_selector("#replay-overlay.hidden", state="attached", timeout=5000)
+            page.wait_for_selector("#replay-overlay.hidden", state="attached", timeout=WAIT_MS)
 
             # open the share link in a fresh context: read-only, no login
             viewer = browser.new_context(viewport={"width": 1280, "height": 800})
             vpage = viewer.new_page()
             vpage.goto(share_url)
-            vpage.wait_for_selector(".tab", timeout=15000)
+            vpage.wait_for_selector(".tab", timeout=WAIT_MS)
             assert "shared" in (vpage.get_attribute("body", "class") or "")
-            vpage.wait_for_selector(".readonly-badge", timeout=15000)
+            vpage.wait_for_selector(".readonly-badge", timeout=WAIT_MS)
 
             # a read-only viewer cannot type into the session
             vpage.click(".term-pane.active .xterm-screen")
@@ -402,15 +409,15 @@ def test_browser_flow(tmp_path: Path) -> None:
 
             # session filter and "detach all" (keeps sessions on the server)
             page.click("#sessions-btn")
-            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=10000)
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=WAIT_MS)
             page.fill("#session-filter", "重命名标签")
             page.wait_for_function(
                 "() => document.querySelectorAll('#sessions-list .session-row').length >= 1",
-                timeout=10000,
+                timeout=WAIT_MS,
             )
             page.click("#sessions-detach-all")
             page.wait_for_function(
-                "() => document.querySelectorAll('.tab').length === 0", timeout=10000
+                "() => document.querySelectorAll('.tab').length === 0", timeout=WAIT_MS
             )
             assert page.locator("#sessions-overlay").get_attribute("class") is not None
 
@@ -418,7 +425,7 @@ def test_browser_flow(tmp_path: Path) -> None:
     finally:
         server.send_signal(signal.SIGINT)
         try:
-            server.wait(timeout=10)
+            server.wait(timeout=WAIT_MS)
         except subprocess.TimeoutExpired:
             server.kill()
         shutil.rmtree(data, ignore_errors=True)
@@ -427,7 +434,7 @@ def test_browser_flow(tmp_path: Path) -> None:
 def _stop_server(server: subprocess.Popen[bytes]) -> None:
     server.send_signal(signal.SIGINT)
     try:
-        server.wait(timeout=10)
+        server.wait(timeout=WAIT_MS)
     except subprocess.TimeoutExpired:
         server.kill()
 
