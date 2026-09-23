@@ -111,6 +111,17 @@ class User:
     created_at: float
 
 
+def _is_lock_contention(exc: BaseException) -> bool:
+    """Is this "a peer is holding the database", i.e. worth another try?
+
+    Kept narrow: anything else -- a corrupt file, a missing directory -- must
+    surface immediately rather than be hidden behind twenty seconds of
+    retries.
+    """
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -128,11 +139,40 @@ class Store:
         self.sliding_ttl = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._init_schema()
-        self._migrate()
+        self._open_schema()
+
+    #: How long an open waits for a peer that is mid-migration. Concurrent
+    #: opens are a supported mode -- two instances sharing a data directory is
+    #: exactly what a SO_REUSEPORT handover does -- so "someone else holds the
+    #: lock" must not fail the open.
+    OPEN_LOCK_TIMEOUT = 20.0
+
+    def _open_schema(self) -> None:
+        """Apply pragmas, schema and migrations, waiting out a busy peer.
+
+        ``PRAGMA journal_mode=WAL`` and the DDL both take write locks. On
+        Windows in particular a peer mid-migration surfaces as
+        ``database is locked`` rather than waiting: ``busy_timeout`` covers
+        ordinary statements, not this window. The work below is idempotent
+        (``CREATE TABLE IF NOT EXISTS`` plus column additions that are already
+        tolerated), so retrying the whole sequence is safe and is what makes
+        "start two instances at once" work instead of one of them dying.
+        """
+        deadline = time.monotonic() + self.OPEN_LOCK_TIMEOUT
+        while True:
+            try:
+                self._conn.execute("PRAGMA busy_timeout=5000")
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._init_schema()
+                self._migrate()
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_lock_contention(exc):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def close(self) -> None:
         with self._lock:
