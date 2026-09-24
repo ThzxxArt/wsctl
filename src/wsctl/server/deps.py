@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 from typing import Any
 
 import segno
@@ -49,10 +50,30 @@ def require_admin(user: User = Depends(current_user)) -> User:
 
 
 def qr_svg(text: str) -> str:
-    """Render ``text`` as a standalone SVG QR code (for TOTP provisioning)."""
+    """Render ``text`` as a standalone SVG QR code (for TOTP provisioning).
+
+    segno emits ``width="45" height="45"`` (module pixels) and **no
+    viewBox**. Loaded through ``<img>`` that is harmless -- a replaced
+    element scales the whole *document* to its box, which is why the share
+    code always looked right. As an *inline* ``<svg>`` it is not: CSS
+    ``width/height: 100%`` enlarges only the viewport, the user units stay
+    1:1 with pixels, and the code keeps drawing at 45px in the corner of a
+    200px card. The viewBox is what ties user units to the viewport -- add
+    it, and the code finally scales with its container.
+    """
     buffer = io.BytesIO()
     segno.make(text, error="m").save(buffer, kind="svg")
-    return buffer.getvalue().decode("utf-8")
+    svg = buffer.getvalue().decode("utf-8")
+    if "viewBox" not in svg and "viewbox" not in svg:
+        match = re.search(r'width="(\d+)"\s+height="(\d+)"', svg)
+        if match:
+            svg = re.sub(
+                r"<svg\b",
+                f'<svg viewBox="0 0 {match.group(1)} {match.group(2)}"',
+                svg,
+                count=1,
+            )
+    return svg
 
 
 def render_setting(value: Any) -> str:

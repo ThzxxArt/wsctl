@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.19] - 2026-09-24
+
+**2FA 二维码从「45px 邮票」修成正常大小：根因是 SVG 缺 viewBox。**
+
+分享会话的二维码一直是正常大小，管理里启用 2FA 弹框中的码却**非常小**——
+两者 CSS 盒子同为 200px，但根本不是同一个东西：
+
+- **分享码**走 `<img src="qr.svg">`：替换元素会把**整份 SVG 文档**缩放到盒子，
+  segno 的 `width="45" height="45"` 无关紧要；
+- **2FA 码**是 `innerHTML` 注入的**行内** `<svg>`：segno 默认输出**没有 viewBox**，
+  CSS 的 `width/height: 100%` 只放大视口、用户单位仍是 1:1 像素——码永远按
+  固有的 **45px** 画在 200px 白盒的左上角。
+
+`qr_svg()` 现按固有尺寸补 `viewBox`（`0 0 W H`），行内 SVG 的内容才真正随容器
+缩放。尺寸同时对齐分享码规格取 **220×220**（分享 200×200；两者是同一量级的
+兄弟，且 2FA 必须一次扫对）。
+
+### Fixed
+
+- **`qr_svg` 缺 viewBox**（行内使用不缩放，45px 邮票的真正根因）。`<img>` 路径
+  一直是好的，故只有 2FA 中招——两条路径的差异正是定位线索。
+
+### Changed
+
+- `.qr-holder` 与 `.qr`（分享码）同规格：220×220 对 200×200。
+
+### 守卫（本版的教训收录）
+
+守卫连踩两个坑后才钉死：① 量 `svg` **元素盒子**（被 CSS 撑到 184px）——45px
+的码照过不误；② 量路径墨迹却把阈值设成 200px——墨迹只占 viewBox 的 82%
+（静区不画路径），修复后的 183px 反被误杀。现双钉：**DOM 上的 viewBox 属性**
+（根因本体）+ 路径墨迹 ≥ 150px（与缺陷态 ~37px 隔 4 倍），单测再断言
+`viewBox` 与固有宽高一致。**量盒子不等于量内容**。
+
+### Verified
+
+459 unit（含 28 前端结构契约）· 29 browser · 6 slow · 10 e2e 全绿；
+ruff / mypy strict / `node --check` 通过。
+
 ## [0.1.18] - 2026-09-24
 
 **连接生命周期收口：重连不双开、回放不掺旧帧、状态随事实复位。**

@@ -564,3 +564,27 @@ def test_a_background_tab_may_never_rewrite_the_connection_indicator() -> None:
     assert "setConnectionFor(s," not in js[connect_at : connect_at + 900], (
         "connect must paint the whole indicator state, not just the text"
     )
+
+
+def test_the_2fa_qr_matches_the_share_qr_scale() -> None:
+    """Two codes, one visual scale -- 2FA allowed to be a shade larger.
+
+    A desktop product: the phone comes to the monitor either way, so the codes
+    should look related rather than one being a stamp and the other a poster.
+    The contract is the *relationship* (never smaller than the share code),
+    not a magic number: whatever the share code is sized to, 2FA follows.
+    """
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    def px(selector: str, prop: str) -> int:
+        match = re.search(rf"\.{re.escape(selector)}\s*\{{[^}}]*?{prop}:\s*(\d+)px", css)
+        assert match is not None, f".{selector} must declare {prop}"
+        return int(match.group(1))
+
+    share, _2fa = px("qr", "width"), px("qr-holder", "width")
+    assert _2fa == px("qr-holder", "height"), "the QR holder must be square"
+    assert share == px("qr", "height"), "the share code must be square"
+    assert _2fa >= share, (
+        f"the 2FA QR ({_2fa}px) is smaller than the share QR ({share}px); "
+        "it is the one that must be scanned correctly on the first try"
+    )

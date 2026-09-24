@@ -315,6 +315,28 @@ def test_browser_flow(tmp_path: Path) -> None:
             ).first.locator("button:has-text('启用 2FA')").click()
             page.wait_for_selector("#qr-overlay:not(.hidden)", timeout=WAIT_MS)
             page.wait_for_selector("#qr-image svg", timeout=WAIT_MS)
+            # Desktop product: the code lives at the share-QR scale (200px)
+            # or a shade larger. Two facts are checked on the *rendered* DOM:
+            #
+            # 1. The inline SVG carries a viewBox. segno emits none -- with
+            #    CSS `width/height: 100%` the viewport grows and the code
+            #    stays at its intrinsic 45px in the corner. The viewBox is
+            #    what makes the code scale; the `<img>`-based share code was
+            #    always fine because a replaced element scales the document.
+            # 2. The drawn path is big. Measured on the svg *element* this
+            #    passed while the code was 45px (the box is stretched either
+            #    way). The path covers ~82% of the viewBox (the quiet zone is
+            #    not ink), so a ~204px viewport yields ~183px of path -- and
+            #    the 45px bug yields ~37px. 150px separates the two by 4x.
+            assert page.evaluate(
+                "() => { const s = document.querySelector('#qr-image svg');"
+                " return s && s.hasAttribute('viewBox'); }"
+            ), "the inline QR has no viewBox; it cannot scale past 45px"
+            qr_box = page.locator("#qr-image svg .qrline").bounding_box()
+            assert qr_box and qr_box["width"] >= 150 and qr_box["height"] >= 150, (
+                f"the 2FA QR code drew at {qr_box and qr_box['width']:.0f}px; "
+                "the share-QR scale expects about 180px of ink"
+            )
             page.keyboard.press("Escape")
             page.wait_for_selector("#qr-overlay.hidden", state="attached", timeout=WAIT_MS)
             assert page.locator("#admin-overlay").is_visible()
