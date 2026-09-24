@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.21] - 2026-09-24
+
+**环形缓冲要留「最新的 N 字节」，不是「整块整块地扔到不超容为止」。**
+
+CI 的 browser 腿挂了一条：重连后等不到 `XXXX`。根因不在 0.1.20 的改动，在
+0.1.17 就写下的 `_trim`——一场**PTY 读边界彩票**：
+
+```
+scrollback：[按键回显…, X洪峰块(5000B), 提示符(50B)]，预算 512B
+旧逻辑：while size>512: 整块弹出  →  只超 50 字节，却扔掉整个 5000B 的 X 块
+结果：只剩 b'prompt> '（8B）→ 重连回放无内容 → 超时
+```
+
+同一字节流三种分块方式（纯 Python 追踪）：X 洪峰与提示符**分两次读**（慢 CI
+的典型边界）必挂；**合一次读**（快机把两次写合并进同一次 `read()`）必过；
+X 分两读、尾巴随提示符则必过。0.1.18/0.1.19 的 CI 绿与本地全绿都是边界
+运气，0.1.20 抽到了坏的那次——**产品不允许把命运押在内核怎么分片上**。
+
+### Fixed
+
+- **`Scrollback._trim` 整块淘汰只在「移除整块仍装得下预算」时进行**，余量
+  交给尾切路径（保留最新 N 字节的本义）。对齐规则不变：淘汰到「最后一块
+  结束在序列外」；唯一保留块从序列中间开始时跳到边界。
+
+### 守卫
+
+- **三布局对拍**：同一字节流按三种 PTY 读边界分块，必须留**同一尾巴**——
+  从此与内核分片无关。上一版宣称的「丢帧触发确定性」只钉了丢帧那一半，
+  scrollback 留什么这一半仍是彩票，这次一并钉死。
+
+### Verified
+
+464 unit（含 29 前端结构契约 + 读边界不变性）· 30 browser · 6 slow ·
+10 e2e 全绿；ruff / mypy strict / `node --check` 通过。
+
 ## [0.1.20] - 2026-09-24
 
 **花屏的根因不在字节流，在恢复模型：屏幕在应用内存里，回放字节流永远还原不了 TUI。**

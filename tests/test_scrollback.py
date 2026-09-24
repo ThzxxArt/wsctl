@@ -297,3 +297,40 @@ def test_an_oversized_frame_must_not_take_the_queue_down_with_it() -> None:
     # ...and a later frame that *does* fit still gets through.
     client.put(b"tail")
     assert client.queued_binary() == b"REPLAY-REPLAY-REPLAYtail"
+
+
+def test_the_kept_tail_is_the_same_at_every_pty_read_boundary() -> None:
+    """A ring buffer keeps the newest N *bytes*, whatever the chunking.
+
+    The old eviction dropped whole heads while merely over budget: 50 bytes
+    over threw away an entire 5000-byte middle chunk, so whether a replay
+    still carried its tail depended on whether the PTY happened to deliver
+    the flood and the prompt in one read or two. One read passed, two reads
+    lost everything -- a flake that only a slow CI runner could reproduce,
+    and the product had no business depending on the kernel's chunking.
+
+    Three layouts of the same byte stream must keep the same tail.
+    """
+    def flood_tail(chunks: list[bytes]) -> bytes:
+        sb = Scrollback(max_bytes=512)
+        for ch in chunks:
+            sb.append(ch)
+        return sb.snapshot()
+
+    keystrokes = [bytes([c]) for c in b"printf 'X%.0s' {1..5000}"]
+    x_flood, prompt = b"X" * 5000, b"prompt> "
+    layouts = {
+        # flood and prompt as separate reads (a slow machine's boundary)
+        "split": [*keystrokes, x_flood, prompt],
+        # one read of everything (a fast machine coalesces the writes)
+        "coalesced": [*keystrokes, x_flood + prompt],
+        # the flood split in two, the tail riding with the prompt
+        "halfway": [*keystrokes, x_flood[:4000], x_flood[4000:] + prompt],
+    }
+    for name, chunks in layouts.items():
+        tail = flood_tail(chunks)
+        assert b"XXXX" in tail, (
+            f"layout {name!r} lost the newest history to whole-chunk eviction: "
+            f"kept {len(tail)} bytes ending {tail[-16:]!r}"
+        )
+        assert len(tail) <= 512

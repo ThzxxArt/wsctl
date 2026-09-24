@@ -113,22 +113,36 @@ class Scrollback:
         2. **Cut where the stream is outside a sequence**, using the same rule
            as :meth:`wsctl.server.client.WsClient._drop_oldest_binary`: keep
            evicting until the last chunk removed *ended* outside, so whatever
-           is now at the head starts at a fresh boundary. A stateless scan of
-           the head cannot tell -- it may legitimately begin mid-sequence.
+           is now at the head starts at a fresh boundary.
 
-        ``resume_state`` covers the one place that rule cannot reach: the last
+        And a third, from a flake that only reproduced on a slow CI runner:
+
+        3. **Evict a whole chunk only while it is *entirely* in excess.**
+           The old loop dropped heads while merely over budget, so being 50
+           bytes over threw away a whole 5000-byte middle chunk -- the newest
+           several kilobytes of history vanished instead of being tail-trimmed
+           to the budget. Whether a replay still carried its tail then depended
+           on how the PTY reads happened to split (``printf``'s flood and the
+           prompt in one read survived; in two reads everything went), which
+           is not a property the product may depend on.
+
+        ``resume_state`` covers the one place rule 2 cannot reach: the last
         chunk is kept even when the bytes before it left the parser inside a
         sequence (we do not throw away the only copy). That head is re-anchored
         by skipping the remainder of the sequence it resumes in.
         """
         resume_state: str | None = None
-        while self._size > self._max_bytes and len(self._chunks) > 1:
-            while len(self._chunks) > 1:
+        while self._chunks and self._size - len(self._chunks[0]) >= self._max_bytes:
+            dropped = self._chunks.popleft()
+            resume_state = self._inside.popleft()
+            self._size -= len(dropped)
+            # Rule 2: a head that resumes mid-escape cannot start a replay.
+            # Drop it too (the last copy is never dropped here -- rule 2
+            # gives way to the re-anchor below for a sole remaining chunk).
+            while resume_state is not None and len(self._chunks) > 1:
                 dropped = self._chunks.popleft()
                 resume_state = self._inside.popleft()
                 self._size -= len(dropped)
-                if resume_state is None:
-                    break
         if self._chunks and resume_state is not None:
             # The kept head resumes mid-escape. Skip the rest of that sequence
             # (its first half is gone) so the replay starts at a boundary.
@@ -144,10 +158,10 @@ class Scrollback:
                 self._chunks.popleft()
                 self._inside.popleft()
         if self._size > self._max_bytes and self._chunks:
-            # A single chunk larger than the cap: keep its tail. The cut must
-            # land outside a sequence as well -- feeding the dropped prefix to
-            # a tracker is the only way to know, because the tail may open on
-            # the remainder (``1m...``) rather than on an ESC.
+            # The head is *partially* needed (rule 3 kept it): keep its tail.
+            # The cut must land outside a sequence as well -- feeding the
+            # dropped prefix to a tracker is the only way to know, because the
+            # tail may open on the remainder (``1m...``) rather than on an ESC.
             chunk = self._chunks[0]
             drop = self._size - self._max_bytes
             tail = chunk[drop:]
