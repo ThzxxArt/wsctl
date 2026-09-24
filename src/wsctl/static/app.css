@@ -353,14 +353,20 @@ body { display: flex; flex-direction: column; }
    box its content actually needs: a confirm is narrow, a form is medium, a
    dashboard is wide. The previous scheme had three unlabelled widths and the
    settings dialog -- a theme gallery plus fifteen key bindings -- sat in the
-   360px one. */
-.modal-card.sm { width: 380px; }
-.modal-card.md { width: 480px; }
-.modal-card.lg { width: 560px; }
-.modal-card.xl { width: 720px; }
-.modal-card.narrow { width: 380px; }   /* legacy alias of sm */
-.modal-card.wide { width: 560px; }     /* legacy alias of lg */
-.modal-card.settings-card { width: 560px; }
+   360px one.
+
+   0.1.16 widened the four working dialogs again. They were sized for the
+   number of *fields*, not for what is in those fields: the new-session form
+   carries a two-column SSH block, the session list is a row of name + meta +
+   two actions, the admin panel lays out a six-column audit table, and Settings
+   runs a two-column key-binding grid. All four were wrapping what should have
+   fitted on one line. */
+.modal-card.sm { width: 400px; }
+.modal-card.md { width: 560px; }
+.modal-card.lg { width: 720px; }
+.modal-card.xl { width: 920px; }
+.modal-card.narrow { width: 400px; }   /* legacy alias of sm */
+.modal-card.wide { width: 720px; }     /* legacy alias of lg */
 .modal-card.tall { max-height: 86vh; }
 .login-card { width: 340px; }
 .modal-head {

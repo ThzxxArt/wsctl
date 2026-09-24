@@ -1722,7 +1722,7 @@ def test_browser_settings_dialog_is_wide_grouped_and_reports_the_renderer(
             page.wait_for_selector("#settings-overlay:not(.hidden)", timeout=WAIT_MS)
 
             box = page.locator("#settings-overlay .modal-card").bounding_box()
-            assert box is not None and box["width"] >= 500, (
+            assert box is not None and box["width"] >= 700, (
                 f"settings card is only {box and box['width']:.0f}px wide"
             )
             assert page.locator("#settings-overlay .field-group").count() >= 3, (

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.16] - 2026-09-24
+
+**四个工作弹框按内容重新定宽。**
+
+它们当初是按**字段数量**定尺寸的，而不是按**字段里装的是什么**：新建会话有两列的
+SSH 块、会话列表每行是「名称 + 元信息 + 两个动作」、管理面板铺一张**六列**审计表、
+设置里跑两列快捷键网格。四者都在 360–560px 的盒子里把本该一行放下的东西折了行。
+
+### Changed
+
+- **宽度阶梯重定**：`sm 400 / md 560 / lg 720 / xl 920`（此前 `380 / 480 / 560 / 720`）。
+  阶梯必须单调——两档宽度一旦塌成一档，弹框之间就再也没有宽度上的区分度。
+- **新建会话** 360 → **720**（`lg`）：SSH 的用户名/端口两列终于并排，不再被挤成两行。
+- **会话列表** 560 → **720**（`lg`）：名称、元信息与「打开 / 终止」同排。
+- **管理** 560 → **920**（`xl`）：审计表六列（时间/事件/用户/会话/IP/详情）不再换行。
+- **设置** 560 → **720**（`lg`）：快捷键两列网格的标签与输入框不再互相挤压。
+- 顺带删掉 `settings-card` 这个只用来覆盖宽度的类——宽度该由尺寸档位表达，
+  一个弹框私有的宽度值就是「阶梯被绕过」的入口。
+
+### Added
+
+- **宽度回归守卫**（`test_working_dialogs_are_wide_enough_for_their_own_content`）：
+  四个弹框各自的档位与该档位的最小宽度一并钉死，含「四档必须单调」断言。
+  将来谁「顺手调小一个数字」都会直接红。
+
+### Verified
+
+431 unit（含新增契约）· 24 browser · 6 slow · 10 前端结构契约 · 10 e2e 全绿；
+ruff / mypy strict / `node --check` 通过。
+
 ## [0.1.15] - 2026-09-23
 
 **根治网页终端的卡屏 / 闪屏 / 花屏，并修掉四处界面缺陷。**

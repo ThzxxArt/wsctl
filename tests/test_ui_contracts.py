@@ -196,3 +196,45 @@ def test_a_hidden_tab_keeps_its_layout_box_until_it_is_really_done() -> None:
     assert "display: none" not in body.group(0), (
         "display:none collapses the box and brings the blank frame back"
     )
+
+
+def test_working_dialogs_are_wide_enough_for_their_own_content() -> None:
+    """Four dialogs, sized for what is inside them rather than how many fields.
+
+    A two-column SSH block, a session row of name + meta + two actions, a
+    six-column audit table and a two-column key-binding grid all wrap badly in
+    a 360px card. This pins both halves: each dialog asks for a size tier, and
+    that tier is actually wide enough -- the tiers are the thing that silently
+    shrinks when someone "tidies up" a number.
+    """
+    html = INDEX.read_text(encoding="utf-8")
+    css = (ROOT / "src" / "wsctl" / "static" / "app.css").read_text(encoding="utf-8")
+
+    def card_class(anchor: str) -> str:
+        m = re.search(re.escape(anchor) + r'.*?class="([^"]*modal-card[^"]*)"', html, re.S)
+        assert m is not None, f"no modal card near {anchor}"
+        return m.group(1)
+
+    def tier_width(name: str) -> float:
+        m = re.search(rf"\.modal-card\.{name}\s*\{{[^}}]*width:\s*([0-9.]+)px", css)
+        assert m is not None, f"tier .modal-card.{name} is not defined"
+        return float(m.group(1))
+
+    widths = {name: tier_width(name) for name in ("sm", "md", "lg", "xl")}
+    # A monotone ladder: if two tiers ever collapse into one another, dialogs
+    # silently stop being distinguishable in width.
+    assert widths["sm"] < widths["md"] < widths["lg"] < widths["xl"], widths
+
+    want = {
+        "new-session-form": "lg",   # two-column SSH block
+        "sessions-overlay": "lg",   # name + meta + two actions per row
+        "admin-overlay": "xl",      # six-column audit table
+        "settings-overlay": "lg",   # two-column key-binding grid
+    }
+    for anchor, tier in want.items():
+        cls = card_class(anchor)
+        assert tier in cls.split(), f"{anchor} should ask for {tier}, got {cls!r}"
+        assert widths[tier] >= 700, (
+            f"{anchor} uses {tier} at {widths[tier]:.0f}px, which is too narrow "
+            "for the content it lays out"
+        )
