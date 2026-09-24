@@ -1753,12 +1753,36 @@ def test_browser_cjk_columns_stay_aligned(tmp_path: Path) -> None:
     xterm ships a Unicode **v6** width table whose East Asian widths are years
     out of date. When it is wrong, ``中文测试`` takes four cells instead of
     eight and every column after it slides -- which is what "花屏" looks like as
-    soon as the text is Chinese. ``@xterm/addon-unicode11`` is one half of the
-    fix (the width table) and the CJK monospace font stack is the other.
+    soon as the text is Chinese. ``@xterm/addon-unicode11`` is one half of
+    the fix (the width table) and the CJK monospace font stack is the other.
 
     Asserted on xterm's own buffer rather than on pixels: that is what the
     width table decides, and it is the same on every renderer -- the WebGL
     renderer paints to a canvas and leaves no DOM rows behind to measure.
+
+    Three traps this test previously stepped in, each of which made it pass
+    while proving nothing (or fail for reasons that have nothing to do with
+    widths):
+
+    1. **The echo of the command line contains the markers.** ``printf
+       '中文测试|...'`` echoes as a row holding ``中文测试|`` *and*
+       ``abcdabcd|`` -- so the wait matched the input, and both marker
+       columns were the *same* ``|`` on the *same* echoed row. The alignment
+       assertion held trivially before the shell had printed anything. (The
+       identical trap is documented for T1 in CHANGELOG 0.1.15: a completion
+       marker that appears in the input verifies nothing.)
+    2. **The completion marker must be computed by the shell.** ``echo
+       $((700*700))`` prints ``490000`` (the marker :func:`_done_marker` uses
+       in ``test_load.py``, precisely because a literal would echo); that
+       number is not in the command, so waiting for it waits for real output.
+    3. **The input is pure ASCII and Python manufactures the glyphs.**
+       Typing CJK/emoji relies on the key path (``type`` splits astral code
+       points, ``insert_text`` never reaches xterm's ``onData``), and
+       ``printf`` octals rely on the shell's escape grammar -- the fox row
+       "never arrived" on CI. ``print('\\U0001f98aX|')`` is ASCII on the wire
+       and the *Python runtime* produces the character: no key mapping, no
+       shell grammar. The echoed command then carries ``\\U0001f98a`` as
+       literals and can never fake the emoji row.
     """
     data = tmp_path / "data"
     files = tmp_path / "files"
@@ -1781,15 +1805,23 @@ def test_browser_cjk_columns_stay_aligned(tmp_path: Path) -> None:
             # Unicode 6, so xterm's *bundled* width table gets it wrong while
             # `@xterm/addon-unicode11` gets it right. (``中文`` cannot tell the
             # two tables apart: CJK ideographs are Wide in both.)
-            page.keyboard.type("printf '中文测试|\\nabcdabcd|\\n\\360\\237\\246\\212X|\\n'")
+            page.keyboard.type(
+                "python3 -c \"print('\\u4e2d\\u6587\\u6d4b\\u8bd5|'); "
+                "print('abcd'+'abcd|'); print('\\U0001f98aX|')\"; echo $((700*700))"
+            )
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, "abcdabcd")
+            _wait_screen_includes(page, "490000")
 
             # Locate the two marker columns in the buffer's own cell grid.
+            # The echo of the command is structurally excluded from faking any
+            # row: the CJK and fox exist only as ``\\u`` escapes in the input,
+            # ``abcdabcd`` exists only as ``'abcd'+'abcd'`` (the concatenation
+            # marker is broken up in the source), and ``490000`` is computed.
+            # The "python3" filter is belt and braces for the ASCII row.
             def marker_column(prefix: str) -> int:
                 screen = page.evaluate("() => window.__wsctlScreen().split('\\n')")
                 for idx, text in enumerate(screen):
-                    if prefix in text:
+                    if prefix in text and "python3" not in text and "700*700" not in text:
                         cells = page.evaluate(f"() => window.__wsctlRowCells({idx})")
                         for cell in cells:
                             if cell["ch"] == "|":
@@ -1798,8 +1830,8 @@ def test_browser_cjk_columns_stay_aligned(tmp_path: Path) -> None:
 
             cjk_col = marker_column("中文测试")
             ascii_col = marker_column("abcdabcd")
-            assert cjk_col >= 0, "the CJK row never arrived"
-            assert ascii_col >= 0, "the ASCII row never arrived"
+            assert cjk_col >= 0, "the CJK row never arrived as output"
+            assert ascii_col >= 0, "the ASCII row never arrived as output"
             assert cjk_col == ascii_col, (
                 f"columns do not line up: CJK marker at cell {cjk_col}, "
                 f"ASCII marker at cell {ascii_col}"
@@ -1809,8 +1841,15 @@ def test_browser_cjk_columns_stay_aligned(tmp_path: Path) -> None:
             # two cells. This is the assertion that fails when the addon is not
             # loaded -- the CJK alignment above cannot tell on its own.
             screen = page.evaluate("() => window.__wsctlScreen().split('\\n')")
-            fox_line = next((i for i, t in enumerate(screen) if "\U0001f98a" in t), -1)
-            assert fox_line >= 0, f"the emoji row never arrived: {screen[-3:]!r}"
+            fox_line = next(
+                (
+                    i
+                    for i, t in enumerate(screen)
+                    if "\U0001f98a" in t and "python3" not in t and "700*700" not in t
+                ),
+                -1,
+            )
+            assert fox_line >= 0, f"the emoji row never arrived: {screen[-6:]!r}"
             cells = page.evaluate(f"() => window.__wsctlRowCells({fox_line})")
             fox = [c for c in cells if c["ch"] == "\U0001f98a"]
             assert fox, cells[:12]
