@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -101,16 +102,26 @@ STALE_LOCK_SECONDS = 60.0
 
 
 def _pid_alive(pid: int) -> bool:
-    """Best-effort liveness; ``True`` when it cannot be determined."""
+    """Best-effort liveness; ``True`` when it cannot be determined.
+
+    **Never** ``os.kill(pid, 0)`` on Windows. ``signal.CTRL_C_EVENT`` is ``0``
+    there, so CPython's ``os.kill`` takes its ``sig == CTRL_C_EVENT`` branch
+    and sends the *caller's own process group* a console-control event -- the
+    probe interrupts itself with a KeyboardInterrupt from inside
+    ``threading.join``. ``server.maintenance.pid_alive`` documents the same
+    hazard; this is the second liveness probe in the tree and it must not
+    reintroduce it.
+    """
     if pid <= 0:
         return False
+    if sys.platform == "win32":  # pragma: no cover - platform specific
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except (PermissionError, OSError):
-        # Permission denied means it exists. Windows turns this into things
-        # that are not "absent", so assume alive rather than break a live lock.
+        # Permission denied means it exists.
         return True
     return True
 

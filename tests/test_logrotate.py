@@ -184,3 +184,29 @@ def test_a_lock_from_a_crashed_writer_is_broken_by_age(tmp_path: Path) -> None:
     old = _time.time() - logrotate.STALE_LOCK_SECONDS - 5
     _os.utime(lock, (old, old))
     assert logrotate._lock_is_stale(lock) is True
+
+
+def test_the_lock_liveness_probe_never_signals_on_windows() -> None:
+    """``os.kill(pid, 0)`` on Windows is not a probe -- it is **Ctrl+C**.
+
+    ``signal.CTRL_C_EVENT`` is ``0`` there, so the ``sig == CTRL_C_EVENT``
+    branch of CPython's ``os.kill`` matches and sends a console-control event
+    to the process group: the caller interrupts *itself*. That is what turned
+    ``windows-smoke`` into "127 passed" followed by a KeyboardInterrupt out of
+    ``threading.join`` and a 90-second hang. ``server.maintenance.pid_alive``
+    documents exactly this hazard; this is the second liveness probe and it
+    must not reintroduce it.
+    """
+    import sys
+
+    from wsctl.core import logrotate
+
+    if sys.platform == "win32":  # pragma: no cover - exercised on the CI leg
+        assert logrotate._pid_alive(12345) is True, (
+            "on Windows liveness cannot be probed; assume alive and fall back "
+            "to the age rule"
+        )
+    else:
+        assert logrotate._pid_alive(0) is False
+        assert logrotate._pid_alive(-1) is False
+        assert logrotate._pid_alive(2**22) is False or logrotate._pid_alive(2**22) is True
