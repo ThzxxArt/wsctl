@@ -9,6 +9,7 @@ vanished from the product. These endpoints are the missing read path.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -32,6 +33,28 @@ _REASONS = {
 }
 
 
+def _parse_argv(raw: object) -> list[str] | None:
+    """The ``argv`` column is JSON; the live view is a list. One shape only.
+
+    The endpoint used to hand back whichever it had -- a JSON *string* on the
+    history path, a ``list`` on the live one -- so a consumer had to branch on
+    "is it alive" just to read argv, and the 0.1.8 promise of "one shape either
+    way" was quietly broken by a type.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    if isinstance(raw, str):
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(loaded, list):
+            return [str(item) for item in loaded]
+    return None
+
+
 def _history_row(row: dict[str, Any]) -> dict[str, Any]:
     """Shape a finished ``term_sessions`` row for the UI."""
     created = float(row.get("created_at") or 0.0)
@@ -44,7 +67,7 @@ def _history_row(row: dict[str, Any]) -> dict[str, Any]:
         "owner": None,
         "backend": row.get("backend"),
         "command": row.get("command"),
-        "argv": row.get("argv"),
+        "argv": _parse_argv(row.get("argv")),
         "cwd": row.get("cwd"),
         "status": row.get("status"),
         # ``status`` is the enum, ``ended_reason`` is the sentence: "killed"

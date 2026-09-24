@@ -59,6 +59,14 @@ MAX_AUDIT_LINE = 512
 MAX_AUDIT_BUFFER = 8192
 ACCESS_RECHECK = 5.0
 
+#: Largest single input frame accepted from a client. The PTY write buffer has
+#: its own hard cap, but that check runs on what is *already buffered* -- one
+#: 16 MiB frame sailed past a 1 MiB "limit" whenever the buffer happened to be
+#: empty. The transport limit (uvicorn's ``ws_max_size``, 16 MiB) is not an
+#: application bound either. Rejected whole rather than sliced: a half-
+#: delivered keystroke sequence is worse than a reported drop.
+MAX_INPUT_FRAME = 256 * 1024
+
 
 # Close a connection that has sent nothing for this long. Both clients send a
 # `ping` every 25s, so this detects a half-open TCP connection (a peer that
@@ -187,14 +195,17 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         # the close code but never the sentence. Every denial path (share
         # revoked, login expired, idle timeout, rate limit) shared the defect.
         pending_close: list[int | None] = [None]
-        recheck: Callable[[], Awaitable[bool]] | None = None
+        recheck: Callable[[], Awaitable[User | None]] | None = None
         if user is not None and auth_token is not None:
             token = auth_token
 
-            async def recheck() -> bool:
+            async def recheck() -> User | None:
                 # Off the event loop: this runs every few seconds per connection
                 # and the store consults a short-lived cache on the hot path.
-                return await asyncio.to_thread(store.resolve_auth_session, token) is not None
+                # Returning the *user* (not a bool) is what lets the pump
+                # re-derive access: a demoted admin must not keep a writable
+                # handle on a session ``can_access()`` now refuses.
+                return await asyncio.to_thread(store.resolve_auth_session, token)
 
         await _pump(
             websocket,
@@ -216,6 +227,10 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             client.put({"type": "error", "msg": exc.message})
     except Exception:
         log.exception("websocket handler failed")
+        # An internal failure is *not* a clean shutdown. Reporting 1000 made
+        # the browser treat it as one and reconnect as if nothing happened.
+        if close_code == 1000:
+            close_code = CLOSE_SERVER_ERROR
     finally:
         if session is not None:
             with contextlib.suppress(Exception):
@@ -257,7 +272,12 @@ async def _handshake(
     try:
         raw = await websocket.receive_text()
         msg = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, KeyError, RuntimeError):
+        # ``KeyError`` is what Starlette raises for ``message["text"]`` when the
+        # first frame is *binary*; ``RuntimeError`` covers a socket torn down
+        # mid-handshake. Both are protocol violations, not internal errors --
+        # and falling through to the generic handler used to close with 1000
+        # ("normal closure"), which made the browser retry as if all were well.
         raise _Denied("首条消息必须是 JSON 格式的 attach", CLOSE_BAD_REQUEST) from None
     if not isinstance(msg, dict) or msg.get("type") != "attach":
         raise _Denied("首条消息必须是 attach", CLOSE_BAD_REQUEST)
@@ -265,8 +285,12 @@ async def _handshake(
     try:
         cols = int(msg.get("cols") or 80)
         rows = int(msg.get("rows") or 24)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # ``int(1e400)`` is an ``inf`` float that raises ``OverflowError``, not
+        # ``ValueError`` -- a bare 1000 close used to be the result.
         raise _Denied("cols/rows 必须是整数", CLOSE_BAD_REQUEST) from None
+    cols = min(max(1, cols), 1000)
+    rows = min(max(1, rows), 1000)
     sid = msg.get("session")
     share = msg.get("share") or share_param
 
@@ -379,7 +403,7 @@ async def _pump(
     *,
     writable: bool = True,
     share: str | None = None,
-    recheck: Callable[[], Awaitable[bool]] | None = None,
+    recheck: Callable[[], Awaitable[User | None]] | None = None,
     metrics: Metrics | None = None,
     close_code_out: list[int | None] | None = None,
 ) -> None:
@@ -387,9 +411,46 @@ async def _pump(
     read_only_notice = False
     backpressure_notice = False
     last_rx = time.monotonic()
+    # Drives the periodic re-validation. This must be a *clock*, not a side
+    # effect of "the receive timed out": the checks used to live only in the
+    # ``except TimeoutError`` branch, so any peer that kept sending a frame
+    # every few seconds -- ``ping``, even a malformed one -- postponed the
+    # share/auth/idle checks forever. A disabled account, a revoked token or a
+    # revoked share then kept a fully writable terminal indefinitely.
+    last_recheck = time.monotonic()
 
     def share_revoked() -> bool:
         return share is not None and not session.share_valid(share)
+
+    async def enforce_access() -> bool:
+        """Run the periodic re-validation. ``True`` = a denial was issued, stop.
+
+        Called whenever ``ACCESS_RECHECK`` has elapsed, at the top of the loop,
+        so it is driven by time rather than by which branch happened to run.
+        Every input path therefore inherits it, and a peer that never goes
+        quiet cannot dodge it.
+        """
+        nonlocal writable, last_recheck
+        if client.closed:
+            return True
+        if share_revoked():
+            await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
+            return True
+        if recheck is not None:
+            fresh = await recheck()
+            if fresh is None:
+                await deny("登录已失效，请重新登录", CLOSE_UNAUTHORIZED)
+                return True
+            # Re-derive access with the *fresh* user: a role change since the
+            # handshake must downgrade (or drop) this connection now rather
+            # than at the next reconnect.
+            access = _access(fresh, session, share)
+            if access is None:
+                await deny("无权访问该会话", CLOSE_FORBIDDEN)
+                return True
+            writable = access == "write"
+        last_recheck = time.monotonic()
+        return False
 
     async def deny(message: str, code: int = CLOSE_UNAUTHORIZED) -> None:
         """Explain, then let the caller close -- after the writer has flushed.
@@ -457,6 +518,23 @@ async def _pump(
                 {"type": "notice", "level": "warn", "msg": "终端输入过快，部分按键已丢弃"}
             )
 
+    oversized_notice = False
+
+    def reject_oversized() -> None:
+        """One notice per connection for a frame past the application bound."""
+        nonlocal oversized_notice
+        if oversized_notice:
+            return
+        oversized_notice = True
+        with contextlib.suppress(ClientGone):
+            client.put(
+                {
+                    "type": "notice",
+                    "level": "warn",
+                    "msg": "单条输入过大，已丢弃（可分批粘贴）",
+                }
+            )
+
     def forward_input(data: bytes) -> None:
         """Feed input to the child; report a drop instead of hiding it.
 
@@ -487,12 +565,16 @@ async def _pump(
                 on_line(line.decode("utf-8", "replace"))
 
     while True:
+        if time.monotonic() - last_recheck >= ACCESS_RECHECK and await enforce_access():
+            return
         try:
             message = await asyncio.wait_for(websocket.receive(), timeout=ACCESS_RECHECK)
         except TimeoutError:
-            # Re-validate periodically so a revoked/expired share, or a
-            # disabled user / revoked token, is enforced even on a session that
-            # produces no output.
+            # Only the *idle* rule lives here now. The share/auth re-validation
+            # is time-driven (``enforce_access`` above) and would already have
+            # fired on the way around the loop; keeping a second copy in this
+            # branch is what made "checks only run when the peer goes quiet"
+            # possible in the first place.
             if client.closed:
                 # The session dropped this client (e.g. memory backpressure);
                 # close the socket rather than lingering here.
@@ -500,12 +582,6 @@ async def _pump(
             if time.monotonic() - last_rx > IDLE_TIMEOUT:
                 # No ping/input for a long time: the peer is gone (half-open).
                 await deny("连接空闲超时，请重新连接", CLOSE_TIMEOUT)
-                return
-            if share_revoked():
-                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
-                return
-            if recheck is not None and not await recheck():
-                await deny("登录已失效，请重新登录", CLOSE_UNAUTHORIZED)
                 return
             continue
         last_rx = time.monotonic()
@@ -523,6 +599,13 @@ async def _pump(
                 return
             if not writable:
                 reject_readonly()
+                continue
+            if len(data_bytes) > MAX_INPUT_FRAME:
+                # Whole-or-nothing: a frame past the application bound never
+                # reaches the PTY write buffer (which would hold it in full).
+                if metrics is not None:
+                    metrics.inc("wsctl_pty_input_dropped_total")
+                reject_oversized()
                 continue
             if over_limit(len(data_bytes)):
                 if persistently_over_limit():
@@ -548,7 +631,7 @@ async def _pump(
                     session.resize(
                         int(data.get("cols") or 80), int(data.get("rows") or 24)
                     )
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     continue  # ignore a malformed resize rather than dropping the link
         elif kind == "input":
             # The same revocation check as the binary path. Text ``input`` used
@@ -562,6 +645,11 @@ async def _pump(
                 reject_readonly()
                 continue
             chunk = str(data.get("data", "")).encode("utf-8")
+            if len(chunk) > MAX_INPUT_FRAME:
+                if metrics is not None:
+                    metrics.inc("wsctl_pty_input_dropped_total")
+                reject_oversized()
+                continue
             if over_limit(len(chunk)):
                 if persistently_over_limit():
                     await deny("输入速率持续超限", CLOSE_RATE_LIMITED)
@@ -573,9 +661,14 @@ async def _pump(
             # browser counts frames it merged and sends the saving here, so
             # "is coalescing actually happening on real pages" is answerable
             # from /metrics rather than only from a synthetic test.
+            if share_revoked():
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
+                return
             coalesced = data.get("coalesced")
             if metrics is not None and isinstance(coalesced, (int, float)) and coalesced > 0:
-                metrics.inc("wsctl_ws_frames_coalesced_total", float(coalesced))
+                # Clamp: a client must not be able to inflate the metric (or
+                # feed it a huge value) at will.
+                metrics.inc("wsctl_ws_frames_coalesced_total", min(float(coalesced), 1e6))
             try:
                 client.put({"type": "pong"})
             except ClientGone:
@@ -591,6 +684,15 @@ async def _pump(
             # gone, and a full-screen application may still need its own repaint
             # afterwards. The client says exactly that instead of claiming a
             # restore it cannot deliver.
+            #
+            # The revocation check is *not* optional here: ``resync`` hands out
+            # the whole scrollback, and the session-level ``share_valid`` filter
+            # in ``_broadcast`` never sees this path (it replays straight from
+            # the session buffer). A revoked viewer used to be able to pull the
+            # entire history this way.
+            if share_revoked():
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
+                return
             if metrics is not None:
                 metrics.inc("wsctl_shed_resync_requests_total")
             try:

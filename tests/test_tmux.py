@@ -75,8 +75,8 @@ async def test_tmux_session_survives_restart() -> None:
         session = await manager.create(spec, sid=sid)
         first = FakeClient()
         await session.attach(first)
-        session.write_input(b"echo TMUX-MARK\n")
-        assert await wait_for(lambda: b"TMUX-MARK" in first.output())
+        session.write_input(b"echo $((31*37))\n")
+        assert await wait_for(lambda: b"1147\r\n" in first.output())
 
         # Simulate a server restart: keep the tmux session, drop the local state.
         await session.stop(preserve=True)
@@ -85,7 +85,7 @@ async def test_tmux_session_survives_restart() -> None:
         restored = await manager2.create(spec, sid=sid)
         second = FakeClient()
         await restored.attach(second)
-        assert await wait_for(lambda: b"TMUX-MARK" in second.output()), "screen not restored"
+        assert await wait_for(lambda: b"1147" in second.output()), "screen not restored"
         assert restored.backend == "tmux"
 
         # A real kill tears the tmux session down.

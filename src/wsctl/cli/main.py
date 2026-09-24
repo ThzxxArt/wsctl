@@ -625,7 +625,11 @@ _SERVE_FLAG_MAP = {
     "host": "--host",
     "port": "--port",
     "config": "--config",
-    "admin_password": "--admin-password",
+    # ``admin_password`` is deliberately *absent*: it travels to the detached
+    # child through ``WSCTL_ADMIN_PASSWORD`` in its environment (see
+    # ``daemon.child_env``). As a command-line flag it sat in
+    # ``/proc/<pid>/cmdline`` and in ``ps`` output, readable by every local
+    # user on the box -- including the one-shot bootstrap password.
     "ssl_cert": "--ssl-cert",
     "ssl_key": "--ssl-key",
     "log_level": "--log-level",
@@ -717,7 +721,7 @@ def _start_background(
     settings: Settings, argv: list[str], *, timeout: float, admin_password: str | None = None
 ) -> None:
     try:
-        instance = daemon_mod.start(settings, argv, timeout=timeout)
+        instance = daemon_mod.start(settings, argv, timeout=timeout, admin_password=admin_password)
     except daemon_mod.DaemonError as exc:
         _fail(str(exc))
     console.print(
@@ -850,7 +854,12 @@ def serve(
         bool, typer.Option("--no-auth", help="关闭认证（不安全）。")
     ] = False,
     admin_password: Annotated[
-        str | None, typer.Option("--admin-password", help="初始管理员密码。")
+        str | None,
+        typer.Option(
+            "--admin-password",
+            envvar="WSCTL_ADMIN_PASSWORD",
+            help="初始管理员密码（后台启动时经环境变量传递，不出现在进程表）。",
+        ),
     ] = None,
     ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
     ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
@@ -930,7 +939,12 @@ def start(
         bool, typer.Option("--no-auth", help="关闭认证（不安全）。")
     ] = False,
     admin_password: Annotated[
-        str | None, typer.Option("--admin-password", help="初始管理员密码。")
+        str | None,
+        typer.Option(
+            "--admin-password",
+            envvar="WSCTL_ADMIN_PASSWORD",
+            help="初始管理员密码（后台启动时经环境变量传递，不出现在进程表）。",
+        ),
     ] = None,
     ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
     ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
@@ -1044,7 +1058,14 @@ def restart(
     port: Annotated[int | None, typer.Option(help="监听端口。")] = None,
     config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
     no_auth: Annotated[bool, typer.Option("--no-auth", help="关闭认证。")] = False,
-    admin_password: Annotated[str | None, typer.Option("--admin-password")] = None,
+    admin_password: Annotated[
+        str | None,
+        typer.Option(
+            "--admin-password",
+            envvar="WSCTL_ADMIN_PASSWORD",
+            help="初始管理员密码（后台启动时经环境变量传递，不出现在进程表）。",
+        ),
+    ] = None,
     ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
     ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
     log_level: Annotated[str | None, typer.Option(help="日志级别。")] = None,
@@ -1122,6 +1143,12 @@ def restart(
             # process silently comes up on the default port instead.
             options.set("port", running.instance.port)
             options.set("host", running.instance.host)
+        if running.instance.reuse_port:
+            # And the *binding mode*: a plain ``restart`` used to drop
+            # ``--reuse-port``, after which the next ``restart --rolling`` had
+            # to fall back to a one-off migration with a visible gap -- the
+            # zero-downtime capability was silently downgraded.
+            options.set("reuse_port", True)
     elif running.ambiguous:
         err_console.print(
             f"[yellow]发现 {len(running.found)} 个实例，请用 --port 指定要重启哪一个：[/]"
@@ -2083,9 +2110,13 @@ def session_attach(
 ) -> None:
     """把当前终端连接到已有会话。"""
     try:
-        connect_mod.run_connect(url, sid, token, reconnect=not no_reconnect)
+        code = connect_mod.run_connect(url, sid, token, reconnect=not no_reconnect)
     except connect_mod.ConnectError as exc:
         _fail(str(exc))
+    if code:
+        # A fatal close (revoked login, forbidden, missing session, server
+        # error) is a failure and must not look like a clean detach to ``&&``.
+        raise typer.Exit(code=code)
 
 
 @session_app.command("record")
@@ -2206,9 +2237,11 @@ def connect(
 ) -> None:
     """把当前终端连接到远程 wsctl 服务。"""
     try:
-        connect_mod.run_connect(url, session, token, reconnect=not no_reconnect)
+        code = connect_mod.run_connect(url, session, token, reconnect=not no_reconnect)
     except connect_mod.ConnectError as exc:
         _fail(str(exc))
+    if code:
+        raise typer.Exit(code=code)
 
 
 if __name__ == "__main__":

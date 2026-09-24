@@ -25,14 +25,35 @@ SECURITY_HEADERS = {
 }
 
 
+def _is_loopback(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
 def client_ip(conn: Request | WebSocket, settings: Settings) -> str | None:
-    """Resolve the client IP, honouring ``X-Forwarded-For`` behind a proxy."""
+    """Resolve the client IP, honouring ``X-Forwarded-For`` behind a proxy.
+
+    Takes the **rightmost non-loopback hop**, not the leftmost. The header is
+    *appended* to by every proxy on the path (``proxy_add_x_forwarded_for`` in
+    the nginx example does exactly that), which means the leftmost entry is
+    whatever the client sent -- attacker-controlled. Reading it made
+    ``allowed_ips``, the login rate-limit key and every audit record forgeable.
+    The rightmost entry is the one our own trusted proxy observed.
+
+    Assumes a single trusted appending proxy; a multi-hop chain needs the
+    proxy count to be configured, which this deployment shape does not have.
+    """
     if settings.trust_proxy:
         forwarded = conn.headers.get("x-forwarded-for")
         if forwarded:
-            first = forwarded.split(",")[0].strip()
-            if first:
-                return first
+            hops = [part.strip() for part in forwarded.split(",") if part.strip()]
+            for hop in reversed(hops):
+                if not _is_loopback(hop):
+                    return hop
+            if hops:
+                return hops[-1]
     return conn.client.host if conn.client else None
 
 

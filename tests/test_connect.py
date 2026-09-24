@@ -56,7 +56,9 @@ def test_recv_loop_surfaces_operational_notices(monkeypatch: pytest.MonkeyPatch)
         json.dumps({"type": "attached", "incomplete": True}),
         json.dumps({"type": "exit", "code": 0}),
     ]
-    _notice_msg, code, exited = asyncio.run(_recv_loop(_FakeWS(messages), "sid", 80, 24))
+    _notice_msg, code, exited, _exit_code = asyncio.run(
+        _recv_loop(_FakeWS(messages), "sid", 80, 24)
+    )
     assert exited and code == 1000
     joined = "\n".join(said)
     assert "输出过快" in joined, "desync must reach the operator"
@@ -77,6 +79,8 @@ def test_recv_loop_stays_quiet_when_the_replay_is_whole(
         json.dumps({"type": "attached", "incomplete": False}),
         json.dumps({"type": "exit", "code": 0}),
     ]
-    _notice, _code, exited = asyncio.run(_recv_loop(_FakeWS(messages), "sid", 80, 24))
+    _notice, _code, exited, _exit_code = asyncio.run(
+        _recv_loop(_FakeWS(messages), "sid", 80, 24)
+    )
     assert exited
     assert said == [], f"a clean attach printed noise: {said}"

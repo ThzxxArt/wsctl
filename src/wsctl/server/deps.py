@@ -124,7 +124,7 @@ def serialize_session(
         # shape regardless of whether the session is still running. Consumers
         # should not have to branch on "is it alive" just to read argv.
         "duration": max(0.0, session.last_active - session.created_at),
-        "command": None,
+        "command": session.spec.command,
         "argv": list(session.spec.argv),
         "cwd": session.spec.cwd,
         "status": "running" if session.is_alive else "stopped",

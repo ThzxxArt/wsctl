@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -15,22 +16,74 @@ class FsError(Exception):
     """Raised for invalid paths or filesystem operations."""
 
 
+def _lexists(path: Path) -> bool:
+    """Does ``path`` exist, counting a dangling symlink as existing?
+
+    ``Path.exists()`` follows links, so a symlink whose target has gone away
+    looks absent -- and an "absent" target is exactly what a clobbering
+    ``rename`` then silently replaces.
+    """
+    try:
+        os.lstat(path)
+    except OSError:
+        return False
+    return True
+
+
+def rename_noreplace(source: Path, target: Path) -> None:
+    """Rename ``source`` to ``target``, refusing to clobber an existing entry.
+
+    ``os.rename`` silently replaces its target on POSIX: two concurrent renames
+    to the same new name both pass an ``exists()`` check and the second one
+    destroys the first one's file with no error anywhere. ``os.link`` fails
+    atomically on an existing name, so link-then-unlink is a rename that cannot
+    clobber. Filesystems without hard links (directories, FAT, some network
+    mounts) fall back to a checked rename -- narrower than the atomic form, but
+    better than refusing to work at all.
+    """
+    if _lexists(target):
+        raise FsError("已存在同名条目")
+    try:
+        os.link(source, target)
+    except FileExistsError as exc:
+        # The atomic half of the contract: the name is taken *right now*.
+        # This must not fall through to the rename fallback below -- that is
+        # exactly the clobbering path this function exists to avoid.
+        raise FsError("已存在同名条目") from exc
+    except (OSError, NotImplementedError):
+        try:
+            source.rename(target)
+        except FileExistsError as exc:
+            raise FsError("已存在同名条目") from exc
+        return
+    source.unlink()
+
+
 def safe_resolve(root: Path, rel: str | None) -> Path:
     """Resolve ``rel`` under ``root``, rejecting anything that escapes it.
 
-    Symlinks are followed before the containment check, so links that point
-    outside the root are rejected too.
+    Symlinks that point outside the root are rejected: containment is decided
+    on the *resolved* path. The caller, however, gets the **lexical** path
+    back. That split is deliberate and is the whole point -- operating on the
+    resolved path made every ``is_symlink()`` guard in this module dead code
+    (``.resolve()`` had already erased the link), so "拒绝操作符号链接" never
+    fired and a delete/rename on a link acted on whatever it pointed at.
     """
     root_resolved = root.resolve()
     rel = (rel or "").strip()
     if rel in ("", ".", "/"):
         return root_resolved
+    if "\x00" in rel:
+        # ``Path.resolve()`` raises ValueError on a NUL byte, which no caller
+        # here catches -- a 500 instead of a 400.
+        raise FsError("名称无效")
     if rel.startswith("/") or (len(rel) > 1 and rel[1] == ":"):
         raise FsError("absolute paths are not allowed")
-    candidate = (root_resolved / rel).resolve()
+    lexical = root_resolved / rel
+    candidate = lexical.resolve()
     if candidate != root_resolved and root_resolved not in candidate.parents:
         raise FsError("path escapes the configured root")
-    return candidate
+    return lexical
 
 
 def list_dir(
@@ -54,8 +107,11 @@ def list_dir(
     truncated = False
     for child in target.iterdir():
         try:
-            stat = child.stat()
-            is_dir = child.is_dir()
+            # ``lstat``: a symlink must not advertise its *target's* size and
+            # mtime (which may be outside the root). The listing shows the
+            # link; following it is a separate, guarded step.
+            stat = child.lstat()
+            is_dir = child.is_dir() and not child.is_symlink()
         except OSError:
             continue
         entries.append(
@@ -121,11 +177,13 @@ def rename_entry(root: Path, rel: str, new_name: str) -> Path:
     target = source.parent / new_name
     if target == source:
         return source
-    if target.exists():
-        raise FsError("已存在同名条目")
+    # ``safe_resolve`` hands back the lexical path, so these guards finally
+    # mean what they say: the link itself is refused, not whatever it points at.
     if target.is_symlink() or source.is_symlink():
         raise FsError("拒绝操作符号链接")
-    source.rename(target)
+    if _lexists(target):
+        raise FsError("已存在同名条目")
+    rename_noreplace(source, target)
     return target
 
 
@@ -170,15 +228,26 @@ def read_text_file(root: Path, rel: str, *, limit: int = PREVIEW_MAX_BYTES) -> t
 def write_text_file(root: Path, rel: str, content: str) -> int:
     """Replace a small text file atomically (sidecar + ``os.replace``)."""
     target = safe_resolve(root, rel)
+    if target.is_symlink():
+        # Checked first and on the *lexical* path: writing through a symlink
+        # would land in whatever it points at.
+        raise FsError("拒绝写入符号链接")
     if not target.is_file():
         raise FsError("不是文件")
-    if target.is_symlink():
-        raise FsError("拒绝写入符号链接")
     data = content.encode("utf-8")
     if len(data) > EDIT_MAX_BYTES:
         raise FsError(f"内容过大（上限 {EDIT_MAX_BYTES // 1024} KB）")
-    staging = target.parent / f".{target.name}.wsctl-edit"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    # Unique + ``O_EXCL``: a fixed sidecar name let two concurrent edits of the
+    # same file interleave their bytes into one staging file and publish the
+    # mixture, and a hostile neighbour could pre-create the predictable name to
+    # catch someone else's draft.
+    staging = target.parent / f".{target.name}.wsctl-{secrets.token_hex(8)}.edit"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     fd = os.open(staging, flags, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:

@@ -129,9 +129,13 @@ class Scrollback:
         ``resume_state`` covers the one place rule 2 cannot reach: the last
         chunk is kept even when the bytes before it left the parser inside a
         sequence (we do not throw away the only copy). That head is re-anchored
-        by skipping the remainder of the sequence it resumes in.
+        by skipping the remainder of the sequence it resumes in -- and when the
+        sequence is *still* open at the end of that head (an unterminated OSC),
+        the head stays: the next chunk continues the sequence rather than
+        starting where it ended, and dropping the head would empty the buffer.
         """
         resume_state: str | None = None
+        size_before = self._size
         while self._chunks and self._size - len(self._chunks[0]) >= self._max_bytes:
             dropped = self._chunks.popleft()
             resume_state = self._inside.popleft()
@@ -149,14 +153,25 @@ class Scrollback:
             probe = AnsiTracker()
             probe.resume(resume_state)
             head = probe.skip_to_boundary(self._chunks[0])
-            self._size -= len(self._chunks[0]) - len(head)
             if head:
+                self._size -= len(self._chunks[0]) - len(head)
                 self._chunks[0] = head
-            else:
-                # The whole head was the remainder of a sequence; the next
-                # chunk (if any) starts where that sequence ended.
-                self._chunks.popleft()
+            elif probe.state is None:
+                # The remainder of the sequence ended exactly at the chunk
+                # boundary: whatever follows is a fresh start.
+                dropped = self._chunks.popleft()
                 self._inside.popleft()
+                self._size -= len(dropped)
+            else:
+                # The sequence is *still* open at the end of the head -- an
+                # unterminated OSC, a transfer cut off by eviction. The next
+                # chunk does not start where it ended; it continues it, so
+                # dropping this head throws away the only copy and, when it is
+                # the sole remaining chunk, empties the buffer outright (the
+                # very thing "the last copy is never dropped" was written for).
+                # Keep it: a replay may start mid-sequence here, which is the
+                # honest lesser evil.
+                pass
         if self._size > self._max_bytes and self._chunks:
             # The head is *partially* needed (rule 3 kept it): keep its tail.
             # The cut must land outside a sequence as well -- feeding the
@@ -169,8 +184,22 @@ class Scrollback:
             if probe.feed(chunk[:drop]):
                 tail = probe.skip_to_boundary(tail)
             tail = _align_utf8(tail)
-            self._chunks[0] = tail
-            self._size -= len(chunk) - len(tail)
+            if tail:
+                self._size -= len(chunk) - len(tail)
+                self._chunks[0] = tail
+            # else: the cut would have left *nothing* -- the prefix and the
+            # tail are one unfinished sequence (or one character). Dropping the
+            # last copy empties the replay; being slightly over budget is the
+            # lesser evil, and "the last copy is never dropped" wins.
+        elif self._chunks and self._size < size_before:
+            # Whole-chunk eviction can land a multi-byte character's tail at
+            # the new head. Only the tail-cut path used to call ``_align_utf8``,
+            # so the "evict exactly one whole chunk and stop" layout replayed
+            # orphan continuation bytes as replacement glyphs.
+            aligned = _align_utf8(self._chunks[0])
+            if aligned:
+                self._size -= len(self._chunks[0]) - len(aligned)
+                self._chunks[0] = aligned
 
 
 def _align_utf8(buf: bytes) -> bytes:

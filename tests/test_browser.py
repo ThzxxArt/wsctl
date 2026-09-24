@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 import httpx
+import pyotp
 import pytest
 
 playwright_api = pytest.importorskip("playwright.sync_api")
@@ -179,9 +180,9 @@ def test_browser_flow(tmp_path: Path) -> None:
 
             # type into the terminal and see the echoed output
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo BROWSER-OK")
+            page.keyboard.type("echo $((103*107))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'BROWSER-OK'),
+            _wait_screen_includes(page, '11021'),
 
             # bundled addons are available
             assert page.evaluate("() => typeof window.ImageAddon") != "undefined"
@@ -191,9 +192,9 @@ def test_browser_flow(tmp_path: Path) -> None:
             # enabling ZMODEM must not break normal terminal I/O
             page.click("#zmodem-btn")
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo ZMODEM-ON-OK")
+            page.keyboard.type("echo $((137*139))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'ZMODEM-ON-OK'),
+            _wait_screen_includes(page, '19043'),
             page.click("#zmodem-btn")
 
             # create a second session and switch tabs. The "+" button now opens
@@ -337,9 +338,32 @@ def test_browser_flow(tmp_path: Path) -> None:
                 f"the 2FA QR code drew at {qr_box and qr_box['width']:.0f}px; "
                 "the share-QR scale expects about 180px of ink"
             )
+            # Esc closes the *topmost* modal (not the admin panel underneath).
             page.keyboard.press("Escape")
             page.wait_for_selector("#qr-overlay.hidden", state="attached", timeout=WAIT_MS)
             assert page.locator("#admin-overlay").is_visible()
+            # ...and abandoning an enrolment must leave the account untouched:
+            # two-step (0.1.22) means nothing is active until a code verifies.
+            page.wait_for_function(
+                "() => {"
+                " const row = document.querySelector('#admin-body .admin-table tbody tr');"
+                " return row && row.innerText.includes('启用 2FA');"
+                "}",
+                timeout=WAIT_MS,
+            )
+
+            # Now complete an enrolment properly: read the secret the dialog
+            # showed, compute a code, and confirm it.
+            page.locator(
+                "#admin-body .admin-table tbody tr"
+            ).first.locator("button:has-text('启用 2FA')").click()
+            page.wait_for_selector("#qr-overlay:not(.hidden)", timeout=WAIT_MS)
+            secret = page.inner_text("#qr-secret").strip()
+            assert secret, "the dialog must show the shared secret"
+            code = pyotp.TOTP(secret).now()
+            page.fill("#qr-code", code)
+            page.click("#qr-done")
+            page.wait_for_selector("#qr-overlay.hidden", state="attached", timeout=WAIT_MS)
             # Turn the 2FA back off (the row above is admin); leaving it on
             # would lock every later login behind a code nobody has.
             page.locator(
@@ -359,7 +383,7 @@ def test_browser_flow(tmp_path: Path) -> None:
             page.click(".term-pane.active .xterm-screen")
             page.click("#search-btn")
             page.wait_for_selector("#search-bar:not(.hidden)", timeout=WAIT_MS)
-            page.fill("#search-input", "BROWSER-OK")
+            page.fill("#search-input", "11021")
             page.wait_for_function(
                 "() => document.getElementById('search-count').textContent.includes('/')",
                 timeout=WAIT_MS,
@@ -403,9 +427,9 @@ def test_browser_flow(tmp_path: Path) -> None:
             # record the session, then replay it in the asciinema player
             page.click("#record-btn")
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo REPLAY-OK")
+            page.keyboard.type("echo $((149*151))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'REPLAY-OK'),
+            _wait_screen_includes(page, '22499'),
             page.click("#record-btn")  # stop
             page.wait_for_timeout(400)
             page.click("#replay-btn")
@@ -913,9 +937,13 @@ def test_browser_hotkey_help_and_search_options(tmp_path: Path) -> None:
 
             # -- search is case-sensitive only when asked ---------------------
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo MiXeD-case")
+            # Both halves matter: ``MiXeD-case`` is what the case-sensitivity
+            # assertions search for, and the arithmetic product is the
+            # unforgeable "the command really ran" marker (the echo of the
+            # command line can never contain 25591).
+            page.keyboard.type("echo MiXeD-case-$((157*163))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'MiXeD-case'),
+            _wait_screen_includes(page, '25591'),
             page.click("#search-btn")
             page.fill("#search-input", "mixed-case")
             page.wait_for_function(
@@ -948,9 +976,9 @@ def test_browser_hotkey_help_and_search_options(tmp_path: Path) -> None:
 
             # A bare `?` typed into the terminal reaches the shell.
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo Q?MARK")
+            page.keyboard.type("echo $((167*173))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'Q?MARK'),
+            _wait_screen_includes(page, '28891'),
             browser.close()
     finally:
         _stop_server(server)
@@ -992,8 +1020,9 @@ def test_browser_upload_can_be_cancelled(tmp_path: Path) -> None:
             )
             # Either the bar is up (progress events fired) or a local upload
             # this small finished first -- both are fine. What must not happen
-            # is a silent hang with no feedback at all. Only try to cancel if
-            # there is anything left to cancel.
+            # is a silent hang with no feedback at all. Record which happened
+            # rather than suppressing it away: "never showed anything" is the
+            # one outcome this test exists to rule out.
             with contextlib.suppress(Exception):
                 page.wait_for_selector("#file-upload-progress:not(.hidden)", timeout=4000)
             # Clicking is racy by nature here: on a fast runner the upload can
@@ -1005,14 +1034,17 @@ def test_browser_upload_can_be_cancelled(tmp_path: Path) -> None:
                     assert page.locator("#up-cancel").is_enabled()
                     page.click("#up-cancel", timeout=3000)
 
-            # Either the server already finished (nothing to cancel) or the
-            # abort was reported. What must never happen is a silent hang.
+            # A terminal state the user can see. The first version also
+            # accepted ``p.classList.contains('hidden')`` -- and the progress
+            # bar starts hidden, so "the UI never showed anything at all"
+            # passed instantly, which is exactly the silent hang the docstring
+            # forbids. The bar must have been up *or* the status line must say
+            # what happened.
             page.wait_for_function(
                 "() => {"
                 " const s = document.getElementById('file-status').textContent;"
-                " const p = document.getElementById('file-upload-progress');"
                 " return s.includes('已取消') || s.includes('上传完成')"
-                "   || p.classList.contains('hidden');"
+                "   || s.includes('未上传') || s.includes('失败');"
                 "}",
                 timeout=15000,
             )
@@ -1251,6 +1283,31 @@ def test_browser_history_reopen_uses_argv_and_refuses_ssh(tmp_path: Path) -> Non
                 ".some(el => el.textContent === 'redo')",
                 timeout=15000,
             )
+            # ...and it really replayed the *recorded* argv. A tab appearing is
+            # not evidence of that; the detail endpoint is.
+            created = [
+                s["id"]
+                for s in httpx.get(f"{BASE}/api/sessions", headers=headers, timeout=10).json()
+                if s["name"] == "redo" and s["id"] != sid
+            ]
+            assert created, "no reopened session appeared"
+            detail = httpx.get(
+                f"{BASE}/api/sessions/{created[0]}/detail", headers=headers, timeout=10
+            ).json()
+            assert detail["argv"] == ["sleep", "30"], detail["argv"]
+
+            # An SSH-shaped history row is refused rather than run locally.
+            ssh_sid = httpx.post(
+                f"{BASE}/api/sessions", headers=headers,
+                json={"name": "remote", "backend": "ssh",
+                      "ssh": {"host": "127.0.0.1", "port": 1}}, timeout=10,
+            ).json()["id"]
+            httpx.delete(f"{BASE}/api/sessions/{ssh_sid}", headers=headers, timeout=10)
+            refused = httpx.post(
+                f"{BASE}/api/sessions/{ssh_sid}/reopen", headers=headers, json={}, timeout=10
+            )
+            assert refused.status_code == 400, refused.text
+            assert "local" in refused.text
             browser.close()
     finally:
         _stop_server(server)
@@ -1384,9 +1441,9 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
                 timeout=15000,
             )
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo ALTC-TEST")
+            page.keyboard.type("echo $((179*181))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'ALTC-TEST'),
+            _wait_screen_includes(page, '32399'),
 
             # Alt+? opens the cheatsheet from inside the terminal (a bare `?`
             # must reach the shell instead).
@@ -1407,9 +1464,9 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
 
             # a bare `?` typed into the terminal reaches the shell
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo Q?MARK")
+            page.keyboard.type("echo $((167*173))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'Q?MARK'),
+            _wait_screen_includes(page, '28891'),
             browser.close()
     finally:
         _stop_server(server)
@@ -1444,9 +1501,9 @@ def test_browser_ctrl_shift_c_is_either_ours_or_the_browsers(tmp_path: Path) -> 
                 timeout=15000,
             )
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo SECRET-MARK")
+            page.keyboard.type("echo $((109*113))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'SECRET-MARK'),
+            _wait_screen_includes(page, '12317'),
             # Bring the page's own chord handling into play first, so a
             # toast later is unambiguously ours.
             page.keyboard.press("Control+Shift+F")  # open search (ours)
@@ -1462,6 +1519,15 @@ def test_browser_ctrl_shift_c_is_either_ours_or_the_browsers(tmp_path: Path) -> 
 
             if toasts_after > toasts_before:
                 # The page handled it: Ctrl+Shift+C is ours in this browser.
+                # A toast is not proof of a copy -- read the clipboard, which
+                # this context was granted permission for.
+                body = page.inner_text("#toasts")
+                if "没有选中内容" in body:
+                    return  # honest "nothing selected" is a correct outcome
+                copied = page.evaluate("() => navigator.clipboard.readText()")
+                assert copied, (
+                    f"the page claimed a copy but the clipboard is empty: {body!r}"
+                )
                 return
 
             # Otherwise the browser took the chord (DevTools). That is expected
@@ -1499,9 +1565,9 @@ def test_browser_alt_c_alt_v_are_the_working_copy_paste(tmp_path: Path) -> None:
                 timeout=15000,
             )
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo ALTC-MARK")
+            page.keyboard.type("echo $((127*131))")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, 'ALTC-MARK'),
+            _wait_screen_includes(page, '16637'),
             page.wait_for_timeout(200)
             toasts_before = page.locator("#toasts .toast").count()
             page.keyboard.press("Alt+c")
@@ -1521,65 +1587,111 @@ def test_browser_alt_c_alt_v_are_the_working_copy_paste(tmp_path: Path) -> None:
 
 
 def test_browser_full_screen_app_survives_a_flood(tmp_path: Path) -> None:
-    """`vi` must stay readable through a flood of colour sequences.
+    """A shed mid-colour-sequence must not garble the terminal -- and a TUI must
+    still draw afterwards.
 
-    This is the case that had zero coverage and is the honest limit of
-    "shed frames to keep the connection": dropping bytes across an ``ESC[31m``
-    boundary leaves the terminal parsing the tail of a colour as text, and a
-    full-screen program then renders as garbage. Shedding is now cut on
-    sequence boundaries, and this asserts the consequence end to end.
+    Dropping bytes across an ``ESC[31m`` boundary leaves the terminal parsing
+    the tail of a colour as text, and a full-screen program then renders as
+    garbage. Shedding is now cut on sequence boundaries; this asserts the
+    consequence end to end.
+
+    The flood goes through the **session under test's own output path** -- the
+    only place the shed ever sees. The first version fired recording HTTP
+    requests at a *different* session: not one byte of it reached this
+    terminal, so the assertions below passed against a screen nothing had ever
+    disturbed. The escapes are written to a file and ``cat``-ed, not typed:
+    typing them would echo ``\\033[31m`` as *text*, and the "no ``[31m`` as
+    text" assertion would then be measuring the command echo.
     """
     data = tmp_path / "data"
     files = tmp_path / "files"
     files.mkdir(parents=True)
-    server = _start_server(data, files)
+    os.environ["WSCTL_CLIENT_MAX_BYTES"] = "1024"
     try:
-        _wait_health()
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
-            _login(page)
-            page.wait_for_function(
-                "() => document.getElementById('connection').textContent === '已连接'",
-                timeout=15000,
-            )
-            page.click(".term-pane.active .xterm-screen")
-
-            # A full-screen program: `vi` on a temp file, with a known banner.
-            page.keyboard.type("vi /tmp/wsctl-fs-probe.txt")
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(1200)
-            rows = page.evaluate("() => window.__wsctlScreen()")
-            assert rows.strip(), "vi never drew anything"
-
-            # Now flood colour sequences from a second session -- the exact
-            # input that used to cut `ESC[31m` in half and garble `vi`.
-            headers = _headers_from(page)
-            other = httpx.post(
-                f"{BASE}/api/sessions", headers=headers,
-                json={"name": "flood", "command": "sh"}, timeout=10,
-            ).json()["id"]
-            for _ in range(40):
-                httpx.post(
-                    f"{BASE}/api/sessions/{other}/recording/start", headers=headers,
-                    json={}, timeout=5,
+        server = _start_server(data, files)
+        try:
+            _wait_health()
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_context(
+                    viewport={"width": 1400, "height": 900}
+                ).new_page()
+                _login(page)
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=15000,
                 )
-                httpx.post(
-                    f"{BASE}/api/sessions/{other}/recording/stop", headers=headers,
-                    timeout=5,
+                page.click(".term-pane.active .xterm-screen")
+
+                # Many *small* writes of colour sequences through this
+                # session's own output path. A single oversized write would be
+                # dropped whole (0.1.20: a doomed frame must not take the queue
+                # down with it) -- which never exercises a mid-sequence cut.
+                # Small frames fill the queue and force the shed to cut *inside*
+                # the stream, which is the case that used to garble `vi`.
+                #
+                # The command line is cleared first: typing the escapes would
+                # echo `\033[31m` as *text* and the "no `[31m` as text"
+                # assertion would then be measuring the command echo.
+                #
+                # The generator lives under ``tmp_path``: a fixed ``/tmp/f.py``
+                # is a cross-test collision waiting for the day two runs overlap.
+                gen_path = tmp_path / "floodgen.py"
+                gen = (
+                    f"python3 -c 'open(r\"{gen_path}\",\"w\").write("
+                    "\"import sys\\nfor _ in range(1500):\\n"
+                    " sys.stdout.write(\\\"\\\\x1b[31mRED\\\\x1b[0m\\\\n\\\")\\n\")'"
+                )
+                page.keyboard.type(gen)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(500)
+                page.keyboard.type("clear")
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(300)
+                page.keyboard.type(f"python3 {gen_path}")
+                page.keyboard.press("Enter")
+                # The shed is *reported* -- that is the proof the flood arrived
+                # and the queue had to drop frames.
+                page.wait_for_selector("#desync-bar:not(.hidden)", timeout=20000)
+
+                rows_after = page.evaluate("() => window.__wsctlScreen()")
+                assert rows_after, "the terminal is blank after the flood"
+                assert "\ufffd" not in rows_after, (
+                    "the terminal rendered replacement glyphs"
+                )
+                assert "[31m" not in rows_after, (
+                    f"a colour escape leaked through as text: {rows_after[:200]!r}"
+                )
+                assert "\x1b" not in rows_after, (
+                    f"a bare ESC survived as text: {rows_after[:200]!r}"
                 )
 
-            # Back on the `vi` tab: the screen must still be *terminal output*,
-            # not a wall of raw escape fragments or replacement glyphs.
-            page.wait_for_timeout(800)
-            rows_after = page.evaluate("() => window.__wsctlScreen()")
-            assert "\ufffd" not in rows_after, "the terminal rendered replacement glyphs"
-            assert "[31m" not in rows_after, "a colour escape leaked through as text"
-            assert "\x1b" not in rows_after
-            browser.close()
+                # And a full-screen program still draws: the shed cut the
+                # stream safely, so a TUI's repaint lands on an intact base.
+                # `vi` on a fresh file shows `~` rows *and* a "[New]" banner,
+                # in an order that varies with how far it has painted -- what
+                # must appear is its own chrome, not any particular row.
+                page.keyboard.type(f"vi {tmp_path}/fs-probe.txt")
+                page.keyboard.press("Enter")
+                page.wait_for_function(
+                    "() => {"
+                    " const s = window.__wsctlScreen ? window.__wsctlScreen() : '';"
+                    " return s.includes('~') || s.includes('[New]')"
+                    "   || s.includes('fs-probe.txt');"
+                    "}",
+                    timeout=20000,
+                )
+                rows = page.evaluate("() => window.__wsctlScreen()")
+                assert (
+                    "~" in rows or "[New]" in rows or "fs-probe.txt" in rows
+                ), f"vi did not draw its own chrome: {rows[:200]!r}"
+                assert "[31m" not in rows and "\x1b" not in rows
+                browser.close()
+        finally:
+            _stop_server(server)
     finally:
-        _stop_server(server)
-        shutil.rmtree(data, ignore_errors=True)
+        os.environ.pop("WSCTL_CLIENT_MAX_BYTES", None)
+        shutil.rmtree(files, ignore_errors=True)
 
 
 # -- 0.1.15 行为验证 ----------------------------------------------------
@@ -2317,8 +2429,13 @@ def test_browser_resync_interrupted_by_a_reconnect_never_goes_silent(tmp_path: P
                     timeout=WAIT_MS,
                 )
                 page.click(".term-pane.active .xterm-screen")
-                # One write larger than the budget: the shed (and therefore the
-                # bar) is deterministic, not a race against the consumer.
+                # One write larger than the byte budget: the shed (and
+                # therefore the bar) is deterministic, not a race against the
+                # consumer. The frame is dropped whole, so nothing renders
+                # live -- which is exactly why the *replay* is what must bring
+                # the marker back. Same shape as
+                # ``test_browser_clean_reconnect_clears_the_desync_bar``, which
+                # proves the replay does restore it.
                 page.keyboard.type("printf 'Y%.0s' {1..5000}")
                 page.keyboard.press("Enter")
                 page.wait_for_selector("#desync-bar:not(.hidden)", timeout=WAIT_MS)
@@ -2333,23 +2450,41 @@ def test_browser_resync_interrupted_by_a_reconnect_never_goes_silent(tmp_path: P
                     " || document.getElementById('connection').textContent.includes('重连')",
                     timeout=WAIT_MS,
                 )
-                # Either the reconnect replay restored the screen...
+                # Either the reconnect replay restored real content (a
+                # *specific* marker -- `length > 20` is satisfied by the echo
+                # of the command line and by blank-looking padding)...
+                restored = False
                 try:
                     page.wait_for_function(
                         "() => (window.__wsctlScreen ? window.__wsctlScreen() : '')"
-                        ".trim().length > 20",
+                        ".includes('YYYY')",
                         timeout=8000,
                     )
+                    restored = True
                 except Exception:
-                    # ...or the user is told, with a bar they can act on. A
-                    # blank screen and no explanation is the one failure.
-                    page.wait_for_selector("#desync-bar:not(.hidden)", timeout=2000)
-                screen = _screen_text(page)
-                bar_visible = page.locator("#desync-bar:not(.hidden)").count() > 0
-                assert screen.strip() or bar_visible, (
-                    "silent blank: no content and no desync bar after a resync "
-                    "was interrupted by a reconnect"
-                )
+                    pass
+                    screen = _screen_text(page)
+                    bar_visible = page.locator("#desync-bar:not(.hidden)").count() > 0
+                    state = page.evaluate(
+                        "() => ({"
+                        " screen: (window.__wsctlScreen ? window.__wsctlScreen() : '')"
+                        "          .slice(0, 120),"
+                        " diag: window.__wsctlDiag ? window.__wsctlDiag() : 'n/a',"
+                        "})"
+                    )
+                    if restored:
+                        # Content is back: claiming "已省略" any longer is a lie,
+                        # but the bar may lag a paint. Only require content.
+                        assert "YYYY" in screen
+                    else:
+                        # ...or the user is told, with a bar they can act on. A
+                        # blank screen and no explanation is the one failure. The
+                        # old `screen.strip() or bar_visible` was a tautology on
+                        # both branches of the try/except above.
+                        assert bar_visible, (
+                            "silent blank: no content and no desync bar after a "
+                            f"resync was interrupted by a reconnect; state={state!r}"
+                        )
                 browser.close()
         finally:
             _stop_server(server)
@@ -2513,7 +2648,7 @@ def test_browser_a_tui_repaints_itself_after_a_reconnect(tmp_path: Path) -> None
                     timeout=WAIT_MS,
                 )
                 page.click(".term-pane.active .xterm-screen")
-                page.keyboard.type("vi /tmp/wsctl-nudge-probe.txt")
+                page.keyboard.type(f"vi {tmp_path}/nudge-probe.txt")
                 page.keyboard.press("Enter")
 
                 def tilde_rows() -> str:

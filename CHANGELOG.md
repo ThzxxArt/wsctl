@@ -5,6 +5,198 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.22] - 2026-09-24
+
+**检查跟着事实走，操作原子且不越权——并把「测不到修复的守卫」一并清账。**
+
+一次全量深度审计（`core/` 26 文件、`server/` 20 文件、CLI 与前端、全部测试）挖出
+**6 个 P0、19 个 P1、35 个 P2、约 20 个 P3**，外加 **12 处空守卫**。四条同源缺陷链，
+根子是同一个：**系统在某个分支上做了正确的事，但没有把「事实」（时间流逝 / 消息到达 /
+并发窗口 / 断言对象）当成驱动条件**。
+
+```
+链 A  检查不随事实驱动          周期复查只挂在「receive 超时」分支上
+链 B  文件与写路径边界不原子    rename/上传暂存共用名字、copy-truncate 丢行
+链 C  声明的防护是死代码/假成功 symlink 守卫被 resolve() 抹掉、TOTP 一步锁死自己
+链 D  守卫测不到修复            测试体自己把修复做了一遍；回显假绿成片
+```
+
+### 链 A · 检查跟着事实走
+
+- **【P0】周期性授权复查改由时钟驱动，不再依赖「对端安静」。** `share_revoked()` /
+  `recheck()` / `IDLE_TIMEOUT` 原先只写在 `except TimeoutError:` 分支里——客户端只要
+  持续发帧（`ping`、非法 JSON、未知 type），`wait_for` 永不超时，禁用账号、改密吊销、
+  登录过期、分享撤销**全部永久失效**；且二进制与文本输入路径只查 `share_revoked()`，
+  **从不复查 auth**。现于循环顶部按 `last_recheck` 到期即执行，并**重算访问权**
+  （`_access(fresh_user, …)`）：被降权的管理员在断线前不再保有可写句柄。
+- **【P0】滑动 TTL 的窗口不再复利膨胀。** 续期只把 `expires_at` 前推，而窗口是
+  `expires_at - created_at`——每次续期都在把窗口本身拉长（实测 100→180→340→580…），
+  `session_ttl` 形同虚设。现续期时 `created_at` 同步前移，窗口在任意次续期后不变。
+  旧用例只测**一次**续期（复利从第二次才开始），属「测试会绿但代码错」。
+- **`resync` / `ping` 补上分享撤销检查。** `resync` 直接从会话缓冲吐出全部 scrollback，
+  `_broadcast` 里的 `share_valid` 过滤根本拦不到它——被撤销的观众仍可拉走整段历史。
+- **会话结束原因如实落库（含退出码）。** `_finalize` 知道退出码与「谁要求的停止」，
+  却留给维护循环写一个裸 `stopped`：用户敲 `exit`，历史里显示「服务退出或实例崩溃」，
+  退出码永久丢失。现由会话的 end-hook 在结束瞬间落库；kill 按执行者措辞
+  （「被管理员终止」/「被属主终止」）。
+
+### 链 B · 操作原子且不越权
+
+- **【P0】`rename_entry` 不再静默覆盖同名条目。** `exists()` 检查与 `rename()` 之间是
+  TOCTOU，而 POSIX `os.rename` 对已存在的目标**直接替换**——两个并发重命名同名，
+  后到者摧毁先到者的文件且无任何报错。现以 `os.link` + `unlink` 作为**原子不可覆盖**
+  重命名（link 对已存在目标原子失败），无硬链接的介质退化为受检 rename。
+  > 实现中被新守卫当场抓住一个自引入回归：`FileExistsError` 被 `except OSError` 吞掉后
+  > 走了会静默覆盖的 fallback——正是本条要消灭的行为。
+- **【P0】上传/编辑暂存名唯一化 + `O_EXCL`。** 固定的 `.{name}.wsctl-upload` 让两个并发
+  同名上传**写穿同一暂存文件**，`os.replace` 把两份字节的交织体以「完整文件」之名发布；
+  失败路径的 `staging.unlink` 还会删掉对方正在写的暂存。现暂存名带随机后缀、独占创建。
+- **symlink 守卫改为词法判定，死代码复活。** `safe_resolve` 先 `.resolve()` 抹掉链接
+  身份，三处 `is_symlink()` 守卫**永不可达**——删链接实际删的是它指向的文件。现 containment
+  用 resolved 路径判越界，**操作对象返回词法路径**，守卫按声明生效。
+- **`rename_noreplace` / 暂存唯一化同治 `write_text_file`**（`.{name}.wsctl-edit` 同病）。
+- **copy-truncate 日志轮转不再丢行 + 多实例互锁。** copy 完成到 `ftruncate` 之间落盘的行
+  原先**既不在 `.1` 也不在存活文件**（模块文档却声称「两边重复」）。现把 copy 之后的尾部
+  补写进备份，并以 `O_EXCL` 锁文件串行化轮转；`backup_count=0` 语义改为「清空、不留 `.1`」。
+- **备份的链接策略对称。** `create` 把 symlink 原样入档、`restore` 拒绝一切含链接的归档
+  ——一个软链就造出「备份成功但永远恢复不了」的陷阱。现创建时**跳过**链接（也不解引用，
+  不把档外内容拖进来），恢复侧的拒绝保留为纵深防御。
+- **PTY 写路径如实上报失败，硬顶按余量判定。** `_flush` 的 OSError 路径静默清空缓冲而
+  `write()` 已 `return True`——「送达」是谎言，审计被污染（暗示命令已执行）。单帧写原先
+  只在入口判断缓冲，16 MiB 一帧可直接灌穿「1 MiB 硬上限」。
+- **scrollback 两处「唯一拷贝」边界。** 超长未终结 OSC 触发淘汰时，re-anchor 与尾切两条
+  路径都会把唯一剩下的块丢光（`skip_to_boundary` 返回 `b""` 被读成「序列恰好结束」），
+  整个回放变空白。现规则统一为**淘汰永不清空缓冲**；整块淘汰路径也补上 UTF-8 对齐
+  （原先只有尾切路径做，「恰好落回预算」的布局会回放出孤立续接字节）。
+
+### 链 C · 声明与行为一致
+
+- **`trust_proxy` 的 XFF 改取最右非本机跳。** 该头是被代理**追加**的（README 自己的
+  `proxy_add_x_forwarded_for` 即如此），最左项就是攻击者自带的值——IP 白名单形同虚设、
+  登录限速 key 可无限轮换、审计 IP 全部可伪造。
+- **TOTP 启用改为两步确认（Web/API 与 CLI 对齐）。** 原先**在验证首个验证码之前**就把密钥
+  写进用户行：扫码失败或直接关窗，账号即要求一个从未录入的验证码，登录被永久拒绝。现
+  `POST /totp` 只生成待确认密钥，`POST /totp/confirm` 验证通过才生效；关闭弹框会撤销
+  待确认项。
+- **管理表格排序方向切换真正生效。** `sortRows` 读的 `spec._dir` 从未被写入（方向存在
+  `state.dir` 里但没传进去）——点表头只翻转箭头，数据仍升序。
+- **ssh `-o` 选项白名单。** `ProxyCommand` / `LocalCommand` / `KnownHostsCommand` 会在
+  **wsctl 主机本机**执行任意命令；用户可控的 options 列表原样透传等于给任何能建 ssh
+  会话的用户开了一张本机执行面。现只放行无法拉起进程的配置项，端口钳制 1..65535。
+- **CLI `connect` / `session attach` 对致命关闭码返回非零退出码。** 令牌失效、无权访问、
+  会话不存在、服务端错误原先都**静默以 0 收场**——`… && echo ok` 在认证失败时照样打印 ok。
+  会话自身退出则按 ssh 语义传递退出码。
+- **`credentials.json` 0600 原子创建。** 先 `write_text`（022 umask 下 0644）再 `chmod`
+  留下可读窗口；chmod 前掉电则**永久**全局可读，里面是长效会话令牌。
+- **`WSCTL_DAEMON` / `WSCTL_ROLLING_FROM_PID` / `WSCTL_LOG_FILE` 不再泄漏进会话 shell。**
+  继承了它们的 shell 会以为自己是被托管的守护进程：抢走恰好同 pid 的 pid 文件、
+  `serve --reuse-port` 误入托管语义、`log_file` 指向守护进程日志并在轮转时把它截断。
+  （e2e 早年被开发机 shell 里泄漏的 `WSCTL_DAEMON=1` 坑过一次，这次泄漏源是产品自己。）
+- **WinPty 用专用读线程，退出码不再谎报 0。** 阻塞 `read()` 塞进**默认**线程池会和
+  argon2 / 审计 / 维护循环抢 worker（十几个闲置 Windows 会话即全服务假死）；
+  `exitstatus or 0` 把「被信号杀死」报成正常退出。
+- **pid 文件「读后删」加二次比对。** 判死与 `unlink` 之间，对端可能已用 `O_EXCL` 写入
+  **新的活实例记录**，盲删删掉的是它。
+
+### 链 D · 不再有「测不到修复的守卫」
+
+- **两处「生产路径零守卫」补上。** `test_session_sliding_ttl_reload` 曾**在测试体里**把
+  `store.sliding_ttl = …` 做了一遍再断言（删掉 `app.py` 的接线全绿）；`test_upload_is_atomic`
+  曾自己重演 staging+`os.replace`，把生产路由改回直写目标无一变红，且用 `all(...)` 对
+  **空**样本列表空真通过。两条均改走生产路径，并要求观测非空。
+- **0.1.20 的 nudge 门控有了行为守卫。** 原用例名字说 nudge、断言里根本没有 nudge；
+  现以 spy 断言「空回放不重绘 / 有回放必重绘」（用静默子进程做确定性判别，不再与
+  shell 横幅赛跑）。
+- **0.1.21 的「三布局必须留同一尾巴」名副其实。** 原先只断言 `b"XXXX" in tail`（还是
+  输入自带的子串），三个布局**从未互相比对**；现断言三个尾巴逐字节相同且等于
+  `(洪峰+提示符)[-512:]`。
+- **回显假绿一次性清账（20+ 处）。** `echo BIG-OUTPUT-DONE` 型标记就写在键入的命令里，
+  tty 回显即命中——`seq 1 50000` 的输出可以被全部丢弃而用例照绿。全套件统一改为 shell
+  **算术**标记（`echo $((701*703))` → 等 `492803`）：命令行只含因子，乘积不可伪造。
+- **其余空壳**：代际守卫契约补上 `onerror`（注释说 4 个、实际查 3 个）；`incomplete`
+  判定从「全文出现过这个词」收紧为正则钉住 `int(dropped_events) > before`；
+  `test_revoked_share_stops_text_input_immediately` 不再放行 403（协议承诺的是 4403）；
+  `reopen` 用例原先验证「客户端自带 argv 被原样采用」——恰好是缺陷本身，改为验证
+  **服务端按记录重开**且客户端无法夹带。
+
+### Changed
+
+- `POST /api/users/{u}/totp` 不再立即生效（需 `/totp/confirm`）；`DELETE` 同时撤销待确认项。
+- `POST /api/sessions/{sid}/reopen` 的 `argv` / `backend` 改由**服务端按记录**决定，
+  请求体只剩 `name` / `cwd` 两个显示覆盖项；`{sid}` 不存在或无权时 404/403。
+- `SessionShare.ttl` 要求 `>= 1`（`None` 才是永久）；`ttl <= 0` 现为 422，而不是
+  200 + 一个必然无效的 token。
+- 请求体统一加上界（密码 256、内容 2 MiB、名称 200/255），超大密码不再直送 Argon2。
+- `scrollback_bytes` 要求 `>= 1`（0 会话构造即抛 ValueError，原先全站建不出会话且只报
+  一次 1000「正常关闭」）。
+- `/api/sessions/{sid}/detail` 的 `argv` 在**存活**与**历史**两条路径上同为 `list`；
+  `command` 两边都填。
+- 录制：手动开启同样受 `recordings_max_bytes` 约束；写入中的录制不可删（409）；
+  会话结束后属主仍可取回自己的 cast；未在录制时 `stop` 返回 409 而非 `{"ok": true}`。
+- `wsctl logs -f` 感知 copytruncate 轮转（size 回退即 `seek(0)` 补读）；`logs -n 0`
+  不再因 `[-0:]` 切片打印全部历史。
+- `wsctl restart` 保留原实例的 `--reuse-port`（原先静默降级，下一次滚动重启被迫走
+  一次性迁移）；`stop --force` 在 SIGKILL 后仍未消失时**报错**而非宣告成功。
+- `--admin-password` 不再进子进程 argv（`/proc/*/cmdline` 全机可读），改经一次性环境
+  变量传递。
+- CLI 失步提示与浏览器/服务端对齐（服务端已触发自动重绘），删除对 TUI 无效的 Ctrl+L 建议。
+
+- **PTY/WS 输入双层硬顶。** `PosixPty.write` 的上限原先只在入口判断缓冲量，单帧可
+  直接灌穿；`ws.py` 侧再无应用层帧上限（uvicorn 的 16 MiB `ws_max_size` 不是应用界）。
+  现两层都按「整帧拒绝、并提示可分批粘贴」处理。
+- **`attached` 在「回放为空且用户本就被告知不完整」时不得收起失步提示条。** 原先无条件
+  `clearDesync`：回放为空时它会把屏幕重置成空白并同时撤掉唯一的解释，正是「静默空白」。
+- **轮转锁必须能被陈旧回收。** `O_EXCL` 锁文件的释放在 `finally` 里，而 `SIGKILL`
+  跑不到 `finally`——一次崩溃即让锁永留，此后 `rotate_if_needed` 永远返回 False，
+  **日志轮转就此永久失效**、日志无限增长。现锁内记 pid，持有者已死或超龄（60s）
+  即可被接管；「崩过一次就永远坏」不该是这套软件的行为。
+- **`wsctl logs -f` 的轮转恢复改为确定性判据。** 「size 回退则 `seek(0)`」只在读到空时
+  生效：若轮转在两次轮询之间「截断 + 重写」整个完成（新内容 ≥ 旧偏移），读者会在新文本
+  中间续读、**静默跳过前缀**（实测丢掉 `AFTER-`）。轮转现留下 `.log.gen` 代际标记，
+  跟随者据此判定「这个 inode 被清空过」。
+
+### 根治：重绘是刷新，不是内容——`nudge_repaint` 的输出不得进 scrollback
+
+「`resync` 被重连打断后，回放字节已写入 xterm 而屏幕仍空」的根因已定案并根治。
+逐次写入的 ESC 映射给出铁证：回放的 651 字节在 **offset 235** 带着 `\r\x1b[K`
+——那是 `nudge_repaint` 触发 bash 重绘时**被录进了 scrollback** 的擦行序列：
+
+```
+resync → nudge_repaint → bash 重绘「\r\x1b[K + 提示符」→ 污染 scrollback
+重连回放 = [92 个 Y][提示符][\r\x1b[K + 提示符]        ← 自毁式回放
+           └──────── 被 \r\x1b[K 擦掉 ────────┘
+```
+
+尾部回放**失去了该序列当初的光标位置上下文**：它本该擦掉屏幕中部的提示行，却落在
+回放刚画的那一行上。回放能不能活下来只取决于它恰好跨几行——与 0.1.21「读边界彩票」
+同类的、产品不该依赖的运气。
+
+**修复**：重绘是**显示刷新**，不是会话内容。`nudge_repaint` 期间屏蔽 scrollback
+写入；实况观众照常收到刷新（这才是 nudge 的目的），录制照常记录字节流。回归守卫
+`test_a_repaint_is_a_refresh_not_content_so_it_stays_out_of_the_scrollback`
+把字节注入**mute 窗口内部**再断言「scrollback 快照逐字节不变、实况客户端必须收到」
+——等真实重绘的写法会让守卫对着未修改的代码也通过，那是守卫最不能犯的错。
+
+> 诊断钩子保留为产品能力（`window.__wsctlDiag` 的 `resetLog` / `wroteBytes`）：
+> 「屏幕是空的，谁擦的」是这套终端最坏的失败形态，支持排查需要它。
+>
+> **诚实边界**：mute 窗口为 nudge 的两帧 SIGWINCH 加 50ms 落地余量（约 100ms）。
+> 这段时间里**正常输出**同样不进 scrollback（实况观众不受影响）。取舍是明确的：
+> 少 100ms 的可回放历史，换掉「回放自毁」这一整类故障。nudge 只发生在 attach /
+> resync 的恢复时刻，损失面极小。
+
+### Verified
+
+526 unit（含新增的 45+ 判别性守卫与前端结构契约）· 6 slow · 30 browser · 11 e2e 全绿；
+ruff / mypy strict / `node --check` 通过。**突变体反向验证证毕**（逐项注入旧逻辑必红，再逐项恢复）：
+时钟驱动 recheck · 滑动 TTL 复利 · 结束原因落库 · rename 静默覆盖 · symlink 词法守卫 ·
+scrollback 唯一拷贝（re-anchor 与尾切两条路径）· XFF 最左项 · nudge 门控 ·
+**重绘不入 scrollback** · **生命周期环境变量单一定义** · **ws 输入帧上限** ·
+**轮转锁陈旧回收**。
+> 守卫清账本身也按同一把尺子验收：第一版的「三布局对拍」与「滑动 TTL」突变体**照绿**，
+> 已按「能让错代码通过的守卫不是守卫」重做（前者补互比与精确尾巴，后者把时钟步进 80s
+> 让复利显形）。
+
 ## [0.1.21] - 2026-09-24
 
 **环形缓冲要留「最新的 N 字节」，不是「整块整块地扔到不超容为止」。**

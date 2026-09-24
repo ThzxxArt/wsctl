@@ -180,19 +180,28 @@ class PosixPty:
     def write(self, data: bytes) -> bool:
         if not data:
             return True
-        if len(self._write_buf) >= MAX_WRITE_BUFFER:
-            # The child is not draining its stdin; drop input rather than grow
-            # without bound (memory hard limit for the write path). The caller
-            # is told so the user does not experience this as a dead keyboard.
+        # The hard cap is enforced on *what would be buffered*, not only at the
+        # door: a single oversized frame used to walk straight in past a 1 MiB
+        # "limit" because the check ran before ``extend``. Whole-or-nothing --
+        # a half-delivered keystroke sequence is worse than a reported drop.
+        room = MAX_WRITE_BUFFER - len(self._write_buf)
+        if room <= 0 or len(data) > room:
             global _dropped_input_total
             _dropped_input_total += 1
             self._dropped += 1
             return False
         self._write_buf.extend(data)
-        self._flush()
-        return True
+        return self._flush()
 
-    def _flush(self) -> None:
+    def _flush(self) -> bool:
+        """Push buffered bytes toward the child. ``False`` = the link is gone.
+
+        An ``OSError`` here is EIO on a master whose child has exited. Clearing
+        the buffer and returning silently made ``write()`` report *success* for
+        input that never arrived -- and the caller audits only what it believes
+        reached the shell, so a vanished session came to look like a command
+        that had run.
+        """
         while self._write_buf:
             try:
                 written = os.write(self._fd, self._write_buf)
@@ -200,12 +209,16 @@ class PosixPty:
                 if not self._writer_registered:
                     self._loop.add_writer(self._fd, self._on_writable)
                     self._writer_registered = True
-                return
+                return True
             except OSError:
+                global _dropped_input_total
+                _dropped_input_total += 1
+                self._dropped += 1
                 self._write_buf.clear()
-                return
+                return False
             del self._write_buf[:written]
         self._unregister_writer()
+        return True
 
     def _on_writable(self) -> None:
         self._flush()

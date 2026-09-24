@@ -170,9 +170,10 @@ def create_app(
         a restart). The snapshot and that one UPDATE therefore stay in a single
         synchronous stretch on the loop.
         """
-        expired = await app.state.manager.reap_expired()
-        for sid in expired:
-            app.state.store.term_session_set_status(sid, "expired", "超过空闲或最长寿命")
+        await app.state.manager.reap_expired()
+        # The end of an expired session is persisted by the manager's
+        # ``on_session_end`` hook (with the real reason); the sweep below only
+        # marks rows orphaned by a crash, where "not in memory" is all we know.
         alive = {s.id for s in app.state.manager.list_sessions()}
         app.state.store.term_session_stop_missing(alive, instance_id=instance_id)
         limiter.sweep()
@@ -291,6 +292,25 @@ def create_app(
     app.state.auth_cache = AuthCache(ttl=30.0)
     app.state.store.set_auth_cache(app.state.auth_cache)
     app.state.manager = manager or SessionManager()
+    # A session that ends writes its own row, with the real reason and exit
+    # code, at the moment it ends. The maintenance sweep below only catches
+    # rows orphaned by a crash -- for those, a bare ``stopped`` and the
+    # "服务退出或实例崩溃" fallback are the honest answer.
+    if getattr(app.state.manager, "_on_session_end", None) is None:
+
+        async def _persist_session_end(session: session_mod.TermSession) -> None:
+            if session.end_status == "running":
+                # A preserved tmux session: its shell lives on and the row must
+                # stay ``running`` so the next startup adopts it.
+                return
+            await asyncio.to_thread(
+                app.state.store.term_session_set_status,
+                session.id,
+                session.end_status,
+                session.end_reason,
+            )
+
+        app.state.manager._on_session_end = _persist_session_end
 
     app.state.reload_requested = False
     app.state.maintenance_last = time.monotonic()

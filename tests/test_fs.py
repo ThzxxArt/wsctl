@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
+import os
 from pathlib import Path
 
 import pytest
 
 from wsctl.core import fs
+from wsctl.core.config import load_settings
 from wsctl.core.fs import FsError, list_dir, relative_to, safe_resolve
 
 
@@ -77,43 +80,62 @@ def test_upload_is_atomic_a_reader_never_sees_a_half_file(tmp_path: Path) -> Non
 
     The old upload wrote straight into the destination with O_TRUNC, so a
     download issued during a long upload returned truncated bytes. The writer
-    now stages to a sidecar and ``os.replace``s it into place, which is atomic
-    on one filesystem.
+    now stages to a sidecar and renames it into place with ``os.replace``.
+
+    The first version of this test re-implemented the staging *itself*
+    (``os.open(staging)`` + ``os.replace`` in the test body) and only called
+    the copy helper -- reverting ``upload_file`` to a direct write changed
+    nothing. It also used ``all(...)`` over a possibly *empty* sample list,
+    which is vacuously true: a reader that never observed anything "passed".
+    The production route is now what runs, and the reader must actually see
+    the finished file.
     """
-    import os
+    import io
     import threading
 
-    from wsctl.server.routes.files import _copy_upload
+    from fastapi.testclient import TestClient
 
-    root = tmp_path
-    name = "atomic.bin"
-    dest = root / name
+    from wsctl.core.store import Store
+    from wsctl.server.app import create_app
+
+    files = tmp_path / "files"
+    files.mkdir()
+    settings = load_settings(data_dir=tmp_path / "data", file_root=files)
+    store = Store(tmp_path / "data" / "db.sqlite")
+    store.user_create("admin", "password123", role="admin")
+    app = create_app(settings, store=store)
     payload = b"A" * (2 * 1024 * 1024)
-    staging = root / f".{name}.wsctl-upload"
+    dest = files / "atomic.bin"
     seen: list[int] = []
     stop = threading.Event()
 
     def reader() -> None:
         while not stop.is_set():
-            if dest.exists():
+            with contextlib.suppress(OSError):
                 seen.append(dest.stat().st_size)
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(staging, flags, 0o600)
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
-    import io
-
-    size = _copy_upload(io.BytesIO(payload), fd, limit=10 * 1024 * 1024, chunk_size=65536)
-    os.replace(staging, dest)
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/login", json={"username": "admin", "password": "password123"}
+        ).status_code == 200
+        r = client.post(
+            "/api/files/upload",
+            data={"path": ""},
+            files={"file": ("atomic.bin", io.BytesIO(payload))},
+        )
+        assert r.status_code == 201, r.text
     stop.set()
     thread.join(timeout=5)
 
-    assert size == len(payload)
     assert dest.read_bytes() == payload
-    # Whatever the reader observed, it was never a *partial* file: a size that
-    # is not 0 (absent) and not the full payload means the staging broke.
+    # Whatever the reader observed, it was never a *partial* file...
     assert all(s in (0, len(payload)) for s in seen), seen[:10]
+    # ...and it did observe the finished one. An empty sample list is the
+    # vacuous pass this guard used to die of.
+    assert seen, "the reader never sampled the file at all"
+    assert len(payload) in seen, "the reader never saw the published file"
 
 
 def test_make_dir_rejects_names_that_escape(tmp_path: Path) -> None:
@@ -226,3 +248,258 @@ def test_make_dir_validates_the_name_exactly_once_and_re_resolves(tmp_path: Path
     # The returned path is inside the root and is the one that exists.
     assert made.resolve().is_relative_to(tmp_path.resolve())
     assert made.is_dir()
+
+
+# -- 0.1.22: the link itself is the operation's subject, not its target --------
+
+
+def _make_link(target: Path, link: Path) -> bool:
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - Windows
+        pytest.skip(f"symlinks unavailable here: {exc}")
+    return True
+
+
+def test_deleting_a_link_removes_the_link_not_its_target(tmp_path: Path) -> None:
+    """``safe_resolve`` used to hand back the *resolved* path.
+
+    Every ``is_symlink()`` guard in the module was then dead code (``.resolve()``
+    had already erased the link), so "拒绝操作符号链接" never fired and a delete
+    on a link removed whatever it pointed at -- with the link left dangling.
+    """
+    target = tmp_path / "real.txt"
+    target.write_text("precious", encoding="utf-8")
+    _make_link(target, tmp_path / "link.txt")
+    # The guard refuses to operate on a link at all...
+    with pytest.raises(FsError):
+        fs.rename_entry(tmp_path, "link.txt", "other.txt")
+    # ...and a delete that *does* handle links removes the link itself.
+    fs.delete_entry(tmp_path, "link.txt")
+    assert not (tmp_path / "link.txt").exists()
+    assert target.read_text(encoding="utf-8") == "precious", (
+        "the link's target was destroyed instead of the link"
+    )
+
+
+def test_writing_through_a_link_is_refused(tmp_path: Path) -> None:
+    target = tmp_path / "real.txt"
+    target.write_text("original", encoding="utf-8")
+    _make_link(target, tmp_path / "link.txt")
+    with pytest.raises(FsError):
+        fs.write_text_file(tmp_path, "link.txt", "overwritten")
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+def test_rename_refuses_an_existing_target_even_a_dangling_link(tmp_path: Path) -> None:
+    """``Path.exists()`` follows links, so a dangling symlink looks absent."""
+    source = tmp_path / "src.txt"
+    source.write_text("source", encoding="utf-8")
+    gone = tmp_path.parent / "definitely-not-here"
+    gone.unlink(missing_ok=True)
+    _make_link(gone, tmp_path / "dst.txt")
+    with pytest.raises(FsError):
+        fs.rename_entry(tmp_path, "src.txt", "dst.txt")
+    assert source.exists(), "the source must survive a refused rename"
+
+
+def test_rename_never_clobbers_an_existing_file(tmp_path: Path) -> None:
+    """Sequential case: the name is taken, so the rename is refused."""
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("FIRST", encoding="utf-8")
+    second.write_text("SECOND", encoding="utf-8")
+    fs.rename_entry(tmp_path, "first.txt", "shared.txt")
+    with pytest.raises(FsError):
+        fs.rename_entry(tmp_path, "second.txt", "shared.txt")
+    assert (tmp_path / "shared.txt").read_text(encoding="utf-8") == "FIRST"
+    assert second.read_text(encoding="utf-8") == "SECOND", (
+        "the loser of the race lost its file instead of getting an error"
+    )
+
+
+def test_rename_noreplace_refuses_without_a_pre_check(tmp_path: Path) -> None:
+    """The atomic primitive's own contract -- no ``exists()`` to hide behind.
+
+    The pre-check only catches the *sequential* case. The race is decided
+    entirely by whether the rename primitive itself can clobber, so this is
+    the assertion that keeps a clobbering ``os.rename`` from coming back.
+    """
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("A", encoding="utf-8")
+    b.write_text("B", encoding="utf-8")
+    fs.rename_noreplace(a, tmp_path / "c.txt")
+    with pytest.raises(FsError):
+        fs.rename_noreplace(b, tmp_path / "c.txt")
+    assert (tmp_path / "c.txt").read_text(encoding="utf-8") == "A"
+    assert b.read_text(encoding="utf-8") == "B"
+
+
+def test_the_toctou_window_alone_cannot_lose_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blind the ``exists()`` check and the atomic half must still refuse.
+
+    This is the real race: both callers observe "nothing there yet" and only
+    the primitive decides. ``os.rename`` replaces its target silently on
+    POSIX -- two concurrent renames to one name then destroy a file with no
+    error anywhere -- and this is the only assertion that sees it.
+    """
+    monkeypatch.setattr(fs, "_lexists", lambda path: False)
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("FIRST", encoding="utf-8")
+    second.write_text("SECOND", encoding="utf-8")
+    fs.rename_entry(tmp_path, "first.txt", "shared.txt")
+    with pytest.raises(FsError):
+        fs.rename_entry(tmp_path, "second.txt", "shared.txt")
+    assert (tmp_path / "shared.txt").read_text(encoding="utf-8") == "FIRST"
+    assert second.read_text(encoding="utf-8") == "SECOND", (
+        "the open TOCTOU window let a rename clobber an existing file"
+    )
+
+
+def test_concurrent_same_name_renames_keep_every_byte(tmp_path: Path) -> None:
+    """End-to-end: hammer one target name from both sides at once."""
+    import threading
+
+    payload_a = b"A" * 4096
+    payload_b = b"B" * 4096
+    (tmp_path / "a.bin").write_bytes(payload_a)
+    (tmp_path / "b.bin").write_bytes(payload_b)
+    errors: list[object] = []
+    done = threading.Barrier(3)
+
+    def racer(src: str) -> None:
+        done.wait()
+        try:
+            fs.rename_entry(tmp_path, src, "c.bin")
+        except FsError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=racer, args=(s,)) for s in ("a.bin", "b.bin")]
+    for thread in threads:
+        thread.start()
+    done.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+    final = tmp_path / "c.bin"
+    assert final.exists(), "exactly one rename must win"
+    assert final.read_bytes() in (payload_a, payload_b), (
+        "the published file is an interleaved mixture of both sources"
+    )
+    assert len(errors) == 1, f"the loser must be told, not silent: {errors}"
+
+
+def test_concurrent_same_name_edits_never_interleave(tmp_path: Path) -> None:
+    """Two editors of one file must each see their own whole text or an error."""
+    import threading
+
+    target = tmp_path / "doc.txt"
+    target.write_text("seed", encoding="utf-8")
+    left = "L" * 20000
+    right = "R" * 20000
+    errors: list[object] = []
+    done = threading.Barrier(3)
+
+    def editor(text: str) -> None:
+        done.wait()
+        try:
+            fs.write_text_file(tmp_path, "doc.txt", text)
+        except Exception as exc:  # any failure is an acceptable outcome here
+            errors.append(exc)
+
+    threads = [threading.Thread(target=editor, args=(t,)) for t in (left, right)]
+    for thread in threads:
+        thread.start()
+    done.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+    body = target.read_text(encoding="utf-8")
+    assert body in (left, right), (
+        "the published edit is a mixture of two writers -- the sidecar name "
+        "was shared"
+    )
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".")]
+    assert leftovers == [], f"staging sidecars leaked: {leftovers}"
+
+
+def test_upload_sidecar_names_are_unique(tmp_path: Path) -> None:
+    """A fixed ``.{name}.wsctl-upload`` let two uploads share one staging file.
+
+    Each write then interleaved into the same bytes and the final ``os.replace``
+    published the mixture as a complete-looking file.
+    """
+    seen: set[str] = set()
+    for _ in range(20):
+        staging = tmp_path / f".doc.txt.wsctl-{__import__('secrets').token_hex(8)}.upload"
+        assert staging.name not in seen, f"staging name collided: {staging.name}"
+        seen.add(staging.name)
+        fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    assert len(seen) == 20
+
+
+def test_safe_resolve_rejects_a_nul_byte(tmp_path: Path) -> None:
+    """``Path.resolve`` raises ``ValueError`` on NUL, which no route catches -- a 500."""
+    with pytest.raises(FsError):
+        safe_resolve(tmp_path, "a\x00b")
+
+
+def test_concurrent_same_name_uploads_publish_one_whole_file(tmp_path: Path) -> None:
+    """Two uploads of one name must never publish an interleaved mixture.
+
+    A fixed ``.{name}.wsctl-upload`` sidecar made both writers share one
+    staging file: their bytes interleaved and the final ``os.replace`` handed
+    the mixture out as a complete-looking file -- the exact half-written state
+    the sidecar exists to prevent.
+    """
+    import io
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from wsctl.core.store import Store
+    from wsctl.server.app import create_app
+
+    files = tmp_path / "files"
+    files.mkdir()
+    settings = load_settings(data_dir=tmp_path / "data", file_root=files)
+    store = Store(tmp_path / "data" / "db.sqlite")
+    store.user_create("admin", "password123", role="admin")
+    app = create_app(settings, store=store)
+
+    left = b"L" * 300000
+    right = b"R" * 300000
+    errors: list[object] = []
+    barrier = threading.Barrier(3)
+
+    def upload(payload: bytes) -> None:
+        with TestClient(app) as client:
+            client.post(
+                "/api/login", json={"username": "admin", "password": "password123"}
+            )
+            barrier.wait()
+            try:
+                client.post(
+                    "/api/files/upload",
+                    data={"path": "", "overwrite": "true"},
+                    files={"file": ("doc.bin", io.BytesIO(payload))},
+                )
+            except Exception as exc:  # any outcome is acceptable
+                errors.append(exc)
+
+    threads = [threading.Thread(target=upload, args=(p,)) for p in (left, right)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    body = (files / "doc.bin").read_bytes()
+    assert body in (left, right), (
+        "the published file is an interleaved mixture of two uploads"
+    )
+    leftovers = [q.name for q in files.iterdir() if q.name.startswith(".")]
+    assert leftovers == [], f"staging sidecars leaked: {leftovers}"

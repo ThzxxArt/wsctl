@@ -12,7 +12,7 @@ from wsctl.core import totp, user_admin
 from wsctl.core.store import User
 
 from ..deps import qr_svg, require_admin
-from ..models import UserCreate, UserUpdate
+from ..models import TotpConfirm, UserCreate, UserUpdate
 
 router = APIRouter(prefix="/api", tags=["users"])
 
@@ -108,24 +108,64 @@ async def update_user(
     return {"ok": True}
 
 
+#: Pending TOTP enrolments: ``username -> secret``, awaiting a confirmation
+#: code. Nothing reaches the user row until a code generated from the secret
+#: verifies -- otherwise a scan that never happens leaves the account locked
+#: out of its own login with no way back but an admin reset. The CLI has always
+#: confirmed first; this is the same contract on the HTTP side.
+_pending_totp: dict[str, str] = {}
+
+
 @router.post("/users/{username}/totp")
 async def enable_totp(
     username: str, request: Request, actor: User = Depends(require_admin)
 ) -> dict[str, str]:
+    """Begin a TOTP enrolment. Nothing is active until :func:`confirm_totp`."""
     settings = request.app.state.settings
     if request.app.state.store.user_get(username) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     secret = totp.generate_secret()
-    request.app.state.store.user_set_totp(username, secret)
-    request.app.state.audit.enqueue("user_totp_on", user_id=actor.id, payload=username)
+    _pending_totp[username] = secret
+    request.app.state.audit.enqueue("user_totp_begin", user_id=actor.id, payload=username)
     uri = totp.provisioning_uri(secret, username, issuer=settings.totp_issuer)
     return {"secret": secret, "uri": uri, "qr_svg": qr_svg(uri)}
+
+
+@router.post("/users/{username}/totp/confirm")
+async def confirm_totp(
+    username: str,
+    body: TotpConfirm,
+    request: Request,
+    actor: User = Depends(require_admin),
+) -> dict[str, bool]:
+    """Verify a code against the pending secret; only then is TOTP active."""
+    secret = _pending_totp.get(username)
+    if secret is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="没有待确认的两步验证"
+        )
+    if not totp.verify(secret, body.code):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="验证码校验失败，未启用 TOTP",
+        )
+    request.app.state.store.user_set_totp(username, secret)
+    _pending_totp.pop(username, None)
+    request.app.state.audit.enqueue("user_totp_on", user_id=actor.id, payload=username)
+    return {"ok": True}
 
 
 @router.delete("/users/{username}/totp")
 async def disable_totp(
     username: str, request: Request, actor: User = Depends(require_admin)
 ) -> dict[str, bool]:
+    """Drop any *pending* enrolment, then the active one.
+
+    Closing the QR dialog without confirming must leave the account exactly as
+    it was -- a half-enrolment is the self-lockout this endpoint exists to
+    prevent.
+    """
+    _pending_totp.pop(username, None)
     if not request.app.state.store.user_clear_totp(username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     request.app.state.audit.enqueue("user_totp_off", user_id=actor.id, payload=username)

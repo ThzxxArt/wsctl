@@ -31,7 +31,12 @@ def _snapshot_db(src: Path, dst: Path) -> bool:
     if not src.is_file():
         return False
     try:
-        source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        # The URI must be percent-encoded: a data directory whose path contains
+        # ``?`` or ``#`` (both legal in a POSIX filename) would otherwise be
+        # parsed as a query string or a fragment and open the wrong thing.
+        from urllib.parse import quote
+
+        source = sqlite3.connect(f"file:{quote(str(src))}?mode=ro", uri=True)
     except sqlite3.Error as exc:
         raise BackupError(f"无法打开数据库 {src}：{exc}") from exc
     try:
@@ -45,6 +50,21 @@ def _snapshot_db(src: Path, dst: Path) -> bool:
     finally:
         source.close()
     return True
+
+
+def _skip_links(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    """Drop symlinks from an archive instead of storing them.
+
+    ``create`` used to archive links as links while ``restore`` rejected any
+    archive containing one -- so a single symlink in the recordings directory
+    (a NAS mount, a cross-volume archive) produced a backup that could never
+    be restored. Skipping them is also the safer of the two repairs: following
+    them instead would pull whatever they point at (possibly outside the data
+    directory) into the archive.
+    """
+    if member.issym() or member.islnk():
+        return None
+    return member
 
 
 def create_backup(
@@ -82,12 +102,17 @@ def create_backup(
             if has_config and config_path is not None:
                 tar.add(config_path, arcname="config.toml")
             if recordings_dir.is_dir():
-                tar.add(recordings_dir, arcname="recordings")
+                tar.add(recordings_dir, arcname="recordings", filter=_skip_links)
     return output
 
 
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    """Extract without allowing path traversal or links out of ``dest``."""
+    """Extract without allowing path traversal or links out of ``dest``.
+
+    ``create`` no longer stores links (see :func:`_skip_links`); this stays as
+    the second line of defence for archives produced by older versions or by
+    hand.
+    """
     root = dest.resolve()
     for member in tar.getmembers():
         if member.issym() or member.islnk():

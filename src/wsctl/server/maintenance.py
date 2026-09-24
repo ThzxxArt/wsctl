@@ -148,10 +148,15 @@ def dead_instance_ids(store: Store, ttl: float, me: str) -> list[str]:
 def active_recording_paths(manager: SessionManager) -> set[str]:
     # Read the live set on the loop (touching the manager from a thread would
     # race with session creation/removal).
+    #
+    # ``is_recording`` (not merely "a ``recording_path`` is set") is the test:
+    # a *stopped* recording keeps its path for the download endpoint, and
+    # treating that as live made the delete endpoint refuse to remove a cast
+    # nothing was writing to any more.
     return {
         str(s.recording_path)
         for s in manager.list_sessions()
-        if s.recording_path is not None
+        if s.is_recording and s.recording_path is not None
     }
 
 

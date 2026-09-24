@@ -263,10 +263,30 @@ def scenario_server() -> None:
             headers = {"Cookie": f"wsctl_session={token}"}
             ws_url = base.replace("http", "ws") + "/ws"
 
+            # Produce output, drop the link, re-attach: the scrollback replay
+            # must bring the content back. The scenario list has claimed
+            # "reconnect replay" since day one while the body only ever opened
+            # one socket -- the marker fix alone did not make that true.
             with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
                 ws.send(json.dumps({"type": "attach", "cols": 100, "rows": 30}))
-                ws.send(b"echo E2E-MARK\r")
-                assert b"E2E-MARK" in ws_recv_until(ws, b"E2E-MARK")
+                ws.send(b"echo $((67*71))\r")
+                assert b"4757\r\n" in ws_recv_until(ws, b"4757\r\n")
+            # Reconnect to the same session and demand the replay.
+            token2 = login(base)
+            headers2 = {"Cookie": f"wsctl_session={token2}"}
+            sessions = httpx.get(f"{base}/api/sessions", headers=headers2, timeout=10).json()
+            assert sessions, "the session must outlive its connection"
+            sid = sessions[0]["id"]
+            with connect(ws_url, additional_headers=headers2, open_timeout=10) as ws:
+                ws.send(json.dumps({
+                    "type": "attach", "session": sid, "cols": 100, "rows": 30,
+                }))
+                # The *replayed* stream carries the arithmetic product; the
+                # command line only ever spelled `67*71`, so this cannot be
+                # satisfied by an echo of a command we type here (we type none).
+                assert b"4757" in ws_recv_until(ws, b"4757"), (
+                    "reconnect replay did not bring the output back"
+                )
 
             with httpx.Client(base_url=base, timeout=10) as http:
                 listing = http.get("/api/files", headers=headers).json()["entries"]
@@ -318,6 +338,12 @@ def scenario_cli() -> None:
             # A two-factor account must still be usable from the CLI (0.1.3
             # lock-out regression): enable 2FA over the API, then log in with
             # a computed code.
+            #
+            # Enrolment is two-step everywhere (0.1.22): ``POST /totp`` only
+            # creates a *pending* secret -- it becomes active when a code from
+            # the authenticator verifies, so a scan that never happens cannot
+            # lock the account out. The scenario must complete that second step
+            # before it can demand a code at login.
             run("user", "add", "totpuser", "-p", PASSWORD)
             admin = login(base)
             info = httpx.post(
@@ -328,6 +354,13 @@ def scenario_cli() -> None:
             assert info.status_code == 200, info.text
             secret = info.json()["secret"]
             code = pyotp.TOTP(secret).now()
+            confirmed = httpx.post(
+                f"{base}/api/users/totpuser/totp/confirm",
+                headers={"Cookie": f"wsctl_session={admin}"},
+                json={"code": code},
+                timeout=10,
+            )
+            assert confirmed.status_code == 200, confirmed.text
 
             run("logout")
             no_code = subprocess.run(
@@ -368,12 +401,12 @@ def scenario_connect() -> None:
 
         try:
             drain(2.0)
-            os.write(master, b"echo CONNECT-MARK\r")
+            os.write(master, b"echo $((73*79))\r")
             for _ in range(50):
                 drain(0.2)
-                if b"CONNECT-MARK" in output:
+                if b"5767\r\n" in output:
                     break
-            assert b"CONNECT-MARK" in output, output[-200:]
+            assert b"5767\r\n" in output, output[-200:]
             os.write(master, b"exit\r")
             client.wait(timeout=5)
         finally:
@@ -405,8 +438,8 @@ def scenario_tmux() -> None:
 
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
-            ws.send(b"echo TMUX-MARK\r")
-            assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK")
+            ws.send(b"echo $((83*89))\r")
+            assert b"7387\r\n" in ws_recv_until(ws, b"7387\r\n")
 
         assert _wait_tmux(name(sid)), (
             "tmux session missing while the server is running: " + " ".join(_tmux_ls())
@@ -432,7 +465,7 @@ def scenario_tmux() -> None:
 
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
-            assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK"), "screen not restored"
+            assert b"7387" in ws_recv_until(ws, b"7387"), "screen not restored"
 
         # A share link must outlive the restart it was created before. The
         # anonymous viewer authenticates with the token in the query string,
@@ -443,7 +476,7 @@ def scenario_tmux() -> None:
                 "type": "attach", "session": sid, "share": share_token,
                 "cols": 100, "rows": 30,
             }))
-            assert b"TMUX-MARK" in ws_recv_until(ws, b"TMUX-MARK"), (
+            assert b"7387" in ws_recv_until(ws, b"7387"), (
                 "share link did not survive the restart"
             )
     finally:
@@ -481,8 +514,8 @@ def scenario_crash() -> None:
 
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
-            ws.send(b"echo CRASH-MARK\r")
-            assert b"CRASH-MARK" in ws_recv_until(ws, b"CRASH-MARK")
+            ws.send(b"echo $((97*101))\r")
+            assert b"9797\r\n" in ws_recv_until(ws, b"9797\r\n")
         assert _wait_tmux(tmux_mod.session_name(sid))
 
         # SIGKILL: the lease is NOT removed gracefully, unlike a clean shutdown.
@@ -498,7 +531,7 @@ def scenario_crash() -> None:
 
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
-            assert b"CRASH-MARK" in ws_recv_until(ws, b"CRASH-MARK"), "screen not restored"
+            assert b"9797" in ws_recv_until(ws, b"9797"), "screen not restored"
     finally:
         if second is not None:
             stop(second)

@@ -120,3 +120,49 @@ def test_backup_without_database_is_allowed(tmp_path: Path) -> None:
     with tarfile.open(out) as tar:
         assert "manifest.json" in tar.getnames()
         assert "wsctl.db" not in tar.getnames()
+
+
+def test_a_symlink_in_recordings_does_not_make_the_backup_unrestorable(
+    tmp_path: Path,
+) -> None:
+    """``create`` stored links while ``restore`` rejected any archive with one.
+
+    A single symlink in the recordings directory (a NAS mount, a cross-volume
+    archive) therefore produced a backup that could never be restored -- the
+    worst possible place to find out.
+    """
+    data = tmp_path / "data"
+    data.mkdir()
+    store = _make_store(data / "wsctl.db")
+    store.close()
+    recordings = data / "recordings"
+    recordings.mkdir()
+    (recordings / "a.cast").write_text('{"version": 2}\n', encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not-a-recording", encoding="utf-8")
+    try:
+        (recordings / "link.cast").symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover - Windows
+        pytest.skip(f"symlinks unavailable here: {exc}")
+
+    out = tmp_path / "bak.tar.gz"
+    backup.create_backup(data / "wsctl.db", recordings, out, version="t")
+
+    # The link is skipped rather than stored...
+    with tarfile.open(out) as tar:
+        names = tar.getnames()
+        assert not any(n.endswith("link.cast") for n in names), names
+        # ...and nothing outside the data directory leaked in through it.
+        assert outside.read_text(encoding="utf-8") == "not-a-recording"
+
+    # ...so the archive restores, which is the whole point of a backup.
+    dest = tmp_path / "restored"
+    dest.mkdir()
+    backup.restore_backup(
+        out,
+        dest / "wsctl.db",
+        dest / "recordings",
+        force=False,
+    )
+    assert (dest / "wsctl.db").is_file()
+    assert (dest / "recordings" / "a.cast").is_file()

@@ -36,8 +36,10 @@ async def test_echo_round_trip() -> None:
     client = FakeClient()
     try:
         await session.attach(client)
-        session.write_input(b"echo wsctl-marker\n")
-        assert await wait_for(lambda: b"wsctl-marker" in client.output())
+        session.write_input(b"echo $((11*13))\n")
+        # 143 is computed by the shell; the command line says `11*13`, so the
+        # terminal's echo of the input can never satisfy this wait.
+        assert await wait_for(lambda: b"143\r\n" in client.output())
     finally:
         await manager.shutdown()
 
@@ -63,14 +65,14 @@ async def test_reconnect_replays_scrollback() -> None:
     first = FakeClient()
     try:
         await session.attach(first)
-        session.write_input(b"echo replay-me\n")
-        assert await wait_for(lambda: b"replay-me" in first.output())
+        session.write_input(b"echo $((17*19))\n")
+        assert await wait_for(lambda: b"323\r\n" in first.output())
 
         await session.detach(first)
         second = FakeClient()
         await session.attach(second)
         assert second.controls("attached"), "attach should announce the session"
-        assert b"replay-me" in second.output(), "buffered output must be replayed"
+        assert b"323\r\n" in second.output(), "buffered output must be replayed"
     finally:
         await manager.shutdown()
 
@@ -226,13 +228,13 @@ async def test_recording_captures_output(tmp_path: Path) -> None:
         await session.start_recording(path, record_input=True)
         assert session.is_recording
         await session.attach(client)
-        session.write_input(b"echo REC-MARK\n")
-        assert await wait_for(lambda: b"REC-MARK" in client.output())
+        session.write_input(b"echo $((23*29))\n")
+        assert await wait_for(lambda: b"667\r\n" in client.output())
     finally:
         await session.stop_recording()
         await manager.shutdown()
     text = path.read_text(encoding="utf-8")
-    assert '"o"' in text and "REC-MARK" in text
+    assert '"o"' in text and "667" in text
     assert '"i"' in text
 
 
@@ -517,17 +519,148 @@ async def test_nudge_repaint_issues_two_real_size_changes() -> None:
     )
 
 
-async def test_a_brand_new_session_is_not_nudged_but_a_replayed_one_is() -> None:
-    """The trigger is "was anything replayed", not "did a socket open"."""
+async def test_a_brand_new_session_replays_nothing_so_there_is_nothing_to_repaint() -> None:
+    """``attach`` replays only what exists; the repaint gate is the caller's.
+
+    ``nudge_repaint`` is invoked by the *endpoint* (``ws.py``) on "was anything
+    replayed", not by ``attach`` itself -- so a spy on the session cannot see
+    it here. What this layer must guarantee is the input to that gate:
+    ``has_scrollback`` is False for a fresh session and True once output has
+    been produced. The gate itself is pinned in
+    ``test_server.py::test_only_an_attach_that_replays_something_repaints``.
+    """
     manager = SessionManager()
     session = await manager.create(SessionSpec(name="gated", argv=[SHELL]))
     try:
         assert session.has_scrollback is False, "a new session has nothing to replay"
         client = FakeClient()
         await session.attach(client)
-        session.write_input(b"echo NUDGE-PROBE\n")
+        assert session.has_scrollback is False, "attaching alone writes no output"
+        session.write_input(b"echo $((19*23))\n")
         assert await wait_for(lambda: session.has_scrollback, timeout=5), (
             "the echo must have reached the scrollback"
+        )
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_clean_exit_records_its_exit_code_not_a_crash() -> None:
+    """The history row must say *why* -- and carry the exit code.
+
+    ``_finalize`` knows the code and whether anyone asked for the stop. Left
+    to the maintenance sweep the row got a bare ``stopped`` and every clean
+    ``exit`` was filed as "服务退出或实例崩溃", with the exit code gone forever.
+    """
+    ended: list[tuple[str, str, int | None]] = []
+
+    def on_end(session: object) -> None:
+        ended.append((session.end_status, session.end_reason, session.exit_code))  # type: ignore[attr-defined]
+
+    manager = SessionManager(on_session_end=on_end)
+    session = await manager.create(SessionSpec(name="bye", argv=["/bin/sh", "-c", "exit 7"]))
+    assert await wait_for(lambda: session.closed, timeout=5), "the child never finished"
+    assert await wait_for(lambda: bool(ended), timeout=5), "the end hook never ran"
+    status, reason, code = ended[0]
+    assert status == "stopped", status
+    assert code == 7, code
+    assert "7" in reason, f"the exit code is missing from the reason: {reason!r}"
+    assert "崩溃" not in reason and "服务退出" not in reason, (
+        f"a clean exit must not be filed as a crash: {reason!r}"
+    )
+
+
+async def test_a_requested_stop_records_who_asked() -> None:
+    """``stop(reason=...)`` is the history row's ``ended_reason``."""
+    ended: list[tuple[str, str]] = []
+
+    def on_end(session: object) -> None:
+        ended.append((session.end_status, session.end_reason))  # type: ignore[attr-defined]
+
+    manager = SessionManager(on_session_end=on_end)
+    session = await manager.create(
+        SessionSpec(name="killed", argv=["/bin/sh", "-c", "sleep 30"])
+    )
+    await manager.remove(session.id, reason="被属主终止", status="killed")
+    assert await wait_for(lambda: bool(ended), timeout=5), "the end hook never ran"
+    status, reason = ended[0]
+    assert status == "killed", status
+    assert reason == "被属主终止", reason
+
+
+def test_a_session_shell_does_not_inherit_the_daemon_s_lifecycle_env() -> None:
+    """The server hands its sessions its environment -- including its own plumbing.
+
+    ``WSCTL_DAEMON``/``WSCTL_ROLLING_FROM_PID``/``WSCTL_LOG_FILE`` are how the
+    *managed daemon* is talked to. A shell that inherits them believes it is
+    the daemon: it can claim the pid file of a process that merely matched,
+    start a "managed" instance that steals it, or point ``log_file`` at the
+    daemon's log and truncate it on rotation. The very accident e2e once had
+    from a leaked ``WSCTL_DAEMON=1`` in a developer's shell.
+    """
+    import os
+
+    from wsctl.core.session import session_env
+
+    os.environ["WSCTL_DAEMON"] = "1"
+    os.environ["WSCTL_ROLLING_FROM_PID"] = "4242"
+    os.environ["WSCTL_LOG_FILE"] = "/tmp/daemon.log"
+    os.environ["WSCTL_SOMETHING_HARMLESS"] = "keep-me"
+    try:
+        env = session_env(None)
+        assert "WSCTL_DAEMON" not in env
+        assert "WSCTL_ROLLING_FROM_PID" not in env
+        assert "WSCTL_LOG_FILE" not in env
+        assert env.get("WSCTL_SOMETHING_HARMLESS") == "keep-me", (
+            "only the lifecycle variables are stripped"
+        )
+        assert env.get("PATH"), "the ordinary environment must still be there"
+    finally:
+        for key in (
+            "WSCTL_DAEMON",
+            "WSCTL_ROLLING_FROM_PID",
+            "WSCTL_LOG_FILE",
+            "WSCTL_SOMETHING_HARMLESS",
+        ):
+            os.environ.pop(key, None)
+
+
+async def test_a_repaint_is_a_refresh_not_content_so_it_stays_out_of_the_scrollback() -> None:
+    """The nudge's own output must never enter the replay buffer.
+
+    ``nudge_repaint`` makes the application redraw with cursor-relative
+    sequences -- bash sends ``\r\x1b[K`` + prompt. Recorded into the
+    scrollback, a **tail** replay later re-executes them with none of the
+    cursor context they were written for: ``\r\x1b[K`` then erases exactly
+    the line the replay just drew. That is how a reconnect ended with "the
+    bytes reached xterm and the screen is still blank" -- and with the desync
+    bar cleared, with no explanation at all.
+
+    Live viewers still get the repaint (that is the point of the nudge). The
+    bytes are injected *inside* the mute window so the guard is about the
+    muting itself and not about how fast a particular shell happens to
+    repaint -- waiting for a real redraw made this test pass against the
+    un-mutated code, which is the one thing a guard must never do.
+    """
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="nudge-mute", argv=[SHELL]))
+    client = FakeClient()
+    try:
+        await session.attach(client)
+        session.write_input(b"echo $((13*17))\n")
+        assert await wait_for(lambda: session.has_scrollback, timeout=5)
+        before = session.scrollback_snapshot()
+        nudge = asyncio.create_task(session.nudge_repaint())
+        await asyncio.sleep(0.02)  # inside the mute window
+        await session._broadcast(b"\r\x1b[KREPAINT")
+        await nudge
+        after = session.scrollback_snapshot()
+        assert after == before, (
+            "the repaint leaked into the scrollback; a later replay would "
+            "re-execute its cursor-relative erase and wipe the replayed screen"
+        )
+        # ...but live viewers did receive it: the refresh is for them.
+        assert b"REPAINT" in client.output(), (
+            "the repaint must still reach attached viewers"
         )
     finally:
         await manager.shutdown()

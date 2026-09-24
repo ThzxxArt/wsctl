@@ -10,9 +10,17 @@ from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
-    totp: str | None = None
+    username: str = Field(min_length=1, max_length=128)
+    # Bounded *before* it reaches Argon2: an unbounded password field is a
+    # free CPU knob for anyone who can reach /api/login.
+    password: str = Field(min_length=1, max_length=256)
+    totp: str | None = Field(default=None, max_length=16)
+
+
+class TotpConfirm(BaseModel):
+    """The code that turns a *pending* TOTP enrolment into an active one."""
+
+    code: str = Field(min_length=6, max_length=16)
 
 
 class SshConfig(BaseModel):
@@ -25,9 +33,9 @@ class SshConfig(BaseModel):
 
 
 class SessionCreate(BaseModel):
-    name: str | None = None
-    command: str | None = None
-    cwd: str | None = None
+    name: str | None = Field(default=None, max_length=200)
+    command: str | None = Field(default=None, max_length=4000)
+    cwd: str | None = Field(default=None, max_length=4096)
     backend: str | None = None
     ssh: SshConfig | None = None
     cols: int = Field(default=80, ge=1, le=1000)
@@ -35,26 +43,27 @@ class SessionCreate(BaseModel):
 
 
 class SessionReopen(BaseModel):
-    """Recreate a finished session the way it originally ran.
+    """Optional display overrides for a history "reopen".
 
-    The client sends back the ``argv`` the session was created with, not a
-    ``command`` string plus a backend name. Reconstructing an SSH session from
-    its remote command alone would either 400 (no ``ssh`` block) or -- if the
-    backend were dropped -- run the *remote* command on the *local* shell.
+    The ``argv`` and the backend come from the *record* (see
+    ``routes.sessions.reopen_session``): the endpoint replays what was
+    recorded, and the caller does not get to dictate what is spawned. These
+    fields only rename the replay or move its working directory.
     """
 
-    argv: list[str]
-    name: str | None = None
-    cwd: str | None = None
-    backend: str = "local"
+    name: str | None = Field(default=None, max_length=200)
+    cwd: str | None = Field(default=None, max_length=4096)
 
 
 class SessionRename(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
 
 
 class SessionShare(BaseModel):
-    ttl: int | None = None
+    #: ``None`` means "no expiry". 0 and negatives used to be accepted and
+    # produced a share that was already dead on arrival -- a 200 with a token
+    # that could never work.
+    ttl: int | None = Field(default=None, ge=1)
     writable: bool = False
 
 
@@ -63,12 +72,12 @@ class RecordingStart(BaseModel):
 
 
 class UserCreate(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
     role: str = "user"
 
 
 class UserUpdate(BaseModel):
     role: str | None = None
     disabled: bool | None = None
-    password: str | None = None
+    password: str | None = Field(default=None, max_length=256)

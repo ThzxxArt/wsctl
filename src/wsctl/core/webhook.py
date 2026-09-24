@@ -30,18 +30,35 @@ class WebhookDispatcher:
         self.max_attempts = max_attempts
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
+        self._stop = False
 
     def start(self) -> None:
         if self._task is None:
+            self._stop = False
             self._task = asyncio.get_running_loop().create_task(self._run())
 
-    async def stop(self) -> None:
+    async def stop(self, *, drain_timeout: float = 5.0) -> None:
+        """Stop delivering -- but only after the queue has had its say.
+
+        ``app``'s shutdown comment promises "flush queued audit events (and
+        deliver them to the webhook) before tearing the webhook down". A bare
+        ``cancel()`` did not: the events ``audit.stop()`` had just dispatched
+        were sitting in this queue, and the cancel dropped them -- the final
+        audit events of a run, exactly the ones an operator is most likely to
+        want in the SIEM.
+        """
         if self._task is None:
             return
-        self._task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._task
-        self._task = None
+        task, self._task = self._task, None
+        # Then give the runner a bounded window to drain. (Intake is *not*
+        # closed here: ``app`` calls ``audit.stop()`` first, which is exactly
+        # what pushes the final events into this queue.)
+        self._stop = True
+        with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=drain_timeout)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     def emit(self, payload: dict[str, Any]) -> None:
         try:
@@ -52,7 +69,12 @@ class WebhookDispatcher:
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
-            payload = await self._queue.get()
+            try:
+                payload = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+            except TimeoutError:
+                if self._stop and self._queue.empty():
+                    return
+                continue
             for attempt in range(1, self.max_attempts + 1):
                 try:
                     await loop.run_in_executor(None, self._post, payload)
@@ -74,5 +96,15 @@ class WebhookDispatcher:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        # ``urlopen`` follows redirects unconditionally, so a compromised (or
+        # simply misconfigured) endpoint could bounce the delivery at an
+        # internal address. No redirects: the configured URL is the only place
+        # audit events may go.
+        opener = urllib.request.build_opener(_NoRedirect)
+        with opener.open(request, timeout=self.timeout) as response:
             response.read()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None

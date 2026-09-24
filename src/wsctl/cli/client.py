@@ -44,8 +44,17 @@ def load_credentials() -> dict[str, Any]:
 def save_credentials(url: str, token: str) -> None:
     path = credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"url": url, "token": token}), encoding="utf-8")
-    os.chmod(path, 0o600)
+    # Created 0600 from the start. Writing first and chmod-ing afterwards left
+    # a world-readable window -- and a crash in between left the file world-
+    # readable *forever* -- with a long-lived session token inside.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"url": url, "token": token}))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
 
 
 def clear_credentials() -> None:
@@ -95,7 +104,12 @@ class ApiClient:
             raise ApiError(0, f"cannot reach {self.base_url}: {exc.reason}") from exc
         if not payload:
             return None
-        return json.loads(payload)
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            # A reverse proxy in trouble answers 200 with an HTML error page.
+            # Letting the traceback out looked like a wsctl crash.
+            raise ApiError(0, "响应不是 JSON（是否被反向代理拦截？）") from exc
 
     def download(self, path: str) -> bytes:
         """Fetch a raw (non-JSON) resource such as a recording."""
@@ -141,7 +155,8 @@ def login(
         method="POST",
     )
     try:
-        opener.open(req, timeout=timeout)
+        with opener.open(req, timeout=timeout) as response:
+            response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         with contextlib.suppress(json.JSONDecodeError):

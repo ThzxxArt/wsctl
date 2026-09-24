@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from wsctl.server.client import WsClient
 
@@ -188,3 +191,51 @@ def test_shed_oldest_gives_up_backlog_before_a_viewer(tmp_path) -> None:
     assert gone > 0, "backlog must actually be given up"
     assert client.pending_bytes < before
     assert client.closed is False, "shedding backlog must never close the link"
+
+
+def test_credentials_are_created_private(tmp_path: Path) -> None:
+    """The token file must never be world-readable, not even for an instant.
+
+    ``write_text`` (0644 under a 022 umask) followed by ``chmod`` left a
+    readable window -- and a crash in between left it readable *forever*.
+    """
+    import os
+    import stat
+
+    from wsctl.cli import client as client_mod
+
+    client_mod.save_credentials("http://127.0.0.1:7681", "secret-token-value")
+    path = client_mod.credentials_path()
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert mode == 0o600, f"credentials landed as {oct(mode)}"
+    assert client_mod.load_credentials()["token"] == "secret-token-value"
+    client_mod.clear_credentials()
+
+
+def test_a_non_json_success_response_is_an_error_not_a_traceback() -> None:
+    """A reverse proxy in trouble answers 200 with an HTML error page."""
+    from wsctl.cli import client as client_mod
+
+    class FakeOpener:
+        def open(self, req: object, timeout: float | None = None) -> object:
+            class Resp:
+                def read(self) -> bytes:
+                    return b"<html>502 Bad Gateway</html>"
+
+                def __enter__(self) -> object:
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    return None
+
+            return Resp()
+
+    api = client_mod.ApiClient("http://127.0.0.1:9", "t")
+    # ``client.py`` binds ``opener_for`` into its own namespace; patch there.
+    original = client_mod.opener_for
+    client_mod.opener_for = lambda *a, **k: FakeOpener()  # type: ignore[assignment]
+    try:
+        with pytest.raises(client_mod.ApiError, match="JSON"):
+            api.request("GET", "/api/me")
+    finally:
+        client_mod.opener_for = original  # type: ignore[assignment]

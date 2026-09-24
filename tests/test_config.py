@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from wsctl.core.config import Settings, load_settings, reload_settings_file
 
 
@@ -186,33 +184,43 @@ def test_new_objects_tier_is_not_advertised_as_immediate() -> None:
         assert kind_of(key) == "new", key
 
 
-def test_session_sliding_ttl_reload_reaches_the_store(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_session_sliding_ttl_reload_reaches_the_store(tmp_path: Path) -> None:
     """Reload must rewire the live mirror, not just the Settings object.
 
     ``sliding_ttl`` is read from ``Store`` on every token resolution. Updating
     only ``settings.session_sliding_ttl`` left the store on the old value
     forever, so the field was advertised as hot-reloadable while the code that
     honours it never noticed.
+
+    The first version of this test performed the rewire *itself*
+    (``store.sliding_ttl = settings.session_sliding_ttl``) and then asserted
+    the assignment had happened. Deleting the production line changed nothing.
+    The reload is now driven through ``POST /api/config/reload`` -- the only
+    path a user has -- and the store is read back untouched.
     """
-    from wsctl.core.config import load_settings, reload_settings_file
+    from fastapi.testclient import TestClient
+
     from wsctl.core.store import Store
+    from wsctl.server.app import create_app
 
-    config = tmp_path / "config.toml"
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text("session_sliding_ttl = false\n", encoding="utf-8")
-    monkeypatch.setenv("WSCTL_CONFIG", str(config))
-    settings = load_settings(data_dir=tmp_path)
+    settings = load_settings(data_dir=tmp_path, config_path=config)
     store = Store(tmp_path / "db.sqlite")
-    store.sliding_ttl = settings.session_sliding_ttl
-    assert store.sliding_ttl is False
+    store.user_create("admin", "password123", role="admin")
+    app = create_app(settings, store=store)
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/login", json={"username": "admin", "password": "password123"}
+        ).status_code == 200
+        assert store.sliding_ttl is False
 
-    config.write_text("session_sliding_ttl = true\n", encoding="utf-8")
-    changed, errors = reload_settings_file(settings)
-    assert not errors, errors
-    assert "session_sliding_ttl" in changed
-    assert settings.session_sliding_ttl is True
-    # Without the explicit rewire this assertion is what fails.
-    store.sliding_ttl = settings.session_sliding_ttl
-    assert store.sliding_ttl is True
-    store.close()
+        config.write_text("session_sliding_ttl = true\n", encoding="utf-8")
+        r = client.post("/api/config/reload")
+        assert r.status_code == 200, r.text
+        assert "session_sliding_ttl" in r.json().get("changed", []), r.text
+        assert store.sliding_ttl is True, (
+            "the reload updated Settings but never reached the store -- the "
+            "field stays advertised as hot-reloadable while nothing honours it"
+        )

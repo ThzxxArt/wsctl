@@ -322,3 +322,106 @@ def test_explicit_host_refuses_a_different_host(tmp_path: Path) -> None:
         assert loose.instance is not None and loose.instance.host == "0.0.0.0"
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_stop_force_reports_failure_when_the_process_is_still_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGKILL is not a promise. Reporting "已停止" over a surviving process is
+    how the next ``start`` collided with a ghost and the operator lost the trail.
+    """
+    from wsctl.cli import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "process_alive", lambda pid: True)
+    monkeypatch.setattr(daemon_mod, "read_instance", lambda settings: _fake_instance())
+    monkeypatch.setattr(daemon_mod, "release_pidfile", lambda *a, **k: None)
+    with pytest.raises(daemon_mod.DaemonError, match=r"仍未消失|未退出"):
+        daemon_mod.stop(_fake_settings(tmp_path), timeout=0.0, force=True)
+
+
+def test_tail_log_follow_recovers_from_a_copytruncate_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: object,
+) -> None:
+    """copytruncate empties the *same* inode; sitting at the old offset then
+    reads nothing until the file grows past it -- the next rotation's first
+    lines vanished from ``logs -f`` exactly when they mattered most.
+    """
+    import os as _os
+    import threading
+    import time as _time
+
+    from wsctl.cli import daemon as daemon_mod
+
+    live = tmp_path / "run" / "wsctl-7681.log"
+    live.parent.mkdir(parents=True)
+    live.write_text("first\n", encoding="utf-8")
+    monkeypatch.setattr(daemon_mod, "logfile_path", lambda settings: live)
+    monkeypatch.setattr(daemon_mod, "log_history_paths", lambda settings, **k: [live])
+
+    def rotate() -> None:
+        _time.sleep(0.2)
+        # Exactly the rotator's sequence: empty the inode in place, then write
+        # the new content. Doing it in one go is the *hard* case -- by the time
+        # the follower looks, the file is already longer than its old offset,
+        # so a size check alone would resume mid-text and skip the prefix.
+        fd = _os.open(live, _os.O_WRONLY | _os.O_APPEND)
+        _os.ftruncate(fd, 0)
+        _os.close(fd)
+        live.write_text("AFTER-ROTATION\n", encoding="utf-8")
+        from wsctl.core import logrotate
+
+        logrotate._bump_generation(live)
+
+    thread = threading.Thread(target=rotate, daemon=True)
+    thread.start()
+    # Bound the follow: after a handful of polls, stop it the way a user would.
+    original_sleep = _time.sleep
+    counter = {"n": 0}
+
+    def bounded_sleep(seconds: float) -> None:
+        counter["n"] += 1
+        if counter["n"] > 8:
+            raise KeyboardInterrupt
+        original_sleep(seconds)
+
+    monkeypatch.setattr(daemon_mod.time, "sleep", bounded_sleep)
+    daemon_mod.tail_log(_fake_settings(tmp_path), lines=1, follow=True)
+    thread.join(timeout=2)
+    out = capsys.readouterr().out  # type: ignore[attr-defined]
+    assert "AFTER-ROTATION" in out, (
+        f"the follow never recovered from the rotation: {out!r}"
+    )
+
+
+def _fake_instance() -> object:
+    from wsctl.cli.daemon import Instance
+
+    return Instance(
+        pid=999999,
+        host="127.0.0.1",
+        port=7681,
+        started_at=0.0,
+        version="t",
+        identity="",
+        reuse_port=True,
+    )
+
+
+def _fake_settings(tmp_path: Path) -> object:
+    from wsctl.core.config import load_settings
+
+    return load_settings(data_dir=tmp_path, port=7681)
+
+
+def test_restart_replays_reuse_port_from_the_running_instance() -> None:
+    """A plain ``restart`` used to drop ``--reuse-port``, silently downgrading
+    the instance to one that must take the visible-gap path on the next
+    ``restart --rolling``."""
+    main_src = (Path(__file__).resolve().parent.parent
+                / "src" / "wsctl" / "cli" / "main.py").read_text(encoding="utf-8")
+    assert "options.set(\"reuse_port\", True)" in main_src, (
+        "restart must carry the instance's binding mode into the child argv"
+    )
+    assert "running.instance.reuse_port" in main_src

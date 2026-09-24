@@ -18,11 +18,22 @@ session can run commands as the server's user. Treat it like SSH:
   cannot disagree. Existing accounts are not force-changed; `wsctl doctor`
   reports which ones are below the bar rather than locking anyone out
 - Optional TOTP two-factor authentication (available from both the web UI and
-  the CLI — `wsctl login --totp` / `WSCTL_TOTP`)
+  the CLI — `wsctl login --totp` / `WSCTL_TOTP`). Enrolment is **two-step** on
+  every surface: the secret becomes active only after a code from the
+  authenticator verifies, so a scan that never happens can never lock the
+  account out of its own login.
 - Login rate limiting per IP + username (`429` + `Retry-After`)
+- **`X-Forwarded-For` is read from the rightmost non-loopback hop** when
+  `trust_proxy = true`. The header is *appended* to by every proxy (the nginx
+  example uses `proxy_add_x_forwarded_for`), so the leftmost entry is whatever
+  the client sent. Assumes a single trusted appending proxy.
 - CIDR IP allowlist for HTTP and WebSocket
 - Origin allowlist on WebSocket handshakes (anti-CSWSH)
-- Traversal-proof file panel rooted at a configurable directory
+- Traversal-proof file panel rooted at a configurable directory. Renames are
+  atomic-and-non-clobbering (`os.link` + unlink) and uploads edit through a
+  unique `O_EXCL` sidecar, so two concurrent same-name operations cannot
+  interleave or silently destroy each other. Symlink guards act on the *link*,
+  not on whatever it points at.
 - Upload size limits and session count/idle/lifetime limits
 - Uploads never silently replace an existing file: a name collision is refused
   (`409`) unless the client explicitly opts in to overwriting

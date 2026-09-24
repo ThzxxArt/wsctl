@@ -478,10 +478,20 @@ class Store:
                 updates = "last_seen = ?"
                 params.append(now)
             if self.sliding_ttl:
+                # The *window* is what must stay constant. Anchoring it at the
+                # original ``created_at`` while pushing ``expires_at`` forward
+                # made every renewal widen the window itself (100 -> 180 ->
+                # 340 -> ...): ``session_ttl`` silently stopped meaning "this
+                # token is good for at most N seconds". Move ``created_at``
+                # along with ``expires_at`` so ``expires_at - created_at`` is
+                # invariant across any number of renewals.
                 ttl = expires_at - float(row["created_at"])
-                expires_at = now + ttl
-                updates = f"{updates + ', ' if updates else ''}expires_at = ?"
-                params.append(expires_at)
+                if ttl > 0:
+                    expires_at = now + ttl
+                    sep = ", " if updates else ""
+                    updates = f"{updates}{sep}expires_at = ?, created_at = ?"
+                    params.append(expires_at)
+                    params.append(now)
             if updates:
                 params.append(token_hash)
                 self._conn.execute(

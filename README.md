@@ -836,7 +836,10 @@ location / {
 }
 ```
 
-位于代理后请设 `trust_proxy = true`（让限速与 IP 白名单看到真实客户端 IP）；
+位于代理后请设 `trust_proxy = true`（让限速与 IP 白名单看到真实客户端 IP）。
+> `X-Forwarded-For` 取的是**最右非本机跳**——该头会被每一跳代理**追加**（上面的
+> `proxy_add_x_forwarded_for` 正是如此），最左项是客户端自带、不可信。此语义假定
+> **单个**可信追加式代理；多跳链路需要另行约定。
 生产环境请用 HTTPS/WSS 并设 `cookie_secure = true`。
 
 ### 零停机重启
@@ -868,7 +871,7 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 
 - 默认开启认证，密码使用 Argon2 哈希；会话 token 仅存哈希。
 - 密码策略：新建/改密强制非空且至少 8 位（API 与 CLI 同源强制）。
-- 可选 TOTP 双因子（`wsctl user totp <用户>`）。
+- 可选 TOTP 双因子（`wsctl user totp <用户>`，启用需输入一次验证码确认）。
 - 登录失败限速；`allowed_ips` 限制来源网段。
 - WebSocket 握手校验 Origin 白名单（防 CSWSH）。
 - 分享链接不可猜测、可设有效期、可撤销；只读链接拒绝输入；链接跨服务重启仍有效

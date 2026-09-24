@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import secrets
@@ -114,6 +115,10 @@ class SessionSpec:
 
     name: str
     argv: list[str]
+    #: The command string the user typed, if any -- kept verbatim so the
+    #: history and the live view agree on ``command`` instead of one of them
+    #: always saying ``None``.
+    command: str | None = None
     cwd: str | None = None
     env: dict[str, str] | None = None
     backend: str = "local"
@@ -131,6 +136,32 @@ class _ClientEntry:
     client: Client
     writable: bool = True
     share: str | None = None
+
+
+#: wsctl's own lifecycle variables. A session shell must not inherit them: it
+#: would believe it is the managed daemon (``claim_pidfile`` would "take over"
+#: a pid file that merely matched, ``serve --reuse-port`` would steal the
+#: daemon's, ``log_file`` would point at the daemon's log and truncate it on
+#: rotation).
+#:
+#: **One definition.** ``cli.daemon`` sets exactly these for its child and
+#: :func:`session_env` strips exactly these from a session -- two lists would
+#: be two chances to drift, which is how ``4401`` ended up fatal in one client
+#: and not the others (see ``core.closecodes``).
+LIFECYCLE_ENV_KEYS = ("WSCTL_DAEMON", "WSCTL_ROLLING_FROM_PID", "WSCTL_LOG_FILE")
+
+
+def session_env(env: dict[str, str] | None) -> dict[str, str]:
+    """The environment a session's child runs with, minus wsctl's own plumbing.
+
+    Defaults to a copy of the server's environment, which is the right base
+    (PATH, locale, ssh agent, ...) but also carries the variables the daemon
+    lifecycle uses to talk to *itself* (see :data:`LIFECYCLE_ENV_KEYS`).
+    """
+    base = dict(os.environ if env is None else env)
+    for key in LIFECYCLE_ENV_KEYS:
+        base.pop(key, None)
+    return base
 
 
 class TermSession:
@@ -152,6 +183,26 @@ class TermSession:
         self.last_active = self.created_at
         self.exit_code: int | None = None
         self.closed = False
+        #: How the session ended, decided by :meth:`stop` (or by the child
+        #: exiting on its own). Consumed by the manager's ``on_session_end``
+        #: hook so the database row says *why*, not just ``stopped``.
+        self._stop_status: str | None = None
+        self._stop_reason: str | None = None
+        #: True when a tmux-backed session was only *detached* (``preserve``):
+        #: its shell lives on and the row must stay ``running`` so the next
+        #: startup adopts it. Writing an end here is what made a preserved
+        #: session vanish across a restart.
+        self._preserved = False
+        self.end_status: str = "stopped"
+        self.end_reason: str = ""
+        #: True while :meth:`nudge_repaint` is in flight. Its output is a
+        #: *display refresh*, not session content -- and recording it is
+        #: actively harmful: bash's redraw is ``\\r\\x1b[K`` + prompt, and a
+        #: **tail** replay no longer carries the cursor position that sequence
+        #: was written for. Replayed into a cleared screen it erases exactly
+        #: the line the replay just drew, which is how a reconnect could end
+        #: with "the bytes were written and the screen is blank".
+        self._mute_scrollback = False
         self._on_close = on_close
         self._loop = loop
         self._scrollback = Scrollback(spec.scrollback_bytes)
@@ -171,8 +222,10 @@ class TermSession:
             self._tmux_name = tmux.session_name(sid)
             argv = tmux.wrap_argv(self._tmux_name, spec.argv)
             # tmux needs a usable TERM; a headless/CI environment may not set it.
-            env = dict(os.environ if env is None else env)
+            env = session_env(env)
             env.setdefault("TERM", "xterm-256color")
+        else:
+            env = session_env(env)
         self._pty: Pty = create_pty(
             argv,
             cwd=spec.cwd,
@@ -282,16 +335,27 @@ class TermSession:
         if self.closed:
             return
         cols, rows = self.spec.cols, self.spec.rows
-        if rows > 1:
-            self._pty.resize(cols, rows - 1)
-        elif cols > 1:
-            self._pty.resize(cols - 1, rows)
-        else:
-            return
-        await asyncio.sleep(0.05)
-        if self.closed:
-            return
-        self._pty.resize(self.spec.cols, self.spec.rows)
+        # The repaint's own output must not enter the scrollback (see
+        # ``_mute_scrollback``). Live viewers still get it -- that is the whole
+        # point of the nudge -- but a *recorded* redraw would make every later
+        # replay self-destructive.
+        self._mute_scrollback = True
+        try:
+            if rows > 1:
+                self._pty.resize(cols, rows - 1)
+            elif cols > 1:
+                self._pty.resize(cols - 1, rows)
+            else:
+                return
+            await asyncio.sleep(0.05)
+            if self.closed:
+                return
+            self._pty.resize(self.spec.cols, self.spec.rows)
+            # Let the application's repaint actually arrive before unmuting;
+            # it is generated asynchronously off the SIGWINCH.
+            await asyncio.sleep(0.05)
+        finally:
+            self._mute_scrollback = False
 
     def _enforce_memory_limit(self) -> None:
         """Drop the greediest client once the session is over its memory cap.
@@ -521,7 +585,8 @@ class TermSession:
 
     async def _broadcast(self, data: bytes) -> None:
         async with self._lock:
-            self._scrollback.append(data)
+            if not self._mute_scrollback:
+                self._scrollback.append(data)
             if self._recorder is not None:
                 self._recorder.output(data)
             targets = list(self._clients.items())
@@ -627,10 +692,30 @@ class TermSession:
             except Exception:
                 code = -1
         self.exit_code = code if code is not None else -1
+        # Decide *why* this session ended while the facts are still fresh.
+        # Left to the maintenance sweep, every clean ``exit`` looked like
+        # "服务退出或实例崩溃" and the exit code was lost forever.
+        if self._preserved:
+            # The tmux shell outlives us. The row is not finished and must not
+            # be filed as such -- adoption on the next startup reads
+            # ``status='running'``.
+            self.end_status = "running"
+            self.end_reason = ""
+        elif self._stop_reason:
+            self.end_status = self._stop_status or "killed"
+            self.end_reason = self._stop_reason
+        else:
+            self.end_status = "stopped"
+            self.end_reason = f"进程退出（退出码 {self.exit_code}）"
         await self._notify({"type": "exit", "code": self.exit_code})
         self._pty.close()
         if self._on_close is not None:
-            self._on_close(self)
+            done = self._on_close(self)
+            # The hook may be sync (tests, simple consumers) or async (the
+            # server persists the row on a worker thread). Await whatever it
+            # gives back so the row is written before this coroutine ends.
+            if inspect.isawaitable(done):
+                await done
 
     # -- lifecycle -----------------------------------------------------
 
@@ -641,6 +726,7 @@ class TermSession:
         timeout: float = 3.0,
         preserve: bool = False,
         reason: str | None = None,
+        status: str = "killed",
     ) -> None:
         """Terminate the session and wait for its read loop to finish.
 
@@ -649,13 +735,16 @@ class TermSession:
         client is closed.
 
         ``reason`` is announced to every attached client *before* the terminal
-        goes away. Without it a stop is indistinguishable from a crash at the
-        far end -- the screen simply dies -- and a remote operator has no way
-        to tell "I asked for this" from "the box fell over".
+        goes away, and is what the history row will say -- without it a stop is
+        indistinguishable from a crash at the far end, and a remote operator
+        has no way to tell "I asked for this" from "the box fell over".
+        ``status`` is the enum half (``killed`` / ``expired`` / ``stopped``).
         """
         if self.closed:
             return
         if reason and not preserve:
+            self._stop_reason = reason
+            self._stop_status = status
             with contextlib.suppress(Exception):
                 await self._notify({"type": "notice", "level": "warn", "msg": reason})
         if self._tmux_name is not None and not preserve:
@@ -665,6 +754,7 @@ class TermSession:
         if self._tmux_name is not None and preserve:
             # Detach the client without signalling its process group, so a
             # freshly forked tmux server is not caught by the signal.
+            self._preserved = True
             signaler = getattr(self._pty, "signal_process", None)
             if callable(signaler):
                 signaler(sig)
@@ -686,10 +776,16 @@ class TermSession:
 class SessionManager:
     """Owns the lifecycle of every terminal session on this server."""
 
-    def __init__(self, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+        on_session_end: Callable[[TermSession], None] | None = None,
+    ) -> None:
         # The loop is resolved lazily: managers are often built while a server
         # factory runs, before the serving event loop exists.
         self._loop = loop
+        self._on_session_end = on_session_end
         self._sessions: dict[str, TermSession] = {}
         self._lock = asyncio.Lock()
 
@@ -725,16 +821,24 @@ class SessionManager:
         if expired:
             reason = "会话已超过空闲/最长寿命，正在回收"
             await asyncio.gather(
-                *(s.stop(reason=reason) for s in expired), return_exceptions=True
+                *(s.stop(reason=reason, status="expired") for s in expired),
+                return_exceptions=True,
             )
         return [s.id for s in expired]
 
-    async def remove(self, sid: str, *, sig: int | None = None) -> bool:
+    async def remove(
+        self,
+        sid: str,
+        *,
+        sig: int | None = None,
+        reason: str = "会话已被终止",
+        status: str = "killed",
+    ) -> bool:
         async with self._lock:
             session = self._sessions.get(sid)
         if session is None:
             return False
-        await session.stop(sig=sig, reason="会话已被终止")
+        await session.stop(sig=sig, reason=reason, status=status)
         return True
 
     async def shutdown(self, *, preserve: bool = False) -> None:
@@ -746,14 +850,21 @@ class SessionManager:
         sessions = list(self._sessions.values())
         reason = None if preserve else "服务正在停止，会话即将结束"
         await asyncio.gather(
-            *(s.stop(preserve=preserve, reason=reason) for s in sessions),
+            *(s.stop(preserve=preserve, reason=reason, status="stopped") for s in sessions),
             return_exceptions=True,
         )
         self._sessions.clear()
 
-    def _on_session_close(self, session: TermSession) -> None:
+    def _on_session_close(self, session: TermSession) -> Any:
         # Called from the read loop; the entry is pruned lazily via _reap().
         self._sessions.pop(session.id, None)
+        # Persist *now*, while ``end_status``/``end_reason``/``exit_code`` are
+        # still the truth. The maintenance loop's ``stop_missing`` only sees
+        # "not in memory" and would write a bare ``stopped`` with no reason --
+        # which is how a clean ``exit`` came to be filed as "服务退出或实例崩溃".
+        if self._on_session_end is not None:
+            return self._on_session_end(session)
+        return None
 
     def _reap(self) -> None:
         for sid, session in list(self._sessions.items()):

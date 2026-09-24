@@ -26,6 +26,11 @@ def _js() -> str:
     return APP_JS.read_text(encoding="utf-8")
 
 
+def _read(rel: str) -> str:
+    """Read any source file in the repository, for cross-file contracts."""
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
 def test_admin_panel_has_one_source_of_truth() -> None:
     """The highlight and the content must come from the same variable.
 
@@ -283,6 +288,7 @@ def test_stale_socket_callbacks_are_inert() -> None:
         "ws.onopen = () => {",
         "ws.onmessage = (event) => {",
         "ws.onclose = (event) => {",
+        "ws.onerror = () => {",
     )
     for handler in handlers:
         at = js.index(handler)
@@ -343,7 +349,17 @@ def test_resync_must_not_announce_success_over_its_own_shed_frames() -> None:
     """
     js = _js()
     ws = (ROOT / "src" / "wsctl" / "server" / "ws.py").read_text(encoding="utf-8")
-    assert "incomplete" in ws and "dropped_events" in ws
+    # Not "the word appears somewhere in the file" -- a comment satisfies that.
+    # The verdict must be *computed* from a before/after comparison, on both
+    # the attach and the resync path.
+    assert re.search(
+        r"incomplete = int\(client\.dropped_events\) > before", ws
+    ), "resynced must carry a real before/after verdict"
+    session_src = (ROOT / "src" / "wsctl" / "core" / "session.py").read_text(encoding="utf-8")
+    assert re.search(
+        r"incomplete = int\(getattr\(client, \"dropped_events\", 0\)\) > before",
+        session_src,
+    ), "attached must carry a real before/after verdict"
     resynced = js.index('case "resynced":')
     window = js[resynced : resynced + 800]
     assert "msg.incomplete" in window, "the client must honour the server's verdict"
@@ -625,3 +641,116 @@ def test_a_replay_is_followed_by_an_application_repaint() -> None:
     assert hint is not None, "the desync bar must explain what happens next"
     assert "Ctrl+L" not in hint.group(1), "Ctrl+L never reaches a TUI"
     assert "自动重绘" in hint.group(1), "the bar must say the app repaints for them"
+
+
+def test_table_sort_direction_comes_from_the_table_state() -> None:
+    """``sortRows`` must read the *table's* direction, not the column spec.
+
+    ``spec`` is the column definition and never carried a direction; reading
+    ``spec._dir`` (always ``undefined``) made every "descending" sort a lie --
+    the header showed ↓ while the rows stayed ascending, and an operator
+    looking for the newest record got the oldest.
+    """
+    js = _js()
+    # Not a blanket "the substring is absent" -- the explanation comment names
+    # the old bug. What must be absent is the *read*.
+    assert "spec._dir &&" not in js and "spec._dir.key" not in js, (
+        "the column spec is not a sort-state holder"
+    )
+    assert "sortRows(rows, state.sort, spec, state)" in js, (
+        "sortRows must be handed the table state"
+    )
+    assert "state.sort === key && state.dir === -1" in js, (
+        "the direction must come from state.dir"
+    )
+
+
+def test_a_totp_enrolment_is_not_active_before_it_is_confirmed() -> None:
+    """Two-step enrolment: the secret is pending until a code verifies.
+
+    The one-step version wrote the secret to the user row before the QR was
+    even shown. A scan that never happened left the account demanding a code
+    nobody had -- locked out of its own login.
+    """
+    py = _read("src/wsctl/server/routes/users.py")
+    assert "_pending_totp" in py
+    begin = py.index("async def enable_totp")
+    confirm = py.index("async def confirm_totp")
+    assert "user_set_totp" not in py[begin:confirm], (
+        "the begin endpoint must not activate TOTP"
+    )
+    assert "user_set_totp" in py[confirm:], "confirm is what activates it"
+    js = _js()
+    assert "totp/confirm" in js, "the dialog must confirm before finishing"
+    assert "qrConfirmed" in js, "closing without confirming must clean up"
+
+
+def test_a_spoofed_xff_header_is_not_trusted() -> None:
+    """``X-Forwarded-For`` is appended to: the LEFT end is client-controlled."""
+    py = _read("src/wsctl/server/security.py")
+    assert "reversed(hops)" in py, "the trusted end of the header is the right one"
+    assert "split(\",\")[0]" not in py, "the leftmost hop is the attacker's"
+
+
+def test_an_admin_password_never_reaches_the_process_table() -> None:
+    """``--admin-password`` in argv is world-readable in ``/proc/*/cmdline``."""
+    py = _read("src/wsctl/cli/main.py")
+    assert '"admin_password": "--admin-password"' not in py, (
+        "the bootstrap password must not be a child-process flag"
+    )
+    daemon = _read("src/wsctl/cli/daemon.py")
+    assert "WSCTL_ADMIN_PASSWORD" in daemon, (
+        "it travels in the child environment instead"
+    )
+
+
+def test_the_connect_client_reports_a_fatal_close_through_its_exit_code() -> None:
+    """A revoked login is a failure. Returning 0 made ``&& echo ok`` lie."""
+    py = _read("src/wsctl/cli/connect.py")
+    assert "return 1" in py
+    assert "if code in FATAL_CODES:" in py
+    main = _read("src/wsctl/cli/main.py")
+    assert "if code:" in main and "typer.Exit(code=code)" in main
+
+
+def test_a_session_shell_cannot_claim_the_daemon_s_identity() -> None:
+    """The lifecycle variables must not leak into a session's environment."""
+    session = _read("src/wsctl/core/session.py")
+    assert "WSCTL_ROLLING_FROM_PID" in session
+    assert "session_env" in session
+    daemon = _read("src/wsctl/cli/daemon.py")
+    assert "LIFECYCLE_ENV_KEYS" in daemon
+
+
+def test_ssh_options_that_execute_locally_are_not_forwarded() -> None:
+    """``-o ProxyCommand=...`` is local command execution, not configuration."""
+    py = _read("src/wsctl/core/ssh.py")
+    assert "SAFE_OPTIONS" in py
+    assert "ProxyCommand" in py, "the dangerous option must be named in the refusal"
+    assert "_check_option" in py
+
+
+def test_the_lifecycle_env_keys_have_one_definition() -> None:
+    """The same three names in two modules is two chances to drift.
+
+    ``core.closecodes`` exists because "three consumers, three lists" is how
+    ``4401`` ended up fatal in one and not the others. This is the same shape:
+    the keys the daemon sets for its child and the keys a *session* strips
+    must be the same set, or a new lifecycle variable is added to one and
+    leaks into every shell.
+    """
+    session = _read("src/wsctl/core/session.py")
+    daemon = _read("src/wsctl/cli/daemon.py")
+    core_def = re.search(r"^LIFECYCLE_ENV_KEYS = (\([^)]*\))", session, re.M)
+    assert core_def, "core.session must own the list"
+    assert "WSCTL_DAEMON" in core_def.group(1)
+    assert "WSCTL_ROLLING_FROM_PID" in core_def.group(1)
+    assert "WSCTL_LOG_FILE" in core_def.group(1)
+    cli_def = re.search(r"^LIFECYCLE_ENV_KEYS = (\([^)]*\))", daemon, re.M)
+    assert cli_def is None, (
+        "cli.daemon keeps its own copy of the lifecycle env keys; it must "
+        "import the single definition from core.session instead"
+    )
+    assert re.search(
+        r"from wsctl\.core\.session import[^\n]*LIFECYCLE_ENV_KEYS", daemon
+    ), "cli.daemon must take the keys from core.session"

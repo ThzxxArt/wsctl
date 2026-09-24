@@ -206,8 +206,27 @@ def _read_raw(path: Path) -> dict[str, Any] | None:
 
 
 def read_instance(settings: Settings) -> Instance | None:
-    """Return the live instance, or ``None`` (pruning a stale pid file)."""
+    """Return the live instance, or ``None`` (pruning a stale pid file).
+
+    Pruning is compare-then-unlink, and the comparison is repeated immediately
+    before the unlink: between "this record is stale" and "unlink" a peer can
+    have written a *fresh, live* record to the same path (``claim_pidfile``'s
+    ``O_EXCL`` create), and the blind unlink deleted that one instead.
+    """
     path = pidfile_path(settings)
+
+    def prune(stale_pid: int, stale_identity: str) -> None:
+        with contextlib.suppress(OSError):
+            current = _read_raw(path)
+            if current is None:
+                return
+            if (
+                int(current.get("pid", -1)) != stale_pid
+                or str(current.get("identity", "")) != stale_identity
+            ):
+                return  # someone else's record is there now
+            path.unlink()
+
     data = _read_raw(path)
     if data is None:
         # A missing file is a no-op; a corrupt one must be removed so it cannot
@@ -230,8 +249,7 @@ def read_instance(settings: Settings) -> Instance | None:
             path.unlink()
         return None
     if not process_alive(instance.pid) or not _identity_matches(instance):
-        with contextlib.suppress(OSError):
-            path.unlink()
+        prune(instance.pid, instance.identity)
         return None
     return instance
 
@@ -354,7 +372,13 @@ def _tail(path: Path, lines: int = 12) -> str:
 # -- lifecycle ---------------------------------------------------------
 
 
-def start(settings: Settings, argv: list[str], *, timeout: float = 20.0) -> Instance:
+def start(
+    settings: Settings,
+    argv: list[str],
+    *,
+    timeout: float = 20.0,
+    admin_password: str | None = None,
+) -> Instance:
     """Spawn ``argv`` detached and wait until it answers ``/healthz``."""
     existing = read_instance(settings)
     if existing is not None:
@@ -379,7 +403,7 @@ def start(settings: Settings, argv: list[str], *, timeout: float = 20.0) -> Inst
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
-                env=child_env(settings),
+                env=child_env(settings, admin_password=admin_password),
             )
         except OSError as exc:
             raise DaemonError(f"无法启动子进程：{exc}") from exc
@@ -391,7 +415,10 @@ def start(settings: Settings, argv: list[str], *, timeout: float = 20.0) -> Inst
                 f"启动失败（退出码 {proc.returncode}）。日志：{log_path}\n{_tail(log_path)}"
             )
         instance = read_instance(settings)
-        if instance is not None and health(settings):
+        # The ready gate must identify *who* answered: ``health()`` alone is
+        # true when any process on the port speaks HTTP, and "已在后台启动" was
+        # then reported over a child that died of EADDRINUSE in the log.
+        if instance is not None and health_pid(settings) == instance.pid:
             return instance
         time.sleep(0.2)
 
@@ -423,6 +450,13 @@ def stop(settings: Settings, *, timeout: float = 15.0, force: bool = False) -> I
         if not process_alive(instance.pid):
             break
         time.sleep(0.2)
+    if process_alive(instance.pid):
+        # SIGKILL is not a promise: a zombie awaiting reap, or an unkillable
+        # state, is still there. Reporting "已停止" anyway is how the next
+        # ``start`` collided with a ghost and the operator lost the trail.
+        raise DaemonError(
+            f"进程 {instance.pid} 在 SIGKILL 后仍未消失（可能是僵尸进程，等待 init 回收）"
+        )
     release_pidfile(settings, instance)
     return instance
 
@@ -675,32 +709,56 @@ def discover(settings: Settings) -> list[Instance]:
     return found
 
 
-def child_env(settings: Settings, *, rolling_from: int | None = None) -> dict[str, str]:
+#: The variables wsctl's own lifecycle uses to talk to its managed child.
+#: Re-exported from :mod:`wsctl.core.session`, which strips exactly the same
+#: set from a session's environment -- one list, because two lists is how
+#: ``4401`` ended up fatal in one client and not another (``core.closecodes``).
+from wsctl.core.session import LIFECYCLE_ENV_KEYS  # noqa: E402
+
+
+def child_env(
+    settings: Settings,
+    *,
+    rolling_from: int | None = None,
+    admin_password: str | None = None,
+) -> dict[str, str]:
     """Environment for the detached server child.
 
     ``WSCTL_LOG_FILE`` tells the child which file it writes to so *it* can
     rotate by size. Rotation has to happen in-process: the append-mode
     descriptor we hand over keeps writing to the same inode, which is exactly
     what the copy-and-truncate rotator is designed for.
+
+    ``WSCTL_ADMIN_PASSWORD`` carries the bootstrap password instead of a
+    ``--admin-password`` flag: a flag is world-readable in ``/proc/*/cmdline``.
+    The variable is a one-shot -- the child must not re-export it downwards.
     """
     env = {
-        **os.environ,
-        "WSCTL_DAEMON": "1",
-        "WSCTL_LOG_FILE": str(logfile_path(settings)),
+        key: value
+        for key, value in os.environ.items()
+        if key not in LIFECYCLE_ENV_KEYS
     }
+    env["WSCTL_DAEMON"] = "1"
+    env["WSCTL_LOG_FILE"] = str(logfile_path(settings))
     if rolling_from is not None:
         # The replacement is allowed to take over the pid file from exactly
         # this pid -- see ``claim_pidfile``.
         env["WSCTL_ROLLING_FROM_PID"] = str(rolling_from)
+    if admin_password:
+        env["WSCTL_ADMIN_PASSWORD"] = admin_password
     return env
 
 
-def log_history_paths(settings: Settings, backup_count: int = 3) -> list[Path]:
+def log_history_paths(settings: Settings, backup_count: int | None = None) -> list[Path]:
     """Log files oldest-first: ``.N`` … ``.1`` then the live file.
 
     Rotation keeps history in sidecar files, so "show me the last N lines" has
     to read across them or a rotation would silently hide everything.
+    ``backup_count`` defaults to the configured value -- hardcoding 3 hid
+    history from anyone who had raised the setting.
     """
+    if backup_count is None:
+        backup_count = int(getattr(settings, "log_backup_count", 3) or 0)
     live = logfile_path(settings)
     backups = [live.with_name(f"{live.name}.{i}") for i in range(backup_count, 0, -1)]
     return [p for p in backups if p.is_file()] + ([live] if live.is_file() else [])
@@ -733,13 +791,42 @@ def tail_log(settings: Settings, *, lines: int = 50, follow: bool = False) -> No
     sys.stdout.flush()
     with live.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(0, os.SEEK_END)
+        offset = handle.tell()
+        # copy-and-truncate empties the *same* inode. A size check alone is
+        # not enough: if the rotation finishes between two polls and the new
+        # content is at least as long as the old offset, the reader resumes in
+        # the middle of the new text and silently skips its prefix. The
+        # rotator leaves a generation marker for exactly this case.
+        gen_path = live.with_name(f"{live.name}.gen")
+
+        def generation() -> str:
+            try:
+                return gen_path.read_text(encoding="utf-8")
+            except OSError:
+                return ""
+
+        seen_gen = generation()
         try:
             while True:
+                if generation() != seen_gen:
+                    # This inode was emptied since we last looked: whatever is
+                    # at the old offset is not a continuation of our stream.
+                    seen_gen = generation()
+                    handle.seek(0)
+                    offset = 0
                 chunk = handle.readline()
                 if chunk:
+                    offset = handle.tell()
                     sys.stdout.write(chunk)
                     sys.stdout.flush()
                 else:
+                    try:
+                        size = os.fstat(handle.fileno()).st_size
+                    except OSError:
+                        size = offset
+                    if size < offset:
+                        handle.seek(0)
+                        offset = 0
                     time.sleep(0.3)
         except KeyboardInterrupt:
             return

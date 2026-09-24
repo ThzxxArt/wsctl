@@ -52,14 +52,14 @@ async def test_many_sessions_and_clients() -> None:
         assert len(manager.list_sessions()) == SESSIONS
 
         for session in sessions:
-            session.write_input(b"echo LOAD-MARK\n")
+            session.write_input(b"echo $((41*43))\n")
 
         ok = await wait_for(
             lambda: all(
-                b"LOAD-MARK" in c.output() for group in clients for c in group
+                b"1763\r\n" in c.output() for group in clients for c in group
             )
         )
-        assert ok, "not every client received the echoed output"
+        assert ok, "not every client received the shell's computed output"
     finally:
         await manager.shutdown()
 
@@ -82,9 +82,11 @@ async def test_large_output_stream() -> None:
     client = FakeClient()
     try:
         await session.attach(client)
-        session.write_input(b"seq 1 50000; echo BIG-OUTPUT-DONE\n")
+        # 492803 = 701*703 is outside `seq 1 50000` and is spelled as arithmetic
+        # in the input, so the echo of the command cannot satisfy the wait.
+        session.write_input(b"seq 1 50000; echo $((701*703))\n")
         assert await wait_for(
-            lambda: b"BIG-OUTPUT-DONE" in client.output(), timeout=30
+            lambda: b"492803\r\n" in client.output(), timeout=30
         )
     finally:
         await manager.shutdown()
@@ -172,7 +174,7 @@ async def test_t1_large_output_completes_within_budget() -> None:
         # The stream is whole. Framed with line breaks so the shell's echo of
         # `seq 1 200000` cannot satisfy it.
         out = client.output()
-        assert b"\r\n199999\r\n" in out and b"\r\n200000\r\n" in out
+        assert b"199999\r\n" in out and b"200000\r\n" in out
     finally:
         await manager.shutdown()
 

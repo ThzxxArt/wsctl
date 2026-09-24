@@ -87,7 +87,10 @@ class Settings(BaseSettings):
     client_max_bytes: int = 8 * 1024 * 1024
     input_rate_limit: int = 0
     input_rate_burst: int = 0
-    scrollback_bytes: int = DEFAULT_MAX_BYTES
+    # 0 is *not* "unlimited" here: Scrollback requires a positive budget and
+    # raising ValueError from the session constructor took every attach down
+    # with a bare 1000 close. Reject the value where it is read instead.
+    scrollback_bytes: int = Field(DEFAULT_MAX_BYTES, ge=1)
 
     # How long another instance's lease may go unheard before its sessions are
     # considered abandoned (only relevant with SO_REUSEPORT / shared data_dir).

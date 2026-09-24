@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from wsctl.core.store import Store
 
 
@@ -182,28 +184,62 @@ def test_last_seen_write_is_throttled(tmp_path: Path) -> None:
         store.close()
 
 
-def test_sliding_ttl_extends_expiry(tmp_path: Path) -> None:
+def test_sliding_ttl_extends_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A renewal slides the deadline -- without ever widening the window.
+
+    The window is ``expires_at - created_at``. Pushing only ``expires_at``
+    forward made every renewal widen the window itself, so ``session_ttl``
+    silently stopped meaning "at most N seconds". The compounding only shows
+    when *time passes* between renewals -- three renewals inside the same
+    millisecond cannot tell the difference, which is exactly why the first
+    version of this test went green against the buggy code. The clock is
+    therefore stepped 80s per round against a 100s ttl: the buggy formula
+    yields 100 -> 180 -> 340, the correct one stays at 100.
+    """
     import sqlite3
-    import time
+
+    import wsctl.core.store as store_mod
+
+    real_time = store_mod.time
+    clock = {"now": 1_000_000.0}
+
+    class TimeShim:
+        def time(self) -> float:
+            return clock["now"]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(real_time, name)
+
+    monkeypatch.setattr(store_mod, "time", TimeShim())
 
     store = make_store(tmp_path)
     try:
         store.sliding_ttl = True
         user = store.user_create("slider", "password123")
         token = store.create_auth_session(user.id, ttl=100)
-        conn = sqlite3.connect(tmp_path / "test.db")
-        conn.execute(
-            "UPDATE auth_sessions SET last_seen = 0, expires_at = ?", (time.time() + 100,)
-        )
-        conn.commit()
-        conn.close()
-        store.resolve_auth_session(token)
-        conn = sqlite3.connect(tmp_path / "test.db")
-        try:
-            expires = float(conn.execute("SELECT expires_at FROM auth_sessions").fetchone()[0])
-        finally:
-            conn.close()
-        assert expires > time.time() + 90
+        window = None
+        for round_no in range(3):
+            clock["now"] += 80.0
+            assert store.resolve_auth_session(token) is not None, f"round {round_no}"
+            conn = sqlite3.connect(tmp_path / "test.db")
+            try:
+                created, expires = conn.execute(
+                    "SELECT created_at, expires_at FROM auth_sessions"
+                ).fetchone()
+            finally:
+                conn.close()
+            now_window = float(expires) - float(created)
+            assert float(expires) > clock["now"] + 90, f"round {round_no} did not extend"
+            if window is None:
+                window = now_window
+            else:
+                assert abs(now_window - window) < 1.0, (
+                    f"round {round_no}: the window itself grew "
+                    f"{window:.1f}s -> {now_window:.1f}s -- session_ttl is being "
+                    "compounded away"
+                )
     finally:
         store.close()
 

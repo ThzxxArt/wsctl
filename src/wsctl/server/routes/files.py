@@ -3,14 +3,15 @@
 The panel used to offer exactly three verbs -- list, download, upload -- and
 one of them (upload) had no progress, no cancel and no way to organise
 anything afterwards. These routes complete the file-management surface while
-keeping every path through :func:`~wsctl.core.fs.safe_resolve` and refusing
-symlinks at every write.
+keeping every path through :func:`~wsctl.core.fs.safe_resolve` and refusing to
+*write through* a symlink (the link itself is never the write target).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from wsctl.core import fs as fs_mod
 from wsctl.core.store import User
@@ -36,17 +37,20 @@ router = APIRouter(prefix="/api", tags=["files"])
 
 
 class NameBody(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=255)
 
 
 class RenameBody(BaseModel):
-    path: str
-    name: str
+    path: str = Field(max_length=4096)
+    name: str = Field(min_length=1, max_length=255)
 
 
 class ContentBody(BaseModel):
-    path: str
-    content: str
+    path: str = Field(max_length=4096)
+    # Bounded before it reaches the encoder: the 1 MiB check in
+    # ``write_text_file`` runs on the *encoded* bytes, and a multi-megabyte
+    # request body is already in memory by then.
+    content: str = Field(max_length=2 * 1024 * 1024)
 
 
 class _UploadTooLarge(Exception):
@@ -240,11 +244,13 @@ async def upload_file(
     settings = request.app.state.settings
     root = settings.files_root
     name = Path(file.filename or "").name
-    if not name or name in (".", ".."):
+    if not name or name in (".", "..") or "\x00" in name or name.startswith(".wsctl-"):
+        await file.close()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件名无效")
     try:
         directory = fs_mod.safe_resolve(root, path)
     except fs_mod.FsError as exc:
+        await file.close()
         raise _fs_error(exc) from exc
     if not directory.is_dir():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="不是目录")
@@ -270,11 +276,24 @@ async def upload_file(
     # with O_TRUNC meant a concurrent download could read a half-written file
     # for the whole duration of a large upload. ``os.replace`` is atomic on the
     # same filesystem, so a reader sees either the old bytes or the new ones.
-    staging = directory / f".{name}.wsctl-upload"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    #
+    # The sidecar name is *unique* (and opened with ``O_EXCL``). A fixed
+    # ``.{name}.wsctl-upload`` let two concurrent uploads of the same name
+    # write into one shared staging file and publish an interleaved mixture --
+    # the exact half-written state the sidecar exists to prevent -- and one
+    # request's failure path would unlink the sidecar the other was still
+    # writing to.
+    staging = directory / f".{name}.wsctl-{secrets.token_hex(8)}.upload"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         fd = os.open(staging, flags, 0o600)
     except OSError as exc:
+        await file.close()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="拒绝覆盖符号链接或非法路径",
@@ -285,13 +304,19 @@ async def upload_file(
         size = await loop.run_in_executor(
             None, _copy_upload, file.file, fd, settings.file_max_upload
         )
+        if dest.is_dir():
+            raise OSError("目标是目录")
         os.replace(staging, dest)
     except _UploadTooLarge as exc:
         staging.unlink(missing_ok=True)
         raise HTTPException(status_code=413, detail="文件过大") from exc
-    except Exception:
+    except Exception as exc:
         # Do not leave a half-written sidecar behind on any other failure.
         staging.unlink(missing_ok=True)
+        if isinstance(exc, OSError) and "目录" in str(exc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="目标是目录，无法覆盖"
+            ) from exc
         raise
     finally:
         await file.close()

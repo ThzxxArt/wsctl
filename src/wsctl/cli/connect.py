@@ -40,14 +40,24 @@ class ConnectError(RuntimeError):
 
 def run_connect(
     url: str | None, session: str | None, token: str | None, *, reconnect: bool = True
-) -> None:
+) -> int:
+    """Bridge the local terminal to a remote session; return a process exit code.
+
+    A fatal close (revoked login, forbidden, missing session, server error) is
+    a *failure* and must say so through the exit status. Returning normally
+    made ``wsctl session attach … && echo ok`` print "ok" after an
+    authentication failure -- a script could not tell success from "the
+    server threw me out".
+    """
     creds = load_credentials()
     base = url or (str(creds["url"]) if creds.get("url") else None)
     if not base:
         raise ConnectError("缺少服务器地址：请传入 <url>，或先运行 'wsctl login <url>'")
     bearer = token or (str(creds["token"]) if creds.get("token") else None)
+    code = 0
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(_run(base, session, bearer, reconnect=reconnect))
+        code = asyncio.run(_run(base, session, bearer, reconnect=reconnect))
+    return code
 
 
 def _ws_url(base: str) -> str:
@@ -79,13 +89,14 @@ def _notice(message: str) -> None:
     sys.stderr.flush()
 
 
-async def _run(base: str, session: str | None, token: str | None, *, reconnect: bool) -> None:
+async def _run(base: str, session: str | None, token: str | None, *, reconnect: bool) -> int:
     if sys.platform == "win32":
         raise ConnectError("wsctl connect 目前需要 POSIX 终端")
     if not sys.stdin.isatty():
         raise ConnectError("wsctl connect 需要交互式终端")
 
-    session_id = session or _create_session(base, token)
+    session_id = session or await asyncio.to_thread(_create_session, base, token)
+    assert session_id is not None
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     ws_url = _ws_url(base)
 
@@ -111,20 +122,38 @@ async def _run(base: str, session: str | None, token: str | None, *, reconnect: 
         width, height = _winsize()
         outbound.put_nowait(json.dumps({"type": "resize", "cols": width, "rows": height}))
 
-    tty.setraw(fd)
-    loop.add_reader(fd, on_stdin)
-    with contextlib.suppress(NotImplementedError):
-        loop.add_signal_handler(signal.SIGWINCH, on_resize)
-    try:
-        await _session_loop(
-            ws_url, headers, session_id, outbound, state, reconnect=reconnect
-        )
-    finally:
+    def restore() -> None:
+        """Whatever happens to the bridge, the user's terminal must come back.
+
+        ``tty.setraw`` used to run *outside* the try, so a failure in the very
+        next line left the shell with no echo and no SIGINT -- only ``reset``
+        could save it. SIGTERM/SIGHUP also skipped the ``finally`` entirely.
+        """
         with contextlib.suppress(Exception):
             loop.remove_reader(fd)
         with contextlib.suppress(NotImplementedError):
             loop.remove_signal_handler(signal.SIGWINCH)
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        with contextlib.suppress(Exception):
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    def on_fatal_signal() -> None:
+        restore()
+        sys.exit(1)
+
+    code = 1
+    try:
+        tty.setraw(fd)
+        loop.add_reader(fd, on_stdin)
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(signal.SIGWINCH, on_resize)
+            loop.add_signal_handler(signal.SIGTERM, on_fatal_signal)
+            loop.add_signal_handler(signal.SIGHUP, on_fatal_signal)
+        code = await _session_loop(
+            ws_url, headers, session_id, outbound, state, reconnect=reconnect
+        )
+    finally:
+        restore()
+    return code
 
 
 def _drain(queue: asyncio.Queue[bytes | str | None]) -> None:
@@ -138,17 +167,23 @@ def _drain(queue: asyncio.Queue[bytes | str | None]) -> None:
 
 async def _recv_loop(
     ws: object, session_id: str, cols: int, rows: int
-) -> tuple[str | None, int | None, bool]:
-    """Attach and pump output. Returns ``(notice, close_code, exited)``."""
+) -> tuple[str | None, int | None, bool, int]:
+    """Attach and pump output. Returns ``(notice, close_code, exited, code)``."""
     await ws.send(  # type: ignore[attr-defined]
         json.dumps({"type": "attach", "session": session_id, "cols": cols, "rows": rows})
     )
     notice: str | None = None
+    exit_code = 0
     try:
         while True:
             message = await ws.recv()  # type: ignore[attr-defined]
             if isinstance(message, bytes):
-                os.write(sys.stdout.fileno(), message)
+                try:
+                    os.write(sys.stdout.fileno(), message)
+                except OSError:
+                    # The local stdout went away (``| head``): stop cleanly
+                    # instead of dying with a BrokenPipeError traceback.
+                    return notice, None, True, 0
                 continue
             # A proxy or middlebox can inject non-JSON text frames; ignoring
             # them keeps the terminal alive instead of tearing the link down.
@@ -160,7 +195,9 @@ async def _recv_loop(
                 continue
             kind = data.get("type")
             if kind == "exit":
-                return f"会话已退出（退出码 {data.get('code')}）", 1000, True
+                raw = data.get("code")
+                exit_code = int(raw) if isinstance(raw, (int, float)) else 0
+                return f"会话已退出（退出码 {raw}）", 1000, True, exit_code
             if kind == "error":
                 # The reason may be followed by a fatal close; keep reading to
                 # learn the close code before deciding whether to retry.
@@ -174,10 +211,12 @@ async def _recv_loop(
             elif kind == "desync":
                 # Frames were shed to keep the link. The local terminal is a
                 # real emulator and holds whatever arrived; say so and say what
-                # cannot be undone.
+                # cannot be undone. The server triggers the redraw itself (two
+                # real size changes) -- asking the user for Ctrl+L was wrong
+                # for a TUI, which eats the key.
                 _notice(
                     str(data.get("msg") or "输出过快，部分内容已省略")
-                    + "。全屏程序可按 Ctrl+L 或调整一次窗口大小自行重绘"
+                    + "。同步后全屏程序会自动重绘；仍不完整可再请求一次同步"
                 )
             elif kind == "evicted":
                 _notice(str(data.get("msg") or "连接已被释放（会话仍在运行）"))
@@ -191,7 +230,7 @@ async def _recv_loop(
             code = exc.rcvd.code
         elif exc.sent is not None:
             code = exc.sent.code
-        return notice, code, False
+        return notice, code, False, 0
 
 
 async def _session_loop(
@@ -202,7 +241,7 @@ async def _session_loop(
     state: dict[str, bool],
     *,
     reconnect: bool,
-) -> None:
+) -> int:
     delay = INITIAL_DELAY
     while True:
         try:
@@ -219,6 +258,10 @@ async def _session_loop(
             delay = min(delay * 2, MAX_DELAY)
             continue
 
+        # A successful connection resets the backoff. Without this the delay
+        # kept growing across a long-lived session: after a few early hiccups
+        # every later reconnect waited 16-30s and looked like a dead server.
+        delay = INITIAL_DELAY
         _drain(outbound)  # discard input meant for the previous connection
         cols, rows = _winsize()
         async with ws:
@@ -246,7 +289,7 @@ async def _session_loop(
             send_task = asyncio.create_task(sender())
             ping_task = asyncio.create_task(pinger())
             try:
-                notice, code, exited = await _recv_loop(ws, session_id, cols, rows)
+                notice, code, exited, exit_code = await _recv_loop(ws, session_id, cols, rows)
             finally:
                 send_task.cancel()
                 ping_task.cancel()
@@ -256,8 +299,16 @@ async def _session_loop(
 
         if notice:
             _notice(notice)
-        if exited or state["stdin_closed"] or not reconnect or code in FATAL_CODES:
-            return
+        if exited:
+            return exit_code
+        if state["stdin_closed"]:
+            return 0
+        if code in FATAL_CODES:
+            # Revoked login, forbidden, missing session, server error: retrying
+            # cannot help and the exit status must say so.
+            return 1
+        if not reconnect:
+            return 1
         _notice(f"连接断开；{delay:.0f}s 后重连…")
         await asyncio.sleep(delay)
         delay = min(delay * 2, MAX_DELAY)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 from pathlib import Path
 from typing import Any
@@ -96,12 +97,17 @@ async def create_session(
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail="命令为空"
                 )
+            if argv[0].startswith("-"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="argv 无效"
+                )
         else:
             argv = [settings.shell]
         name = body.name or (Path(argv[0]).name if argv else "终端")
     spec = SessionSpec(
         name=name,
         argv=argv,
+        command=body.command,
         cwd=body.cwd or settings.default_cwd,
         backend=backend,
         cols=body.cols,
@@ -160,20 +166,39 @@ async def create_session(
 async def reopen_session(
     sid: str, body: SessionReopen, request: Request, user: User = Depends(current_user)
 ) -> dict[str, Any]:
-    """Recreate a session from its original ``argv``.
+    """Recreate a session the way ``sid`` originally ran.
 
-    History used to offer "reopen" built from ``command`` + ``backend``. For an
-    SSH session that produced ``backend="ssh"`` with no ``ssh`` block and a 400
-    -- and the obvious "fix" (drop the backend) would have executed the remote
-    command on the local shell. Replaying the recorded ``argv`` is both correct
-    and free of that trap: ``ssh`` stays ``ssh`` because the argv says so.
+    The ``argv`` comes from the *record*, not from the request body. The
+    endpoint name promises "the way it originally ran"; taking the caller's
+    word for it made ``sid`` decorative -- any id, including one that never
+    existed or belonged to someone else, answered 201 -- while letting the
+    client dictate what would be spawned. History's "reopen" is a replay of
+    what was recorded, and only of that.
     """
-    if not body.argv or not all(isinstance(a, str) and a for a in body.argv):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="argv 无效")
-    if body.argv[0].startswith("-"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="argv 无效")
+    row = await asyncio.to_thread(request.app.state.store.term_session_get, sid)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+    if user.role != "admin" and row.get("owner_id") != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该会话")
+
+    raw_argv = row.get("argv")
+    argv: list[str] | None = None
+    if isinstance(raw_argv, list):
+        argv = [str(a) for a in raw_argv]
+    elif isinstance(raw_argv, str):
+        try:
+            loaded = json.loads(raw_argv)
+        except json.JSONDecodeError:
+            loaded = None
+        if isinstance(loaded, list):
+            argv = [str(a) for a in loaded]
+    if not argv or not all(a for a in argv) or argv[0].startswith("-"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="该会话没有可重开的命令记录"
+        )
+    backend = str(row.get("backend") or "local")
     # A reopen must never escalate what the original was allowed to do.
-    if body.backend not in ("local", "tmux"):
+    if backend not in ("local", "tmux"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="重新打开只支持 local / tmux 后端",
@@ -188,14 +213,16 @@ async def reopen_session(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="该用户的会话数量已达上限"
         )
-    if body.backend == "tmux" and not tmux.is_available():
+    if backend == "tmux" and not tmux.is_available():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="未安装 tmux")
-    name = body.name or Path(body.argv[0]).name
+    name = body.name or str(row.get("name") or Path(argv[0]).name)
+    cwd = body.cwd or (str(row["cwd"]) if row.get("cwd") else settings.default_cwd)
     spec = SessionSpec(
         name=name,
-        argv=list(body.argv),
-        cwd=body.cwd or settings.default_cwd,
-        backend=body.backend,
+        argv=list(argv),
+        command=(str(row["command"]) if row.get("command") else None),
+        cwd=cwd,
+        backend=backend,
         idle_timeout=settings.idle_timeout,
         max_life=settings.max_life,
         max_clients=settings.session_max_clients,
@@ -213,8 +240,8 @@ async def reopen_session(
         session.id,
         name=name,
         owner_id=user.id,
-        backend=body.backend,
-        command=None,
+        backend=backend,
+        command=spec.command,
         argv=spec.argv,
         env=spec.env,
         cwd=spec.cwd,
@@ -234,10 +261,11 @@ async def delete_session(
     sid: str, request: Request, user: User = Depends(current_user)
 ) -> dict[str, bool]:
     owned_session(request, sid, user)  # 404/403 guard
-    await request.app.state.manager.remove(sid)
-    await asyncio.to_thread(
-            request.app.state.store.term_session_set_status, sid, "killed", "被管理员终止"
-        )
+    # The row is written by the session's own end hook -- with this reason and
+    # the real exit code -- rather than here. Writing it here as well raced the
+    # hook and always claimed "被管理员终止", even when a plain owner did it.
+    reason = "被管理员终止" if user.role == "admin" else "被属主终止"
+    await request.app.state.manager.remove(sid, reason=reason, status="killed")
     request.app.state.audit.enqueue("session_kill", user_id=user.id, term_session_id=sid)
     return {"ok": True}
 

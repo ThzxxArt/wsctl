@@ -327,10 +327,88 @@ def test_the_kept_tail_is_the_same_at_every_pty_read_boundary() -> None:
         # the flood split in two, the tail riding with the prompt
         "halfway": [*keystrokes, x_flood[:4000], x_flood[4000:] + prompt],
     }
-    for name, chunks in layouts.items():
-        tail = flood_tail(chunks)
-        assert b"XXXX" in tail, (
-            f"layout {name!r} lost the newest history to whole-chunk eviction: "
-            f"kept {len(tail)} bytes ending {tail[-16:]!r}"
-        )
+    tails = {name: flood_tail(chunks) for name, chunks in layouts.items()}
+    for name, tail in tails.items():
+        assert tail, f"layout {name!r} emptied the buffer"
         assert len(tail) <= 512
+    # The actual invariant: the chunking may not be observable at all. One
+    # shared substring check would pass three *different* tails -- which is
+    # exactly how a chunk-dependent regression slips through.
+    unique = set(tails.values())
+    assert len(unique) == 1, (
+        "the same byte stream kept different tails at different PTY read "
+        "boundaries: "
+        + ", ".join(f"{n}={len(t)}B ending {t[-16:]!r}" for n, t in tails.items())
+    )
+    expected = (x_flood + prompt)[-512:]
+    assert tails["split"] == expected, (
+        f"the newest {len(expected)} bytes are what a ring buffer keeps; got "
+        f"{len(tails['split'])} bytes ending {tails['split'][-16:]!r}"
+    )
+
+
+def test_whole_chunk_eviction_aligns_utf8_too() -> None:
+    """``_align_utf8`` used to run only on the tail-cut path.
+
+    The "evict exactly one whole chunk and land on budget" layout never
+    reaches that path, so the new head could open on an orphaned continuation
+    byte and replay a replacement glyph.
+    """
+    euro = "\u20ac".encode()  # e2 82 ac
+    # Chunk A ends two bytes into the euro; chunk B pushes the whole buffer
+    # over budget by exactly A's length, so A is dropped *whole* and the
+    # tail-cut branch is never taken.
+    chunk_a = b"X" * 15 + euro[:2]
+    chunk_b = euro[2:] + b"Y" * 15
+    sb = Scrollback(max_bytes=len(chunk_b))
+    sb.append(chunk_a)
+    sb.append(chunk_b)
+    snapshot = sb.snapshot()
+    assert snapshot, "the newest chunk must survive"
+    assert snapshot == chunk_b[2:] or snapshot.decode("utf-8", "strict") == snapshot.decode(
+        "utf-8", "replace"
+    )
+    # The real contract: no orphan continuation byte at the head, and no
+    # replacement character in the replay.
+    snapshot.decode("utf-8", "strict")
+    assert b"\xef\xbf\xbd" not in snapshot
+
+
+def test_an_unterminated_sequence_may_never_empty_the_buffer() -> None:
+    """An OSC with no terminator keeps the parser "inside" forever.
+
+    ``skip_to_boundary`` then returns ``b""`` on whatever it is pointed at, and
+    two separate call sites read that as "the sequence ended here" and dropped
+    the chunk -- the re-anchor branch *and* the tail-cut branch. With a sole
+    remaining chunk either one emptied the whole buffer, breaking the rule the
+    comment right above it stated ("the last copy is never dropped").
+
+    The layout is chosen to reach the **re-anchor** path specifically: chunk A
+    is entirely in excess (so the whole-chunk loop evicts it) and ends inside
+    the OSC, and chunk B is the sole remaining copy of a sequence that is
+    still open.
+    """
+    open_osc = b"\x1b]0;title-that-never-ends"
+    assert open_osc.endswith(b"ends")
+    sb = Scrollback(max_bytes=10)
+    sb.append(open_osc[:20])          # ends mid-OSC, entirely in excess later
+    sb.append(b"T" * 12)              # continues the OSC; never terminates it
+    assert sb.snapshot(), (
+        "eviction emptied the buffer outright while the stream was still "
+        "inside a sequence"
+    )
+
+
+def test_a_tail_cut_may_not_leave_nothing_at_all() -> None:
+    """The tail-cut's own version of the same rule.
+
+    ``skip_to_boundary`` consumes the whole remaining tail when the sequence
+    never ends. Reading ``b""`` as "drop the chunk" left the replay empty --
+    from a buffer that still held bytes.
+    """
+    open_osc = b"\x1b]0;never-terminated-title"
+    sb = Scrollback(max_bytes=5)
+    sb.append(open_osc * 2)
+    assert sb.snapshot(), (
+        "the tail cut threw away the only copy instead of staying over budget"
+    )

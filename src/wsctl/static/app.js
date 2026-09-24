@@ -47,6 +47,7 @@
     confirmMessage: $("confirm-message"), confirmOk: $("confirm-ok"), confirmCancel: $("confirm-cancel"),
     qrOverlay: $("qr-overlay"), qrTitle: $("qr-title"), qrSecret: $("qr-secret"),
     qrImage: $("qr-image"), qrDone: $("qr-done"), qrClose: $("qr-close"),
+    qrCode: $("qr-code"), qrError: $("qr-error"),
     toasts: $("toasts"),
     desyncBar: $("desync-bar"), desyncNote: $("desync-note"), desyncBtn: $("desync-btn"),
     newSessionOverlay: $("new-session-overlay"), newSessionForm: $("new-session-form"),
@@ -714,6 +715,17 @@
   // rest queued for the next frame, keep byte order.
   const WRITE_MAX_BYTES = 256 * 1024;
 
+  // Every screen wipe goes through here. "The screen is blank and nothing
+  // says why" is the single worst failure this terminal can have, and with
+  // three call sites it has been hard to say which one did it. The log is
+  // part of ``__wsctlDiag`` for exactly that reason.
+  function resetTerm(s, tag) {
+    if (!s.resetLog) s.resetLog = [];
+    s.resetLog.push({ tag, wrote: s.wroteBytes || 0, at: Date.now() % 100000 });
+    if (s.resetLog.length > 32) s.resetLog.shift();  // bounded, like any log
+    try { s.term.reset(); } catch { /* 忽略 */ }
+  }
+
   function enqueueWrite(s, bytes) {
     // Between asking for a resync and its ``resync-begin`` marker, live frames
     // are duplicates of what the replay is about to repeat -- drop them. From
@@ -749,13 +761,17 @@
     let offset = 0;
     for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.length; }
     if (s.sentry) {
+      // A ZMODEM transfer consumes the bytes as protocol; they are not
+      // rendered, so they do not count towards "reached the terminal".
       try { s.sentry.consume(merged); }
-      catch { try { s.term.write(merged); } catch { /* 忽略 */ } }
+      catch {
+        try { s.term.write(merged); s.wroteBytes = (s.wroteBytes || 0) + total; } catch { /* 忽略 */ }
+      }
       // Any traffic counts as transfer progress; re-arm the watchdog that
       // releases the input lock if a transfer dies without `session_end`.
       if (s.zmodemActive) armZmodemWatchdog(s);
     } else {
-      try { s.term.write(merged); } catch { /* 忽略 */ }
+      try { s.term.write(merged); s.wroteBytes = (s.wroteBytes || 0) + total; } catch { /* 忽略 */ }
     }
     if (s.writeQueue.length && s.writeTimer === null) {
       s.writeTimer = setTimeout(() => flushWrite(s), WRITE_FLUSH_MS);
@@ -842,7 +858,7 @@
     if (s.writeTimer !== null) { clearTimeout(s.writeTimer); s.writeTimer = null; }
     s.writeQueue = [];
     s.resyncing = true;
-    try { s.term.reset(); } catch { /* 忽略 */ }
+    resetTerm(s, "requestResync");
     sendControl(s, { type: "resync" });
     // The bar stays up until the replay actually lands. Clearing it on the
     // *request* left a failed resync with a blank screen and no way to know
@@ -1008,7 +1024,7 @@
         // reconnect that never completes still shows what was there.
         if (s.pendingReplayClear) {
           s.pendingReplayClear = false;
-          try { s.term.reset(); } catch { /* 忽略 */ }
+          resetTerm(s, "handleBinary:pendingReplayClear");
         }
         enqueueWrite(s, bytes);
       }
@@ -1051,13 +1067,14 @@
     switch (msg.type) {
       case "attached":
         s.attached = true;
-        // ``attached`` is queued *after* the scrollback replay. If the flag is
-        // still set here the replay was empty (an idle session), and the old
-        // screen is stale rather than current -- clear it now instead of
-        // letting the next real output wipe a still-accurate display.
+        // Did the attach replay deliver anything? ``pendingReplayClear`` is
+        // cleared by the first replayed byte; still set here means the replay
+        // was empty -- and the block below wipes the screen to the blank
+        // state that promise was made against.
+        const replayArrived = !s.pendingReplayClear;
         if (s.pendingReplayClear) {
           s.pendingReplayClear = false;
-          try { s.term.reset(); } catch { /* 忽略 */ }
+          resetTerm(s, "attached:pendingReplayClear");
         }
         // The attach replay is the full scrollback. Whatever a previous
         // connection shed, this replay repairs it -- so a desync that was
@@ -1068,6 +1085,11 @@
           // Not "重连回放": the first attach is not a reconnect either. The
           // bar must say what is true for both paths.
           markDesynced(s, "会话回放未完整，部分内容已省略");
+        } else if (!replayArrived && s.desynced) {
+          // We just wiped a screen the user was told was incomplete, and
+          // nothing came back to fill it. Clearing the bar here is the
+          // "silent blank" this whole feature exists to prevent.
+          showDesyncBar("回放为空，屏幕内容可能仍不完整");
         } else {
           clearDesync(s);
         }
@@ -1242,7 +1264,7 @@
       // A pane that has never been laid out must be measured before its first
       // show; after that ``needsRefit`` is what decides whether anything
       // actually changed (a theme tweak must not re-measure every hidden tab).
-      needsRefit: false, everShown: false,
+      needsRefit: false, everShown: false, resetLog: [],
       // Set while a resync replay is in flight; live frames are dropped, not
       // queued, because the replay is a superset of them.
       resyncing: false, resyncTimer: null,
@@ -1395,6 +1417,31 @@
       if (line) lines.push(line.translateToString(true));
     }
     return lines.join("\n");
+  };
+
+  // Per-session connection state, for support and for the reconnect/resync
+  // tests. Same rationale as ``__wsctlScreen``: the questions a support
+  // conversation starts with ("is it connected, is a replay pending, is the
+  // write path locked?") cannot be answered by reading the DOM.
+  window.__wsctlDiag = () => {
+    const out = {};
+    for (const [id, s] of sessions) {
+      out[id] = {
+        connected: Boolean(s.ws) && s.ws.readyState === WebSocket.OPEN,
+        resyncing: Boolean(s.resyncing),
+        pendingReplayClear: Boolean(s.pendingReplayClear),
+        queued: s.writeQueue ? s.writeQueue.length : 0,
+        queuedBytes: s.writeQueue
+          ? s.writeQueue.reduce((n, c) => n + (c.length || 0), 0) : 0,
+        desynced: Boolean(s.desynced),
+        shedSinceOpen: Boolean(s.shedSinceOpen),
+        everConnected: Boolean(s.everConnected),
+        exited: Boolean(s.exited),
+        wroteBytes: s.wroteBytes || 0,
+        resetLog: s.resetLog || [],
+      };
+    }
+    return out;
   };
 
   // Per-cell characters and widths for one row. Text alone cannot answer "do
@@ -1799,6 +1846,16 @@
 
   // -- 会话列表 ---------------------------------------------------------
 
+  // ``argv`` is a list on both the live and the history path now. Accept the
+  // old JSON-string shape too so a stale response cannot throw mid-render --
+  // one bad row used to take the whole "已结束" list down with it.
+  function argvLabel(argv) {
+    try {
+      const list = typeof argv === "string" ? JSON.parse(argv) : argv;
+      return Array.isArray(list) ? list.join(" ") : "";
+    } catch { return ""; }
+  }
+
   function formatDuration(seconds) {
     seconds = Math.max(0, Math.floor(seconds));
     const d = Math.floor(seconds / 86400);
@@ -1844,20 +1901,12 @@
         } catch (err) { toast(String(err.message || err), "error"); }
       } else if (act === "reopen") {
         try {
-          // Replay the recorded argv, not "command + backend name". For an SSH
-          // session the old shape sent backend=ssh with no ssh block (400), and
-          // the tempting fix -- dropping the backend -- would have run the
-          // *remote* command on the *local* shell.
-          let argv = [];
-          try { argv = typeof row.argv === "string" ? JSON.parse(row.argv) : (row.argv || []); }
-          catch { argv = []; }
-          if (!argv.length) {
-            toast("该会话未记录启动命令，无法原样重开", "error");
-            return;
-          }
-          const backend = row.backend === "tmux" ? "tmux" : "local";
+          // The server replays the *recorded* argv and backend; the client
+          // only supplies display overrides. Sending our own argv used to be
+          // how this worked, which made the sid decorative and let the caller
+          // dictate what would be spawned.
           const info = await api("POST", `/api/sessions/${encodeURIComponent(row.id)}/reopen`, {
-            argv, name: row.name, cwd: row.cwd || undefined, backend,
+            name: row.name, cwd: row.cwd || undefined,
           });
           els.sessionsOverlay.classList.add("hidden");
           sessionTab = "live";
@@ -1943,7 +1992,7 @@
           `运行 ${formatDuration(r.duration)}`,
           r.backend && r.backend !== "local" ? r.backend : "",
         ].filter(Boolean).join(" · ");
-        li.title = `命令：${r.command || (r.argv ? JSON.parse(r.argv).join(" ") : "默认 shell")}`;
+        li.title = `命令：${r.command || argvLabel(r.argv) || "默认 shell"}`;
         // An SSH session needs its structured target (host/user/port/identity)
         // which history does not keep. Reopening it as a local shell would run
         // the remote command on this machine -- so the button says why instead.
@@ -2004,10 +2053,14 @@
     };
   }
 
-  function sortRows(rows, key, spec) {
+  // The *table's* direction state is the only source of truth for sort order.
+  // ``spec`` is the column definition and has never carried a direction --
+  // reading ``spec._dir`` made every "descending" sort a lie (the header
+  // showed ↓ while the rows stayed in ascending order).
+  function sortRows(rows, key, spec, state) {
     const { field, numeric } = spec[key] || {};
     if (!field) return rows.slice();
-    const dir = (spec._dir && spec._dir.key === key && spec._dir.dir === -1) ? -1 : 1;
+    const dir = state && state.sort === key && state.dir === -1 ? -1 : 1;
     return rows.slice().sort((a, b) => {
       const x = a[field]; const y = b[field];
       if (numeric) return ((Number(x) || 0) - (Number(y) || 0)) * dir;
@@ -2017,7 +2070,7 @@
 
   function buildTable(host, id, columns, rows, spec, renderRow) {
     const state = tableState[id] || (tableState[id] = { offset: 0, sort: null });
-    const sorted = state.sort ? sortRows(rows, state.sort, spec) : rows.slice();
+    const sorted = state.sort ? sortRows(rows, state.sort, spec, state) : rows.slice();
     const page = sorted.slice(state.offset, state.offset + TABLE_PAGE);
 
     // Re-render *replaces* the previous table. Appending left a second (third,
@@ -2319,21 +2372,57 @@
     );
   }
 
+  // The QR dialog is a *two-step* enrolment: the secret is only provisioned
+  // once a code from the authenticator verifies. Closing the dialog without
+  // confirming discards the pending secret, so the account is never left
+  // half-enrolled and locked out of its own login.
+  let qrUsername = null;
+  let qrConfirmed = false;
+
   function closeQrDialog(refresh) {
+    const username = qrUsername;
+    const confirmed = qrConfirmed;
+    qrUsername = null;
+    qrConfirmed = false;
     els.qrOverlay.classList.add("hidden");
     els.qrImage.innerHTML = "";
+    if (els.qrCode) els.qrCode.value = "";
+    if (els.qrError) { els.qrError.textContent = ""; els.qrError.classList.add("hidden"); }
+    if (username && !confirmed) {
+      api("DELETE", `/api/users/${encodeURIComponent(username)}/totp`).catch(() => {});
+    }
     if (refresh) renderAdmin();
   }
 
   function showQrDialog(username, info) {
+    qrUsername = username;
+    qrConfirmed = false;
     els.qrTitle.textContent = `为 ${username} 启用 2FA`;
     els.qrSecret.textContent = info.secret;
     els.qrImage.innerHTML = info.qr_svg;
     els.qrOverlay.classList.remove("hidden");
-    els.qrDone.focus();
+    (els.qrCode || els.qrDone).focus();
   }
 
-  els.qrDone.addEventListener("click", () => closeQrDialog(true));
+  els.qrDone.addEventListener("click", async () => {
+    const username = qrUsername;
+    if (!username) { closeQrDialog(true); return; }
+    const code = (els.qrCode ? els.qrCode.value : "").trim();
+    if (!code) {
+      els.qrError.textContent = "请输入认证器上的 6 位验证码";
+      els.qrError.classList.remove("hidden");
+      return;
+    }
+    try {
+      await api("POST", `/api/users/${encodeURIComponent(username)}/totp/confirm`, { code });
+      qrConfirmed = true;
+      closeQrDialog(true);
+      toast("两步验证已启用", "ok");
+    } catch (err) {
+      els.qrError.textContent = String(err.message || err);
+      els.qrError.classList.remove("hidden");
+    }
+  });
   els.qrClose.addEventListener("click", () => closeQrDialog(true));
 
   async function renderAudit() {

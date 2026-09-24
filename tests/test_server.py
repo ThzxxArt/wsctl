@@ -326,7 +326,9 @@ async def test_pty_write_reports_drops_when_the_child_stops_reading(
     pty = PosixPty(["/bin/sh"], cols=80, rows=24, loop=asyncio.get_running_loop())
     try:
         # "The child stopped reading": nothing ever drains the write buffer.
-        monkeypatch.setattr(pty, "_flush", lambda: None)
+        # The stub still reports success (an accepted-but-unflushed write is
+        # not a drop); only a full buffer or a dead link is.
+        monkeypatch.setattr(pty, "_flush", lambda: True)
         assert pty.write(b"x" * MAX_WRITE_BUFFER) is True  # exactly fills the cap
         assert pty.dropped_input == 0
         assert pty.write(b"more") is False  # buffer is at the cap
@@ -804,9 +806,9 @@ def test_input_rate_limit_drops_input_but_keeps_the_connection(
 
             # The connection survived: a well-sized write must still reach the
             # shell. If rate limiting killed the link this would never come.
-            ws.send_text(json.dumps({"type": "input", "data": "echo RATE-ALIVE\r"}))
-            out = _recv_bytes_until(ws, b"RATE-ALIVE")
-            assert b"RATE-ALIVE" in out, "connection was killed by one over-limit chunk"
+            ws.send_text(json.dumps({"type": "input", "data": "echo $((47*53))\r"}))
+            out = _recv_bytes_until(ws, b"2491\r\n")
+            assert b"2491\r\n" in out, "connection was killed by one over-limit chunk"
 
 
 def test_input_rate_limit_disconnects_a_persistent_flood(tmp_path: Path) -> None:
@@ -862,9 +864,9 @@ def test_ws_notices_never_enter_the_terminal_buffer(tmp_path: Path) -> None:
                 # Nothing about the drop may reach the terminal as bytes: the
                 # scrollback is what a reconnect replays, and replaying an
                 # operational warning makes the shell appear to have printed it.
-                ws.send_text(json.dumps({"type": "input", "data": "echo CLEAN-BUFFER\r"}))
-                out = _recv_bytes_until(ws, b"CLEAN-BUFFER")
-                assert b"CLEAN-BUFFER" in out
+                ws.send_text(json.dumps({"type": "input", "data": "echo $((59*61))\r"}))
+                out = _recv_bytes_until(ws, b"3599\r\n")
+                assert b"3599\r\n" in out
                 assert "丢弃".encode() not in out
                 assert b"\x1b[31m[wsctl]" not in out
             client.delete(f"/api/sessions/{sid}")
@@ -959,16 +961,63 @@ def test_update_user_password(tmp_path: Path) -> None:
 
 
 def test_totp_admin_endpoints(tmp_path: Path) -> None:
+    """TOTP is a *two-step* enrolment: nothing is active until a code verifies.
+
+    The first version wrote the secret to the user row before returning the QR.
+    A scan that never happened then left the account demanding a code nobody
+    had -- locked out of its own login with no way back but an admin reset. The
+    CLI has always confirmed first; the API now matches.
+    """
+    import pyotp
+
     with TestClient(build_app(tmp_path)) as client:
         login(client, ADMIN)
         info = client.post("/api/users/bob/totp").json()
         assert info["secret"]
         assert "<svg" in info["qr_svg"]
         users = {u["username"]: u for u in client.get("/api/users").json()}
+        assert users["bob"]["totp"] is False, (
+            "the pending enrolment must not be active before a code is confirmed"
+        )
+
+        # A wrong code must not activate it either.
+        assert client.post(
+            "/api/users/bob/totp/confirm", json={"code": "000000"}
+        ).status_code == 400
+        users = {u["username"]: u for u in client.get("/api/users").json()}
+        assert users["bob"]["totp"] is False
+
+        # The real code activates it.
+        code = pyotp.TOTP(info["secret"]).now()
+        assert client.post(
+            "/api/users/bob/totp/confirm", json={"code": code}
+        ).status_code == 200
+        users = {u["username"]: u for u in client.get("/api/users").json()}
         assert users["bob"]["totp"] is True
+
         assert client.delete("/api/users/bob/totp").status_code == 200
         users = {u["username"]: u for u in client.get("/api/users").json()}
         assert users["bob"]["totp"] is False
+
+
+def test_cancelling_a_totp_enrolment_leaves_the_account_untouched(
+    tmp_path: Path,
+) -> None:
+    """Closing the QR dialog without confirming must be a no-op.
+
+    That is the whole point of the second step: an abandoned scan may never
+    turn into a login requirement.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        client.post("/api/users/bob/totp")
+        assert client.delete("/api/users/bob/totp").status_code == 200
+        users = {u["username"]: u for u in client.get("/api/users").json()}
+        assert users["bob"]["totp"] is False
+        # And the account can still log in with its password alone.
+        assert client.post(
+            "/api/login", json={"username": "bob", "password": "bobpw1234"}
+        ).status_code == 200
 
 
 def test_recordings_admin_crud(tmp_path: Path) -> None:
@@ -1136,20 +1185,21 @@ def test_password_change_revokes_other_sessions(tmp_path: Path) -> None:
 
 
 def test_password_policy_is_enforced_over_the_api(tmp_path: Path) -> None:
+    """A weak password is refused -- whether by the field bounds (422) or by
+    the shared storage-boundary policy (400). Both are refusals; the point is
+    that neither path lets it through.
+    """
     with TestClient(build_app(tmp_path)) as client:
         login(client, ADMIN)
-        assert client.post(
-            "/api/users", json={"username": "weak", "password": ""}
-        ).status_code == 400
-        assert client.post(
-            "/api/users", json={"username": "weak", "password": "short"}
-        ).status_code == 400
+        for weak in ("", "short", "1234567"):
+            r = client.post("/api/users", json={"username": "weak", "password": weak})
+            assert r.status_code in (400, 422), f"{weak!r} was accepted: {r.status_code}"
         assert client.post(
             "/api/users", json={"username": "ok", "password": "password123"}
         ).status_code == 201
         assert client.patch(
             "/api/users/ok", json={"password": "short"}
-        ).status_code == 400
+        ).status_code in (400, 422)
 
 
 def test_share_is_persisted_and_survives_a_restart(tmp_path: Path) -> None:
@@ -1375,9 +1425,13 @@ def test_file_panel_endpoints(tmp_path: Path) -> None:
         assert made.status_code == 201, made.text
         assert (files / "notes").is_dir()
 
-        # illegal names are refused
+        # illegal names are refused (400 by the name rules, 422 by the field
+        # bounds -- both are refusals and neither may slip through)
         for bad in ("..", "a/b", ".wsctl-upload", ""):
-            assert client.post("/api/files/mkdir", json={"name": bad}).status_code == 400
+            assert client.post("/api/files/mkdir", json={"name": bad}).status_code in (
+                400,
+                422,
+            ), bad
 
         # rename
         renamed = client.post("/api/files/rename", json={"path": "seed.txt", "name": "seeds.txt"})
@@ -1506,12 +1560,12 @@ def test_reopen_replays_argv_so_an_ssh_session_never_becomes_local(
     History used to rebuild a session from ``command`` + ``backend``. For SSH
     that 400'd (no ``ssh`` block) and the tempting fix -- dropping the backend
     -- would have executed the *remote* command on the *local* shell. Replaying
-    the recorded ``argv`` is what the plan actually asked for.
+    the **recorded** ``argv`` is what the endpoint promises; taking the
+    caller's word for it instead made ``sid`` decorative and let the client
+    dictate what would be spawned.
     """
     with TestClient(build_app(tmp_path)) as client:
         login(client, ADMIN)
-        # A recorded argv that is clearly "not a local shell": if it were run
-        # locally the marker below would appear in this test process's cwd.
         created = client.post(
             "/api/sessions", json={"name": "orig", "command": "sleep 30"}
         ).json()["id"]
@@ -1519,30 +1573,49 @@ def test_reopen_replays_argv_so_an_ssh_session_never_becomes_local(
 
         again = client.post(
             f"/api/sessions/{created}/reopen",
-            json={"argv": ["/bin/sh", "-c", "sleep 30"], "name": "orig", "backend": "local"},
+            json={"name": "orig"},
         )
         assert again.status_code == 201, again.text
         body = again.json()
         assert body["name"] == "orig"
 
-        # The argv is preserved verbatim (this is the property that keeps an
-        # ``ssh`` an ``ssh``), and is visible on the detail endpoint.
+        # The *recorded* argv is preserved verbatim -- that is the property
+        # that keeps an ``ssh`` an ``ssh`` -- and it is visible on detail.
         detail = client.get(f"/api/sessions/{body['id']}/detail").json()
-        assert detail["argv"] == ["/bin/sh", "-c", "sleep 30"]
+        assert detail["argv"] == ["sleep", "30"], detail["argv"]
+        # The same shape as the history row: a list, never a JSON string.
+        history = client.get("/api/sessions/history").json()
+        recorded = next(r for r in history if r["id"] == created)
+        assert recorded["argv"] == ["sleep", "30"], recorded["argv"]
+        assert isinstance(recorded["argv"], list)
 
-        # An SSH-shaped argv is refused as a *backend*, never silently run
-        # as a local command.
-        refused = client.post(
-            f"/api/sessions/{body['id']}/reopen",
-            json={"argv": ["ssh", "-tt", "user@host"], "backend": "ssh"},
+        # The caller cannot smuggle a different command through the replay.
+        smuggled = client.post(
+            f"/api/sessions/{created}/reopen",
+            json={"name": "evil", "argv": ["touch", "/tmp/pwned"], "backend": "local"},
         )
+        assert smuggled.status_code == 201, smuggled.text
+        assert smuggled.json()["name"] in ("evil", "orig")
+        smuggled_detail = client.get(f"/api/sessions/{smuggled.json()['id']}/detail").json()
+        assert smuggled_detail["argv"] == ["sleep", "30"], (
+            "the replay must ignore a caller-supplied argv"
+        )
+
+        # A nonexistent or foreign sid is not "reopenable".
+        assert client.post("/api/sessions/nope/nope/reopen", json={}).status_code in (404,)
+        missing = client.post("/api/sessions/ffffffffffffffff/reopen", json={})
+        assert missing.status_code == 404
+
+        # An SSH-shaped record is refused as a *backend*, never silently run
+        # as a local command.
+        ssh_sid = client.post(
+            "/api/sessions",
+            json={"backend": "ssh", "ssh": {"host": "127.0.0.1", "port": 1}},
+        ).json()["id"]
+        client.delete(f"/api/sessions/{ssh_sid}")
+        refused = client.post(f"/api/sessions/{ssh_sid}/reopen", json={})
         assert refused.status_code == 400
         assert "local" in refused.text
-
-        # Garbage argv is refused rather than spawned.
-        for bad in ([], ["-evil"], ["ok", ""], ["ok", None]):
-            r = client.post(f"/api/sessions/{body['id']}/reopen", json={"argv": bad})
-            assert r.status_code in (400, 422), (bad, r.status_code)
 
 
 def test_rate_limit_disconnect_sends_exactly_one_reason(tmp_path: Path) -> None:
@@ -1780,7 +1853,10 @@ def test_revoked_share_stops_text_input_immediately(tmp_path: Path) -> None:
             started = time.time()
             ws.send_text(json.dumps({"type": "input", "data": "echo X\r"}))
             close = _recv_until_close(ws, timeout=5)
-            assert close["code"] == 403 or close["code"] == 4403, close
+            # 4403 is the contract (core.closecodes.CLOSE_FORBIDDEN). The 403
+            # of the early days is an HTTP status, not a WebSocket close code,
+            # and letting both through left "used the wrong code" free to pass.
+            assert close["code"] == 4403, close
             # Immediate: not "sometime within the 5 s recheck window".
             assert time.time() - started < 3.0, "revocation took a recheck cycle"
 
@@ -1866,3 +1942,396 @@ def test_release_assets_cannot_go_stale(tmp_path: Path) -> None:
         vendor = client.get("/static/vendor/xterm.js")
         assert vendor.status_code == 200
         assert "max-age=31536000" in vendor.headers.get("cache-control", "")
+
+
+# -- 0.1.22: checks must be driven by the clock, not by "the peer went quiet" --
+
+
+def test_a_chatty_peer_cannot_dodge_the_periodic_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-validation is driven by the *clock*, not by the receive timing out.
+
+    The share/auth/idle checks used to live only in the ``except TimeoutError``
+    branch. Any client that sent a frame every few seconds -- ``ping``, even a
+    malformed one -- kept ``wait_for`` from ever timing out, so a disabled
+    account, a revoked token or a revoked share was never re-checked and the
+    connection kept a fully writable terminal indefinitely. This test keeps the
+    peer *loud* the whole time: under the old code the loop below runs to its
+    deadline with the socket still open.
+    """
+    from wsctl.server import ws as ws_mod
+
+    monkeypatch.setattr(ws_mod, "ACCESS_RECHECK", 0.2)
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            app.state.store.user_set_disabled("admin", True)  # type: ignore[attr-defined]
+            end = time.time() + 5.0
+            closed = None
+            while time.time() < end:
+                try:
+                    ws.send_text(json.dumps({"type": "ping"}))
+                except Exception:
+                    break
+                message = ws.receive()
+                if message.get("type") == "websocket.close":
+                    closed = message
+                    break
+            assert closed is not None, (
+                "a peer that never went quiet kept a disabled account's "
+                "terminal open for the whole window"
+            )
+            assert closed["code"] == 4401, closed
+
+
+def test_a_revoked_share_may_not_resync_the_history(tmp_path: Path) -> None:
+    """``resync`` hands out the whole scrollback -- revocation has to gate it.
+
+    Every input path checked ``share_revoked()``; ``resync`` did not. And the
+    session-level share filter inside ``_broadcast`` never sees this path at
+    all (it replays straight from the session buffer), so a revoked viewer
+    could pull the entire history -- and trigger a repaint nudge -- with one
+    frame.
+    """
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": True}
+        ).json()["token"]
+        client.cookies.clear()
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            attached = _recv_control(ws, {"attached", "error"})
+            assert attached is not None and attached["writable"] is True
+            app.state.manager.get(sid).revoke_share()  # type: ignore[attr-defined]
+            ws.send_text(json.dumps({"type": "resync"}))
+            close = _recv_until_close(ws, timeout=5)
+            assert close["code"] == 4403, close
+
+
+def test_a_demoted_admin_loses_their_live_writable_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Access is re-derived on every recheck, not frozen at the handshake.
+
+    ``recheck()`` used to answer only "does this token still resolve to *some*
+    user". A demoted admin therefore kept ``writable=True`` on sessions
+    ``can_access()`` now refuses, until they happened to reconnect.
+    """
+    from wsctl.server import ws as ws_mod
+
+    monkeypatch.setattr(ws_mod, "ACCESS_RECHECK", 0.2)
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        # Bob owns the session; admin attaches by privilege.
+        login(client, BOB)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            attached = _recv_control(ws, {"attached", "error"})
+            assert attached is not None and attached.get("writable") is True
+            # Demote the connected admin to a plain user: the very session they
+            # are sitting in is Bob's, which a plain user may not touch.
+            assert app.state.store.user_set_role("admin", "user")  # type: ignore[attr-defined]
+            close = _recv_until_close(ws, timeout=5)
+            assert close["code"] == 4403, close
+
+
+def test_history_says_why_a_session_ended(tmp_path: Path) -> None:
+    """A clean ``exit`` must not appear in history as "服务退出或实例崩溃"."""
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post(
+            "/api/sessions", json={"command": "/bin/sh -c 'exit 3'"}
+        ).json()["id"]
+        end = time.time() + 8.0
+        row = None
+        while time.time() < end:
+            rows = client.get("/api/sessions/history").json()
+            match = [r for r in rows if r["id"] == sid]
+            if match:
+                row = match[0]
+                break
+            time.sleep(0.1)
+        assert row is not None, "the finished session never reached history"
+        reason = str(row["ended_reason"])
+        assert "3" in reason, f"the exit code is missing from {reason!r}"
+        assert "崩溃" not in reason and "服务退出" not in reason, (
+            f"a clean exit was filed as a crash: {reason!r}"
+        )
+
+
+def test_history_says_who_ended_a_session(tmp_path: Path) -> None:
+    """An admin kill is "被管理员终止"; the row must not blame the crash daemon."""
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        assert client.delete(f"/api/sessions/{sid}").status_code == 200
+        end = time.time() + 8.0
+        row = None
+        while time.time() < end:
+            rows = client.get("/api/sessions/history").json()
+            match = [r for r in rows if r["id"] == sid]
+            if match:
+                row = match[0]
+                break
+            time.sleep(0.1)
+        assert row is not None, "the killed session never reached history"
+        assert row["ended_reason"] == "被管理员终止", row["ended_reason"]
+
+
+# -- 0.1.22: "claims of work that never happened" --------------------------
+
+
+def test_a_manual_recording_start_respects_the_capacity_limit(tmp_path: Path) -> None:
+    """``recordings_max_bytes`` binds auto-record *and* a click on 录制."""
+    app = build_app(tmp_path, recordings_max_bytes=1)
+    (tmp_path / "recordings").mkdir(exist_ok=True)
+    (tmp_path / "recordings" / "filler.cast").write_bytes(b"x" * 100)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        r = client.post(f"/api/sessions/{sid}/recording/start", json={})
+        assert r.status_code == 409, "the manual start walked past the quota"
+
+
+def test_stopping_a_recording_that_never_started_is_not_an_ok(tmp_path: Path) -> None:
+    """``{"ok": True}`` for "there was nothing to stop" is a claim of work
+    that never happened."""
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        r = client.post(f"/api/sessions/{sid}/recording/stop")
+        assert r.status_code == 409, r.text
+
+
+def test_a_live_recording_is_not_deleted_from_under_the_writer(
+    tmp_path: Path,
+) -> None:
+    """Unlinking a cast the recorder still holds made the data vanish: the
+    writer kept appending to a deleted inode and ``stop`` closed it for good."""
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        assert client.post(f"/api/sessions/{sid}/recording/start", json={}).status_code == 200
+        name = f"{sid}.cast"
+        assert client.delete(f"/api/recordings/{name}").status_code == 409
+        assert (tmp_path / "recordings" / name).is_file(), (
+            "the cast must survive a refused delete"
+        )
+        assert client.post(f"/api/sessions/{sid}/recording/stop").status_code == 200
+        # ...and is deletable once nothing is writing to it.
+        assert client.delete(f"/api/recordings/{name}").status_code == 200
+
+
+def test_an_owner_can_still_fetch_their_own_recording_after_the_session_ends(
+    tmp_path: Path,
+) -> None:
+    """The only other door (``GET /api/recordings``) is admin-only.
+
+    A plain user whose session had ended could therefore never get their own
+    cast back -- a data-loss-shaped hole in the product.
+    """
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, BOB)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        client.post(f"/api/sessions/{sid}/recording/start", json={})
+        client.post(f"/api/sessions/{sid}/recording/stop")
+        client.delete(f"/api/sessions/{sid}")  # the session is gone now
+        got = client.get(f"/api/sessions/{sid}/recording")
+        assert got.status_code == 200, got.text
+        assert got.content.startswith(b'{"version": 2')
+
+
+def test_argv_has_one_shape_on_both_the_live_and_the_history_path(
+    tmp_path: Path,
+) -> None:
+    """A JSON *string* on one path and a ``list`` on the other forces every
+    consumer to branch on "is it alive" just to read argv."""
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post(
+            "/api/sessions", json={"name": "shape", "command": "sleep 30"}
+        ).json()["id"]
+        live = client.get(f"/api/sessions/{sid}/detail").json()
+        client.delete(f"/api/sessions/{sid}")
+        finished = client.get(f"/api/sessions/{sid}/detail").json()
+        assert isinstance(live["argv"], list), live["argv"]
+        assert isinstance(finished["argv"], list), finished["argv"]
+        assert live["argv"] == finished["argv"], (live["argv"], finished["argv"])
+        # ``command`` is filled in on both, not just one.
+        assert live["command"] == "sleep 30", live["command"]
+        assert finished["command"] == "sleep 30", finished["command"]
+
+
+def test_a_share_with_a_non_positive_ttl_is_refused_not_delivered_dead(
+    tmp_path: Path,
+) -> None:
+    """A 200 with a token that can never work is worse than a 400."""
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        for bad in (0, -1, -3600):
+            r = client.post(
+                f"/api/sessions/{sid}/share", json={"writable": True, "ttl": bad}
+            )
+            assert r.status_code == 422, (bad, r.status_code, r.text)
+
+
+def test_the_shutdown_flushes_the_webhook_queue(tmp_path: Path) -> None:
+    """``stop()`` used to cancel mid-flight and drop the events ``audit.stop()``
+    had just dispatched -- the final audit events of a run."""
+    import asyncio
+
+    from wsctl.core.webhook import WebhookDispatcher
+
+    delivered: list[dict] = []
+
+    async def run() -> None:
+        dispatcher = WebhookDispatcher("http://127.0.0.1:9/hook")
+        dispatcher._post = lambda payload: delivered.append(payload)  # type: ignore[assignment]
+        dispatcher.start()
+        for index in range(5):
+            dispatcher.emit({"event": f"e{index}"})
+        await dispatcher.stop(drain_timeout=5.0)
+
+    asyncio.run(run())
+    assert len(delivered) == 5, f"shutdown dropped {5 - len(delivered)} webhook events"
+
+
+def test_only_an_attach_that_replays_something_repaints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repaint is triggered by "was anything replayed", not "a socket opened".
+
+    ``nudge_repaint`` is what the 0.1.20 recovery model rests on: a replayed
+    byte stream can never rebuild a full-screen app's screen, so the app is
+    asked to redraw from its own model. A brand-new session replays nothing
+    and needs nothing. The first guard asserted only ``has_scrollback`` and
+    never watched the repaint at all.
+    """
+    from wsctl.core import session as session_mod
+
+    calls: list[str] = []
+    original = session_mod.TermSession.nudge_repaint
+
+    async def spy(self: object) -> None:
+        calls.append(self.id)  # type: ignore[attr-defined]
+        await original(self)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_mod.TermSession, "nudge_repaint", spy)
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        # A silent child: nothing is ever written, so "was anything replayed"
+        # has a deterministic answer. Racing a shell for its banner (the first
+        # attempt) is what made this guard flaky in the full suite.
+        quiet = client.post(
+            "/api/sessions", json={"command": "/bin/sleep 30"}
+        ).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": quiet, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+        assert calls == [], (
+            f"an empty replay must not repaint: {calls}"
+        )
+
+        noisy = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": noisy, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            ws.send_text(json.dumps({"type": "input", "data": "echo $((29*31))\r"}))
+            _recv_bytes_until(ws, b"899\r\n")
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": noisy, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+        assert noisy in calls, (
+            "an attach that replays something must trigger the application repaint"
+        )
+
+
+def test_an_oversized_input_frame_never_reaches_the_pty_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The application bound is on the *frame*, not only on what is buffered.
+
+    ``PosixPty.write`` checks ``len(buf) >= MAX`` and then ``buf.extend(data)``
+    -- so one oversized frame walked straight past a 1 MiB "limit" whenever
+    the buffer happened to be empty. The transport's 16 MiB ``ws_max_size`` is
+    not an application bound either.
+    """
+    from wsctl.core import session as session_mod
+
+    seen: list[int] = []
+    original = session_mod.TermSession.write_input
+
+    def spy(self: object, data: bytes) -> bool:
+        seen.append(len(data))
+        return original(self, data)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_mod.TermSession, "write_input", spy)
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            ws.send_bytes(b"x" * (256 * 1024 + 1))
+            notice = _recv_control(ws, {"notice"})
+            assert notice is not None and "过大" in str(notice["msg"]), notice
+            assert not seen, f"an oversized frame reached write_input: {seen}"
+            # And the connection is still usable for ordinary input -- which
+            # also proves the spy is live (the next line *must* register).
+            ws.send_text(json.dumps({"type": "input", "data": "echo $((37*41))\r"}))
+            out = _recv_bytes_until(ws, b"1517\r\n")
+            assert b"1517\r\n" in out, "the link must survive a refused frame"
+            assert seen, "the spy never fired -- this guard was measuring nothing"
+            assert all(size <= 256 * 1024 for size in seen), seen
+        client.delete(f"/api/sessions/{sid}")
+
+
+def test_request_bodies_are_bounded_before_they_reach_the_work(tmp_path: Path) -> None:
+    """An unbounded field is a free memory/CPU knob.
+
+    The password field is the sharp one: it reaches Argon2, and the rate-limit
+    key is ``ip:username`` -- so a new username bought a fresh allowance of
+    arbitrarily large hashes. The bounds must be at the *model*, before any of
+    that.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        huge = "x" * 300
+        for body in (
+            {"username": "u", "password": huge},
+            {"username": huge, "password": "password123"},
+        ):
+            r = client.post("/api/users", json=body)
+            assert r.status_code == 422, (list(body), r.status_code)
+        # The TOTP field is bounded on the *login* body: it is the one that
+        # reaches the verifier, and an unbounded one is free CPU.
+        r = client.post(
+            "/api/login",
+            json={"username": "admin", "password": "adminpw123", "totp": "1" * 17},
+        )
+        assert r.status_code == 422, r.status_code
+        # A session name past its bound is refused rather than stored.
+        r = client.post("/api/sessions", json={"name": "n" * 500})
+        assert r.status_code == 422, r.status_code
+        # File content past its bound is refused rather than encoded.
+        r = client.put(
+            "/api/files/content",
+            json={"path": "x.txt", "content": "c" * (3 * 1024 * 1024)},
+        )
+        assert r.status_code == 422, r.status_code
