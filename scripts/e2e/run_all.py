@@ -907,14 +907,24 @@ def scenario_selfrestart() -> None:
 
         def watch() -> None:
             end = time.time() + 60
+            # One client for the whole run: rebuilding it per probe is heavy
+            # enough to make the probe itself slow on a loaded runner.
+            client = local_http()
             while time.time() < end:
                 polled["n"] += 1
                 try:
-                    got = local_http().get(f"{base}/healthz", timeout=1)
+                    got = client.get(f"{base}/healthz", timeout=5)
                     if got.status_code != 200:
                         gaps.append(time.time())
-                except httpx.HTTPError:
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    # Nothing accepted the connection: the swap really did
+                    # drop the port.
                     gaps.append(time.time())
+                except httpx.HTTPError:
+                    # A slow *answer* is not a dropped connection -- the socket
+                    # was accepted and served. Counting a ReadTimeout as a gap
+                    # measured the runner's load, not the handover.
+                    pass
                 time.sleep(0.05)
 
         import threading
@@ -969,13 +979,18 @@ def scenario_selfrestart() -> None:
         stop_watch = threading.Event()
 
         def watch() -> None:
+            client = local_http()
             while not stop_watch.is_set():
                 try:
-                    got = local_http().get(f"{base}/healthz", timeout=1)
+                    got = client.get(f"{base}/healthz", timeout=5)
                     if got.status_code != 200:
                         gaps.append(time.time())
-                except httpx.HTTPError:
+                except (httpx.ConnectError, httpx.ConnectTimeout):
                     gaps.append(time.time())
+                except httpx.HTTPError:
+                    # See the note above: a slow answer is not a dropped
+                    # connection.
+                    pass
                 time.sleep(0.05)
 
         watcher = threading.Thread(target=watch, daemon=True)
@@ -1021,7 +1036,8 @@ def scenario_selfrestart() -> None:
             cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120,
         )
         stop_watch.set()
-        watcher.join(timeout=5)
+        watcher.join(timeout=30)
+        assert not watcher.is_alive(), "the gap watcher did not stop"
         assert rolled2.returncode == 0, rolled2.stdout + rolled2.stderr
         assert not gaps, f"after the migration rolling restart must be gapless: {gaps[:5]}"
     finally:

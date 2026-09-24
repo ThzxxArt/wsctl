@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -2335,3 +2336,155 @@ def test_request_bodies_are_bounded_before_they_reach_the_work(tmp_path: Path) -
             json={"path": "x.txt", "content": "c" * (3 * 1024 * 1024)},
         )
         assert r.status_code == 422, r.status_code
+
+
+def test_upload_is_atomic_a_reader_never_sees_a_half_file(tmp_path: Path) -> None:
+    """Uploading must not expose a partially written file to concurrent reads.
+
+    The first version of this test re-implemented the staging *itself* and only
+    called the copy helper -- reverting ``upload_file`` to a direct write
+    changed nothing. It also used ``all(...)`` over a possibly *empty* sample
+    list, which is vacuously true. The production route runs here, and the
+    reader must actually observe the finished file.
+    """
+    import io
+    import threading
+
+    from wsctl.core.config import load_settings
+    from wsctl.core.store import Store
+
+    files = tmp_path / "files"
+    files.mkdir()
+    settings = load_settings(data_dir=tmp_path / "data", file_root=files)
+    store = Store(tmp_path / "data" / "db.sqlite")
+    store.user_create("admin", "password123", role="admin")
+    app = create_app(settings, store=store)
+    payload = b"A" * (2 * 1024 * 1024)
+    dest = files / "atomic.bin"
+    seen: list[int] = []
+    stop = threading.Event()
+
+    def reader() -> None:
+        while not stop.is_set():
+            with contextlib.suppress(OSError):
+                seen.append(dest.stat().st_size)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/login", json={"username": "admin", "password": "password123"}
+        ).status_code == 200
+        r = client.post(
+            "/api/files/upload",
+            data={"path": ""},
+            files={"file": ("atomic.bin", io.BytesIO(payload))},
+        )
+        assert r.status_code == 201, r.text
+    stop.set()
+    thread.join(timeout=5)
+
+    assert dest.read_bytes() == payload
+    assert all(s in (0, len(payload)) for s in seen), seen[:10]
+    assert seen, "the reader never sampled the file at all"
+    assert len(payload) in seen, "the reader never saw the published file"
+
+
+def test_concurrent_same_name_uploads_publish_one_whole_file(tmp_path: Path) -> None:
+    """Two uploads of one name must never publish an interleaved mixture.
+
+    A fixed ``.{name}.wsctl-upload`` sidecar made both writers share one
+    staging file: their bytes interleaved and the final ``os.replace`` handed
+    the mixture out as a complete-looking file.
+
+    One ``TestClient`` and one lifespan. Two concurrent ``with TestClient(app)``
+    blocks start two lifespans on one app (two audit writers, two
+    ``store.close()`` calls) and leave the interpreter hanging on exit -- which
+    is exactly what this test did before.
+    """
+    import io
+    import threading
+
+    from wsctl.core.config import load_settings
+    from wsctl.core.store import Store
+
+    files = tmp_path / "files"
+    files.mkdir()
+    settings = load_settings(data_dir=tmp_path / "data", file_root=files)
+    store = Store(tmp_path / "data" / "db.sqlite")
+    store.user_create("admin", "password123", role="admin")
+    app = create_app(settings, store=store)
+
+    left = b"L" * 300000
+    right = b"R" * 300000
+    errors: list[object] = []
+    barrier = threading.Barrier(3)
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/login", json={"username": "admin", "password": "password123"}
+        ).status_code == 200
+
+        def upload(payload: bytes) -> None:
+            barrier.wait()
+            try:
+                client.post(
+                    "/api/files/upload",
+                    data={"path": "", "overwrite": "true"},
+                    files={"file": ("doc.bin", io.BytesIO(payload))},
+                )
+            except Exception as exc:  # any outcome is acceptable
+                errors.append(exc)
+
+        threads = [threading.Thread(target=upload, args=(p,)) for p in (left, right)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=30)
+
+    body = (files / "doc.bin").read_bytes()
+    assert body in (left, right), (
+        "the published file is an interleaved mixture of two uploads"
+    )
+    leftovers = [q.name for q in files.iterdir() if q.name.startswith(".")]
+    assert leftovers == [], f"staging sidecars leaked: {leftovers}"
+
+
+def test_session_sliding_ttl_reload_reaches_the_store(tmp_path: Path) -> None:
+    """Reload must rewire the live mirror, not just the Settings object.
+
+    ``sliding_ttl`` is read from ``Store`` on every token resolution. Updating
+    only ``settings.session_sliding_ttl`` left the store on the old value
+    forever, so the field was advertised as hot-reloadable while the code that
+    honours it never noticed.
+
+    The first version of this test performed the rewire *itself* and then
+    asserted the assignment had happened -- deleting the production line
+    changed nothing. The reload is driven through ``POST /api/config/reload``,
+    the only path a user has.
+    """
+    from wsctl.core.config import load_settings
+    from wsctl.core.store import Store
+
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("session_sliding_ttl = false\n", encoding="utf-8")
+    settings = load_settings(data_dir=tmp_path, config_path=config)
+    store = Store(tmp_path / "db.sqlite")
+    store.user_create("admin", "password123", role="admin")
+    app = create_app(settings, store=store)
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/login", json={"username": "admin", "password": "password123"}
+        ).status_code == 200
+        assert store.sliding_ttl is False
+
+        config.write_text("session_sliding_ttl = true\n", encoding="utf-8")
+        r = client.post("/api/config/reload")
+        assert r.status_code == 200, r.text
+        assert "session_sliding_ttl" in r.json().get("changed", []), r.text
+        assert store.sliding_ttl is True, (
+            "the reload updated Settings but never reached the store -- the "
+            "field stays advertised as hot-reloadable while nothing honours it"
+        )

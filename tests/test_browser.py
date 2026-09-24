@@ -1630,19 +1630,20 @@ def test_browser_full_screen_app_survives_a_flood(tmp_path: Path) -> None:
                 # Small frames fill the queue and force the shed to cut *inside*
                 # the stream, which is the case that used to garble `vi`.
                 #
-                # The command line is cleared first: typing the escapes would
-                # echo `\033[31m` as *text* and the "no `[31m` as text"
-                # assertion would then be measuring the command echo.
-                #
-                # The generator lives under ``tmp_path``: a fixed ``/tmp/f.py``
-                # is a cross-test collision waiting for the day two runs overlap.
+                # The generator is written by *this* process and then run by
+                # name. Typing the escapes into the terminal (``python3 -c``)
+                # echoed `\x1b[31m` as text, and the assertion below then
+                # measured the command echo instead of the terminal's handling
+                # of the bytes -- it failed on the first CI runner whose
+                # scrollback still held that echo.
                 gen_path = tmp_path / "floodgen.py"
-                gen = (
-                    f"python3 -c 'open(r\"{gen_path}\",\"w\").write("
-                    "\"import sys\\nfor _ in range(1500):\\n"
-                    " sys.stdout.write(\\\"\\\\x1b[31mRED\\\\x1b[0m\\\\n\\\")\\n\")'"
+                gen_path.write_text(
+                    "import sys\n"
+                    "for _ in range(1500):\n"
+                    "    sys.stdout.buffer.write(b'\\x1b[31mRED\\x1b[0m\\n')\n",
+                    encoding="utf-8",
                 )
-                page.keyboard.type(gen)
+                page.keyboard.type(f"python3 {gen_path}")
                 page.keyboard.press("Enter")
                 page.wait_for_timeout(500)
                 page.keyboard.type("clear")

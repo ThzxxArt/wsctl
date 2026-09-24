@@ -185,6 +185,23 @@ resync → nudge_repaint → bash 重绘「\r\x1b[K + 提示符」→ 污染 scr
 > 少 100ms 的可回放历史，换掉「回放自毁」这一整类故障。nudge 只发生在 attach /
 > resync 的恢复时刻，损失面极小。
 
+### 发布前 CI 修的三处（本地全绿、远程才现形）
+
+- **browser：断言在量「命令回显」。** 洪峰生成器是用 `python3 -c` 键进终端的，
+  命令行里就有 `\x1b[31m` 字面量；断言「屏幕上不许出现 `[31m`」于是量的是回显
+  ——本地 scrollback 恰好滚没了它，CI 上还在。生成器改由**测试进程写文件**，
+  终端里只键入 `python3 <path>`，命令行不含任何转义文本。
+- **windows-smoke：平台中立白名单被塞进了应用机器。** D1/D2 的改造把
+  `create_app`/`TestClient` 拉进 `test_fs`/`test_config`，而并发上传用例开了
+  **同一 app 的两个 lifespan**（两套 audit writer、两次 `store.close()`），
+  测试全过但解释器退出时挂死。两个上传路由用例与滑动 TTL 接线用例移入
+  `test_server`（其本职就是应用层），并发用例改为**单一 lifespan + 多线程请求**。
+- **e2e：gap 探测器把「一次探测慢」当成了「连接被丢」。** `except
+  httpx.HTTPError` 吞下了 `ReadTimeout`，且每次探测都新建一个 httpx 客户端
+  ——CI 负载下 1s 超时就记一次 gap。现只计**连接级**失败（`ConnectError` /
+  `ConnectTimeout` / 非 200），客户端复用，`join` 加「线程必须真的停下」断言。
+  `rolling-migrate` 随即转绿。
+
 ### Verified
 
 526 unit（含新增的 45+ 判别性守卫与前端结构契约）· 6 slow · 30 browser · 11 e2e 全绿；
