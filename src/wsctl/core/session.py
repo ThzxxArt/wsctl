@@ -249,6 +249,50 @@ class TermSession:
             total += int(getattr(entry.client, "pending_bytes", 0))
         return total
 
+    @property
+    def has_scrollback(self) -> bool:
+        """Whether a reconnect would replay anything at all."""
+        return self._scrollback.size > 0
+
+    async def nudge_repaint(self) -> None:
+        """Make the application redraw its own screen: two real SIGWINCHes.
+
+        A terminal's state lives in the *application*'s model; the byte stream
+        is only how the app paints it. A replayed stream is therefore the wrong
+        tool whenever it cannot be complete -- frames shed on the wire leave
+        holes, and the bounded scrollback evicts the head of a long session
+        (enter-alt-screen, the first full paint). A full-screen app draws by
+        cursor-addressed overwrites, so both cases land its output on a wrong
+        base and the display stays wrong. Replaying the same bytes again
+        reproduces the same garbage: that is why "重新同步" could not rescue a
+        TUI and the session had to be killed.
+
+        What *can* reconstruct the display is the app itself. Every TUI (vim,
+        htop, opencode/Ink, ...) repaints from its own model on SIGWINCH, and
+        a SIGWINCH is only delivered on Linux when the size **changes** -- so
+        shrink by one row and put it back. This is the "调整一次窗口大小自行
+        重绘" the desync hint used to ask the user to do by hand (and its
+        Ctrl+L suggestion never reaches a TUI at all: the app eats the key).
+
+        Server-initiated, so it works for read-only share viewers and the CLI
+        too -- a display refresh is not terminal input. The restore targets
+        the session's *current* size, so a real window resize landing during
+        the 50ms window is not undone.
+        """
+        if self.closed:
+            return
+        cols, rows = self.spec.cols, self.spec.rows
+        if rows > 1:
+            self._pty.resize(cols, rows - 1)
+        elif cols > 1:
+            self._pty.resize(cols - 1, rows)
+        else:
+            return
+        await asyncio.sleep(0.05)
+        if self.closed:
+            return
+        self._pty.resize(self.spec.cols, self.spec.rows)
+
     def _enforce_memory_limit(self) -> None:
         """Drop the greediest client once the session is over its memory cap.
 

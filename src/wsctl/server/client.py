@@ -246,23 +246,20 @@ class WsClient:
             # could land inside an escape sequence -- the exact corruption this
             # whole mechanism exists to prevent.
             ends_inside = self._tracker.feed(item)
-            self._shed_for(len(item))
-            if self._max_bytes > 0 and self._pending_bytes + len(item) > self._max_bytes:
-                # Nothing left to evict and the frame still does not fit: lose
-                # *this* frame rather than the connection.
-                #
-                # This path sheds too, so it has to say so. It used to bump
-                # ``dropped_events`` and return in silence, and a frame larger
-                # than the whole byte budget lands here every time -- which is
-                # the common case whenever the budget is set lower than a PTY
-                # read (64 KiB). Every frame then vanished without a word and
-                # the viewer sat in front of a screen that was quietly wrong:
-                # the exact "loss must be reported" rule the other two drop
-                # paths already follow.
+            if self._max_bytes > 0 and len(item) > self._max_bytes:
+                # A frame bigger than the whole budget can never enter the
+                # queue. Shedding older frames to "make room" for it first
+                # destroys whatever was queued -- an attach replay, typically
+                # -- and the frame is then dropped anyway: the worst of both
+                # worlds. A doomed frame is lost alone. (This also settles
+                # every "cannot fit" case: while it stands, the shed below
+                # always finds room for a frame of at most ``max_bytes``, so
+                # no second loss branch is reachable.)
                 self.dropped_bytes += len(item)
                 self.dropped_events += 1
                 self._announce_shed()
                 return
+            self._shed_for(len(item))
             self._pending_bytes += len(item)
             self._seq += 1
             self._binary.append((self._seq, item, ends_inside))

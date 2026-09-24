@@ -264,3 +264,36 @@ def test_a_replay_frame_never_exceeds_the_client_byte_budget() -> None:
     # TUI flood (that is what the companion test's frame cap is about).
     wide = WsClient(Capture(), max_pending=512, max_bytes=0)  # type: ignore[arg-type]
     assert replay_target_for(wide) == 65536
+
+
+def test_an_oversized_frame_must_not_take_the_queue_down_with_it() -> None:
+    """A frame that can never fit is doomed; the queue is not.
+
+    ``put`` used to shed the *oldest* frames to make room for a 64 KiB PTY
+    read on a 1 KiB budget -- evicting the entire queue (the attach replay,
+    typically) -- and then drop the oversized frame anyway because it still
+    did not fit. The worst of both worlds: the screen got nothing at all,
+    and "重新同步" had the same empty queue to show. Found as a flake that a
+    reconnect landed mid-flood; the bug is deterministic.
+    """
+    from wsctl.server.client import WsClient
+
+    class Capture:
+        async def send_bytes(self, data: bytes) -> None:  # pragma: no cover
+            return None
+
+        async def send_json(self, obj: object) -> None:  # pragma: no cover
+            return None
+
+    client = WsClient(Capture(), max_pending=512, max_bytes=1024)  # type: ignore[arg-type]
+    client.put(b"REPLAY-REPLAY-REPLAY")
+    assert client.queued_binary() == b"REPLAY-REPLAY-REPLAY"
+
+    client.put(b"X" * 65536)  # can never fit a 1 KiB budget
+    assert client.queued_binary() == b"REPLAY-REPLAY-REPLAY", (
+        "the doomed frame evicted the queue on its way to being dropped"
+    )
+    assert client.dropped_bytes >= 65536, "the oversized frame itself must be counted"
+    # ...and a later frame that *does* fit still gets through.
+    client.put(b"tail")
+    assert client.queued_binary() == b"REPLAY-REPLAY-REPLAYtail"

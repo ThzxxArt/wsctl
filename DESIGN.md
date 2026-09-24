@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.19 · 状态：0.1.0–0.1.16、0.1.18 已发布（0.1.17 撤回，由 0.1.18 承载）
+> 版本：0.1.20 · 状态：0.1.0–0.1.16、0.1.18–0.1.19 已发布（0.1.17 撤回，由 0.1.18 承载）
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -393,6 +393,7 @@ CLI 全线 `--json`、多 shell 补全。**验证深度提升**：ZMODEM 从「�
 | **M74** | 回归 review 收口：`flushWrite` 入口 disarm 旧定时器（直接调用不再留孤儿）；`requestResync` 清队后断管；`paintConnectionFor` 唯一写入状态栏附属物；`chordGrade` 空绑定不评级；`AnsiTracker.resume`/`skip_to_boundary` 直接单测 |
 | **M75** | 发布前终检：`__version__` 与 `pyproject.toml` 单一事实源对齐（此前分叉、`wsctl --version` 报旧版）；「write 封顶 256 KiB」「点击立即重连」补结构契约——CHANGELOG 的每条声明都必须有能变红的守卫 |
 | **M76** | 回放合批帧宽服从客户端字节预算（`replay_target_for` = `min(64 KiB, max_bytes)`）：固定 64 KiB 帧在小预算下整帧被丢、整段回放消失的自引入回退；browser 丢帧触发改确定性（单次大写入 vs 小预算，不再依赖洪峰竞速） |
+| **M77** | **恢复模型换轨：字节流回放 → 应用自绘。** 字节流回放对增量绘制的 TUI 永远还原不了屏幕（有洞/无头即死局，resync 重放同一段 = 复现同一片花屏）；`TermSession.nudge_repaint()` 以两个真实 SIGWINCH 让应用从自身模型重绘，attach（有回放时）与 resync 后自动触发，服务端发起（只读观众/CLI 同享）。失步提示条删除 Ctrl+L 的错误建议 |
 
 ## 11. Backlog（后续）
 

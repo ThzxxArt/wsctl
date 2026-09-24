@@ -171,6 +171,14 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             ip=ip,
             payload="readonly" if not writable else None,
         )
+        # A replayed byte stream cannot reconstruct a full-screen app's
+        # screen: it draws by cursor-addressed overwrites on top of a state
+        # the stream may no longer carry (shed holes, evicted head). Anything
+        # replayed is followed by an *application* repaint -- the app holds
+        # the only complete model. A brand-new session replays nothing and
+        # needs nothing.
+        if session.has_scrollback:
+            await session.nudge_repaint()
         on_line = _input_auditor(audit, settings, user_id, session.id)
         bucket = _input_bucket(settings)
         # The reason a connection is being closed must reach the client *before*
@@ -608,5 +616,11 @@ async def _pump(
                         "incomplete": incomplete,
                     }
                 )
+                # And then the thing replaying bytes cannot do: ask the
+                # application to redraw from its own model. Replaying the
+                # same tail into a full-screen app reproduces the same
+                # garbage -- the app is the only party that knows what its
+                # screen is supposed to look like.
+                await session.nudge_repaint()
             except ClientGone:
                 return

@@ -482,3 +482,52 @@ async def test_memory_pressure_sheds_backlog_before_dropping_anyone() -> None:
         assert client.closed is False, "nobody should be evicted over backlog alone"
     finally:
         await manager.shutdown()
+
+
+async def test_nudge_repaint_issues_two_real_size_changes() -> None:
+    """The app repaints on SIGWINCH -- and SIGWINCH needs a real delta.
+
+    A replayed byte stream cannot rebuild a full-screen app's screen (gapped
+    by shedding, or headless after scrollback eviction). The app's own model
+    is the only complete one, and a window-size change is what makes it paint.
+    Linux delivers SIGWINCH only when the size *changes*, so the nudge must
+    shrink and restore -- one resize would be invisible to the app.
+    """
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="nudge", argv=[SHELL]))
+    calls: list[tuple[int, int]] = []
+    original = session._pty.resize
+
+    def spy(cols: int, rows: int) -> None:
+        calls.append((cols, rows))
+        original(cols, rows)
+
+    session._pty.resize = spy  # type: ignore[method-assign]
+    before = (session.spec.cols, session.spec.rows)
+    try:
+        await session.nudge_repaint()
+    finally:
+        session._pty.resize = original  # type: ignore[method-assign]
+        await manager.shutdown()
+    assert len(calls) == 2, f"expected shrink + restore, got {calls}"
+    assert calls[0] != calls[1], "a size that does not change sends no SIGWINCH"
+    assert calls[1] == before, "the session must end up at its real size"
+    assert calls[0][0] == calls[1][0] or calls[0][1] != calls[1][1], (
+        "the nudge must change something the app can see"
+    )
+
+
+async def test_a_brand_new_session_is_not_nudged_but_a_replayed_one_is() -> None:
+    """The trigger is "was anything replayed", not "did a socket open"."""
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="gated", argv=[SHELL]))
+    try:
+        assert session.has_scrollback is False, "a new session has nothing to replay"
+        client = FakeClient()
+        await session.attach(client)
+        session.write_input(b"echo NUDGE-PROBE\n")
+        assert await wait_for(lambda: session.has_scrollback, timeout=5), (
+            "the echo must have reached the scrollback"
+        )
+    finally:
+        await manager.shutdown()

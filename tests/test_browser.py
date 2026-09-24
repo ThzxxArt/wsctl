@@ -2470,3 +2470,75 @@ def test_browser_large_paste_is_sent_in_chunks(tmp_path: Path) -> None:
     finally:
         _stop_server(server)
         shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_a_tui_repaints_itself_after_a_reconnect(tmp_path: Path) -> None:
+    """The application is the only party that knows its screen.
+
+    With a 16-byte scrollback, the replay after a reconnect is a *fragment*
+    of vi's first paint: xterm resets, draws that fragment on a blank base,
+    and the display is wrong -- cursor-addressed overwrites landed without
+    the state they were written against. Asking for the same bytes again
+    (resync) reproduces the same garbage; that dead end is why a garbled TUI
+    session had to be killed.
+
+    What restores it is vi itself: after the replay the server nudges the
+    window size (two real deltas -- SIGWINCH only fires on change), vi
+    repaints from its own model, and the ~ tilde rows come back. Without the
+    nudge this test sees zero of them and fails.
+
+    The 16 bytes are load-bearing arithmetic, not taste. The cheapest way to
+    paint *n* distinct tilde rows is ``~\\n`` per row -- 2n-1 bytes. Ten rows
+    therefore need at least 19 bytes at *any* draw order, so a 16-byte
+    fragment cannot fake the threshold no matter how the editor paints.
+    (A larger fragment could: 200 bytes carries ~100 compact rows, and the
+    test would then depend on vi drawing top-down with CSI addressing.)
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    os.environ["WSCTL_SCROLLBACK_BYTES"] = "16"
+    try:
+        server = _start_server(data, files)
+        try:
+            _wait_health()
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                context = browser.new_context(viewport={"width": 1400, "height": 900})
+                context.add_init_script(_WS_COUNTER_INIT)
+                page = context.new_page()
+                _login(page)
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=WAIT_MS,
+                )
+                page.click(".term-pane.active .xterm-screen")
+                page.keyboard.type("vi /tmp/wsctl-nudge-probe.txt")
+                page.keyboard.press("Enter")
+
+                def tilde_rows() -> str:
+                    return (
+                        "() => (window.__wsctlScreen ? window.__wsctlScreen() : '')"
+                        ".split('\\n').filter(l => l.startsWith('~')).length"
+                    )
+
+                # vi's first paint must be on screen (and already past the
+                # 16-byte scrollback: only a fragment of it survives).
+                page.wait_for_function(f"{tilde_rows()} >= 10", timeout=WAIT_MS)
+
+                page.evaluate("() => { const w = window.__wsLive.at(-1); if (w) w.close(); }")
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=WAIT_MS,
+                )
+                # The replay alone cannot bring these rows back -- the nudge's
+                # repaint does. Generous wait: two SIGWINCHes + vi's paint.
+                page.wait_for_function(f"{tilde_rows()} >= 10", timeout=WAIT_MS)
+                screen = _screen_text(page)
+                assert "\ufffd" not in screen, "the repaint left replacement glyphs"
+                browser.close()
+        finally:
+            _stop_server(server)
+            shutil.rmtree(data, ignore_errors=True)
+    finally:
+        os.environ.pop("WSCTL_SCROLLBACK_BYTES", None)

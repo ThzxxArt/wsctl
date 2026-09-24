@@ -588,3 +588,40 @@ def test_the_2fa_qr_matches_the_share_qr_scale() -> None:
         f"the 2FA QR ({_2fa}px) is smaller than the share QR ({share}px); "
         "it is the one that must be scanned correctly on the first try"
     )
+
+
+def test_a_replay_is_followed_by_an_application_repaint() -> None:
+    """Bytes cannot rebuild a TUI screen; the application itself must repaint.
+
+    Replaying the byte stream is the wrong tool whenever the stream cannot be
+    complete (shed holes, scrollback eviction): a full-screen app paints by
+    cursor-addressed overwrites and lands them on a wrong base, and replaying
+    the same bytes again reproduces the same garbage -- the "怎么弄都恢复不了"
+    dead end. The app holds the only complete model and repaints on SIGWINCH;
+    the server must issue that nudge wherever bytes were just replayed.
+    """
+    ws = (ROOT / "src" / "wsctl" / "server" / "ws.py").read_text(encoding="utf-8")
+    session = (ROOT / "src" / "wsctl" / "core" / "session.py").read_text(encoding="utf-8")
+    assert "async def nudge_repaint" in session
+    assert "has_scrollback" in session
+    assert ws.count("nudge_repaint()") >= 2, (
+        "both replay paths (attach and resync) must end with an application repaint"
+    )
+    # Attach is gated on "was anything replayed"; resync is unconditional --
+    # the user just asked for their screen back.
+    assert "if session.has_scrollback:" in ws
+    gate = ws.index("if session.has_scrollback:")
+    call = ws.index("await session.nudge_repaint()", gate)
+    assert "writable" not in ws[gate:call], (
+        "a display refresh is not terminal input: read-only share viewers "
+        "must get the repaint nudge too"
+    )
+    resync = ws.index('elif kind == "resync":')
+    assert "nudge_repaint" in ws[resync : ws.index("except ClientGone", resync)]
+    # The hint must not send the user to Ctrl+L (a TUI eats that key) or to a
+    # manual window resize (the thing the product now does itself).
+    html = INDEX.read_text(encoding="utf-8")
+    hint = re.search(r'desync-hint">([^<]+)<', html)
+    assert hint is not None, "the desync bar must explain what happens next"
+    assert "Ctrl+L" not in hint.group(1), "Ctrl+L never reaches a TUI"
+    assert "自动重绘" in hint.group(1), "the bar must say the app repaints for them"
