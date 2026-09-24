@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.23] - 2026-09-24
+
+**一处 Windows 产品缺陷 + 测试清账：0.1.22 的 CI 是红着发出去的。**
+
+0.1.22 打 tag 时没等 CI 结果，带两条红灯上了 PyPI。追查下来三条失败里两条在
+测试侧、一条是真产品缺陷，全部已根治：
+
+### Fixed（产品）
+
+- **`logrotate` 的锁存活探测在 Windows 上是给自己发 Ctrl+C。** `os.kill(pid, 0)`
+  里的 `0` 就是 `signal.CTRL_C_EVENT`，于是 CPython 走 `sig == CTRL_C_EVENT`
+  分支、给**调用方自己的进程组**投递控制台事件——探测把自己中断了（表现为
+  「127 passed」后 `KeyboardInterrupt` 从 `threading.join` 冒出，再挂 90 秒到
+  pytest-timeout）。`server/maintenance.pid_alive` 的注释早就写明这个坑，这是
+  树里第二个存活探测，把它踩了回来。win32 直接视为存活，交给既有的 60s 超龄
+  规则兜底；docstring 写准确机理。
+
+### Fixed（测试——守卫自己得先站得住）
+
+- **browser 断言在量「命令回显」。** 洪峰生成器用 `python3 -c` 键进终端，命令行
+  里就有 `\x1b[31m` 字面量；「屏幕上不许出现 `[31m`」于是量的是回显——本地
+  scrollback 恰好滚没了它，CI 上还在。生成器改由**测试进程写文件**。
+- **平台中立白名单被塞进了应用机器。** D1/D2 的改造把 `create_app`/`TestClient`
+  拉进 `test_fs`/`test_config`，并发上传用例又开了**同一 app 的两个 lifespan**
+  ——测试全过但解释器退出时挂死。两个上传路由用例与滑动 TTL 接线用例移入
+  `test_server`，并发用例改单一 lifespan + 多线程请求。
+- **e2e gap 探测器把「一次探测慢」当成「连接被丢」。** `except httpx.HTTPError`
+  吞下了 `ReadTimeout`，且每次探测新建一个 httpx 客户端。现只计**连接级**失败
+  （`ConnectError` / `ConnectTimeout` / 非 200），客户端复用，`join` 断言线程
+  真的停了。
+- **tmux 等屏幕却等行流。** tmux 客户端吐的是**渲染后的屏幕**，`1147` 被画在
+  光标位置上、后面是绘制指令，永远不以 CRLF 结尾；恢复处用的就是裸产品，首处
+  却加了行尾。
+- **非 daemon 线程挂死解释器 + 无界 barrier。** `join(timeout=5)` 超时返回后线程
+  还活着，非 daemon 线程挡住退出；`Barrier(n)` 无超时，任一方异常则其余方永久
+  阻塞。全部线程 daemon 化、barrier 加超时。
+- **凭据私有性守卫把 POSIX 语义强加给 Windows。** `stat.S_IMODE` 对任何普通文件
+  都报 `0o666`——Windows 的隐私由父目录 ACL 决定，mode 位不承载这个信息。改为
+  对 `os.open` 的 mode 参数做探针，断言「**创建即 0600**」（这才是主张本身），
+  POSIX 下再读回 stat 双重确认。
+
+### Verified
+
+527 unit（Windows 白名单 172）· 6 slow · 30 browser · 11 e2e 全绿；
+**CI 9/9 jobs 全绿**（含 windows-smoke 与 macOS）；ruff / mypy strict /
+`node --check` 通过。凭据守卫与 `_pid_alive` 均突变体证毕（绿→红→绿）。
+
+> 诚实边界：0.1.22 的 wheel 主体是正确的，坏的是「一轮 Windows 挣扎 + sdist 里
+> 三处测试」。本版把它们一并清掉，并把「等 CI 全绿再打 tag」写回流程。
+
 ## [0.1.22] - 2026-09-24
 
 **检查跟着事实走，操作原子且不越权——并把「测不到修复的守卫」一并清账。**

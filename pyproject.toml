@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wsctl"
-version = "0.1.22"
+version = "0.1.23"
 description = "单机部署的 Web 在线终端：多会话、多用户 RBAC、审计、分享、录制与可观测，ttyd 的现代 Python 超集。"
 readme = "README.md"
 requires-python = ">=3.11"
