@@ -76,7 +76,12 @@ async def test_tmux_session_survives_restart() -> None:
         first = FakeClient()
         await session.attach(first)
         session.write_input(b"echo $((31*37))\n")
-        assert await wait_for(lambda: b"1147\r\n" in first.output())
+        # Bare product, not `1147\r\n`: what a tmux client emits is a
+        # *rendered screen*, and `1147` is painted at a cursor position with
+        # drawing commands after it -- never as a line ending in CRLF. Demanding
+        # the CRLF made this wait fail on every runner (it passed locally only
+        # by the shell echoing before tmux repainted).
+        assert await wait_for(lambda: b"1147" in first.output())
 
         # Simulate a server restart: keep the tmux session, drop the local state.
         await session.stop(preserve=True)

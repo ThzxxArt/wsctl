@@ -409,17 +409,17 @@ def test_schema_migration_is_safe_under_two_concurrent_instances(tmp_path) -> No
 
     db = tmp_path / "wsctl.db"
     errors: list[BaseException] = []
-    barrier = threading.Barrier(8)
+    barrier = threading.Barrier(8, timeout=30)
 
     def open_one() -> None:
         try:
-            barrier.wait(timeout=20)
+            barrier.wait(timeout=30)
             store = Store(db)
             store.close()
         except BaseException as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=open_one) for _ in range(8)]
+    threads = [threading.Thread(target=open_one, daemon=True) for _ in range(8)]
     for th in threads:
         th.start()
     for th in threads:

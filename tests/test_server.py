@@ -2418,7 +2418,7 @@ def test_concurrent_same_name_uploads_publish_one_whole_file(tmp_path: Path) -> 
     left = b"L" * 300000
     right = b"R" * 300000
     errors: list[object] = []
-    barrier = threading.Barrier(3)
+    barrier = threading.Barrier(3, timeout=30)
 
     with TestClient(app) as client:
         assert client.post(
@@ -2426,7 +2426,7 @@ def test_concurrent_same_name_uploads_publish_one_whole_file(tmp_path: Path) -> 
         ).status_code == 200
 
         def upload(payload: bytes) -> None:
-            barrier.wait()
+            barrier.wait(timeout=30)
             try:
                 client.post(
                     "/api/files/upload",
@@ -2436,10 +2436,10 @@ def test_concurrent_same_name_uploads_publish_one_whole_file(tmp_path: Path) -> 
             except Exception as exc:  # any outcome is acceptable
                 errors.append(exc)
 
-        threads = [threading.Thread(target=upload, args=(p,)) for p in (left, right)]
+        threads = [threading.Thread(target=upload, args=(p,), daemon=True) for p in (left, right)]
         for thread in threads:
             thread.start()
-        barrier.wait()
+        barrier.wait(timeout=30)
         for thread in threads:
             thread.join(timeout=30)
 

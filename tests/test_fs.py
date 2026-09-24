@@ -304,19 +304,19 @@ def test_concurrent_same_name_renames_keep_every_byte(tmp_path: Path) -> None:
     (tmp_path / "a.bin").write_bytes(payload_a)
     (tmp_path / "b.bin").write_bytes(payload_b)
     errors: list[object] = []
-    done = threading.Barrier(3)
+    done = threading.Barrier(3, timeout=30)
 
     def racer(src: str) -> None:
-        done.wait()
+        done.wait(timeout=30)
         try:
             fs.rename_entry(tmp_path, src, "c.bin")
         except FsError as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=racer, args=(s,)) for s in ("a.bin", "b.bin")]
+    threads = [threading.Thread(target=racer, args=(s,), daemon=True) for s in ("a.bin", "b.bin")]
     for thread in threads:
         thread.start()
-    done.wait()
+    done.wait(timeout=30)
     for thread in threads:
         thread.join(timeout=5)
     final = tmp_path / "c.bin"
@@ -336,19 +336,19 @@ def test_concurrent_same_name_edits_never_interleave(tmp_path: Path) -> None:
     left = "L" * 20000
     right = "R" * 20000
     errors: list[object] = []
-    done = threading.Barrier(3)
+    done = threading.Barrier(3, timeout=30)
 
     def editor(text: str) -> None:
-        done.wait()
+        done.wait(timeout=30)
         try:
             fs.write_text_file(tmp_path, "doc.txt", text)
         except Exception as exc:  # any failure is an acceptable outcome here
             errors.append(exc)
 
-    threads = [threading.Thread(target=editor, args=(t,)) for t in (left, right)]
+    threads = [threading.Thread(target=editor, args=(t,), daemon=True) for t in (left, right)]
     for thread in threads:
         thread.start()
-    done.wait()
+    done.wait(timeout=30)
     for thread in threads:
         thread.join(timeout=5)
     body = target.read_text(encoding="utf-8")
