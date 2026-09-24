@@ -100,16 +100,33 @@
     paste_clipboard: "warn",
   };
 
-  // Chords a browser claims before the page ever sees them. Binding one of
+  // Which chords a browser claims before the page ever sees them. Binding one of
   // these looks fine in Settings and silently does nothing at runtime -- which
   // is how people ended up opening the DevTools inspector instead of copying.
+  //
+  // All entries are **lowercase** and lookups must lowercase too: the arrow
+  // entries used to sit here in mixed case (``alt+ArrowLeft``) while the lookup
+  // compared against ``value.toLowerCase()``, so the warning never fired --
+  // and the same mixed-case entries also contradicted ``DEFAULT_KEYS``, whose
+  // tab-switch chords *are* ``alt+ArrowLeft/Right``. Those two are gone from
+  // this set: the page receives their keydown and ``preventDefault()`` cancels
+  // history navigation, unlike chrome-level chords (DevTools) below. This set
+  // is the single source of truth for the help sheet's ✅/⚠️/❌ marks.
   const BROWSER_RESERVED = new Set([
     "ctrl+shift+c", "ctrl+shift+j", "ctrl+shift+i", "ctrl+shift+p",
     "ctrl+shift+n", "ctrl+shift+t", "ctrl+shift+w", "ctrl+shift+o",
     "ctrl+shift+delete", "ctrl+w", "ctrl+t", "ctrl+n", "ctrl+r",
     "ctrl+u", "ctrl+h", "ctrl+d", "ctrl+l", "ctrl+p", "f5", "f12",
-    "ctrl+tab", "ctrl+shift+tab", "alt+ArrowLeft", "alt+ArrowRight",
+    "ctrl+tab", "ctrl+shift+tab",
   ]);
+
+  /** Reliable (ok) / partially claimed (warn) / browser-reserved (bad). */
+  function chordGrade(action, combo) {
+    if (!combo) return "ok";  // unbound: nothing can swallow a chord that is not there
+    if (BROWSER_RESERVED.has(String(combo).toLowerCase())) return "bad";
+    if (action && CHORD_RELIABILITY[action]) return "warn";
+    return "ok";
+  }
 
   const params = new URLSearchParams(location.search);
   const sharedSession = params.get("session");
@@ -560,7 +577,25 @@
   // reconnecting or being suspended must not rewrite it to "空闲"/"连接中".
   function setConnectionFor(s, text, cls) {
     if (s && activeId && s.id !== activeId) return;
+    // Explicit states ("已连接" / "未授权" / ...) are never "click to retry";
+    // clear the affordances so a previous backoff cannot leave a stale one.
+    els.connection.title = "";
+    els.connection.style.cursor = "";
     setConnection(text, cls);
+  }
+
+  // One writer for the indicator *and* its affordances (title / cursor), so a
+  // background tab can never clobber the visible one's "click to retry" state.
+  function paintConnection(s) {
+    const [text, cls] = describeConnection(s);
+    const retrying = Boolean(s && s.reconnectTimer);
+    els.connection.title = retrying ? "点击立即重连" : "";
+    els.connection.style.cursor = retrying ? "pointer" : "";
+    setConnection(text, cls);
+  }
+  function paintConnectionFor(s) {
+    if (s && activeId && s.id !== activeId) return;
+    paintConnection(s);
   }
 
   // Derive the indicator from a session's actual state, so switching tabs
@@ -568,12 +603,27 @@
   function describeConnection(s) {
     if (!s) return ["空闲", ""];
     if (s.exited) return ["已结束", "bad"];
+    if (s.reconnectTimer) {
+      // Backoff is a state, not silence: "已断开" could not be told apart from
+      // "gave up", and a remote operator has no way to act on a bare red word.
+      return [`重连中（${Math.ceil((s.retryIn || 0) / 1000)}s 后重试）`, ""];
+    }
     if (s.standby || !s.ws) return ["未连接", ""];
     if (s.ws.readyState === WebSocket.OPEN) return ["已连接", "ok"];
     if (s.ws.readyState === WebSocket.CONNECTING) return ["连接中", ""];
     return ["已断开", s.intentional ? "" : "bad"];
   }
 
+  // Clicking the indicator during backoff retries *now*. The timer is the
+  // polite path; the click is for "I fixed the network, stop waiting".
+  els.connection.addEventListener("click", () => {
+    const s = activeId && sessions.get(activeId);
+    if (!s || !s.reconnectTimer) return;
+    clearTimeout(s.reconnectTimer);
+    s.reconnectTimer = null;
+    s.retryIn = 0;
+    connect(s);
+  });
   // How long a request may hang before the UI gives up and says so. Without
   // this a single wedged request left the admin panel on its skeleton forever.
   const API_TIMEOUT_MS = 15000;
@@ -618,6 +668,31 @@
   function sendInput(s, data) {
     if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(encoder.encode(data));
   }
+  // A paste is not a keystroke. Sending 500 KB as one frame fills the PTY
+  // write buffer in a single call (its cap is checked only on entry), after
+  // which every keystroke is dropped as "input too fast" -- a keyboard that
+  // appears dead. Chunk it; one WebSocket is ordered, so the pieces arrive as
+  // one stream. Byte slicing is safe here: the child reads stdin as a byte
+  // stream and reassembles UTF-8 across reads.
+  const PASTE_CHUNK = 32 * 1024;
+  function sendPaste(s, text) {
+    const bytes = encoder.encode(text);
+    if (bytes.length <= PASTE_CHUNK) {
+      if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(bytes);
+      return;
+    }
+    let offset = 0;
+    const pump = () => {
+      if (!s.ws || s.ws.readyState !== WebSocket.OPEN) return;
+      if (offset >= bytes.length) return;
+      const end = Math.min(offset + PASTE_CHUNK, bytes.length);
+      s.ws.send(bytes.subarray(offset, end));
+      offset = end;
+      if (offset < bytes.length) setTimeout(pump, 0);
+    };
+    pump();
+    toast(`粘贴 ${formatSize(bytes.length)}，已分片发送`, "info");
+  }
   function markTab(s, state) {
     s.tabEl.classList.toggle("connected", state === "connected");
     s.tabEl.classList.toggle("exited", state === "exited");
@@ -633,6 +708,11 @@
   // paint -- the terminal appears to freeze, then lurch. Queuing the frames and
   // handing xterm a single buffer per animation frame turns N passes into one.
   const WRITE_FLUSH_MS = 16;
+  // One `term.write` per flush, capped. A 4 MiB scrollback replay coalesced
+  // whole is a multi-megabyte parse on the main thread -- one long frame (or
+  // worse) exactly when the screen is being rebuilt. Cap the bite, leave the
+  // rest queued for the next frame, keep byte order.
+  const WRITE_MAX_BYTES = 256 * 1024;
 
   function enqueueWrite(s, bytes) {
     // Between asking for a resync and its ``resync-begin`` marker, live frames
@@ -646,15 +726,25 @@
   }
 
   function flushWrite(s) {
-    s.writeTimer = null;
+    // Always disarm first. Called on the timer *and* directly (resync paths);
+    // a direct call that merely nulls the id leaves the old timer armed, and
+    // the next `enqueueWrite` then sees a non-null id and refuses to schedule
+    // -- frames sit unflushed until the orphan fires.
+    if (s.writeTimer !== null) { clearTimeout(s.writeTimer); s.writeTimer = null; }
     if (!s.writeQueue.length || s.resyncing) return;
-    const chunks = s.writeQueue;
-    s.writeQueue = [];
+    // Merge at most WRITE_MAX_BYTES; a single oversized chunk still goes (the
+    // first one is always taken) so nothing is stranded.
+    let total = 0;
+    let count = 0;
+    for (const chunk of s.writeQueue) {
+      if (count > 0 && total + chunk.length > WRITE_MAX_BYTES) break;
+      total += chunk.length;
+      count += 1;
+    }
+    const chunks = s.writeQueue.splice(0, count);
     s.writeBatches += 1;
     // One merged buffer, one call: xterm's parser is far happier with a few
     // large writes than with many small ones.
-    let total = 0;
-    for (const chunk of chunks) total += chunk.length;
     const merged = new Uint8Array(total);
     let offset = 0;
     for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.length; }
@@ -666,6 +756,9 @@
       if (s.zmodemActive) armZmodemWatchdog(s);
     } else {
       try { s.term.write(merged); } catch { /* 忽略 */ }
+    }
+    if (s.writeQueue.length && s.writeTimer === null) {
+      s.writeTimer = setTimeout(() => flushWrite(s), WRITE_FLUSH_MS);
     }
   }
 
@@ -744,6 +837,9 @@
   function requestResync(s) {
     if (!s || s.resyncing) return;  // a second click must not reset mid-replay
     flushWrite(s);
+    // flushWrite may have re-armed for the overflow; the queue is about to go
+    // and `resyncing` will drop anything new, so disarm before that happens.
+    if (s.writeTimer !== null) { clearTimeout(s.writeTimer); s.writeTimer = null; }
     s.writeQueue = [];
     s.resyncing = true;
     try { s.term.reset(); } catch { /* 忽略 */ }
@@ -783,7 +879,7 @@
     s.intentional = true;
     s.standby = true;
     if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
-    if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
+    resetTransients(s);
     if (s.ws) { try { s.ws.close(); } catch { /* 忽略 */ } s.ws = null; }
     forgetLive(s.id);
     // Unmounting frees the layout box. Never unmount the pane the user is
@@ -793,6 +889,21 @@
     s.needsRefit = true;
     markTab(s, "standby");
     setConnectionFor(s, "空闲", "");
+  }
+
+  // Everything that belongs to *one* socket attempt rather than to the
+  // session. A new connection must not inherit the previous attempt's
+  // backoff timer (that is how one tab ended up with two WebSockets), its
+  // queued terminal bytes (those would interleave with the new replay) or
+  // its resync lock (the new attach replay is a superset of any resync and
+  // would be *dropped* by it -- a blank screen until the resync timed out).
+  function resetTransients(s) {
+    if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
+    s.retryIn = 0;
+    if (s.writeTimer) { clearTimeout(s.writeTimer); s.writeTimer = null; }
+    s.writeQueue = [];
+    if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
+    s.resyncing = false;
   }
 
   function ensureConnected(s) {
@@ -810,19 +921,45 @@
 
   function scheduleReconnect(s) {
     if (s.exited || s.reconnectTimer) return;
-    s.reconnectTimer = setTimeout(() => { s.reconnectTimer = null; connect(s); }, s.delay);
+    const wait = s.delay;
+    s.retryIn = wait;
+    s.reconnectTimer = setTimeout(() => {
+      s.reconnectTimer = null;
+      s.retryIn = 0;
+      connect(s);
+    }, wait);
     s.delay = Math.min(s.delay * 2, 8000);
+    paintConnectionFor(s);
   }
 
   function connect(s) {
+    // A fresh attempt starts from a known state -- see resetTransients.
+    resetTransients(s);
+    if (s.ws) {
+      // Replacing a live socket without closing it leaked the old one: the
+      // server kept it attached and its handlers kept writing into `s`.
+      try { s.ws.close(); } catch { /* 忽略 */ }
+      s.ws = null;
+    }
     s.intentional = false;
-    setConnectionFor(s, "连接中", "");
     const ws = new WebSocket(wsUrl(s));
     ws.binaryType = "arraybuffer";
     s.ws = ws;
     s.attached = false;
+    s.shedSinceOpen = false;
+    // Paint *after* `s.ws` is set: before it, `describeConnection` says
+    // "未连接" and the indicator flickers between two wrong states.
+    paintConnectionFor(s);
+
+    // Every handler below is scoped to *this* socket. A replaced or closed
+    // socket's callbacks must be inert: without the generation check a stale
+    // `onclose` scheduled a second reconnect alongside the live one and a
+    // stale `onmessage` wrote the old connection's bytes into the new
+    // connection's screen.
+    const current = () => s.ws === ws;
 
     ws.onopen = () => {
+      if (!current()) return;
       s.delay = 500;
       // Do NOT clear the screen here. ``onopen`` only means the socket is up;
       // the replay that justifies clearing arrives afterwards. Clearing
@@ -833,6 +970,10 @@
       s.pendingReplayClear = s.everConnected;
       s.everConnected = true;
       s.standby = false;
+      // A new attach replay supersedes any in-flight resync and is a superset
+      // of it. Leaving ``resyncing`` set would drop that replay on the floor.
+      s.resyncing = false;
+      if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
       // Remember which rename generation this attach belongs to.
       s.attachNameVersion = s.nameVersion || 0;
       noteLive(s);
@@ -842,6 +983,7 @@
       sendControl(s, { type: "attach", session: s.id, cols: s.term.cols, rows: s.term.rows, share: s.share || undefined });
       if (s.heartbeat) clearInterval(s.heartbeat);
       s.heartbeat = setInterval(() => {
+        if (!current()) return;
         // Piggy-back the client's write-batching counters on the heartbeat that
         // already goes out every 25s. They say whether coalescing is actually
         // happening in the field, which is the one number that proves the
@@ -854,6 +996,7 @@
     };
 
     ws.onmessage = (event) => {
+      if (!current()) return;
       if (typeof event.data === "string") {
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
@@ -872,8 +1015,10 @@
     };
 
     ws.onclose = (event) => {
+      if (!current()) return;
       if (s.heartbeat) { clearInterval(s.heartbeat); s.heartbeat = null; }
       forgetLive(s.id);
+      s.ws = null;
       if (event.code === 4401) {
         setConnectionFor(s, "未授权", "bad");
         if (!sharedMode) showLogin("请先登录");
@@ -893,10 +1038,13 @@
         }
         return;
       }
-      setConnectionFor(s, s.intentional ? "空闲" : "已断开", s.intentional ? "" : "bad");
-      if (!s.intentional && !s.exited) scheduleReconnect(s);
+      if (!s.intentional && !s.exited) {
+        scheduleReconnect(s);
+      } else {
+        setConnectionFor(s, s.intentional ? "空闲" : "已断开", s.intentional ? "" : "bad");
+      }
     };
-    ws.onerror = () => setConnectionFor(s, "连接错误", "bad");
+    ws.onerror = () => { if (current()) setConnectionFor(s, "连接错误", "bad"); };
   }
 
   function handleControl(s, msg) {
@@ -911,6 +1059,21 @@
           s.pendingReplayClear = false;
           try { s.term.reset(); } catch { /* 忽略 */ }
         }
+        // The attach replay is the full scrollback. Whatever a previous
+        // connection shed, this replay repairs it -- so a desync that was
+        // raised before the reconnect is now a lie and must go. Unless the
+        // replay *itself* shed (``desync`` arrived after this socket opened,
+        // or the server says so): then the screen is still incomplete.
+        if (msg.incomplete || s.shedSinceOpen) {
+          // Not "重连回放": the first attach is not a reconnect either. The
+          // bar must say what is true for both paths.
+          markDesynced(s, "会话回放未完整，部分内容已省略");
+        } else {
+          clearDesync(s);
+        }
+        // A live resync cannot outlive the socket that was asked for it.
+        s.resyncing = false;
+        if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
         s.writable = msg.writable !== false;
         // `attached` echoes the name the session had when this socket attached.
         // A rename issued after that must win, otherwise the tab silently
@@ -956,13 +1119,20 @@
         // resumes from here and only here, so nothing can land on top of it.
         s.resyncing = false;
         if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
-        clearDesync(s);
+        if (msg.incomplete) {
+          // The server shed part of *this* replay too. Announcing success
+          // would be the same lie the bar exists to avoid.
+          showDesyncBar("重新同步未完整，部分内容仍缺失");
+        } else {
+          clearDesync(s);
+        }
         flushWrite(s);
         break;
       case "desync":
         // Distinct from a notice: the screen is now known to be incomplete, and
         // the remedy is a resync rather than an acknowledgement. Surfaced as a
         // bar with a button, not a toast that ages out before it is read.
+        s.shedSinceOpen = true;
         markDesynced(s, msg.msg);
         toast(msg.msg || "输出过快，部分内容已省略", "warn");
         break;
@@ -970,15 +1140,18 @@
         // A notice, not terminal output: writing it into the buffer would make
         // it show up again on every reconnect replay. ``backpressure`` used to
         // arrive as nothing at all -- the socket simply closed "normally".
+        //
+        // Do *not* mark the tab standby here: 4410 / memory eviction are
+        // recoverable and `onclose` is about to auto-reconnect. Claiming
+        // "未连接" in between was a state that contradicted what the code did
+        // next. The toast is the message; the connection indicator is
+        // `onclose`'s job alone.
         toast(
           msg.msg || (msg.reason === "backpressure"
             ? "输出过快，连接已释放（会话仍在运行，重连即可恢复）"
             : "连接已被释放（会话仍在运行）"),
           "error",
         );
-        s.standby = true;
-        markTab(s, "standby");
-        setConnectionFor(s, "未连接", "");
         break;
       case "error":
         // Terminal output is for what the *shell* printed. An operational
@@ -1052,9 +1225,9 @@
 
     const s = {
       id, name, term, fit, pane, tabEl, renderer, unicodeVersion,
-      ws: null, heartbeat: null, reconnectTimer: null, delay: 500,
+      ws: null, heartbeat: null, reconnectTimer: null, delay: 500, retryIn: 0,
       intentional: false, exited: false, standby: false, attached: false,
-      pendingReplayClear: false,
+      pendingReplayClear: false, shedSinceOpen: false,
       nameVersion: 0, attachNameVersion: 0,
       share: options.share || null,
       writable: options.writable !== false,
@@ -1171,7 +1344,7 @@
     ensureConnected(s);
     // `connect()` may have skipped its own status write (it ran before
     // `activeId` pointed here), so repaint from the resulting state.
-    setConnection(...describeConnection(s));
+    paintConnection(s);
     // Fit *synchronously* after the pane becomes visible. Deferring it to
     // requestAnimationFrame let the browser paint the tab switch first -- at
     // which point the terminal still had the hidden pane's zero size, so every
@@ -1249,8 +1422,9 @@
     if (!s) return;
     s.intentional = true;
     if (s.heartbeat) clearInterval(s.heartbeat);
-    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
-    if (s.ws) s.ws.close();
+    resetTransients(s);
+    if (s.zmodemWatchdog) { clearTimeout(s.zmodemWatchdog); s.zmodemWatchdog = null; }
+    if (s.ws) { try { s.ws.close(); } catch { /* 忽略 */ } s.ws = null; }
     forgetLive(id);
     s.term.dispose();
     s.pane.remove();
@@ -1293,7 +1467,7 @@
   function doPaste(s) {
     if (s.writable === false) { toast("会话为只读", ""); return; }
     navigator.clipboard.readText()
-      .then((text) => { if (text) sendInput(s, text); else toast("剪贴板为空", ""); })
+      .then((text) => { if (text) sendPaste(s, text); else toast("剪贴板为空", ""); })
       .catch(() => toast("粘贴失败：浏览器拒绝了剪贴板访问", "error"));
   }
 
@@ -2492,14 +2666,34 @@
   els.searchClose.addEventListener("click", () => toggleSearch(false));
   els.searchNext.addEventListener("click", () => runSearch(1));
   els.searchInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); runSearch(e.shiftKey ? -1 : 1); }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (searchDebounce.timer !== null) {
+        clearTimeout(searchDebounce.timer);
+        searchDebounce.timer = null;
+      }
+      runSearch(e.shiftKey ? -1 : 1);
+    }
     else if (e.key === "Escape") { e.preventDefault(); toggleSearch(false); }
   });
+  // Debounced like every other filter box. "All matches" highlighting on every
+  // keystroke is a full buffer scan plus a decoration rebuild; against a
+  // flood-filled session that is a stutter per character.
+  const searchDebounce = { timer: null };
   els.searchInput.addEventListener("input", () => {
     const s = activeId && sessions.get(activeId);
     if (s) { s.searchPos = -1; }
-    if (els.searchInput.value) runSearch(1);
-    else els.searchCount.textContent = "";
+    if (searchDebounce.timer !== null) clearTimeout(searchDebounce.timer);
+    if (!els.searchInput.value) {
+      searchDebounce.timer = null;
+      els.searchCount.textContent = "";
+      if (s && s.searchAddon) s.searchAddon.clearDecorations();
+      return;
+    }
+    searchDebounce.timer = setTimeout(() => {
+      searchDebounce.timer = null;
+      runSearch(1);
+    }, 250);
   });
 
   // -- ZMODEM -----------------------------------------------------------
@@ -2743,23 +2937,29 @@
       "<span><b>⚠️</b> 部分浏览器可用</span>" +
       "<span><b>❌</b> 浏览器占用，请改用其它键</span>";
     els.hotkeyHelp.appendChild(legend);
+    // Fixed chords, in raw form so the grade comes from the same source
+    // (``chordGrade`` → ``BROWSER_RESERVED``) as the editable ones. Hardcoded
+    // grades here are how the sheet and the reserved set drifted apart.
     const fixed = [
-      ["Alt+?", "打开 / 关闭本帮助（打字时用它，不抢 ? 键）", "ok"],
-      ["?", "打开 / 关闭本帮助（仅在终端未聚焦时）", "ok"],
-      ["Esc", "关闭最上层弹窗或搜索", "ok"],
-      ["Ctrl+C（有选区时）", "复制选区", "ok"],
-      ["Ctrl+Shift+C", "复制选区", "bad"],
-      ["Ctrl+Shift+V", "粘贴剪贴板", "bad"],
-      ["Ctrl+Insert / Shift+Insert", "复制 / 粘贴（传统终端）", "ok"],
-      ["终端右键", "弹出操作菜单（可在设置里改为快捷复制粘贴）", "ok"],
+      ["alt+?", "打开 / 关闭本帮助（打字时用它，不抢 ? 键）"],
+      ["?", "打开 / 关闭本帮助（仅在终端未聚焦时）"],
+      ["Escape", "关闭最上层弹窗或搜索"],
+      ["ctrl+c", "复制选区（有选区时）"],
+      ["ctrl+shift+c", "复制选区"],
+      ["ctrl+shift+v", "粘贴剪贴板"],
+      ["ctrl+Insert", "复制（传统终端）"],
+      ["shift+Insert", "粘贴（传统终端）"],
     ];
     const rows = Object.entries(prefs.keybindings)
       .map(([action, binding]) => [
         prettyCombo(binding) || "未绑定",
         HOTKEY_LABELS[action] || action,
-        CHORD_RELIABILITY[action] ? "warn" : "ok",
+        chordGrade(action, binding),
       ])
-      .concat(fixed);
+      .concat(
+        fixed.map(([raw, label]) => [prettyCombo(raw), label, chordGrade(null, raw)]),
+        [["终端右键", "弹出操作菜单（可在设置里改为快捷复制粘贴）", "ok"]],
+      );
     for (const [combo, label, grade] of rows) {
       const row = document.createElement("div");
       row.className = "hotkey-row";
@@ -2817,6 +3017,7 @@
         }
         // Also warn when the chord is one the browser claims first. Without
         // this the setting accepted it happily and the shortcut never worked.
+        // The set is lowercase; the field is not necessarily (``alt+ArrowRight``).
         if (value && BROWSER_RESERVED.has(value.toLowerCase())) {
           toast(
             `⚠️ ${value} 被浏览器占用（例如 DevTools / 关闭标签页），实际会拦不住。建议换一组键`,
@@ -2920,6 +3121,7 @@
   let fileOffset = 0;
   let menuEntry = null;
   let previewPath = null;
+  let previewDirtyBase = null;
   let uploadXhr = null;
 
   function formatSize(bytes) {
@@ -3134,6 +3336,7 @@
       }
       const text = await res.text();
       els.previewBody.value = text;
+      previewDirtyBase = text;
       const encoding = res.headers.get("X-Wsctl-Encoding") || "utf-8";
       els.previewNote.textContent = `编码 ${encoding} · ${formatSize(new Blob([text]).size)} · 修改后点「保存」`;
       els.previewSave.disabled = false;
@@ -3143,14 +3346,27 @@
       els.previewSave.disabled = true;
     }
   }
-  function closePreview() {
-    els.previewOverlay.classList.add("hidden");
-    previewPath = null;
-    els.previewBody.value = "";
-    els.previewSave.disabled = false;
+  function closePreview(force) {
+    // Losing a page of edits to a stray click on the backdrop is not a
+    // confirmation-worthy trade. Ask when -- and only when -- the buffer
+    // differs from what was loaded.
+    const finish = () => {
+      els.previewOverlay.classList.add("hidden");
+      previewPath = null;
+      previewDirtyBase = null;
+      els.previewBody.value = "";
+      els.previewSave.disabled = false;
+    };
+    if (!force && previewDirtyBase !== null && els.previewBody.value !== previewDirtyBase) {
+      confirmDialog("放弃未保存的修改？", "关闭预览", { variant: "warn" }).then((ok) => {
+        if (ok) finish();
+      });
+      return;
+    }
+    finish();
   }
-  els.previewClose.addEventListener("click", closePreview);
-  els.previewCancel.addEventListener("click", closePreview);
+  els.previewClose.addEventListener("click", () => closePreview(false));
+  els.previewCancel.addEventListener("click", () => closePreview(false));
   els.previewDownload.addEventListener("click", () => {
     if (!previewPath) return;
     window.location.href = `/api/files/download?path=${encodeURIComponent(previewPath)}`;
@@ -3160,7 +3376,7 @@
     try {
       await api("PUT", "/api/files/content", { path: previewPath, content: els.previewBody.value });
       toast("已保存", "ok");
-      closePreview();
+      closePreview(true);
       loadFiles(filePath);
     } catch (err) { els.previewNote.textContent = String(err.message || err); }
   });
@@ -3299,7 +3515,6 @@
   els.fileUploadBtn.addEventListener("click", () => els.fileInput.click());
   els.fileInput.addEventListener("change", () => { uploadFiles(els.fileInput.files); els.fileInput.value = ""; });
   els.fileList.addEventListener("dragleave", () => els.fileList.classList.remove("dragover"));
-  els.fileRefresh.addEventListener("click", () => loadFiles(filePath));
 
   bootstrap();
 })();

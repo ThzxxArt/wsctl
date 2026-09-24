@@ -238,3 +238,329 @@ def test_working_dialogs_are_wide_enough_for_their_own_content() -> None:
             f"{anchor} uses {tier} at {widths[tier]:.0f}px, which is too narrow "
             "for the content it lays out"
         )
+
+
+# -- 0.1.17 连接生命周期收口 ------------------------------------------------
+#
+# The 0.1.15/0.1.16 contracts guard rendering and dialogs. These guard the
+# state machine: who is allowed to write the screen, where a replay starts, and
+# when a status flag is allowed to contradict what the code does next. Each one
+# is a defect that shipped because an *action* and a *declaration* drifted.
+
+
+def test_a_new_socket_attempt_starts_from_a_clean_transient_state() -> None:
+    """`connect` must not inherit the previous attempt's timers or queues.
+
+    A backoff timer left pending alongside a manual connect opened **two**
+    WebSockets for one tab (the second `s.ws = ws` orphaned the first, which
+    stayed attached server-side). A write queue left over from the previous
+    connection interleaveed with the new replay. An ``resyncing`` lock left
+    over dropped the new attach replay on the floor -- a blank screen.
+    """
+    js = _js()
+    assert "function resetTransients(" in js
+    # Called at the top of connect, before a socket is created.
+    connect_at = js.index("function connect(s)")
+    reset_call = js.index("resetTransients(s)", connect_at)
+    socket_at = js.index("new WebSocket(", connect_at)
+    assert reset_call < socket_at, "resetTransients must run before the socket is created"
+    body = js[js.index("function resetTransients(") : js.index("function ensureConnected(")]
+    for token in ("s.reconnectTimer", "s.writeQueue", "s.resyncing", "s.resyncTimer"):
+        assert token in body, f"resetTransients does not clear {token}"
+
+
+def test_stale_socket_callbacks_are_inert() -> None:
+    """A replaced socket's handlers must not touch the session.
+
+    Without a generation check a stale `onclose` scheduled a second reconnect
+    alongside the live one and a stale `onmessage` wrote the old connection's
+    bytes into the new connection's screen.
+    """
+    js = _js()
+    assert "const current = () => s.ws === ws;" in js
+    # Every handler must consult it. onopen / onmessage / onclose / onerror.
+    handlers = (
+        "ws.onopen = () => {",
+        "ws.onmessage = (event) => {",
+        "ws.onclose = (event) => {",
+    )
+    for handler in handlers:
+        at = js.index(handler)
+        window = js[at : at + 400]
+        assert "current()" in window, f"{handler} does not check the socket generation"
+    # And a replaced socket is closed rather than leaked.
+    assert "try { s.ws.close(); } catch { /* 忽略 */ }" in js
+
+
+def test_a_new_attach_supersedes_an_inflight_resync() -> None:
+    """`onopen` must lift the resync write-lock.
+
+    ``enqueueWrite`` drops frames while ``resyncing`` is set -- which is right
+    for live duplicates and catastrophic for the attach *replay* after a
+    reconnect: the replay is a superset of the resync and would be dropped,
+    leaving a blank screen until the resync timed out.
+    """
+    js = _js()
+    onopen = js.index("ws.onopen = () => {")
+    attached = js.index('case "attached":')
+    window = js[onopen : onopen + 1400]
+    assert "s.resyncing = false" in window, "onopen must lift the resync write-lock"
+    assert "s.resyncTimer" in window and "clearTimeout" in window
+    # `attached` (the end of the replay) does the same, belt and braces.
+    attached_window = js[attached : js.index('case "exit":', attached)]
+    assert "s.resyncing = false" in attached_window
+
+
+def test_desync_is_dropped_by_a_clean_attach_replay_and_kept_by_a_shedding_one() -> None:
+    """The bar must say true things.
+
+    Client-side shedding only sheds the *delivery queue*; the server's
+    scrollback is whole. A reconnect therefore repairs the screen, and a bar
+    still claiming "内容已省略" is a lie. Unless the replay itself shed -- then
+    the screen is still incomplete and the bar must stay.
+    """
+    js = _js()
+    assert "s.shedSinceOpen" in js
+    attached = js.index('case "attached":')
+    window = js[attached : attached + 1600]
+    # The clean case must clear; the incomplete case must keep (or raise) it.
+    assert "clearDesync(s)" in window
+    assert "msg.incomplete" in window and "s.shedSinceOpen" in window
+    # A `desync` marks the flag; a fresh attempt resets it.
+    desync = js.index('case "desync":')
+    assert "s.shedSinceOpen = true" in js[desync : desync + 400]
+    connect_at = js.index("function connect(s)")
+    assert "s.shedSinceOpen = false" in js[connect_at : connect_at + 900]
+
+
+def test_resync_must_not_announce_success_over_its_own_shed_frames() -> None:
+    """`resynced` carries the server's verdict; the client believes it.
+
+    A resync of a large buffer can shed too -- and what it sheds is the head of
+    the screen being rebuilt. Clearing the bar then is the same lie the bar
+    exists to prevent. The server compares ``dropped_events`` across the
+    replay and sends ``incomplete``; the client keeps the bar when it is set.
+    """
+    js = _js()
+    ws = (ROOT / "src" / "wsctl" / "server" / "ws.py").read_text(encoding="utf-8")
+    assert "incomplete" in ws and "dropped_events" in ws
+    resynced = js.index('case "resynced":')
+    window = js[resynced : resynced + 800]
+    assert "msg.incomplete" in window, "the client must honour the server's verdict"
+    assert "clearDesync" in window
+
+
+def test_attached_must_not_claim_a_whole_screen_over_its_own_shed_frames() -> None:
+    """Same honesty rule on the attach path: `attached` carries a verdict too.
+
+    The attach replay can shed (a small byte budget, or the frame cap when the
+    stored chunk count is a TUI's PTY-read count). Saying "attached" as if the
+    screen came back whole is what produced "lost sync" at an idle prompt with
+    no explanation of what was actually missing.
+    """
+    js = _js()
+    session = (ROOT / "src" / "wsctl" / "core" / "session.py").read_text(encoding="utf-8")
+    assert '"incomplete": incomplete' in session, "attach must report its own sheds"
+    assert "dropped_events" in session
+    attached = js.index('case "attached":')
+    window = js[attached : attached + 1600]
+    assert "msg.incomplete" in window, "the client must honour the attach verdict"
+    assert "markDesynced" in window
+
+
+def test_an_eviction_notice_must_not_contradict_the_reconnect_that_follows() -> None:
+    """`evicted` is recoverable: no standby claim, no manual-open nudge.
+
+    4410 / memory eviction close the socket and `onclose` auto-reconnects.
+    Marking the tab standby in between displayed "未连接" -- a state the very
+    next line of code was about to contradict. The toast is the message.
+    """
+    js = _js()
+    evicted = js.index('case "evicted":')
+    window = js[evicted : js.index('case "error":', evicted)]
+    # On the code, not the prose: the comment that explains the fix says the
+    # word "standby", and a substring check on the block would fire on it --
+    # exactly the "guard that the wrong code can pass" trap, inverted.
+    assert "s.standby" not in window, "evicted must not mark the tab standby"
+    assert "markTab(" not in window
+    assert "setConnectionFor(" not in window
+    assert "toast(" in window, "the user must still be told"
+
+
+def test_a_paste_is_sent_in_chunks() -> None:
+    """One huge frame fills the PTY write buffer in a single call.
+
+    Its cap is checked only on entry, so a 500 KB paste makes every keystroke
+    afterwards look like a dead keyboard. Chunking keeps the buffer draining.
+    """
+    js = _js()
+    assert "function sendPaste(" in js
+    assert "PASTE_CHUNK" in js
+    assert "bytes.subarray(" in js
+    # The paste path must use it (the keystroke path must not change).
+    do_paste = js.index("function doPaste(")
+    assert "sendPaste(" in js[do_paste : do_paste + 500]
+
+
+def test_flushwrite_disarms_its_own_timer_on_every_entry() -> None:
+    """`flushWrite` is called on the timer *and* directly.
+
+    Nulling the id without `clearTimeout` left the old timer armed; the next
+    `enqueueWrite` then saw a non-null id and refused to schedule, and the
+    queued frames sat unflushed until the orphan fired. `requestResync` must
+    also disarm after emptying the queue -- `flushWrite` may re-arm for the
+    overflow it could not write this turn.
+    """
+    js = _js()
+    flush = js.index("function flushWrite(")
+    window = js[flush : flush + 400]
+    assert "clearTimeout(s.writeTimer)" in window, (
+        "flushWrite must disarm, not just null the id"
+    )
+    resync = js.index("function requestResync(")
+    resync_window = js[resync : resync + 700]
+    assert "s.writeQueue = []" in resync_window
+    assert "clearTimeout(s.writeTimer)" in resync_window, (
+        "requestResync drops the queue; any timer flushWrite re-armed must go too"
+    )
+
+
+def test_one_write_call_never_swallows_the_whole_replay() -> None:
+    """`term.write` is capped so rebuilding the screen cannot eat a frame.
+
+    A 4 MiB replay written whole is a multi-megabyte parse on the main thread
+    exactly when the screen is being rebuilt. The cap is a changelog promise
+    with no guard behind it until this test: "the terminal does not stutter"
+    is not testable, "no single write exceeds 256 KiB" is.
+    """
+    js = _js()
+    match = re.search(r"const WRITE_MAX_BYTES = (\d+) \* 1024;", js)
+    assert match is not None, "WRITE_MAX_BYTES must exist and be spelled in KiB"
+    assert int(match.group(1)) == 256, "the cap is a 256 KiB promise"
+    flush = js.index("function flushWrite(")
+    window = js[flush : js.index("function ", flush + 10)]
+    assert "WRITE_MAX_BYTES" in window and "break" in window, (
+        "flushWrite must stop merging at the cap"
+    )
+    # And the overflow is re-scheduled rather than stranded.
+    assert "s.writeTimer = setTimeout" in window
+
+
+def test_backoff_is_visible_and_can_be_skipped_by_clicking() -> None:
+    """"重连中（Ns 后重试）" plus a click that retries *now*.
+
+    A bare "已断开" could not be told apart from "gave up"; a remote operator
+    has nothing to act on. The click is the "I fixed the network, stop
+    waiting" path -- and it must go through the same single-shot `connect`.
+    """
+    js = _js()
+    assert "重连中（" in js, "backoff must be named in the indicator"
+    assert "点击立即重连" in js
+    click_at = js.index('els.connection.addEventListener("click"')
+    window = js[click_at : click_at + 500]
+    assert "connect(s)" in window, "the click must retry immediately"
+    assert "clearTimeout(s.reconnectTimer)" in window, (
+        "the click must cancel the pending backoff, or two connects race"
+    )
+
+
+def test_search_input_is_debounced_like_every_other_filter() -> None:
+    """"All matches" highlighting on every keystroke is a full buffer scan.
+
+    The file and session filter boxes were debounced 250ms; the terminal search
+    was not, and against a flood-filled session it stuttered per character.
+    Enter still searches immediately.
+    """
+    js = _js()
+    assert "searchDebounce" in js
+    input_at = js.index('els.searchInput.addEventListener("input"')
+    window = js[input_at : input_at + 700]
+    assert "250" in window, "search input must be debounced"
+    key_at = js.index('els.searchInput.addEventListener("keydown"')
+    assert "clearTimeout" in js[key_at : key_at + 500], "Enter must flush the debounce"
+
+
+def test_the_help_legend_and_the_reserved_set_cannot_drift() -> None:
+    """One source of truth for "will a browser swallow this chord".
+
+    ``BROWSER_RESERVED`` and the help sheet's grades were two lists. They
+    disagreed about ``alt+ArrowLeft/Right`` -- which are *also* the default
+    tab-switch chords -- and the set's mixed-case arrow entries never matched
+    the lowercased lookup, so the bind-dialog warning never fired either.
+    """
+    js = _js()
+    assert "function chordGrade(" in js
+    assert "chordGrade(action, binding)" in js, "editable chords must be graded"
+    assert "chordGrade(null, raw)" in js, "fixed chords must be graded the same way"
+    # The set is lowercase-only and the arrows (a default binding) are not in it.
+    reserved = re.search(r"const BROWSER_RESERVED = new Set\(\[([^\]]*)\]", js)
+    assert reserved is not None
+    entries = re.findall(r'"([^"]+)"', reserved.group(1))
+    assert entries, "the reserved set is empty"
+    assert all(e == e.lower() for e in entries), (
+        f"reserved entries must be lowercase or the lookup misses them: {entries}"
+    )
+    assert "alt+arrowleft" not in entries and "alt+arrowright" not in entries
+    # ...but they are still the defaults, so the contradiction is resolved in
+    # the direction of "the page can cancel these" rather than by quietly
+    # rebinding the user's tab switches.
+    assert 'next_tab: "alt+ArrowRight"' in js
+    assert 'prev_tab: "alt+ArrowLeft"' in js
+
+
+def test_file_refresh_is_registered_once() -> None:
+    """A duplicated listener is two requests and a flickering status line.
+
+    Not a theoretical defect: the refresh button was bound twice at the bottom
+    of the file-panel block.
+    """
+    js = _js()
+    registrations = js.count('els.fileRefresh.addEventListener("click"')
+    assert registrations == 1, f"file refresh bound {registrations} times"
+
+
+def test_closing_the_preview_asks_about_unsaved_edits() -> None:
+    """A stray click on the backdrop must not discard a page of typing."""
+    js = _js()
+    assert "previewDirtyBase" in js
+    close_at = js.index("function closePreview(")
+    window = js[close_at : close_at + 900]
+    assert "previewDirtyBase" in window and "confirmDialog(" in window
+
+
+def test_a_background_tab_may_never_rewrite_the_connection_indicator() -> None:
+    """The indicator describes the *visible* terminal -- and its affordances.
+
+    `setConnectionFor` guarded the text but not the title / cursor that say
+    "click to retry". A background tab's `scheduleReconnect` therefore claimed
+    the active tab's indicator and left it pointing at the wrong session.
+    There is now exactly one painter, and it is guarded.
+    """
+    js = _js()
+    assert "function paintConnectionFor(" in js
+    # Two writers, both guarded: the painter (adds "click to retry") and
+    # `setConnectionFor` (clears it). Anything else writing the affordances
+    # is a background tab about to clobber the visible one.
+    painters = ("function paintConnection(", "function setConnectionFor(")
+    for name in painters:
+        start = js.index(name)
+        end = js.index("function ", start + len(name))
+        block = js[start:end]
+        assert "els.connection.style.cursor" in block, f"{name} must own the cursor state"
+    stripped = js
+    for name in painters:
+        start = stripped.index(name)
+        end = stripped.index("function ", start + len(name))
+        stripped = stripped[:start] + stripped[end:]
+    assert "els.connection.style.cursor" not in stripped, (
+        "a third writer of the indicator cursor exists; background tabs will "
+        "clobber the visible tab's state"
+    )
+    # Both backoff and connect paint through the guarded path.
+    schedule = js.index("function scheduleReconnect(")
+    assert "paintConnectionFor(s)" in js[schedule : schedule + 600]
+    connect_at = js.index("function connect(s)")
+    assert "paintConnectionFor(s)" in js[connect_at : connect_at + 900]
+    assert "setConnectionFor(s," not in js[connect_at : connect_at + 900], (
+        "connect must paint the whole indicator state, not just the text"
+    )

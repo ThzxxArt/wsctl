@@ -26,6 +26,34 @@ def test_version_flag() -> None:
     assert "wsctl" in result.output
 
 
+def test_the_version_number_is_one_fact_in_two_places_that_must_agree() -> None:
+    """``pyproject.toml`` and ``wsctl.__version__`` are both release surfaces.
+
+    They had drifted (the package still reported 0.1.16 after the pyproject
+    bump), and the existing checks only asserted the word "wsctl" appeared --
+    a guard that passes at *any* version. ``wsctl --version`` and ``/healthz``
+    both read ``__version__``, so the lie reaches users and the rolling-
+    restart gate alike.
+    """
+    import tomllib
+
+    import wsctl
+
+    root = Path(__file__).resolve().parent.parent
+    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = data["project"]["version"]
+    assert wsctl.__version__ == declared, (
+        f"__version__={wsctl.__version__!r} but pyproject declares {declared!r}"
+    )
+    for argv in (["version"], ["--version"]):
+        result = runner.invoke(app, argv)
+        assert result.exit_code == 0
+        assert declared in result.output, (
+            f"`wsctl {' '.join(argv)}` printed {result.output!r}; "
+            f"it must say {declared}"
+        )
+
+
 def test_doctor_runs(tmp_path: Path, monkeypatch: object) -> None:
     monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
     monkeypatch.setenv("WSCTL_CONFIG", str(tmp_path / "missing.toml"))  # type: ignore[attr-defined]

@@ -200,3 +200,46 @@ def test_an_opener_split_across_frames_is_still_seen() -> None:
     t = AnsiTracker()
     assert t.feed(b"\x1b") is True
     assert t.feed(b"(B") is False, "ESC ( B is a complete charset designation"
+
+
+def test_resume_and_skip_to_boundary_re_anchor_a_kept_head() -> None:
+    """A head that resumes mid-escape must skip the *rest of that sequence*.
+
+    This is the re-anchor half of scrollback eviction: the bytes before the
+    kept head are gone, and only the recorded state says what kind of sequence
+    the head is still inside. Scanning the head alone reads its remainder
+    (``1m...``) as text -- the exact 花屏 this exists to prevent.
+    """
+    from wsctl.core.ansi import AnsiTracker
+
+    # The kept head is `1mRED` -- the tail of `ESC[31m` plus real text.
+    t = AnsiTracker()
+    t.resume("csi")
+    assert t.skip_to_boundary(b"1mRED") == b"RED"
+    assert not t.inside
+
+    t = AnsiTracker()
+    t.resume("osc")
+    assert t.skip_to_boundary(b"title\x07after") == b"after"
+
+    t = AnsiTracker()
+    t.resume("short")  # ESC ( B: one final byte outstanding
+    assert t.skip_to_boundary(b"Btext") == b"text"
+
+    # Not inside: nothing to skip.
+    t = AnsiTracker()
+    assert t.skip_to_boundary(b"plain") == b"plain"
+
+    # The sequence never completes here: everything is remainder.
+    t = AnsiTracker()
+    t.resume("csi")
+    assert t.skip_to_boundary(b"31") == b""
+
+    # `state` round-trips through `resume`.
+    t = AnsiTracker()
+    t.feed(b"\x1b[31")
+    saved = t.state
+    u = AnsiTracker()
+    u.resume(saved)
+    assert u.inside
+    assert u.skip_to_boundary(b"mOK") == b"OK"

@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.16 · 状态：0.1.0–0.1.15 已发布
+> 版本：0.1.17 · 状态：0.1.0–0.1.16 已发布
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -300,7 +300,7 @@ pyotp  segno  websockets
 
 
 
-## 10.1 实现状态（截至 0.1.7）
+## 10.1 实现状态（截至 0.1.17）
 
 **已实现**：M0–M20 全部交付项；二进制 WS 协议、会话与连接解耦、重连回放、
 多用户 RBAC、审计 + `/api/audit`、登录限速、IP allowlist、TOTP、安全响应头、
@@ -334,6 +334,15 @@ CLI 全线 `--json`、多 shell 补全。**验证深度提升**：ZMODEM 从「�
 假警报同源。具体见 CHANGELOG：输入限速不再伪装成死终端、关闭码单一来源、
 「热更新」三档（八项此前标注不准确）、会话历史终于可见、文件面板从三个动词补成
 完整文件管理、运营提示不再污染终端缓冲。
+
+**0.1.17 新增**：主题「连接生命周期收口」。`断开 → 重连 → 回放 → 失步` 环路上
+最后一批**「动作做了、声明没跟上」**的缺口：scrollback `_trim` 在**零压力**下就
+丢掉跨帧序列的前半（回放以 `1m` 开头的花屏，且守卫是弱形式、错代码照绿）；
+`connect` 不清退避定时器导致**双 WebSocket 孤儿**；resync 写锁把重连回放也丢掉
+（白屏）；失步徽标 / `resynced` / `evicted` 三处状态与代码的下一步互相矛盾。
+根治方式与 0.1.8 同构——**每个状态声明都必须能从「刚发生的事实」推出来**，
+并以 9 项突变体反向验证证毕。流畅性（搜索 debounce / write 封顶 / 粘贴分片）与
+可用性（重连可见可打断 / 编辑脏检查 / 快捷键可靠性单一事实源）同版收尾。
 
 **尚未实现**：无。验证边界（诚实声明）：
 - ZMODEM 真机往返需要 `lrzsz`（CI 已装并执行；本地缺失时该浏览器用例跳过）。
@@ -374,6 +383,16 @@ CLI 全线 `--json`、多 shell 补全。**验证深度提升**：ZMODEM 从「�
 | **M64** | 列表事件委托（每容器 1 监听替代每行 3-4 个）+ 筛选 debounce 250ms |
 | **M65** | 性能验收数值门入 `-m slow`：T1 `seq 1 200000` ≤ 8s · T2 8 会话并发 ≤ 20s 且零驱逐 · T3 事件循环延迟 < 50ms；完成标记用算术展开防回显误匹配 |
 | **M66** | 观测补齐：`wsctl_event_loop_lag_seconds` / `_peak`、`wsctl_ws_frames_coalesced_total`、`wsctl_shed_resync_requests_total`；`window.__wsctlScreen()` 渲染器无关读屏 |
+| **M67** | scrollback 回放起点收口：`_trim` 仅在超容时按 WsClient 语义切割（丢到「最后一块结束在序列外」）；`_inside` 升级为状态串 + `AnsiTracker.resume`/`skip_to_boundary` 处理「保留块从序列中间开始」；单块尾切真正对齐（`_align_ansi` 空转删除）；守卫升级为**强形式**（被淘汰前缀喂 tracker）+ 零压力跨帧回归 |
+| **M68** | 连接状态机收口：`resetTransients`（退避/写队列/resync 锁为连接级瞬态）+ 全 ws 处理器代际比对（`s.ws === ws`）+ 替换前关旧 socket + `onclose` 置空 `s.ws`——重连不再双开、回放不掺旧帧 |
+| **M69** | 失步状态随事实复位：`onopen`/`attached` 抬 resync 写锁（attach 回放是 resync 的超集）；`attached` 在本连接无 `desync` 时收起徽标（scrollback 完整、回放已修复）；`resynced` 带 `incomplete`（resync 自己丢帧时不宣布成功）；`evicted` 只 toast，连接指示由 `onclose` 唯一驱动 |
+| **M70** | 流畅性收尾：搜索 debounce 250ms（Enter 立即）；单次 `term.write` 封顶 256 KiB；大段粘贴按 32 KiB 分片（WS 保序，PTY 写缓冲不被整包占满） |
+| **M71** | 可用性收尾：退避中显示「重连中（Ns 后重试）」+ 点击立即重连；预览/编辑关闭前脏检查（`warn` 确认）；文件刷新单次注册 |
+| **M72** | 快捷键可靠性单一事实源：`chordGrade()` 统一 `BROWSER_RESERVED`（全小写、查找不区分大小写）与 `CHORD_RELIABILITY`；`Alt+←/→` 实测可被 `preventDefault` 接管后移出保留集、保留为默认标签切换键，`test_browser_alt_arrow_really_switches_tabs` 为证据 |
+| **M73** | 回放帧合批（用户现场缺陷）：`Scrollback.replay_frames` 将数千 PTY 小读合批为 ~64 KiB 线帧，attach / resync 不再被 `MAX_PENDING` 帧数上限绞碎自身回放；`attached`/`resynced` 带 `incomplete`（回放丢帧不许宣布成功）；CLI `connect` 同步可见 `desync`/`notice`/`evicted`/`incomplete` |
+| **M74** | 回归 review 收口：`flushWrite` 入口 disarm 旧定时器（直接调用不再留孤儿）；`requestResync` 清队后断管；`paintConnectionFor` 唯一写入状态栏附属物；`chordGrade` 空绑定不评级；`AnsiTracker.resume`/`skip_to_boundary` 直接单测 |
+| **M75** | 发布前终检：`__version__` 与 `pyproject.toml` 单一事实源对齐（此前分叉、`wsctl --version` 报旧版）；「write 封顶 256 KiB」「点击立即重连」补结构契约——CHANGELOG 的每条声明都必须有能变红的守卫 |
+| **M76** | 回放合批帧宽服从客户端字节预算（`replay_target_for` = `min(64 KiB, max_bytes)`）：固定 64 KiB 帧在小预算下整帧被丢、整段回放消失的自引入回退；browser 丢帧触发改确定性（单次大写入 vs 小预算，不再依赖洪峰竞速） |
 
 ## 11. Backlog（后续）
 

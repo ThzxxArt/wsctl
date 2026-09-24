@@ -226,14 +226,21 @@ class TermSession:
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
 
-    def scrollback_chunks(self) -> tuple[bytes, ...]:
-        """Buffered output *as stored*, for a targeted replay.
+    def scrollback_chunks(self, target: int = 65536) -> tuple[bytes, ...]:
+        """Buffered output as **wire frames**, for a targeted replay.
 
-        A resync re-sends this into a screen the viewer has already cleared.
-        Going through :meth:`scrollback_snapshot` would join the whole buffer
-        first -- the exact per-attach copy the attach path stopped making.
+        A resync or attach re-sends this into a screen the viewer has already
+        cleared. Frames are coalesced (see
+        :meth:`~wsctl.core.scrollback.Scrollback.replay_frames`) because the
+        stored chunk count is a PTY-read count: a TUI's tiny bursts would
+        outrun the per-client *frame* cap mid-replay and shred the very thing
+        being restored.
+
+        ``target`` must stay **within the client's byte budget** (see
+        :func:`replay_target_for`): a frame larger than the budget cannot be
+        queued at all and is dropped whole.
         """
-        return self._scrollback.chunks()
+        return self._scrollback.replay_frames(target)
 
     def memory_usage(self) -> int:
         """Approximate bytes held by this session (scrollback + client backlogs)."""
@@ -324,13 +331,19 @@ class TermSession:
                 raise ClientGone("会话已关闭")
             if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
                 raise ClientGone("会话连接数已达上限")
-            replay = self._scrollback.chunks()
+            replay = self._scrollback.replay_frames(replay_target_for(client))
             key = id(client)
             self._clients[key] = _ClientEntry(client, writable=writable, share=share)
             self.last_active = time.time()
             try:
+                before = int(getattr(client, "dropped_events", 0))
                 for chunk in replay:
                     client.put(chunk)
+                # This replay can shed too (a small ``client_max_bytes``, or a
+                # peer that drains slower than the frames arrive). Saying
+                # "attached" as if the screen came back whole would repeat the
+                # exact lie the desync bar exists to correct.
+                incomplete = int(getattr(client, "dropped_events", 0)) > before
                 client.put(
                     {
                         "type": "attached",
@@ -339,6 +352,7 @@ class TermSession:
                         "cols": self.spec.cols,
                         "rows": self.spec.rows,
                         "writable": writable,
+                        "incomplete": incomplete,
                     }
                 )
             except ClientGone:
@@ -713,3 +727,18 @@ def within_user_quota(manager: SessionManager, limit: int, user_id: int | None) 
     if limit <= 0:
         return True
     return sum(1 for s in manager.list_sessions() if s.owner_id == user_id) < limit
+
+
+def replay_target_for(client: Client) -> int:
+    """How big a replay frame may be for *this* client.
+
+    Coalescing fights the frame cap; the byte budget fights oversized frames
+    (``put`` drops a frame that cannot fit at all). The frame size has to sit
+    under both: never above the client's ``max_bytes`` when it has one, and
+    never above 64 KiB (below that the per-frame overhead of thousands of
+    chunks becomes the frame-cap problem all over again).
+    """
+    budget = int(getattr(client, "max_bytes", 0) or 0)
+    if budget <= 0:
+        return 65536
+    return max(1, min(65536, budget))

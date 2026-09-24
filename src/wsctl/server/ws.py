@@ -45,6 +45,7 @@ from wsctl.core.session import (
     SessionManager,
     SessionSpec,
     TermSession,
+    replay_target_for,
     within_user_quota,
 )
 from wsctl.core.store import Store, User
@@ -592,8 +593,20 @@ async def _pump(
                 # from the live stream and would either drop the replay it just
                 # asked for or draw the same bytes twice.
                 client.put({"type": "resync-begin", "session": session.id})
-                for chunk in session.scrollback_chunks():
+                before = client.dropped_events
+                for chunk in session.scrollback_chunks(replay_target_for(client)):
                     client.put(chunk)
-                client.put({"type": "resynced", "session": session.id})
+                # This replay can shed too -- and what it sheds is the *head* of
+                # the very screen being rebuilt. ``resynced`` must not then
+                # announce success; the viewer would clear its desync bar while
+                # the display is still missing its beginning.
+                incomplete = int(client.dropped_events) > before
+                client.put(
+                    {
+                        "type": "resynced",
+                        "session": session.id,
+                        "incomplete": incomplete,
+                    }
+                )
             except ClientGone:
                 return

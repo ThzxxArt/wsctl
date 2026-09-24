@@ -100,6 +100,17 @@ class WsClient:
         return self._pending_bytes
 
     @property
+    def max_bytes(self) -> int:
+        """The per-client byte budget (0 = unbounded by bytes).
+
+        Replay framing must respect this: a frame larger than the budget can
+        never be queued -- ``put`` sheds the *whole* frame -- so coalescing to
+        64 KiB against a 16 KiB client threw away the entire replay where the
+        raw (small) chunks used to fit.
+        """
+        return self._max_bytes
+
+    @property
     def closed(self) -> bool:
         return self._closed
 

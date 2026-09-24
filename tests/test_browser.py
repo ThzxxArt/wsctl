@@ -1868,14 +1868,23 @@ def test_browser_desync_bar_and_resync_recover_the_screen(tmp_path: Path) -> Non
 
                 page.click("#desync-btn")
                 page.wait_for_selector("#desync-bar.hidden", state="attached", timeout=WAIT_MS)
-                # The screen must be repopulated from what the server holds.
+                # Wait for *content*, not for a character count: a freshly
+                # reset screen is fifty blank rows and fifty characters of
+                # newlines. The old `length > 50` guard accepted that, and the
+                # follow-ups (`no U+FFFD`, `40000` at most twice) are both
+                # satisfied by an empty screen -- a guard the wrong outcome
+                # could pass.
                 page.wait_for_function(
-                    "() => (window.__wsctlScreen ? window.__wsctlScreen() : '').length > 50",
+                    "() => (window.__wsctlScreen ? window.__wsctlScreen() : '').includes('40000')",
                     timeout=WAIT_MS,
                 )
                 screen = page.evaluate("() => window.__wsctlScreen()")
                 assert "\ufffd" not in screen, "the replay left replacement glyphs"
-                assert screen.count("40000") <= 2, "the replay duplicated content on top of itself"
+                hits = screen.count("40000")
+                assert 1 <= hits <= 2, (
+                    f"the replay is missing its tail ({hits} hits); "
+                    "a resync must restore what the server holds, once"
+                )
 
                 metrics = httpx.get(f"{BASE}/metrics", headers=_headers_from(page), timeout=10).text
                 assert "wsctl_shed_resync_requests_total" in metrics, "resync must be counted"
@@ -2045,6 +2054,356 @@ def test_browser_switching_tabs_does_not_remeasure_when_nothing_changed(
             assert resizes == 0, (
                 f"a plain tab switch sent {resizes} resize frame(s) to the server; "
                 "nothing changed, so nothing should have been measured or reported"
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+# -- 0.1.17 连接生命周期收口 ------------------------------------------------
+#
+# The structural half lives in ``tests/test_ui_contracts.py``; these assert the
+# behaviour where a user would notice it. The WebSocket counter is installed
+# before any page script runs: "did one tab end up with two sockets" is not
+# visible in the DOM, and it is exactly how a reconnect storm looks from the
+# server side.
+
+
+_WS_COUNTER_INIT = """
+(() => {
+  const orig = window.WebSocket;
+  window.__wsOpened = 0;
+  window.__wsLive = [];
+  const Wrapped = function (...args) {
+    const ws = new orig(...args);
+    window.__wsOpened += 1;
+    window.__wsLive.push(ws);
+    return ws;
+  };
+  Wrapped.prototype = orig.prototype;
+  Wrapped.CONNECTING = orig.CONNECTING;
+  Wrapped.OPEN = orig.OPEN;
+  Wrapped.CLOSING = orig.CLOSING;
+  Wrapped.CLOSED = orig.CLOSED;
+  window.WebSocket = Wrapped;
+})();
+"""
+
+
+def test_browser_reconnect_does_not_open_a_second_socket(tmp_path: Path) -> None:
+    """A drop plus a tab click must still be exactly one new WebSocket.
+
+    ``scheduleReconnect`` and ``ensureConnected`` both called ``connect``;
+    neither cleared the other's backoff timer and ``onclose`` left the closed
+    socket in ``s.ws``. Switching back to the tab while the timer was pending
+    therefore opened a second socket and orphaned the first -- which the server
+    kept attached, writing into the same screen.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(viewport={"width": 1400, "height": 900})
+            context.add_init_script(_WS_COUNTER_INIT)
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            before = page.evaluate("() => window.__wsOpened")
+            assert before == 1, f"the first tab opened {before} sockets"
+
+            # Drop the link from this side (``set_offline`` does not close an
+            # established WebSocket). The tab must say it is retrying rather
+            # than sit silent -- and the retry is the only thing allowed to
+            # reconnect.
+            page.evaluate("() => { const w = window.__wsLive.at(-1); if (w) w.close(); }")
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent.includes('重连')",
+                timeout=WAIT_MS,
+            )
+            # The old defect: a tab click here ran `connect` while the backoff
+            # timer was still pending, and the timer then ran a second one.
+            page.click(".tab.active")
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.wait_for_timeout(1200)  # outlive the original 500ms backoff
+            opened = page.evaluate("() => window.__wsOpened")
+            assert opened == before + 1, (
+                f"one drop + one tab click produced {opened - before} sockets "
+                "(the backoff timer and the click both ran connect)"
+            )
+            live = page.evaluate(
+                "() => window.__wsLive.filter(w => w.readyState === WebSocket.OPEN).length"
+            )
+            assert live == 1, f"{live} sockets are simultaneously open for one tab"
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_clean_reconnect_clears_the_desync_bar(tmp_path: Path) -> None:
+    """A reconnect replays the whole scrollback -- the bar must not outlive it.
+
+    Client-side shedding only drops the delivery queue; the server's scrollback
+    is intact, so the attach replay repairs the screen. A bar still claiming
+    "已省略" afterwards is a lie, and its 重新同步 button offers a remedy for a
+    problem that no longer exists.
+
+    The shed is provoked by **one write larger than the byte budget** -- not by
+    a flood race. `seq 1 40000` only sheds if the PTY reads happen to outpace
+    the consumer, which is exactly the kind of "passes on a fast machine" wait
+    this suite keeps getting bitten by. The replay (512 B scrollback into a
+    1 KiB budget) is small by construction, so it is whole or nothing.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    os.environ["WSCTL_CLIENT_MAX_BYTES"] = "1024"
+    os.environ["WSCTL_SCROLLBACK_BYTES"] = "512"
+    try:
+        server = _start_server(data, files)
+        try:
+            _wait_health()
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                context = browser.new_context(viewport={"width": 1400, "height": 900})
+                context.add_init_script(_WS_COUNTER_INIT)
+                page = context.new_page()
+                _login(page)
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=WAIT_MS,
+                )
+                page.click(".term-pane.active .xterm-screen")
+                # 5 KB in one printf: a PTY read larger than the 1 KiB budget,
+                # so `put` must shed and must say so. Deterministic.
+                page.keyboard.type("printf 'X%.0s' {1..5000}")
+                page.keyboard.press("Enter")
+                page.wait_for_selector("#desync-bar:not(.hidden)", timeout=WAIT_MS)
+
+                # Reconnect. The replay is the whole (512 B) scrollback and it
+                # fits the budget, so whatever the previous connection shed is
+                # repaired and the bar is a lie.
+                page.evaluate("() => { const w = window.__wsLive.at(-1); if (w) w.close(); }")
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent.includes('重连')",
+                    timeout=WAIT_MS,
+                )
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=WAIT_MS,
+                )
+                # "已连接" is set on socket open, *before* the replay lands (and
+                # the replay is written through the 16ms batcher). Waiting on
+                # `__wsctlScreen().length` would accept the freshly *reset*
+                # screen -- fifty blank rows are fifty characters of newlines.
+                # Wait for the content itself.
+                page.wait_for_function(
+                    "() => (window.__wsctlScreen ? window.__wsctlScreen() : '')"
+                    ".includes('XXXX')",
+                    timeout=WAIT_MS,
+                )
+                page.wait_for_selector("#desync-bar.hidden", state="attached", timeout=WAIT_MS)
+                screen = _screen_text(page)
+                assert "XXXX" in screen, f"the replay lost its tail: {screen[-80:]!r}"
+                assert "\ufffd" not in screen, "the replay left replacement glyphs"
+                browser.close()
+        finally:
+            _stop_server(server)
+            shutil.rmtree(data, ignore_errors=True)
+    finally:
+        os.environ.pop("WSCTL_CLIENT_MAX_BYTES", None)
+        os.environ.pop("WSCTL_SCROLLBACK_BYTES", None)
+
+
+def test_browser_resync_interrupted_by_a_reconnect_never_goes_silent(tmp_path: Path) -> None:
+    """Breaking the socket mid-resync must not leave a blank screen unexplained.
+
+    ``requestResync`` clears the terminal and drops live frames until
+    ``resync-begin``. If the connection dies in that window and a reconnect
+    follows, the attach replay is *also* dropped by that lock -- and the user
+    is left staring at nothing until a timer mumbles a minute later. A new
+    attach supersedes the resync; at no point may the screen be blank without
+    either content or an honest bar.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    os.environ["WSCTL_CLIENT_MAX_BYTES"] = "1024"
+    os.environ["WSCTL_SCROLLBACK_BYTES"] = "512"
+    try:
+        server = _start_server(data, files)
+        try:
+            _wait_health()
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                context = browser.new_context(viewport={"width": 1400, "height": 900})
+                context.add_init_script(_WS_COUNTER_INIT)
+                page = context.new_page()
+                _login(page)
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'",
+                    timeout=WAIT_MS,
+                )
+                page.click(".term-pane.active .xterm-screen")
+                # One write larger than the budget: the shed (and therefore the
+                # bar) is deterministic, not a race against the consumer.
+                page.keyboard.type("printf 'Y%.0s' {1..5000}")
+                page.keyboard.press("Enter")
+                page.wait_for_selector("#desync-bar:not(.hidden)", timeout=WAIT_MS)
+
+                # Ask for a resync and break the link in the same breath: the
+                # screen is cleared and the write-lock is up when the socket
+                # dies. Whatever happens next, the outcome must be honest.
+                page.click("#desync-btn")
+                page.evaluate("() => { const w = window.__wsLive.at(-1); if (w) w.close(); }")
+                page.wait_for_function(
+                    "() => document.getElementById('connection').textContent === '已连接'"
+                    " || document.getElementById('connection').textContent.includes('重连')",
+                    timeout=WAIT_MS,
+                )
+                # Either the reconnect replay restored the screen...
+                try:
+                    page.wait_for_function(
+                        "() => (window.__wsctlScreen ? window.__wsctlScreen() : '')"
+                        ".trim().length > 20",
+                        timeout=8000,
+                    )
+                except Exception:
+                    # ...or the user is told, with a bar they can act on. A
+                    # blank screen and no explanation is the one failure.
+                    page.wait_for_selector("#desync-bar:not(.hidden)", timeout=2000)
+                screen = _screen_text(page)
+                bar_visible = page.locator("#desync-bar:not(.hidden)").count() > 0
+                assert screen.strip() or bar_visible, (
+                    "silent blank: no content and no desync bar after a resync "
+                    "was interrupted by a reconnect"
+                )
+                browser.close()
+        finally:
+            _stop_server(server)
+            shutil.rmtree(data, ignore_errors=True)
+    finally:
+        os.environ.pop("WSCTL_CLIENT_MAX_BYTES", None)
+        os.environ.pop("WSCTL_SCROLLBACK_BYTES", None)
+
+
+def test_browser_alt_arrow_really_switches_tabs(tmp_path: Path) -> None:
+    """``Alt+←/→`` are the default tab chords and must actually work.
+
+    They were also listed in ``BROWSER_RESERVED`` ("the browser claims these,
+    binding them silently does nothing"), which contradicted the defaults --
+    and the set's mixed-case arrow entries never matched the lowercased lookup,
+    so the bind dialog never warned either way. The page receives these keys
+    and ``preventDefault()`` cancels history navigation; this test is the
+    evidence that decision rests on.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            headers = _headers_from(page)
+            httpx.post(
+                f"{BASE}/api/sessions", headers=headers,
+                json={"name": "second-tab"}, timeout=10,
+            ).json()
+            page.click("#sessions-btn")
+            page.wait_for_selector("#sessions-overlay:not(.hidden)", timeout=WAIT_MS)
+            # Two rows carry an open button (the first tab is already open and
+            # its button says 切换); click the one for the session just made.
+            page.click("#sessions-list li:has-text('second-tab') button[data-act='open']")
+            page.wait_for_function(
+                "() => document.querySelectorAll('.tab').length >= 2",
+                timeout=WAIT_MS,
+            )
+            page.wait_for_timeout(300)
+
+            def active_label() -> str:
+                return str(page.inner_text(".tab.active .label"))
+
+            start = active_label()
+            page.keyboard.press("Alt+ArrowRight")
+            page.wait_for_timeout(250)
+            moved = active_label()
+            assert moved != start, (
+                f"Alt+ArrowRight did not switch tabs (still {start!r}); the "
+                "chord is claimed by the browser and must not be a default"
+            )
+            page.keyboard.press("Alt+ArrowLeft")
+            page.wait_for_timeout(250)
+            assert active_label() == start, "Alt+ArrowLeft did not switch back"
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_large_paste_is_sent_in_chunks(tmp_path: Path) -> None:
+    """A 100 KB paste must not become one 100 KB WebSocket frame.
+
+    One huge frame fills the PTY write buffer in a single ``write`` (its cap is
+    checked only on entry), after which every keystroke is dropped as "input
+    too fast" -- a keyboard that appears dead. The paste path chunks instead;
+    counting binary sends on the socket is the observable contract.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(viewport={"width": 1400, "height": 900})
+            context.grant_permissions(["clipboard-read", "clipboard-write"])
+            context.add_init_script(_WS_COUNTER_INIT)
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.evaluate(
+                """() => {
+                  window.__binSends = 0;
+                  const raw = WebSocket.prototype.send;
+                  WebSocket.prototype.send = function (data, ...rest) {
+                    if (typeof data !== 'string') window.__binSends += 1;
+                    return raw.call(this, data, ...rest);
+                  };
+                }"""
+            )
+            page.evaluate("() => navigator.clipboard.writeText('y'.repeat(100000))")
+            page.click(".term-pane.active .xterm-screen")
+            page.keyboard.press("Alt+v")
+            page.wait_for_function(
+                "() => window.__binSends >= 3",
+                timeout=WAIT_MS,
+            )
+            sends = page.evaluate("() => window.__binSends")
+            assert sends >= 3, (
+                f"a 100 KB paste went out as {sends} binary frame(s); "
+                "it must be chunked so the PTY write buffer can drain"
             )
             browser.close()
     finally:

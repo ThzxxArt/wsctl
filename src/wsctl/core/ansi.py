@@ -134,6 +134,36 @@ class AnsiTracker:
     def inside(self) -> bool:
         return self._state is not None
 
+    @property
+    def state(self) -> str | None:
+        """The streaming state after the bytes fed so far (``None`` = outside)."""
+        return self._state
+
+    def resume(self, state: str | None) -> None:
+        """Adopt a previously recorded state.
+
+        Used when a buffer's head was chosen as the start of a replay and the
+        bytes *before* it are only known as "left the parser inside kind X" --
+        re-anchoring that head needs to continue the same sequence, not start
+        a fresh scan that would read its remainder as text.
+        """
+        self._state = state
+
+    def skip_to_boundary(self, buf: bytes) -> bytes:
+        """Drop the leading bytes that complete an in-progress sequence.
+
+        ``self._state`` must be the state *before* ``buf`` (see :meth:`resume`).
+        A head that resumes mid-escape -- the remainder of a colour or cursor
+        sequence whose first half was evicted -- is exactly what must not be
+        replayed as text, so those bytes go and whatever follows is returned.
+        """
+        i = 0
+        n = len(buf)
+        while i < n and self._state is not None:
+            self.feed(buf[i : i + 1])
+            i += 1
+        return buf[i:]
+
     def feed(self, buf: bytes) -> bool:
         """Consume ``buf``; return whether the stream now ends inside a sequence."""
         i = 0

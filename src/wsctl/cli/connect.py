@@ -165,6 +165,26 @@ async def _recv_loop(
                 # The reason may be followed by a fatal close; keep reading to
                 # learn the close code before deciding whether to retry.
                 notice = str(data.get("msg"))
+            elif kind == "notice":
+                # Operational notices (read-only, rate limit, shutdown) must
+                # reach the operator here exactly as they reach the browser --
+                # silently swallowing them is the same defect as a browser
+                # toast that never appears.
+                _notice(str(data.get("msg") or "提示"))
+            elif kind == "desync":
+                # Frames were shed to keep the link. The local terminal is a
+                # real emulator and holds whatever arrived; say so and say what
+                # cannot be undone.
+                _notice(
+                    str(data.get("msg") or "输出过快，部分内容已省略")
+                    + "。全屏程序可按 Ctrl+L 或调整一次窗口大小自行重绘"
+                )
+            elif kind == "evicted":
+                _notice(str(data.get("msg") or "连接已被释放（会话仍在运行）"))
+            elif kind == "attached" and data.get("incomplete"):
+                # The replay itself shed. Claiming a whole screen would repeat
+                # the exact lie the desync notice exists to correct.
+                _notice("会话回放未完整，部分内容已省略")
     except ConnectionClosed as exc:
         code: int | None = None
         if exc.rcvd is not None:
