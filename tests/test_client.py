@@ -193,22 +193,46 @@ def test_shed_oldest_gives_up_backlog_before_a_viewer(tmp_path) -> None:
     assert client.closed is False, "shedding backlog must never close the link"
 
 
-def test_credentials_are_created_private(tmp_path: Path) -> None:
-    """The token file must never be world-readable, not even for an instant.
+def test_credentials_are_created_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The token file must be *created* private, not chmod-ed afterwards.
 
     ``write_text`` (0644 under a 022 umask) followed by ``chmod`` left a
     readable window -- and a crash in between left it readable *forever*.
+
+    The claim is about the **creation**, so the guard spies on ``os.open``'s
+    mode rather than on the resulting stat. Reading ``stat`` back is a POSIX
+    sentence only: Windows has no POSIX mode bits (it reports 0o666 for any
+    regular file) and privacy there is the parent directory's ACL. Asserting
+    ``mode == 0o600`` on the stat therefore fails on the Windows CI leg for a
+    reason that has nothing to do with the property under test.
     """
     import os
-    import stat
+    import stat as stat_mod
 
     from wsctl.cli import client as client_mod
 
+    seen: list[int] = []
+    real_open = os.open
+
+    def spy(path: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+        seen.append(mode)
+        return real_open(path, flags, mode, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", spy)
     client_mod.save_credentials("http://127.0.0.1:7681", "secret-token-value")
     path = client_mod.credentials_path()
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    assert mode == 0o600, f"credentials landed as {oct(mode)}"
+
+    assert 0o600 in seen, (
+        f"the credentials file must be *created* 0600; os.open was called with "
+        f"modes {[oct(m) for m in seen]}"
+    )
     assert client_mod.load_credentials()["token"] == "secret-token-value"
+    if os.name != "nt":
+        # POSIX can also read the result back; see the docstring for why
+        # Windows cannot.
+        assert stat_mod.S_IMODE(os.stat(path).st_mode) == 0o600
     client_mod.clear_credentials()
 
 
