@@ -25,7 +25,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from wsctl.core import fs as fs_mod
@@ -82,6 +82,17 @@ def _copy_upload(src: Any, fd: int, limit: int, chunk_size: int = 1 << 20) -> in
         return size
     finally:
         out.close()
+
+
+def _quote_filename(name: str) -> str:
+    """RFC 5987 encoding for a ``filename*`` parameter.
+
+    Percent-encoding rather than raw: a filename containing ``"`` or a newline
+    would otherwise split the header and let the caller inject one of their own.
+    """
+    import urllib.parse
+
+    return urllib.parse.quote(name, safe="")
 
 
 def _fs_error(exc: fs_mod.FsError) -> HTTPException:
@@ -147,6 +158,45 @@ async def preview_file(
     except fs_mod.FsError as exc:
         raise _fs_error(exc) from exc
     return PlainTextResponse(text, headers={"X-Wsctl-Encoding": encoding})
+
+
+@router.get("/files/image")
+async def image_file(
+    request: Request, user: User = Depends(current_user), path: str = ""
+) -> Response:
+    """A bitmap for inline preview, typed by its *content*.
+
+    The media type comes from the file's leading bytes (see
+    ``fs.sniff_image_mime``) and is the only type this response will declare:
+    renaming a script to ``.png`` cannot make the browser execute it here,
+    because the bytes say what the file is and ``nosniff`` forbids a second
+    opinion. SVG is not served -- it is a document with a scripting surface,
+    and the text preview already shows it as what it is.
+    """
+    root = request.app.state.settings.files_root
+    try:
+        data, mime = await asyncio.to_thread(fs_mod.read_image_file, root, path)
+    except fs_mod.FsError as exc:
+        # A missing file is 404 (matching ``download_file``), anything else is
+        # a refused request. Branched on the *code*, not on the message: a
+        # wording change must not turn a 404 into a 400.
+        if exc.code == fs_mod.FsError.NOT_FOUND:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+            ) from exc
+        raise _fs_error(exc) from exc
+    name = Path(path).name or "image"
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            # ``inline`` is what a preview wants; the filename is quoted so a
+            # name with a newline or a quote cannot split the header.
+            "Content-Disposition": f"inline; filename*=UTF-8''{_quote_filename(name)}",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.put("/files/content")

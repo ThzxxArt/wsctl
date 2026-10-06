@@ -278,6 +278,47 @@ def test_metrics_can_be_disabled(tmp_path: Path) -> None:
         assert client.get("/metrics").status_code == 404
 
 
+def test_every_metric_name_appears_once_in_the_exposition(tmp_path: Path) -> None:
+    """One name, one series. Two is a defect however correct each one is.
+
+    ``wsctl_pty_input_dropped_total`` was collected from ``pty`` *and*
+    incremented by the WebSocket layer for refused oversized frames, so
+    ``/metrics`` printed two ``# TYPE`` lines under one name carrying two
+    unrelated numbers -- and ``rate()`` over it was meaningless. The
+    double-registration trap is documented in ``app.py`` for three other
+    counters; this one slipped past it, which is exactly why the invariant
+    belongs to the exposition rather than to a comment.
+
+    Both halves must be *live* in the scrape. A guard that only reads an idle
+    exposition passes even when the two names are identical again, because
+    the refused-frame counter has never been incremented and therefore never
+    printed -- which is how this check passed against the defect the first
+    time it was written.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24}))
+            assert _recv_control(ws, {"attached"}) is not None
+            # This increments the refused-frame counter.
+            ws.send_bytes(b"x" * (256 * 1024 + 1))
+            assert _recv_control(ws, {"notice"}) is not None
+        text = client.get("/metrics").text
+
+    declared: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("# TYPE "):
+            declared.append(line.split()[2])
+    duplicated = sorted({name for name in declared if declared.count(name) > 1})
+    assert not duplicated, f"metric names declared more than once: {duplicated}"
+    assert "wsctl_pty_input_dropped_total" in declared
+    assert "wsctl_ws_oversized_input_frames_total" in declared, (
+        "the refused-frame counter must be counted under its own name"
+    )
+    assert "wsctl_pty_input_dropped_total" != "wsctl_ws_oversized_input_frames_total"
+
+
 # -- M6: gap closure --------------------------------------------------
 
 
@@ -612,6 +653,205 @@ def test_config_reload_admin_only(tmp_path: Path) -> None:
     with TestClient(build_app(tmp_path)) as client:
         login(client, BOB)
         assert client.post("/api/config/reload").status_code == 403
+
+
+# -- M83: online configuration editing --------------------------------
+
+
+def test_config_put_writes_the_file_and_keeps_the_authors_comment(tmp_path: Path) -> None:
+    """The panel edits a document a human maintains, not a key/value store.
+
+    The CLI's ``config set`` promised to keep the trailing comment the author
+    wrote beside a value; the online path makes the same promise or the two
+    entry points differ in the one way that destroys work.
+    """
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("max_sessions = 5  # 峰值并发\n", encoding="utf-8")
+    app = build_app(tmp_path, config_path=config)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.put(
+            "/api/config", json={"items": [{"key": "max_sessions", "value": 9}]}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["written"] == ["max_sessions"]
+    text = config.read_text(encoding="utf-8")
+    assert "max_sessions = 9  # 峰值并发" in text
+    assert "max_sessions = 5" not in text
+
+
+def test_config_put_rejects_a_restart_only_field_with_a_reason(tmp_path: Path) -> None:
+    """Accepting it and doing nothing would be the silent failure to avoid.
+
+    A field the server only reads at startup is refused *now*, with the reason
+    ("restart and it applies"), instead of a 200 that changes nothing.
+    """
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("host = \"127.0.0.1\"\n", encoding="utf-8")
+    app = build_app(tmp_path, config_path=config)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.put("/api/config", json={"items": [{"key": "port", "value": 9999}]})
+        assert r.status_code == 409, r.text
+        assert "重启" in r.json()["detail"]
+    assert "9999" not in config.read_text(encoding="utf-8")
+
+
+def test_config_put_refuses_a_bad_value_and_leaves_the_file_alone(tmp_path: Path) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    original = "max_sessions = 5\n"
+    config.write_text(original, encoding="utf-8")
+    app = build_app(tmp_path, config_path=config)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.put(
+            "/api/config", json={"items": [{"key": "max_sessions", "value": "many"}]}
+        )
+        assert r.status_code == 400, r.text
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_config_put_applies_a_hot_field_immediately(tmp_path: Path) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("", encoding="utf-8")
+    app = build_app(tmp_path, config_path=config, max_sessions=3)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.put(
+            "/api/config", json={"items": [{"key": "max_sessions", "value": 11}]}
+        )
+        assert r.status_code == 200, r.text
+        assert "max_sessions" in r.json()["changed"]
+        assert app.state.settings.max_sessions == 11  # type: ignore[attr-defined]
+
+
+def test_config_put_writes_a_whole_batch_or_nothing(tmp_path: Path) -> None:
+    """Two edits in one request are one edit on disk, never a half-applied set."""
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    original = "max_sessions = 5\nlogin_rate_limit = 10\n"
+    config.write_text(original, encoding="utf-8")
+    app = build_app(tmp_path, config_path=config)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        bad = client.put(
+            "/api/config",
+            json={
+                "items": [
+                    {"key": "max_sessions", "value": 9},
+                    {"key": "login_rate_limit", "value": "not-a-number"},
+                ]
+            },
+        )
+        assert bad.status_code == 400, bad.text
+        # The first item must not have been published on its own.
+        assert config.read_text(encoding="utf-8") == original
+        good = client.put(
+            "/api/config",
+            json={
+                "items": [
+                    {"key": "max_sessions", "value": 9},
+                    {"key": "login_rate_limit", "value": 20},
+                ]
+            },
+        )
+        assert good.status_code == 200, good.text
+        assert good.json()["written"] == ["max_sessions", "login_rate_limit"]
+    text = config.read_text(encoding="utf-8")
+    assert "max_sessions = 9" in text and "login_rate_limit = 20" in text
+
+
+def test_config_put_is_admin_only_and_is_audited(tmp_path: Path) -> None:
+    config = tmp_path / "wsctl" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text("", encoding="utf-8")
+    app = build_app(tmp_path, config_path=config)
+    with TestClient(app) as client:
+        login(client, BOB)
+        assert (
+            client.put("/api/config", json={"items": [{"key": "max_sessions", "value": 1}]})
+            .status_code
+            == 403
+        )
+        login(client, ADMIN)
+        assert (
+            client.put("/api/config", json={"items": [{"key": "max_sessions", "value": 2}]})
+            .status_code
+            == 200
+        )
+        events = {row["event"] for row in client.get("/api/audit").json()}
+        assert "config_set" in events
+
+
+def test_config_get_exposes_the_typed_value_for_the_editor(tmp_path: Path) -> None:
+    """The editor picks a control from the *type*, not from a rendered string."""
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        fields = {f["key"]: f for f in client.get("/api/config").json()["fields"]}
+        assert fields["max_sessions"]["raw"] == 64
+        assert isinstance(fields["auth_required"]["raw"], bool)
+        assert isinstance(fields["allowed_origins"]["raw"], list)
+
+
+# -- M82: inline image preview ----------------------------------------
+
+
+def test_files_image_is_typed_by_content_and_served_with_nosniff(tmp_path: Path) -> None:
+    """Previewing an image is not "download it and look elsewhere".
+
+    The media type must come from the bytes (a rename is one ``mv`` away from
+    serving a script as ``image/png``) and ``nosniff`` must forbid the browser
+    from overriding it -- the two halves of the same defence.
+    """
+    app = build_app(tmp_path, file_root=tmp_path)
+    (tmp_path / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.get("/api/files/image", params={"path": "photo.png"})
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("image/png")
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert "inline" in r.headers["content-disposition"]
+        assert r.content.startswith(b"\x89PNG")
+
+
+def test_files_image_refuses_a_script_disguised_as_a_png(tmp_path: Path) -> None:
+    """The name says image; the bytes say otherwise, and the bytes win."""
+    app = build_app(tmp_path, file_root=tmp_path)
+    (tmp_path / "evil.png").write_bytes(b"<!DOCTYPE html><script>alert(1)</script>")
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert client.get("/api/files/image", params={"path": "evil.png"}).status_code == 400
+
+
+def test_files_image_refuses_svg_and_keeps_it_in_the_text_preview(tmp_path: Path) -> None:
+    """SVG has a scripting surface; it is a document and stays in the text pane."""
+    app = build_app(tmp_path, file_root=tmp_path)
+    (tmp_path / "logo.svg").write_bytes(
+        b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+    )
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert client.get("/api/files/image", params={"path": "logo.svg"}).status_code == 400
+        text = client.get("/api/files/preview", params={"path": "logo.svg"})
+        assert text.status_code == 200 and "<svg" in text.text
+
+
+def test_files_image_is_bounded_and_traversal_proof(tmp_path: Path) -> None:
+    app = build_app(tmp_path, file_root=tmp_path / "root")
+    (tmp_path / "root").mkdir()
+    (tmp_path / "root" / "big.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert client.get("/api/files/image", params={"path": "nope.png"}).status_code == 404
+        escape = client.get("/api/files/image", params={"path": "../outside.png"})
+        assert escape.status_code in (400, 403, 404), escape.status_code
 
 
 # -- M21: hardening after adversarial review --------------------------
@@ -2299,6 +2539,11 @@ def test_an_oversized_input_frame_never_reaches_the_pty_buffer(
             out = _recv_bytes_until(ws, b"1517\r\n")
             assert b"1517\r\n" in out, "the link must survive a refused frame"
             assert seen, "the spy never fired -- this guard was measuring nothing"
+            # A refused frame is counted under its *own* name. It used to share
+            # ``wsctl_pty_input_dropped_total`` with "the child stopped
+            # reading", so one name carried two unrelated numbers.
+            metrics_text = client.get("/metrics").text
+            assert "wsctl_ws_oversized_input_frames_total" in metrics_text
             assert all(size <= 256 * 1024 for size in seen), seen
         client.delete(f"/api/sessions/{sid}")
 
@@ -2329,6 +2574,26 @@ def test_request_bodies_are_bounded_before_they_reach_the_work(tmp_path: Path) -
         assert r.status_code == 422, r.status_code
         # A session name past its bound is refused rather than stored.
         r = client.post("/api/sessions", json={"name": "n" * 500})
+        assert r.status_code == 422, r.status_code
+        # A configuration value past its bound is refused rather than written
+        # into the config file. ``value`` is untyped by design (the settings
+        # model is the schema), but untyped must not mean unbounded -- this is
+        # the same principle as the password field above.
+        #
+        # The sanity assertion comes *before* the allocation, and it is the
+        # load-bearing part: this test sizes its payload from the constant it
+        # is checking, so a constant inflated to gigabytes would make the
+        # guard OOM the machine it is supposed to be protecting. A guard must
+        # fail before it can hurt anything.
+        from wsctl.server.models import CONFIG_VALUE_MAX_CHARS
+
+        assert 0 < CONFIG_VALUE_MAX_CHARS <= 512 * 1024, (
+            f"CONFIG_VALUE_MAX_CHARS = {CONFIG_VALUE_MAX_CHARS} is not a sane bound"
+        )
+        r = client.put(
+            "/api/config",
+            json={"items": [{"key": "default_cwd", "value": "x" * (CONFIG_VALUE_MAX_CHARS + 1)}]},
+        )
         assert r.status_code == 422, r.status_code
         # File content past its bound is refused rather than encoded.
         r = client.put(

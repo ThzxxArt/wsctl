@@ -18,8 +18,14 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": (
+        # ``img-src`` carries ``blob:`` because the file panel previews a
+        # bitmap from an object URL (``URL.createObjectURL``) rather than
+        # shipping it through a data: URL -- an 8 MB picture would otherwise
+        # be base64-inflated by a third and held as one string. A ``blob:``
+        # URL can only name bytes this origin already holds, so it widens
+        # nothing that a script could not reach another way.
         "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
         "connect-src 'self' blob:; worker-src 'self' blob:"
     ),
 }

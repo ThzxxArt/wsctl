@@ -380,3 +380,64 @@ def test_safe_resolve_rejects_a_nul_byte(tmp_path: Path) -> None:
     """``Path.resolve`` raises ``ValueError`` on NUL, which no route catches -- a 500."""
     with pytest.raises(FsError):
         safe_resolve(tmp_path, "a\x00b")
+
+
+# -- M82: inline image preview ----------------------------------------
+#
+# The panel previews text; an image was download-or-nothing. The preview must
+# type the file by what it *is*, because a rename is one `mv` away from
+# serving a script as `image/png`.
+
+
+def _png() -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+def test_image_mime_comes_from_the_bytes_not_the_name() -> None:
+    assert fs.sniff_image_mime(_png()) == "image/png"
+    assert fs.sniff_image_mime(b"\xff\xd8\xff\xe0" + b"\x00" * 8) == "image/jpeg"
+    assert fs.sniff_image_mime(b"GIF89a" + b"\x00" * 8) == "image/gif"
+    assert fs.sniff_image_mime(b"GIF87a" + b"\x00" * 8) == "image/gif"
+    assert fs.sniff_image_mime(b"BM" + b"\x00" * 16) == "image/bmp"
+    assert fs.sniff_image_mime(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "image/webp"
+    assert fs.sniff_image_mime(b"\x00\x00\x00\x20ftypavif" + b"\x00" * 8) == "image/avif"
+
+
+def test_a_script_renamed_to_png_is_not_an_image() -> None:
+    """The whole point: a rename cannot change what the bytes are."""
+    html = b"<!DOCTYPE html><script>alert(1)</script>"
+    assert fs.sniff_image_mime(html) is None
+    svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script/></svg>"
+    assert fs.sniff_image_mime(svg) is None, (
+        "SVG is a document with a scripting surface, not a bitmap"
+    )
+    assert fs.sniff_image_mime(b"") is None
+    assert fs.sniff_image_mime(b"RIFF") is None, "a truncated RIFF proves nothing"
+    # A RIFF that is not WEBP (a WAV) is not an image either.
+    assert fs.sniff_image_mime(b"RIFF\x24\x00\x00\x00WAVEfmt ") is None
+    # An ISO base media file with a brand we do not render is refused, not
+    # guessed at.
+    assert fs.sniff_image_mime(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 8) is None
+
+
+def test_read_image_file_is_limited_and_refuses_links(tmp_path: Path) -> None:
+    root = tmp_path
+    good = root / "photo.png"
+    good.write_bytes(_png())
+    data, mime = fs.read_image_file(root, "photo.png")
+    assert mime == "image/png" and data.startswith(b"\x89PNG")
+
+    big = root / "big.png"
+    big.write_bytes(_png())
+    with pytest.raises(FsError, match="过大"):
+        fs.read_image_file(root, "big.png", limit=8)
+
+    impostor = root / "evil.png"
+    impostor.write_bytes(b"<script>alert(1)</script>")
+    with pytest.raises(FsError, match="不是可预览的图片"):
+        fs.read_image_file(root, "evil.png")
+
+    link = root / "link.png"
+    link.symlink_to(good)
+    with pytest.raises(FsError, match="符号链接"):
+        fs.read_image_file(root, "link.png")

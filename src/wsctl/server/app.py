@@ -363,9 +363,17 @@ def create_app(
         "Input writes dropped because a session's child stopped reading",
         lambda: float(pty_mod.dropped_input_total()),
     )
-    # ``wsctl_input_rate_limited_total`` is not registered here: ``ws.py``
-    # counts it with ``metrics.inc``, which already puts it in the exposition
-    # as a counter. Registering a collector too would print the series twice.
+    # ``wsctl_input_rate_limited_total``, ``wsctl_shed_resync_requests_total``,
+    # ``wsctl_ws_frames_coalesced_total`` and
+    # ``wsctl_ws_oversized_input_frames_total`` are not registered here:
+    # ``ws.py`` counts them with ``metrics.inc``, which already puts them in
+    # the exposition as counters. Registering a collector too would print the
+    # series twice.
+    #
+    # That trap had already caught ``wsctl_pty_input_dropped_total`` once: the
+    # *same name* was both collected from ``pty.dropped_input_total()`` and
+    # incremented by ``ws.py`` for refused oversized frames, so one name
+    # carried two unrelated numbers. They are separate series now.
     metrics.collect_counter(
         "wsctl_client_frames_shed_total",
         "Terminal frames discarded to keep a slow viewer connected (never a disconnect)",

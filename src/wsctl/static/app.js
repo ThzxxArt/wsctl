@@ -15,6 +15,7 @@
     upCancel: $("up-cancel"),
     fileMenu: $("file-menu"), previewOverlay: $("preview-overlay"), previewTitle: $("preview-title"),
     previewNote: $("preview-note"), previewBody: $("preview-body"),
+    previewImage: $("preview-image"), previewImg: $("preview-img"),
     previewClose: $("preview-close"), previewCancel: $("preview-cancel"),
     previewSave: $("preview-save"), previewDownload: $("preview-download"),
     shareBtn: $("share-btn"), shareOverlay: $("share-overlay"), shareQr: $("share-qr"),
@@ -31,6 +32,8 @@
     moreBtn: $("more-btn"), moreMenu: $("more-menu"),
     settingsBtn: $("settings-btn"), settingsOverlay: $("settings-overlay"),
     setTheme: $("set-theme"), setFontsize: $("set-fontsize"), setFont: $("set-font"),
+    setNotifySound: $("set-notify-sound"), setNotifyTitle: $("set-notify-title"),
+    setNotifySystem: $("set-notify-system"),
     settingsClose: $("settings-close"), settingsDone: $("settings-done"),
     recordBtn: $("record-btn"), replayBtn: $("replay-btn"), replayOverlay: $("replay-overlay"),
     replayHost: $("replay-host"), replayNote: $("replay-note"), replayClose: $("replay-close"),
@@ -45,6 +48,9 @@
     renameTitle: $("rename-title"), renameCancel: $("rename-cancel"),
     confirmOverlay: $("confirm-overlay"), confirmTitle: $("confirm-title"),
     confirmMessage: $("confirm-message"), confirmOk: $("confirm-ok"), confirmCancel: $("confirm-cancel"),
+    pickOverlay: $("pick-overlay"), pickTitle: $("pick-title"), pickNote: $("pick-note"),
+    pickSelect: $("pick-select"), pickOk: $("pick-ok"), pickCancel: $("pick-cancel"),
+    pickClose: $("pick-close"),
     qrOverlay: $("qr-overlay"), qrTitle: $("qr-title"), qrSecret: $("qr-secret"),
     qrImage: $("qr-image"), qrDone: $("qr-done"), qrClose: $("qr-close"),
     qrCode: $("qr-code"), qrError: $("qr-error"),
@@ -73,6 +79,14 @@
     copy_selection: "alt+c", paste_clipboard: "alt+v",
     font_inc: "alt+e", font_dec: "alt+d", clear_screen: "alt+r",
     show_help: "alt+?",
+    // Split panes. ``Alt+\`` splits the current pane to the right,
+    // ``Alt+Shift+\`` splits it downward -- a mnemonic pair on the same key,
+    // and neither is claimed by any browser. Focus movement is
+    // ``Alt+Shift+<arrow>``, which is free because the bare ``Alt+<arrow>``
+    // pair is already the tab switcher and must stay that way.
+    split_right: "alt+\\", split_down: "alt+shift+\\",
+    focus_left: "alt+shift+ArrowLeft", focus_right: "alt+shift+ArrowRight",
+    focus_up: "alt+shift+ArrowUp", focus_down: "alt+shift+ArrowDown",
   };
 
   // Which chords a browser may swallow before the page ever sees them. The
@@ -149,6 +163,13 @@
   // at once (the old behaviour) means N WebSockets and N xterm instances before
   // the user has looked at anything; the rest attach on demand.
   const AUTO_CONNECT_MAX = 8;
+
+  // One range for the font, in one place. The README promises 12-18, the
+  // Settings picker offered 12/13/14/16/18 and the Alt+E/D hotkey clamped at
+  // 9-24 -- so a hotkey could reach a size the picker could not show, and the
+  // docs described neither. The picker is generated from the same bounds.
+  const FONT_MIN = 12;
+  const FONT_MAX = 18;
 
   const encoder = new TextEncoder();
   const sessions = new Map();
@@ -248,17 +269,38 @@
         // disables acceleration; "webgl" asks for WebGL and falls back if it
         // will not initialise rather than leaving a blank terminal.
         termRenderer: "auto",
+        // Background-presence signals. On by default (that is the feature);
+        // the system notification is the one a browser may refuse, and it
+        // degrades to the badge and the title rather than failing.
+        notifySound: true, notifyTitle: true, notifySystem: true,
       },
     readPrefs(),
   );
   prefs.keybindings = Object.assign({}, DEFAULT_KEYS, prefs.keybindings);
   prefs.customThemes = prefs.customThemes || {};
+  // A stored value outside the supported range is a value the picker cannot
+  // represent; clamp it rather than let the hotkey and the picker disagree
+  // about what the current size is.
+  prefs.fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, Number(prefs.fontSize) || 14));
 
   function readPrefs() {
     try {
       const parsed = JSON.parse(localStorage.getItem("wsctl-prefs") || "{}");
       return parsed && typeof parsed === "object" ? parsed : {};
     } catch { return {}; }
+  }
+
+  /** The font-size picker, generated from FONT_MIN..FONT_MAX. */
+  function fillFontSizes() {
+    if (!els.setFontsize) return;
+    els.setFontsize.replaceChildren();
+    for (let size = FONT_MIN; size <= FONT_MAX; size += 1) {
+      const opt = document.createElement("option");
+      opt.value = String(size);
+      opt.textContent = String(size);
+      els.setFontsize.appendChild(opt);
+    }
+    els.setFontsize.value = String(prefs.fontSize);
   }
 
   function resolveTheme() {
@@ -279,10 +321,11 @@
       s.term.options.fontSize = prefs.fontSize;
       s.term.options.fontFamily = prefs.fontFamily || DEFAULT_MONO;
       s.term.options.theme = resolveTheme();
-      // Only the visible terminal is re-measured now. Re-fitting every session
-      // at once re-laid out N xterm instances in a single turn, which is what
-      // made a theme or font change flash across the whole tab bar.
-      if (s.id === activeId) {
+      // Only the panes on screen are re-measured now. Re-fitting every
+      // session at once re-laid out N xterm instances in a single turn, which
+      // is what made a theme or font change flash across the whole tab bar.
+      // A split shows several at once, so this is "shown", not "focused".
+      if (isPaneShown(s)) {
         try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
       } else {
         s.needsRefit = true;
@@ -307,7 +350,7 @@
   const TOAST_MS = { ok: 2500, info: 4000, warn: 6000, error: 10000 };
   const TOAST_MAX = 4;
   const TOAST_DEDUPE_MS = 5000;
-  /** kind -> [{el, hideTimer, remaining, message, count}] */
+  /** kind -> [{el, hideTimer, remaining, message, count, lastAt}] */
   const toastLive = [];
   let toastOverflow = null;
 
@@ -348,13 +391,19 @@
 
   function toast(message, kind) {
     const level = kind === "error" || kind === "warn" || kind === "ok" ? kind : "info";
-    // A message repeating within a few seconds is the same event, not a new
-    // one: count it instead of stacking a second identical card.
-    const recent = toastLive.find((e) => e.message === message && e.level === level);
+    // A message repeating within ``TOAST_DEDUPE_MS`` is the same event, not a
+    // new one: count it instead of stacking a second identical card. Outside
+    // that window it is a *new* occurrence of a recurring problem and gets its
+    // own card -- which is what the constant was declared for and never used.
+    const now = Date.now();
+    const recent = toastLive.find(
+      (e) => e.message === message && e.level === level && now - e.lastAt < TOAST_DEDUPE_MS,
+    );
     if (recent) {
       recent.count += 1;
       recent.countEl.textContent = `×${recent.count}`;
       recent.countEl.classList.remove("hidden");
+      recent.lastAt = now;
       recent.remaining = TOAST_MS[level];
       toastSchedule(recent);
       toastUnfold();
@@ -379,7 +428,7 @@
 
     const entry = {
       el, message, level, countEl, count: 1,
-      hideTimer: null, remaining: TOAST_MS[level],
+      hideTimer: null, remaining: TOAST_MS[level], lastAt: Date.now(),
     };
     // Click anywhere dismisses (kept from the first version); the × is for
     // discoverability and for anyone who does not realise the card is a button.
@@ -492,6 +541,43 @@
     }));
   }
 
+  // "Which one?" -- the question a split of *existing* panes has to ask.
+  // A free-text prompt would be a trap (typo = wrong session moved); a list
+  // of what is actually open is the only honest answer.
+  function pickDialog(title, options, note) {
+    return afterCurrentDialog(() => new Promise((resolve) => {
+      els.pickTitle.textContent = title || "选择";
+      els.pickNote.textContent = note || "";
+      els.pickNote.classList.toggle("hidden", !note);
+      els.pickSelect.replaceChildren();
+      for (const option of options) {
+        const el = document.createElement("option");
+        el.value = option.value;
+        el.textContent = option.label;
+        els.pickSelect.appendChild(el);
+      }
+      els.pickOverlay.classList.remove("hidden");
+      els.pickSelect.focus();
+      const done = (value) => {
+        els.pickOverlay.classList.add("hidden");
+        els.pickOk.removeEventListener("click", onOk);
+        els.pickCancel.removeEventListener("click", onCancel);
+        els.pickClose.removeEventListener("click", onCancel);
+        els.pickSelect.removeEventListener("keydown", onKey);
+        resolve(value);
+      };
+      const onOk = () => done(els.pickSelect.value || null);
+      const onCancel = () => done(null);
+      const onKey = (e) => {
+        if (e.key === "Enter") { e.preventDefault(); done(els.pickSelect.value || null); }
+      };
+      els.pickOk.addEventListener("click", onOk);
+      els.pickCancel.addEventListener("click", onCancel);
+      els.pickClose.addEventListener("click", onCancel);
+      els.pickSelect.addEventListener("keydown", onKey);
+    }));
+  }
+
   function promptDialog(title, value, opts) {
     return afterCurrentDialog(() => new Promise((resolve) => {
       renamePromptOpen = true;
@@ -526,6 +612,7 @@
     "replay-overlay": () => els.replayClose.click(),
     "rename-overlay": () => els.renameCancel.click(),
     "confirm-overlay": () => els.confirmCancel.click(),
+    "pick-overlay": () => els.pickCancel.click(),
     "qr-overlay": () => closeQrDialog(true),
     "new-session-overlay": () => closeNewSession(),
     "preview-overlay": () => closePreview(),
@@ -694,11 +781,17 @@
     pump();
     toast(`粘贴 ${formatSize(bytes.length)}，已分片发送`, "info");
   }
+  // The tab entry describes the *group*, not one pane: a split tab is one
+  // entry whose state is the worst of its panes. Each session records its own
+  // state and the group aggregates, so a dead pane in a split cannot hide
+  // behind a live sibling.
   function markTab(s, state) {
-    s.tabEl.classList.toggle("connected", state === "connected");
-    s.tabEl.classList.toggle("exited", state === "exited");
-    s.tabEl.classList.toggle("standby", state === "standby");
-    s.tabEl.title = state === "standby" ? "未连接（点击打开）" : "";
+    if (!s) return;
+    s.tabState = state;
+    const group = groupOf(s);
+    if (!group) return;
+    paintGroupTab(group);
+    group.tabEl.title = state === "standby" ? "未连接（点击打开）" : "";
   }
 
   // -- 出站写合批 -------------------------------------------------------
@@ -731,6 +824,10 @@
     // are duplicates of what the replay is about to repeat -- drop them. From
     // ``resync-begin`` on, the frames *are* the replay and must be written.
     if (s.resyncing) return;
+    // Any output is news if nobody is looking at it. (A replay is not: the
+    // user asked for that.) Measured here rather than in ``flushWrite`` so a
+    // queued frame counts even before it is painted.
+    noteActivity(s, "output");
     s.writeFrames += 1;
     s.writeQueue.push(bytes);
     if (s.writeTimer !== null) return;
@@ -810,10 +907,14 @@
       // makes ``needsRefit`` load-bearing instead of decorative: without this
       // a tab switched to after a window resize would keep its old geometry.
       for (const other of sessions.values()) {
-        if (other.id !== activeId) other.needsRefit = true;
+        if (!isPaneShown(other)) other.needsRefit = true;
       }
-      const s = activeId && sessions.get(activeId);
-      if (s) { try { s.fit.fit(); } catch { /* 隐藏时忽略 */ } }
+      // Every pane on screen is resized by a window resize, not just the one
+      // holding the keyboard.
+      for (const other of sessions.values()) {
+        if (!isPaneShown(other)) continue;
+        try { other.fit.fit(); } catch { /* 隐藏时忽略 */ }
+      }
     }, RESIZE_MS);
   }
 
@@ -825,14 +926,29 @@
   // forces a full repaint. Nothing could, so say so and offer one.
   function markDesynced(s, note) {
     s.desynced = true;
-    s.tabEl.classList.add("desync");
+    // Both: the pane carries its own mark (so in a split you can see *which*
+    // half is incomplete) and the tab carries the group's worst, so a problem
+    // in any pane is still visible from the tab bar.
+    s.pane.classList.add("desync");
+    paintGroupDesync(s);
     if (s.id === activeId) showDesyncBar(note);
   }
 
   function clearDesync(s) {
     s.desynced = false;
-    s.tabEl.classList.remove("desync");
+    s.pane.classList.remove("desync");
+    paintGroupDesync(s);
     if (s.id === activeId) hideDesyncBar();
+  }
+
+  function paintGroupDesync(s) {
+    const group = groupOf(s);
+    if (!group) return;
+    const any = leafIds(group.root).some((id) => {
+      const other = sessions.get(id);
+      return Boolean(other && other.desynced);
+    });
+    group.tabEl.classList.toggle("desync", any);
   }
 
   function showDesyncBar(note) {
@@ -898,10 +1014,16 @@
     resetTransients(s);
     if (s.ws) { try { s.ws.close(); } catch { /* 忽略 */ } s.ws = null; }
     forgetLive(s.id);
-    // Unmounting frees the layout box. Never unmount the pane the user is
-    // actually looking at -- `.term-pane.mounted.active` is what makes it
-    // visible, so dropping `mounted` from the active tab blanks the screen.
-    if (s.id !== activeId) s.pane.classList.remove("mounted");
+    // Unmounting frees the layout box. Never unmount a pane that is on screen
+    // right now -- `.term-pane.mounted.shown` is what makes it visible, so
+    // dropping `mounted` from a visible pane blanks the screen the user is
+    // reading. A split puts several panes on screen at once, so "visible" is
+    // the question; the focused pane is always visible, which is why the older
+    // form of this rule (`s.id !== activeId`) is still true and is still
+    // written out here rather than folded away.
+    if (!isPaneShown(s)) {
+      if (s.id !== activeId) s.pane.classList.remove("mounted");
+    }
     s.needsRefit = true;
     markTab(s, "standby");
     setConnectionFor(s, "空闲", "");
@@ -926,8 +1048,21 @@
     if (!s || s.exited) return;
     if (s.ws && s.ws.readyState <= WebSocket.OPEN) { noteLive(s); return; }
     while (liveOrder.length >= AUTO_CONNECT_MAX) {
-      const victim = sessions.get(liveOrder[0]);
-      if (!victim || victim === s) { forgetLive(liveOrder[0]); continue; }
+      // The budget is about what to keep *warm in the background*, not about
+      // how much of the screen may be live at once. A split puts several
+      // sessions on screen together and every one of them needs its socket:
+      // suspending one would blank a pane the user is looking at right now,
+      // which is the exact failure ``suspendTab`` refuses to do to the
+      // focused pane -- a visible sibling deserves the same.
+      const victim = liveOrder
+        .map((id) => sessions.get(id))
+        .find((v) => v && v !== s && !isPaneShown(v));
+      if (!victim) {
+        // Everything else is on screen. Exceeding the budget here is the
+        // right trade: the user asked to see these panes, and an extra socket
+        // is cheaper than a blank half of the window.
+        break;
+      }
       suspendTab(victim);
     }
     s.standby = false;
@@ -1067,6 +1202,7 @@
     switch (msg.type) {
       case "attached":
         s.attached = true;
+        s.attachedAt = Date.now();
         // Did the attach replay deliver anything? ``pendingReplayClear`` is
         // cleared by the first replayed byte; still set here means the replay
         // was empty -- and the block below wipes the screen to the blank
@@ -1117,6 +1253,9 @@
         // scrollback on reconnect.
         s.exited = true; markTab(s, "exited");
         s.term.write(`\r\n\x1b[33m[wsctl] 会话已退出（退出码 ${msg.code}）\x1b[0m\r\n`);
+        // "The command finished" is the single most useful thing a background
+        // session can tell you. It used to be visible only if you were looking.
+        noteActivity(s, "exit");
         break;
       case "renamed":
         // A rename issued over HTTP (another tab, or the CLI) must reach the
@@ -1186,12 +1325,732 @@
     }
   }
 
-  function createTab(id, name, opts) {
-    const options = opts || {};
-    const pane = document.createElement("div");
-    pane.className = "term-pane";
-    els.wrap.appendChild(pane);
+  // -- 分屏布局 ---------------------------------------------------------
+  //
+  // A tab owns a *layout tree* of panes. The tree is either one leaf (the
+  // default, and what every existing behaviour assumes) or a split of two
+  // subtrees. 2x2 is two splits, not a third node type.
+  //
+  //   leaf  = { type: "leaf", sessionId }
+  //   split = { type: "split", dir: "row"|"col", ratio, a, b }
+  //
+  // The DOM is rebuilt from the tree on every structural change and the
+  // ``.term-pane`` elements are re-parented into it -- moving a node keeps a
+  // live xterm instance intact, which is why a split does not need to
+  // rebuild terminals. ``ratio`` is the first child's share of the split.
+  const tabGroups = new Map();
+  let activeTabId = null;
 
+  function groupOf(s) {
+    return (s && s.groupId && tabGroups.get(s.groupId)) || null;
+  }
+
+  /** Session ids in the tree, left-to-right / top-to-bottom. */
+  function leafIds(node, out) {
+    // The accumulator must be *reused* across the recursion, not rebound per
+    // call: `out = out || []` inside a branch creates a private array that the
+    // caller never sees, and every split then collects as "no panes at all".
+    out = out || [];
+    if (!node) return out;
+    if (node.type === "leaf") { out.push(node.sessionId); return out; }
+    leafIds(node.a, out);
+    leafIds(node.b, out);
+    return out;
+  }
+
+  function findLeaf(node, sessionId) {
+    if (!node) return null;
+    if (node.type === "leaf") return node.sessionId === sessionId ? node : null;
+    return findLeaf(node.a, sessionId) || findLeaf(node.b, sessionId);
+  }
+
+  /** The split that directly contains ``sessionId``, and on which side. */
+  function findParent(node, sessionId, parent) {
+    if (!node) return null;
+    if (node.type === "leaf") return null;
+    if (node.a && findLeaf(node.a, sessionId)) return { node, side: "a", parent };
+    if (node.b && findLeaf(node.b, sessionId)) return { node, side: "b", parent };
+    return findParent(node.a, sessionId, node) || findParent(node.b, sessionId, node);
+  }
+
+  function isPaneShown(s) {
+    const g = groupOf(s);
+    return Boolean(g && g.id === activeTabId && findLeaf(g.root, s.id));
+  }
+
+  /** A leaf whose session is no longer there: the slot, and an explanation. */
+  function buildGhostPane(sessionId) {
+    const ghost = document.createElement("div");
+    ghost.className = "term-pane mounted shown ghost";
+    ghost.dataset.session = sessionId;
+    const note = document.createElement("div");
+    note.className = "ghost-note";
+    note.innerHTML = "<b>会话已结束</b><span>这一栏保留了布局；关闭它可让旁边的一栏占满。</span>";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "text-btn";
+    close.textContent = "关闭本分屏";
+    close.addEventListener("click", () => closeGhostPane(sessionId));
+    ghost.append(note, close);
+    return ghost;
+  }
+
+  /** Is this id a leaf in any tab's tree? */
+  function findLeafFromGroups(sessionId) {
+    for (const g of tabGroups.values()) {
+      if (findLeaf(g.root, sessionId)) return true;
+    }
+    return false;
+  }
+
+  /** Drop a ghost leaf and let its sibling take the space. */
+  function closeGhostPane(sessionId) {
+    for (const g of tabGroups.values()) {
+      if (!findLeaf(g.root, sessionId)) continue;
+      closePane(sessionId, g);
+      if (!g.root) {
+        if (g.tabEl) g.tabEl.remove();
+        g.host.remove();
+        tabGroups.delete(g.id);
+      } else {
+        if (g.focus === sessionId) g.focus = leafIds(g.root).find((id) => sessions.has(id)) || null;
+        renderLayout(g);
+        syncLayoutClasses(g);
+        fitGroup(g);
+      }
+      break;
+    }
+    saveLayout();
+  }
+
+  function buildLayoutNode(node) {
+    if (node.type === "leaf") {
+      const slot = document.createElement("div");
+      slot.className = "pane-slot";
+      slot.dataset.session = node.sessionId;
+      const s = sessions.get(node.sessionId);
+      if (s) {
+        slot.appendChild(s.pane);
+      } else {
+        // The session behind this leaf is gone (it ended and was reaped, or it
+        // belonged to an instance that is no longer here). The *shape* of the
+        // workbench is still the user's, so the slot stays and says what
+        // happened rather than quietly collapsing the split beside it.
+        slot.appendChild(buildGhostPane(node.sessionId));
+      }
+      return slot;
+    }
+    const el = document.createElement("div");
+    el.className = `split ${node.dir}`;
+    const a = buildLayoutNode(node.a);
+    const b = buildLayoutNode(node.b);
+    const bar = document.createElement("div");
+    bar.className = "split-bar";
+    bar.title = "拖动调整大小（双击复位）";
+    applySplitRatio(node, a, b);
+    el.append(a, bar, b);
+    node.el = el; node.aEl = a; node.bEl = b; node.barEl = bar;
+    wireSplitBar(node);
+    return el;
+  }
+
+  function applySplitRatio(node, a, b) {
+    // Write the clamped value back: a stored ratio outside the range used to
+    // render at the limit while persisting the out-of-range number, so what
+    // was saved was not what was drawn.
+    node.ratio = Math.min(0.85, Math.max(0.15, node.ratio || 0.5));
+    (a || node.aEl).style.flex = `${node.ratio} 1 0`;
+    (b || node.bEl).style.flex = `${1 - node.ratio} 1 0`;
+  }
+
+  function wireSplitBar(node) {
+    const bar = node.barEl;
+    if (!bar || bar.dataset.wired) return;
+    bar.dataset.wired = "1";
+    const onMove = (ev) => {
+      const host = node.el.getBoundingClientRect();
+      const point = node.dir === "row" ? ev.clientX : ev.clientY;
+      const start = node.dir === "row" ? host.left : host.top;
+      const size = node.dir === "row" ? host.width : host.height;
+      if (size <= 0) return;
+      node.ratio = Math.min(0.85, Math.max(0.15, (point - start) / size));
+      applySplitRatio(node);
+    };
+    const stop = () => {
+      bar.classList.remove("dragging");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", stop);
+      fitGroup(groupOfNode(node));
+      saveLayout();
+    };
+    bar.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      bar.classList.add("dragging");
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", stop);
+    });
+    bar.addEventListener("dblclick", () => {
+      node.ratio = 0.5;
+      applySplitRatio(node);
+      fitGroup(groupOfNode(node));
+      saveLayout();
+    });
+  }
+
+  // A node does not know its group; the tree is walked from every group's
+  // root instead, which is cheap (the trees are tiny) and cannot be stale.
+  function groupOfNode(node) {
+    for (const g of tabGroups.values()) {
+      if (containsNode(g.root, node)) return g;
+    }
+    return null;
+  }
+  function containsNode(root, node) {
+    if (!root) return false;
+    if (root === node) return true;
+    return root.type === "split" && (containsNode(root.a, node) || containsNode(root.b, node));
+  }
+
+  function renderLayout(group) {
+    if (!group) return;
+    group.host.replaceChildren();
+    group.host.appendChild(buildLayoutNode(group.root));
+    syncLayoutClasses(group);
+  }
+
+  /** Which panes are visible and which one has the keyboard. */
+  function syncLayoutClasses(group) {
+    if (!group) return;
+    const shown = new Set(leafIds(group.root));
+    for (const s of sessions.values()) {
+      const on = shown.has(s.id) && group.id === activeTabId;
+      s.pane.classList.toggle("shown", on);
+      // ``active`` means "has the keyboard" and stays exclusive even in a
+      // split -- it is how a click finds the terminal to type into.
+      s.pane.classList.toggle("active", on && s.id === group.focus);
+      s.pane.classList.toggle("focused", on && s.id === group.focus);
+    }
+    for (const g of tabGroups.values()) {
+      g.host.classList.toggle("active", g.id === activeTabId);
+    }
+    paintGroupTab(group);
+  }
+
+  function paintGroupTab(group) {
+    if (!group) return;
+    const ids = leafIds(group.root);
+    // Worst state wins: a group with one dead pane and one live pane is not
+    // "connected", it is a tab that needs attention. Start from the *best*
+    // state and escalate -- starting from "standby" made every tab look
+    // suspended, which painted the 未连接 badge on all of them and widened
+    // the row until a click aimed at the tab landed on its close button.
+    const rank = { connected: 0, standby: 1, exited: 2 };
+    let worst = "connected";
+    for (const id of ids) {
+      const s = sessions.get(id);
+      if (!s) continue;
+      const state = s.tabState || "standby";
+      if (rank[state] > rank[worst]) worst = state;
+    }
+    if (!ids.length) worst = "standby";
+    group.tabEl.classList.toggle("connected", worst === "connected");
+    group.tabEl.classList.toggle("exited", worst === "exited");
+    group.tabEl.classList.toggle("standby", worst === "standby");
+    const label = group.tabEl.querySelector(".label");
+    if (label) {
+      const s = sessions.get(group.focus) || sessions.get(ids[0]);
+      label.textContent = s ? s.name : group.name;
+    }
+    let badge = group.tabEl.querySelector(".pane-count");
+    if (ids.length > 1) {
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "pane-count";
+        group.tabEl.appendChild(badge);
+      }
+      badge.textContent = `⧉${ids.length}`;
+    } else if (badge) {
+      badge.remove();
+    }
+  }
+
+  function fitGroup(group) {
+    if (!group) return;
+    for (const id of leafIds(group.root)) {
+      const s = sessions.get(id);
+      if (!s) continue;
+      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
+      s.needsRefit = false;
+    }
+  }
+
+  /**
+   * Split ``sessionId``'s pane in ``dir``, putting ``newId`` beside it.
+   * ``newId`` may already exist (another session moved in) or be a fresh one.
+   */
+  function splitPane(sessionId, dir, newId) {
+    const s = sessions.get(sessionId);
+    const group = groupOf(s);
+    if (!group) return false;
+    const leaf = findLeaf(group.root, sessionId);
+    if (!leaf) return false;
+    const joined = sessions.get(newId);
+    // Moving a pane that lives in another tab: take it out of that tab first,
+    // or the old group keeps a leaf pointing at a pane that is no longer
+    // there -- and a tab entry for a session that has moved.
+    const donor = joined ? groupOf(joined) : null;
+    if (donor && donor !== group) {
+      closePane(newId, donor);
+      if (!donor.root) {
+        if (donor.tabEl) donor.tabEl.remove();
+        donor.host.remove();
+        tabGroups.delete(donor.id);
+      } else {
+        if (donor.focus === newId) donor.focus = leafIds(donor.root)[0] || null;
+        renderLayout(donor);
+        syncLayoutClasses(donor);
+      }
+    }
+    const replacement = {
+      type: "split", dir, ratio: 0.5,
+      a: { type: "leaf", sessionId },
+      b: { type: "leaf", sessionId: newId },
+    };
+    replaceNode(group.root, leaf, replacement, group);
+    if (joined) {
+      joined.groupId = group.id;
+      // Two sessions, one tab: the other entry goes away and everything it
+      // owned (label, state) becomes the group's.
+      if (joined.tabEl && joined.tabEl !== group.tabEl) joined.tabEl.remove();
+      joined.tabEl = group.tabEl;
+    }
+    renderLayout(group);
+    group.focus = newId;
+    syncLayoutClasses(group);
+    fitGroup(group);
+    saveLayout();
+    return true;
+  }
+
+  function replaceNode(root, target, replacement, group) {
+    if (root === target) { group.root = replacement; return true; }
+    if (!root || root.type !== "split") return false;
+    if (root.a === target) { root.a = replacement; return true; }
+    if (root.b === target) { root.b = replacement; return true; }
+    return replaceNode(root.a, target, replacement, group)
+      || replaceNode(root.b, target, replacement, group);
+  }
+
+  /** Remove a pane from its group. Returns the session that now owns the tab. */
+  function closePane(sessionId, knownGroup) {
+    const group = knownGroup || groupOf(sessions.get(sessionId));
+    if (!group) return null;
+    const found = findParent(group.root, sessionId, null, null);
+    if (!found) {
+      group.root = null;
+      return null;
+    }
+    const keep = found.side === "a" ? found.node.b : found.node.a;
+    if (found.parent) {
+      if (found.parent.a === found.node) found.parent.a = keep;
+      else found.parent.b = keep;
+    } else {
+      group.root = keep;
+    }
+    return leafIds(group.root)[0] || null;
+  }
+
+  function moveFocus(dir) {
+    const s = activeId && sessions.get(activeId);
+    const group = groupOf(s);
+    if (!group) return;
+    const ids = leafIds(group.root);
+    if (ids.length < 2) return;
+    // Spatial, not list order: a 2x2 grid has a different "next" depending on
+    // whether the direction is horizontal or vertical.
+    const current = s.pane.getBoundingClientRect();
+    const cx = current.left + current.width / 2;
+    const cy = current.top + current.height / 2;
+    let best = null;
+    let bestScore = Infinity;
+    for (const id of ids) {
+      if (id === activeId) continue;
+      const other = sessions.get(id);
+      if (!other) continue;
+      const box = other.pane.getBoundingClientRect();
+      const ox = box.left + box.width / 2;
+      const oy = box.top + box.height / 2;
+      const along = (dir === "left" || dir === "right") ? ox - cx : oy - cy;
+      const wrongWay = (dir === "right" || dir === "down") ? along <= 0 : along >= 0;
+      if (wrongWay) continue;
+      const across = (dir === "left" || dir === "right") ? Math.abs(oy - cy) : Math.abs(ox - cx);
+      const score = Math.abs(along) + across * 2;
+      if (score < bestScore) { bestScore = score; best = id; }
+    }
+    if (best) activateTab(best);
+  }
+
+  /**
+   * Split the focused pane, putting a *new* session beside it.
+   *
+   * This is the fast path (Alt+\\ / Alt+Shift+\\): no dialog, a default shell
+   * appears next to the one you were on, exactly like Alt+N but beside it
+   * rather than as a new tab.
+   */
+  async function splitActive(dir) {
+    const s = activeId && sessions.get(activeId);
+    if (!s) { toast("没有活动会话", "error"); return; }
+    if (sharedMode) { toast("共享会话不支持分屏", ""); return; }
+    try {
+      const info = await api("POST", "/api/sessions", {});
+      // Build the pane first so the split has something to put in it, then
+      // hand it to the existing tab rather than creating a second tab entry.
+      const pane = createTab(info.id, info.name || "终端", {
+        recording: info.recording,
+        autoConnect: true,
+        activate: false,
+        groupId: s.groupId,
+      });
+      splitPane(s.id, dir, info.id);
+      activateTab(info.id);
+      return pane;
+    } catch (err) { toast(String(err.message || err), "error"); }
+    return null;
+  }
+
+  /**
+   * Split the focused pane with a session that is already open.
+   *
+   * The picker is the "and which one?" half of the feature: without it the
+   * only way to get two sessions side by side is to close one and start over.
+   */
+  async function splitWithExisting(dir) {
+    const s = activeId && sessions.get(activeId);
+    if (!s) { toast("没有活动会话", "error"); return; }
+    const group = groupOf(s);
+    const inGroup = new Set(leafIds(group && group.root));
+    const candidates = [...sessions.values()].filter((o) => !inGroup.has(o.id));
+    if (!candidates.length) {
+      toast("没有可并入的其他会话，试试直接分屏新建", "");
+      return;
+    }
+    const picked = await pickDialog(
+      "与哪个会话分屏？",
+      candidates.map((o) => ({ value: o.id, label: o.name })),
+    );
+    if (!picked) return;
+    const other = sessions.get(picked);
+    if (!other) return;
+    if (!splitPane(s.id, dir, picked)) { toast("分屏失败", "error"); return; }
+    activateTab(picked);
+    fitGroup(group);
+  }
+
+  // -- 分屏布局的持久化 -------------------------------------------------
+  //
+  // Sessions outlive their connections, so a reload can rebuild the workbench:
+  // the tree references session ids that are still alive on the server. A
+  // session that has ended is dropped from the tree rather than left as a hole
+  // that makes the whole layout look broken.
+  const LAYOUT_KEY = "wsctl-layout";
+
+  function serializeNode(node) {
+    if (!node) return null;
+    if (node.type === "leaf") return { type: "leaf", sessionId: node.sessionId };
+    return {
+      type: "split", dir: node.dir, ratio: node.ratio,
+      a: serializeNode(node.a), b: serializeNode(node.b),
+    };
+  }
+  function saveLayout() {
+    try {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify({
+        version: 1,
+        activeTabId,
+        activeId,
+        groups: [...tabGroups.values()].map((g) => ({
+          id: g.id, focus: g.focus, name: g.name, root: serializeNode(g.root),
+        })),
+      }));
+    } catch { /* 忽略 */ }
+  }
+  function loadLayout() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "null");
+      return parsed && parsed.version === 1 ? parsed : null;
+    } catch { return null; }
+  }
+
+  // Rebuild one node from a snapshot.
+  //
+  // Every leaf in the snapshot comes back, including the ones whose session is
+  // gone: the *shape* of the workbench is the user's, and a pane that is no
+  // longer backed by a session degrades to a placeholder rather than silently
+  // taking its half of the split with it.
+  function deserializeNode(node) {
+    if (!node) return null;
+    if (node.type === "leaf") return { type: "leaf", sessionId: node.sessionId };
+    const a = deserializeNode(node.a);
+    const b = deserializeNode(node.b);
+    if (a && b) return { type: "split", dir: node.dir, ratio: node.ratio, a, b };
+    return a || b;
+  }
+
+  // -- 后台动静可见 -----------------------------------------------------
+  //
+  // Before this, a background session was silent in every sense: output,
+  // BEL, a title change and the session exiting all left the tab bar, the
+  // page title and the favicon untouched. An operator who put a long build in
+  // one tab and worked in another had no way to know it had finished, other
+  // than by clicking through every tab.
+  //
+  // xterm already reports every one of those facts (``onBell``,
+  // ``onTitleChange``, ``onWriteParsed``); nothing was listening.
+  const ACTIVITY_QUIET_MS = 4000;
+  // How long after ``attached`` output is still "housekeeping", not news.
+  //
+  // Two things arrive in that window and neither is the shell saying
+  // something: the attach replay (the screen the user already had) and the
+  // repaint the server triggers right after it (``core.session.nudge_repaint``,
+  // two real SIGWINCHes so a TUI redraws itself). The replay is marked by
+  // ``attached`` coming after it; the repaint is not marked on the wire at
+  // all, so the client cannot tell it from real output except by when it
+  // arrives. One second is far longer than a repaint and far shorter than
+  // anything a person would call "an event".
+  const ACTIVITY_GRACE_MS = 1000;
+  let unreadTimer = null;
+
+  // Presence is a *derived view* of state that changes on every output frame.
+  // Painting it inline would mean per-frame DOM work -- a full ``sessions``
+  // walk, a querySelector each, a ``document.title`` write and a favicon
+  // redraw -- in exactly the hot path 0.1.15–0.1.21 spent a release getting
+  // out of (frame coalescing, write caps, resize merging). So this records
+  // state and schedules **one** paint per animation frame, the same shape as
+  // ``flushWrite``.
+  let presenceFrame = 0;
+  let lastFaviconCount = -1;
+
+  function schedulePresence() {
+    if (presenceFrame) return;
+    presenceFrame = 1;
+    // Two triggers, one paint. ``requestAnimationFrame`` is frame-aligned and
+    // is the right tick **while the page is visible** -- but it is *paused*
+    // for a hidden page, which is exactly when the page title and the favicon
+    // are the only signals anyone can see. So a timer rides along, and
+    // whichever fires first does the paint and disarms the other.
+    const run = () => {
+      if (!presenceFrame) return;
+      presenceFrame = 0;
+      paintPresence();
+    };
+    requestAnimationFrame(run);
+    setTimeout(run, 50);
+  }
+
+  /** Output, a bell or an exit happened in ``s``. */
+  function noteActivity(s, kind) {
+    if (!s) return;
+    // Before ``attached``, everything arriving is the *attach replay*: the
+    // screen the user already had, re-delivered after a reconnect. The server
+    // enqueues the replay and then ``attached`` under the same lock
+    // (``core/session.py``), so ``attached`` is the fact that says the replay
+    // is over. Counting replayed bytes as news made every network blip ring
+    // every background tab with "有新输出"; the repaint that follows a replay
+    // is the same false alarm, and is covered by ``ACTIVITY_GRACE_MS`` below.
+    if (!s.attached) return;
+    if (Date.now() - (s.attachedAt || 0) < ACTIVITY_GRACE_MS) return;
+    s.lastActivityAt = Date.now();
+    if (s.id === activeId) {
+      // Nothing to report: the user is looking right at it. Still repaint so
+      // the activity glow on the tab stays accurate.
+      schedulePresence();
+      return;
+    }
+    if (kind === "bell") s.bellCount = (s.bellCount || 0) + 1;
+    s.unread = true;
+    maybeNotify(s, kind);
+    schedulePresence();
+  }
+
+  /** The user is looking at this pane now: whatever it had to say is read. */
+  function clearActivity(s) {
+    if (!s) return;
+    s.unread = false;
+    s.bellCount = 0;
+    s.lastActivityAt = 0;
+    schedulePresence();
+  }
+
+  /** Everything that says "there is something you have not looked at".
+
+  Runs at most once per animation frame (see ``schedulePresence``), and every
+  write below is idempotent -- so being called again with the same state costs
+  nothing but the walk.
+  */
+  function paintPresence() {
+    let count = 0;
+    let firstName = "";
+    let bell = false;
+    let chatty = false;
+    // Aggregate **per tab entry**, not per session. A split puts several
+    // sessions on one ``tabEl``, so writing it from the per-session walk let
+    // whichever session the Map happened to reach last win: a live pane's
+    // glow was switched off by a quiet sibling, and a sibling with no bells
+    // deleted the badge another one had just created. Both are "the tab says
+    // nothing", which is the one outcome this whole section exists to avoid.
+    const perTab = new Map();
+    for (const s of sessions.values()) {
+      const active = Boolean(s.lastActivityAt)
+        && Date.now() - s.lastActivityAt <= ACTIVITY_QUIET_MS;
+      const entry = perTab.get(s.tabEl) || { glow: false, bells: 0 };
+      entry.glow = entry.glow || active;
+      entry.bells += s.bellCount || 0;
+      perTab.set(s.tabEl, entry);
+      if (active) chatty = true;
+      if (s.bellCount > 0) bell = true;
+      if (!s.unread) continue;
+      count += 1;
+      if (!firstName) firstName = s.name;
+    }
+    for (const [tabEl, entry] of perTab) {
+      tabEl.classList.toggle("activity", entry.glow);
+      let badge = tabEl.querySelector(".bell-badge");
+      if (entry.bells > 0) {
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.className = "bell-badge";
+          tabEl.appendChild(badge);
+        }
+        badge.textContent = entry.bells > 9 ? "9+" : String(entry.bells);
+        badge.title = `响铃 ${entry.bells} 次`;
+      } else if (badge) {
+        badge.remove();
+      }
+    }
+    // The page title is what an operator sees from another browser tab or
+    // from the taskbar, so it is the one signal that works while the page is
+    // not visible at all.
+    const root = "wsctl";
+    const title = (prefs.notifyTitle !== false && count > 0)
+      ? `${bell ? "\u{1F514}" : "\u25CF"} ${count}${firstName ? ` ${firstName}` : ""} \u2014 ${root}`
+      : root;
+    if (document.title !== title) document.title = title;
+    paintFavicon(count);
+    // The glow fades on its own so a chatty session does not keep it lit for
+    // ever -- one timer for the whole stack, re-armed only while it is lit.
+    if (unreadTimer) { clearTimeout(unreadTimer); unreadTimer = null; }
+    if (chatty) {
+      unreadTimer = setTimeout(() => {
+        unreadTimer = null;
+        schedulePresence();
+      }, ACTIVITY_QUIET_MS + 50);
+    }
+  }
+
+  // The favicon carries the unread count, which is the only signal that
+  // survives being minimised. Drawn on a canvas over the shipped icon rather
+  // than shipping N more files.
+  let faviconLink = null;
+  let faviconBase = null;
+  function paintFavicon(count) {
+    // Only on a *change* of the number. Redrawing on every paint meant an
+    // Image allocation, a canvas pass and a ``toDataURL`` per output frame
+    // during a flood -- thousands of them, all on the main thread.
+    if (count === lastFaviconCount) return;
+    lastFaviconCount = count;
+    try {
+      if (!faviconLink) {
+        faviconLink = document.querySelector("link[rel='icon']") || null;
+        if (!faviconLink) return;
+        faviconBase = faviconLink.href;
+      }
+      if (!count) {
+        faviconLink.href = faviconBase;
+        return;
+      }
+      const img = new Image();
+      img.onload = () => {
+        const size = 64;
+        const canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0, size, size);
+        ctx.beginPath();
+        ctx.arc(size * 0.78, size * 0.22, size * 0.26, 0, Math.PI * 2);
+        ctx.fillStyle = "#e5484d";
+        ctx.fill();
+        ctx.fillStyle = "#fff";
+        ctx.font = `bold ${Math.round(size * 0.3)}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(count > 9 ? "9+" : String(count), size * 0.78, size * 0.23);
+        faviconLink.href = canvas.toDataURL("image/png");
+      };
+      img.src = faviconBase;
+    } catch { /* \u753b\u4e0d\u51fa\u6765\u5c31\u7b97\u4e86 */ }
+  }
+
+  // A system notification is opt-in: browsers require a permission prompt and
+  // a page that spams them is worse than one that says nothing. Denied or
+  // unsupported is a silent, honest no-op -- never an error.
+  function maybeNotify(s, kind) {
+    if (prefs.notifySystem === false) return;
+    if (sharedMode) return;  // a viewer is watching, not operating
+    if (!("Notification" in window)) return;
+    const body = kind === "bell"
+      ? "\u4f1a\u8bdd\u54cd\u94c3"
+      : kind === "exit"
+        ? "\u4f1a\u8bdd\u5df2\u9000\u51fa"
+        : "\u6709\u65b0\u8f93\u51fa";
+    const title = `wsctl \u00b7 ${s.name}`;
+    try {
+      const fire = () => {
+        try {
+          new Notification(title, { body, tag: `wsctl-${s.id}`, silent: true });
+        } catch { /* \u5ffd\u7565 */ }
+      };
+      if (Notification.permission === "granted") fire();
+      else if (Notification.permission === "default") {
+        Notification.requestPermission().then((p) => { if (p === "granted") fire(); }).catch(() => {});
+      }
+    } catch { /* \u6d4f\u89c8\u5668\u4e0d\u7ed9\u5c31\u7b97\u4e86 */ }
+  }
+
+  // A short synthesised "ding". No asset to ship and no autoplay policy to
+  // fight beyond the first gesture -- and if the context will not start, the
+  // bell badge still says what happened.
+  function playBell() {
+    if (prefs.notifySound === false) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!window.__wsctlAudio) window.__wsctlAudio = new Ctx();
+      const ctx = window.__wsctlAudio;
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.09, ctx.currentTime + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.18);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.2);
+    } catch { /* \u58f0\u97f3\u662f\u53ef\u9009\u7684 */ }
+  }
+
+  // Construct a terminal in ``pane``: width table, addons, renderer, open.
+  //
+  // Extracted from ``createTab`` so it can be run a second time on the same
+  // pane -- switching renderer under a live session is a rebuild of this
+  // object, not a reload of the page. Every ordering promise lives in here and
+  // is checked on the source: the width table is active before any data, and a
+  // renderer that will not initialise degrades to the next one instead of
+  // leaving a blank terminal.
+  function buildTerminal(pane) {
     const term = new Terminal(Object.assign({}, TERM_OPTIONS, {
       fontSize: prefs.fontSize,
       fontFamily: prefs.fontFamily || DEFAULT_MONO,
@@ -1238,15 +2097,117 @@
       } catch { renderer = "dom"; }
     }
     term.open(pane);
+    return { term, fit, renderer, unicodeVersion };
+  }
 
-    const tabEl = document.createElement("div");
-    tabEl.className = "tab";
-    tabEl.innerHTML = '<span class="dot"></span><span class="label"></span><span class="close">\u00d7</span>';
-    tabEl.querySelector(".label").textContent = name;
-    els.tabs.appendChild(tabEl);
+  // Handlers that belong to a terminal *instance* rather than to the pane.
+  // A rebuild (``recreateTerminal``) creates a new instance and must wire it
+  // again; anything wired to the pane instead is wired once and stays.
+  function wireTerminal(s) {
+    s.term.onData((data) => {
+      if (s.writable === false) return;
+      if (s.zmodemActive) return;
+      sendInput(s, data);
+    });
+    // Coalesced: `fit()` fires this on every layout change, and dragging a
+    // window produces one per pixel. Each one became a `resize` control message
+    // and a SIGWINCH at the far end -- a full-screen app then repaints on every
+    // one of them, which is both the flicker and the freeze. Also skip the
+    // round trip entirely when the size did not actually change.
+    s.term.onResize(({ cols, rows }) => scheduleResize(s, cols, rows));
+    // The application said "look at me" (BEL) and named itself (OSC title).
+    // Both were being thrown away.
+    s.term.onBell(() => {
+      playBell();
+      noteActivity(s, "bell");
+    });
+    s.term.onTitleChange((title) => {
+      if (!title) return;
+      s.termTitle = String(title).slice(0, 120);
+      // A program changing its title while you are elsewhere is exactly the
+      // "something is happening over there" signal this section exists for.
+      noteActivity(s, "output");
+    });
+  }
+
+  // Swap the renderer under a live session.
+  //
+  // The renderer is baked into a Terminal at construction, so switching it is
+  // a rebuild of that object -- and a rebuilt terminal starts blank. Bytes
+  // cannot reconstruct a TUI screen (see ``requestResync``), so the rebuild
+  // asks for a replay plus the server's application repaint, exactly like a
+  // desync. A session that is not connected simply picks the renderer up on
+  // its next attach, which replays the same way.
+  function recreateTerminal(s) {
+    if (!s) return;
+    if (s.zmodemActive) {
+      toast("文件传输进行中，无法切换渲染器", "warn");
+      return;
+    }
+    try { s.term.dispose(); } catch { /* 忽略 */ }
+    const built = buildTerminal(s.pane);
+    s.term = built.term;
+    s.fit = built.fit;
+    s.renderer = built.renderer;
+    s.unicodeVersion = built.unicodeVersion;
+    // The search addon held a reference to the old instance; drop it so the
+    // next search lazily binds to the new one instead of driving a disposed
+    // terminal.
+    s.searchAddon = null;
+    wireTerminal(s);
+    s.needsRefit = true;
+    if (s.id === activeId) {
+      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
+      s.needsRefit = false;
+      s.everShown = true;
+    }
+    updateRendererNote(s);
+    if (s.ws && s.ws.readyState === WebSocket.OPEN) requestResync(s);
+  }
+
+  function createTab(id, name, opts) {
+    const options = opts || {};
+    const pane = document.createElement("div");
+    pane.className = "term-pane";
+
+    const built = buildTerminal(pane);
+    const { term, fit, renderer, unicodeVersion } = built;
+
+    // One pane is one group until something splits it. The group id is the
+    // first session's id, so an unsplit tab is indistinguishable from the
+    // tab-per-session model every other part of this file still speaks.
+    const groupId = options.groupId || id;
+    const existing = tabGroups.get(groupId);
+    let tabEl;
+    let group;
+    if (existing) {
+      // Joining an existing tab (a split, or a restore): the tab entry already
+      // exists and must not be duplicated.
+      group = existing;
+      tabEl = existing.tabEl;
+    } else {
+      tabEl = document.createElement("div");
+      tabEl.className = "tab";
+      tabEl.innerHTML = '<span class="dot"></span><span class="label"></span><span class="close">\u00d7</span>';
+      tabEl.querySelector(".label").textContent = name;
+        els.tabs.appendChild(tabEl);
+      group = {
+        id: groupId,
+        host: document.createElement("div"),
+        root: null,
+        focus: id,
+        tabEl,
+        name,
+      };
+      group.host.className = "tab-host mounted";
+      els.wrap.appendChild(group.host);
+      tabGroups.set(groupId, group);
+    }
+    if (!group.root) group.root = { type: "leaf", sessionId: id };
 
     const s = {
       id, name, term, fit, pane, tabEl, renderer, unicodeVersion,
+      groupId,
       ws: null, heartbeat: null, reconnectTimer: null, delay: 500, retryIn: 0,
       intentional: false, exited: false, standby: false, attached: false,
       pendingReplayClear: false, shedSinceOpen: false,
@@ -1255,7 +2216,7 @@
       writable: options.writable !== false,
       recording: Boolean(options.recording),
       sentry: null, zmodemActive: false, zmodemWatchdog: null, everConnected: false,
-      searchAddon: null, searchHits: [], searchPos: -1,
+      searchAddon: null,
       autoConnect: options.autoConnect !== false,
       // Outbound-terminal write batching (see ws.onmessage): frames queue here
       // and are handed to xterm once per animation frame instead of once per
@@ -1272,31 +2233,46 @@
       // not become a resize storm (and a SIGWINCH) at the far end.
       sentCols: 0, sentRows: 0, resizeTimer: null,
       desynced: false,
+      // The tab's visual state is the worst of the group's panes, so each
+      // session remembers its own and the group aggregates them.
+      tabState: options.autoConnect === false ? "standby" : "connected",
     };
     sessions.set(id, s);
+    renderLayout(group);
 
     tabEl.addEventListener("click", (e) => {
       if (e.target.classList.contains("close")) return;
-      activateTab(id);
+      // A split tab is one entry: clicking it shows the group and puts the
+      // keyboard where the user last left it.
+      activateTab(group.focus || id);
     });
     tabEl.addEventListener("dblclick", async (e) => {
       if (e.target.classList.contains("close")) return;
       e.stopPropagation();
-      const name = await promptDialog("重命名会话", s.name);
-      if (!name || name === s.name) return;
+      // Renaming a tab renames the session that has the keyboard in it: the
+      // tab label is derived from a session, and a split of two sessions has
+      // no name of its own.
+      const target = sessions.get(group.focus) || s;
+      const name = await promptDialog("重命名会话", target.name);
+      if (!name || name === target.name) return;
       // Mark the rename generation *before* the round trip so a concurrent
       // `attached` from a reconnect cannot clobber the result.
-      s.nameVersion = (s.nameVersion || 0) + 1;
-      const version = s.nameVersion;
+      target.nameVersion = (target.nameVersion || 0) + 1;
+      const version = target.nameVersion;
       try {
-        const info = await api("PATCH", `/api/sessions/${id}`, { name });
-        if (version !== s.nameVersion) return;  // a newer rename won
-        s.name = info.name;
+        const info = await api("PATCH", `/api/sessions/${target.id}`, { name });
+        if (version !== target.nameVersion) return;  // a newer rename won
+        target.name = info.name;
         tabEl.querySelector(".label").textContent = info.name;
       } catch (err) { toast(String(err.message || err), "error"); }
     });
-    tabEl.querySelector(".close").addEventListener("click", (e) => { e.stopPropagation(); detachTab(id); });
-    tabEl.addEventListener("contextmenu", (e) => { e.preventDefault(); openTabMenu(e.clientX, e.clientY, id); });
+    // Closing a tab detaches everything in it (never kills: 0.1.1's promise is
+    // that a connection and a session are different things).
+    tabEl.querySelector(".close").addEventListener("click", (e) => {
+      e.stopPropagation();
+      detachGroup(group);
+    });
+    tabEl.addEventListener("contextmenu", (e) => { e.preventDefault(); openTabMenu(e.clientX, e.clientY, group.focus || id); });
     let pressTimer = null;
     const cancelPress = () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } };
     tabEl.addEventListener("touchstart", (e) => {
@@ -1308,22 +2284,15 @@
     tabEl.addEventListener("touchmove", cancelPress);
     tabEl.addEventListener("touchcancel", cancelPress);
 
-    term.onData((data) => {
-      if (s.writable === false) return;
-      if (s.zmodemActive) return;
-      sendInput(s, data);
-    });
-    // Coalesced: `fit()` fires this on every layout change, and dragging a
-    // window produces one per pixel. Each one became a `resize` control message
-    // and a SIGWINCH at the far end -- a full-screen app then repaints on every
-    // one of them, which is both the flicker and the freeze. Also skip the
-    // round trip entirely when the size did not actually change.
-    term.onResize(({ cols, rows }) => scheduleResize(s, cols, rows));
+    // Handlers that live on the *terminal instance*: rebuilt with it (see
+    // ``recreateTerminal``), never accumulated on the pane.
+    wireTerminal(s);
 
     // Terminal right-click. The old behaviour ("copy if there is a selection,
     // otherwise paste") is still available, but it was completely undiscoverable
     // and it is not what every user wants -- so it is one of three modes and
-    // the default is a real menu.
+    // the default is a real menu. Wired once per pane: it addresses ``s``, not
+    // the terminal instance, and must not double up on a rebuild.
     pane.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       const mode = prefs.rightClickMode || "menu";
@@ -1347,26 +2316,47 @@
   }
 
   function activateTab(id) {
+    const focused = sessions.get(id);
+    if (!focused) return;
     activeId = id;
-    for (const s of sessions.values()) {
-      const on = s.id === id;
-      s.pane.classList.toggle("active", on);
-      s.tabEl.classList.toggle("active", on);
+    const group = groupOf(focused);
+    if (!group) return;
+    activeTabId = group.id;
+    group.focus = id;
+    // One tab entry per group. Highlighting it per session would toggle the
+    // same element N times for a split tab and end on whichever session the
+    // map happened to visit last.
+    for (const g of tabGroups.values()) {
+      g.tabEl.classList.toggle("active", g.id === group.id);
+      if (g.id === group.id) g.host.classList.add("mounted");
     }
-    const s = sessions.get(id);
-    if (!s) return;
+    syncLayoutClasses(group);
     // Mount *before* measuring. `.term-pane` is `display:none` until then, and
-    // `.term-pane.mounted.active` is what makes it visible at all -- so a tab
+    // `.term-pane.mounted.shown` is what makes it visible at all -- so a tab
     // activated before its socket finished opening (a standby tab, or the
     // moment between `createTab` and `onopen`) would otherwise be measured at
-    // zero size and painted as nothing.
-    s.pane.classList.add("mounted");
-    els.recordBtn.classList.toggle("rec-on", Boolean(s.recording));
-    // Opening a tab is the user saying "show me this one": bring it online.
-    ensureConnected(s);
+    // zero size and painted as nothing. A split shows several panes at once,
+    // so every pane in the tab is brought online and measured, not just the
+    // one holding the keyboard.
+    for (const paneId of leafIds(group.root)) {
+      const s = sessions.get(paneId);
+      if (s) s.pane.classList.add("mounted");
+    }
+    els.recordBtn.classList.toggle("rec-on", Boolean(focused.recording));
+    // Looking at a *tab* is what "read" means for everything it shows. A
+    // split puts several panes on screen at once, and clearing only the
+    // focused one left its visible siblings still reporting unread -- for
+    // output that is right in front of the user.
+    for (const paneId of leafIds(group.root)) clearActivity(sessions.get(paneId));
+    // Opening a tab is the user saying "show me these". A split with a
+    // suspended half is a split with a blank half.
+    for (const paneId of leafIds(group.root)) {
+      const s = sessions.get(paneId);
+      if (s) ensureConnected(s);
+    }
     // `connect()` may have skipped its own status write (it ran before
     // `activeId` pointed here), so repaint from the resulting state.
-    paintConnection(s);
+    paintConnection(focused);
     // Fit *synchronously* after the pane becomes visible. Deferring it to
     // requestAnimationFrame let the browser paint the tab switch first -- at
     // which point the terminal still had the hidden pane's zero size, so every
@@ -1376,17 +2366,22 @@
     // layout box while hidden (see ``.term-pane.mounted``), so a plain tab
     // switch does not need a re-measure -- and re-measuring is what used to
     // produce the blank frame.
-    if (s.needsRefit || !s.everShown) {
-      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
-      s.needsRefit = false;
-      s.everShown = true;
+    for (const paneId of leafIds(group.root)) {
+      const s = sessions.get(paneId);
+      if (!s) continue;
+      if (s.needsRefit || !s.everShown) {
+        try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
+        s.needsRefit = false;
+        s.everShown = true;
+      }
     }
-    try { s.term.refresh(0, Math.max(0, s.term.rows - 1)); } catch { /* 忽略 */ }
-    scheduleResize(s, s.term.cols, s.term.rows);
-    if (s.desynced) showDesyncBar(); else hideDesyncBar();
-    syncZmodemButton(s);
-    updateRendererNote(s);
-    requestAnimationFrame(() => s.term.focus());
+    try { focused.term.refresh(0, Math.max(0, focused.term.rows - 1)); } catch { /* 忽略 */ }
+    scheduleResize(focused, focused.term.cols, focused.term.rows);
+    if (focused.desynced) showDesyncBar(); else hideDesyncBar();
+    syncZmodemButton(focused);
+    updateRendererNote(focused);
+    requestAnimationFrame(() => focused.term.focus());
+    saveLayout();
   }
 
   // "Which renderer am I actually on" is not a guess: WebGL falls back silently
@@ -1407,6 +2402,10 @@
   // the first thing any support conversation asks for, and the only way to
   // assert on terminal content without pinning a renderer. Reads xterm's own
   // buffer, which holds the same text whichever renderer drew it.
+  //
+  // Which terminal: the one holding the keyboard. A split shows several at
+  // once, and "the terminal" in any of this product's commands and toolbars
+  // means the focused one -- so this reads the same one those act on.
   window.__wsctlScreen = () => {
     const s = activeId && sessions.get(activeId);
     if (!s || !s.term || !s.term.buffer) return "";
@@ -1444,12 +2443,37 @@
     return out;
   };
 
+  // The workbench as data: every tab's layout tree, where the keyboard is,
+  // and how many sockets are live. Same rationale as the other hooks -- "why
+  // is this pane here / why is that one not connected" is the first question a
+  // support conversation about a split asks, and the DOM cannot answer it.
+  window.__wsctlLayout = () => {
+    const tabs = [];
+    for (const g of tabGroups.values()) {
+      tabs.push({
+        id: g.id,
+        focus: g.focus,
+        name: g.name,
+        root: serializeNode(g.root),
+        panes: leafIds(g.root),
+      });
+    }
+    return {
+      activeTabId,
+      activeId,
+      liveSockets: liveOrder.length,
+      autoConnectMax: AUTO_CONNECT_MAX,
+      tabs,
+    };
+  };
+
   // Per-cell characters and widths for one row. Text alone cannot answer "do
   // the columns line up": ``translateToString`` gives one entry per *character*,
   // while a wide CJK glyph occupies two *cells*. Comparing where a marker
   // column lands in a CJK row against an ASCII row is what actually proves the
   // width table is right -- and it is renderer-independent, because it reads
-  // xterm's buffer rather than anything that was painted.
+  // xterm's buffer rather than anything that was painted. Same terminal as
+  // ``__wsctlScreen``: the focused one.
   window.__wsctlRowCells = (row) => {
     const s = activeId && sessions.get(activeId);
     if (!s || !s.term || !s.term.buffer) return [];
@@ -1464,9 +2488,21 @@
     return cells;
   };
 
+  // Detach one pane. In a split the tab survives with its remaining panes; a
+  // tab's close button detaches the whole group instead (``detachGroup``).
+  // Neither ever kills: 0.1.1's promise is that a connection and a session
+  // are different things.
   function detachTab(id) {
     const s = sessions.get(id);
-    if (!s) return;
+    if (!s) {
+      // Not a live session: a placeholder left by one that ended. It still
+      // occupies a slot and still has to come out when its tab goes.
+      if (id && findLeafFromGroups(id)) closeGhostPane(id);
+      return;
+    }
+    // Captured before the session is deleted: ``closePane`` finds the group
+    // *through* the session, and by then it is gone.
+    const group = tabGroups.get(s.groupId);
     s.intentional = true;
     if (s.heartbeat) clearInterval(s.heartbeat);
     resetTransients(s);
@@ -1475,13 +2511,43 @@
     forgetLive(id);
     s.term.dispose();
     s.pane.remove();
-    s.tabEl.remove();
     sessions.delete(id);
-    if (activeId === id) {
-      const next = sessions.keys().next();
-      if (!next.done) activateTab(next.value);
-      else activeId = null;
+    closePane(id, group || undefined);
+    // A leaf can be a placeholder for a session that is gone. Focusing one is
+    // a no-op (``activateTab`` needs a live session), so the fallback must
+    // skip them -- otherwise ``activeId`` keeps pointing at the pane we just
+    // removed and every toolbar action silently does nothing.
+    const nextLive = group
+      ? (leafIds(group.root).find((paneId) => sessions.has(paneId)) || null)
+      : null;
+    if (group) {
+      if (!group.root) {
+        // The last pane went: the tab goes with it.
+        if (group.tabEl) group.tabEl.remove();
+        group.host.remove();
+        tabGroups.delete(group.id);
+      } else {
+        if (group.focus === id) group.focus = nextLive;
+        renderLayout(group);
+        syncLayoutClasses(group);
+        fitGroup(group);
+      }
+    } else if (s.tabEl) {
+      s.tabEl.remove();
     }
+    if (activeId === id) {
+      const fallback = nextLive || sessions.keys().next().value;
+      if (fallback) activateTab(fallback);
+      else { activeId = null; activeTabId = null; }
+    }
+    saveLayout();
+  }
+
+  /** Detach every pane in a tab. */
+  function detachGroup(group) {
+    if (!group) return;
+    // Snapshot: each detach rewrites the tree this list is read from.
+    for (const paneId of leafIds(group.root).slice()) detachTab(paneId);
   }
 
   async function killTab(id) {
@@ -1524,7 +2590,9 @@
   }
 
   function changeFont(s, delta) {
-    prefs.fontSize = Math.min(24, Math.max(9, prefs.fontSize + delta));
+    // Same bounds as the Settings picker and the README. A hotkey that could
+    // reach a size the picker cannot show is how the three of them drifted.
+    prefs.fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, prefs.fontSize + delta));
     applyPrefs();
     toast(`字号 ${prefs.fontSize}`, "");
   }
@@ -1536,18 +2604,42 @@
   }
 
   let menuSession = null;
+  // A context menu must never open where its own items are unreachable. The
+  // position is the pointer, but the menu is taller and wider than a click --
+  // near the bottom or the right edge the later items fall outside the window
+  // and cannot be clicked at all (which is exactly how "关闭本分屏" became
+  // unclickable once the menu grew). Measure after showing and flip/clamp.
+  function placeMenu(el, x, y) {
+    el.style.left = "0px";
+    el.style.top = "0px";
+    el.classList.remove("hidden");
+    const box = el.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const pad = 8;
+    const left = Math.min(Math.max(pad, x), Math.max(pad, vw - box.width - pad));
+    const top = Math.min(Math.max(pad, y), Math.max(pad, vh - box.height - pad));
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+  }
+
   function openTermMenu(x, y, s) {
     menuSession = s;
     const sel = hasSelection(s);
+    // Splitting only makes sense when there is a pane to split and room for
+    // another one; "close this pane" only matters when there is more than one.
+    const group = groupOf(s);
+    const panes = group ? leafIds(group.root).length : 1;
     els.termMenu.querySelectorAll("button").forEach((b) => {
       const act = b.dataset.taction;
       if (act === "copy") b.disabled = !sel;
       if (act === "paste") b.disabled = s.writable === false;
       if (act === "detach" || act === "kill") b.disabled = sharedMode;
+      if (act === "split-r" || act === "split-d"
+          || act === "split-pick-r" || act === "split-pick-d") b.disabled = sharedMode;
+      if (act === "close-pane") b.disabled = panes < 2;
     });
-    els.termMenu.style.left = `${x}px`;
-    els.termMenu.style.top = `${y}px`;
-    els.termMenu.classList.remove("hidden");
+    placeMenu(els.termMenu, x, y);
   }
   function closeTermMenu() { els.termMenu.classList.add("hidden"); menuSession = null; }
 
@@ -1568,6 +2660,11 @@
         case "font+": changeFont(s, +1); break;
         case "font-": changeFont(s, -1); break;
         case "zmodem": toggleZmodem(s); break;
+        case "split-r": splitActive("row").catch((e) => toast(String(e.message || e), "error")); break;
+        case "split-d": splitActive("col").catch((e) => toast(String(e.message || e), "error")); break;
+        case "split-pick-r": splitWithExisting("row").catch((e) => toast(String(e.message || e), "error")); break;
+        case "split-pick-d": splitWithExisting("col").catch((e) => toast(String(e.message || e), "error")); break;
+        case "close-pane": detachTab(s.id); break;
         case "detach": detachTab(s.id); break;
         case "kill": killTab(s.id); break;
         default: break;
@@ -1577,9 +2674,7 @@
 
   function openTabMenu(x, y, id) {
     menuSid = id; menuOpenedAt = Date.now();
-    els.tabMenu.style.left = `${x}px`;
-    els.tabMenu.style.top = `${y}px`;
-    els.tabMenu.classList.remove("hidden");
+    placeMenu(els.tabMenu, x, y);
   }
   function closeTabMenu() { els.tabMenu.classList.add("hidden"); menuSid = null; }
   els.tabMenu.querySelectorAll("button").forEach((btn) => {
@@ -1767,22 +2862,93 @@
     hideLogin();
     try {
       const list = await api("GET", "/api/sessions");
-      if (!list.length) { await newSession(true); return; }
+      if (!list.length) { clearLayout(); await newSession(true); return; }
       // Most recently used first: those are the ones that get a live socket.
       // The rest stay in the tab bar as "未连接" and attach when opened, so a
       // user with dozens of sessions does not open dozens of sockets.
       const ordered = list.slice().sort((a, b) => (b.last_active || 0) - (a.last_active || 0));
-      ordered.forEach((info, index) => {
-        createTab(info.id, info.name, {
-          recording: info.recording,
-          autoConnect: index < AUTO_CONNECT_MAX,
-          activate: false,
+      const known = new Set(ordered.map((info) => info.id));
+      const saved = loadLayout();
+      const restored = saved && restoreLayout(saved, known, ordered);
+      if (!restored) {
+        clearLayout();
+        ordered.forEach((info, index) => {
+          createTab(info.id, info.name, {
+            recording: info.recording,
+            autoConnect: index < AUTO_CONNECT_MAX,
+            activate: false,
+          });
         });
-      });
-      // Show the newest one first (and make sure it is online).
-      const newest = ordered[0] && sessions.get(ordered[0].id);
-      if (newest) activateTab(newest.id);
+        // Show the newest one first (and make sure it is online).
+        const newest = ordered[0] && sessions.get(ordered[0].id);
+        if (newest) activateTab(newest.id);
+      }
     } catch (err) { setConnection(String(err.message || err), "bad"); }
+  }
+
+  /**
+   * Rebuild the workbench from a saved layout.
+   *
+   * Sessions outlive their connections, so a reload can put back exactly what
+   * was on screen: the same tabs, the same splits, the same ratios. A session
+   * that has ended since is simply absent from ``known`` and is dropped from
+   * the tree rather than left as a blank hole.
+   */
+  function restoreLayout(saved, known, ordered) {
+    const groups = (saved.groups || []).filter((g) => g && g.root);
+    if (!groups.length) return false;
+    for (const g of groups) {
+      // ``deserializeNode`` checks ``sessions.has``, so the panes must exist
+      // first; until then the *raw* snapshot is what names them.
+      for (const id of rawLeafIds(g.root)) {
+        const info = ordered.find((row) => row.id === id);
+        if (!info) continue;
+        createTab(id, info.name, {
+          recording: info.recording,
+          // Attach what was on screen; the rest stay as "未连接" and come
+          // online when opened, exactly as they would have before the reload.
+          autoConnect: Boolean(known.has(id)),
+          activate: false,
+          groupId: g.id,
+        });
+      }
+    }
+    // ``createTab`` puts each new pane in as a single leaf; the saved tree is
+    // the real shape and is applied once every pane exists.
+    let any = false;
+    for (const g of groups) {
+      const live = tabGroups.get(g.id);
+      if (!live) continue;
+      const root = deserializeNode(g.root);
+      if (!root) continue;
+      live.root = root;
+      if (g.focus && sessions.has(g.focus)) live.focus = g.focus;
+      renderLayout(live);
+      any = true;
+    }
+    if (!any) return false;
+    const focus = saved.activeId && sessions.has(saved.activeId)
+      ? saved.activeId
+      : (groups[0] && rawLeafIds(groups[0].root)[0]);
+    if (focus && sessions.has(focus)) activateTab(focus);
+    return true;
+  }
+
+  /** Session ids named by a *snapshot* node (no liveness check). */
+  function rawLeafIds(node, out) {
+    out = out || [];
+    if (!node) return out;
+    if (node.type === "leaf") { out.push(node.sessionId); return out; }
+    rawLeafIds(node.a, out);
+    rawLeafIds(node.b, out);
+    return out;
+  }
+
+  /** Forget every tab and pane; used when starting from an empty workbench. */
+  function clearLayout() {
+    for (const s of [...sessions.values()]) detachTab(s.id);
+    tabGroups.clear();
+    activeTabId = null;
   }
 
   // -- 分享 -------------------------------------------------------------
@@ -2522,6 +3688,109 @@
     );
   }
 
+  // -- 配置（可在线写入） -----------------------------------------------
+  //
+  // The panel used to be a read-only table with a reload button: an operator
+  // could see that ``max_sessions`` was wrong and then go and find a shell.
+  // It is now editable, through the same writer the CLI's ``config set``
+  // uses (``core/config_edit``) -- so both entry points keep the author's
+  // inline comments, type-check the value and roll back rather than publish
+  // a config the server cannot start from.
+  //
+  // Only fields a reload can reach are writable. A ``restart`` field says so
+  // instead of accepting the edit and silently doing nothing.
+
+  // A change that deserves a second look before it lands. Not "high risk" in
+  // the abstract -- these are the ones that open a door or stop one opening.
+  const CONFIG_DANGEROUS = {
+    auth_required: (v) => v === false,
+    allowed_origins: (v) => Array.isArray(v) && v.length === 0,
+    allowed_ips: (v) => Array.isArray(v) && v.length === 0,
+    trust_proxy: (v) => v === true,
+    metrics_require_auth: (v) => v === false,
+    cookie_secure: (v) => v === false,
+    audit_input: (v) => v === true,
+    record_input: (v) => v === true,
+  };
+  const CONFIG_DANGEROUS_WHY = {
+    auth_required: "关闭认证后任何人都能打开终端。确定？",
+    allowed_origins: "清空来源白名单后任何站点都能发起 WebSocket 连接。确定？",
+    allowed_ips: "清空 IP 白名单后任何地址都能访问。确定？",
+    trust_proxy: "信任反向代理头意味着客户端 IP 由代理声明。仅在确有可信代理时开启。",
+    metrics_require_auth: "关闭后任何人无需登录即可读取监控指标。",
+    cookie_secure: "关闭后 Cookie 可能经明文 HTTP 传输。",
+    audit_input: "开启后会把终端按键内容写入审计日志，可能包含密码等敏感输入。",
+    record_input: "开启后录制文件会包含终端输入，可能包含密码等敏感输入。",
+  };
+
+  // Values the settings model will only accept from a fixed set. A free-text
+  // box for these means the operator types "infoo", gets a 400, and has to
+  // guess the vocabulary -- the control should carry the vocabulary.
+  const CONFIG_CHOICES = {
+    default_backend: ["local", "tmux", "ssh"],
+    log_level: ["debug", "info", "warning", "error", "critical"],
+  };
+
+  function configControl(field) {
+    const raw = field.raw;
+    const wrap = document.createElement("span");
+    wrap.className = "config-control";
+    if (typeof raw === "boolean") {
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = raw;
+      wrap.appendChild(input);
+      wrap.input = input;
+      return wrap;
+    }
+    const choices = CONFIG_CHOICES[field.key];
+    if (Array.isArray(choices)) {
+      const input = document.createElement("select");
+      input.className = "config-input";
+      for (const value of choices) {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = value;
+        input.appendChild(opt);
+      }
+      input.value = String(raw);
+      wrap.appendChild(input);
+      wrap.input = input;
+      return wrap;
+    }
+    const input = document.createElement("input");
+    input.type = typeof raw === "number" ? "number" : "text";
+    input.value = Array.isArray(raw) ? JSON.stringify(raw) : (raw === null || raw === undefined ? "" : String(raw));
+    input.className = "config-input";
+    wrap.appendChild(input);
+    wrap.input = input;
+    return wrap;
+  }
+
+  function configReadback(field, wrap) {
+    const input = wrap.input;
+    if (typeof field.raw === "boolean") return Boolean(input.checked);
+    const text = input.value.trim();
+    if (Array.isArray(field.raw)) {
+      // An empty box is an empty list, which is a real value (`allowed_origins
+      // = []` means "no origin is allowed") -- not "unset".
+      if (!text) return [];
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) throw new Error("需要一个数组，例如 [\"a\", \"b\"]");
+      return parsed;
+    }
+    // An empty box on a scalar means "unset", and the writer removes the key.
+    // Returning "" instead turned `default_cwd` from "no cwd" into "cwd of the
+    // empty string", and asked an int field to be `""`.
+    if (text === "") return null;
+    if (typeof field.raw === "number") {
+      const n = Number(text);
+      if (!Number.isFinite(n)) throw new Error("需要一个数字");
+      return Number.isInteger(field.raw) ? Math.trunc(n) : n;
+    }
+    return text;
+  }
+
   async function renderConfig() {
     const data = await api("GET", "/api/config");
     const host = document.createElement("div");
@@ -2537,33 +3806,38 @@
     const reloadBtn = document.createElement("button");
     reloadBtn.className = "text-btn";
     reloadBtn.textContent = "重载配置";
-    const reloadNote = document.createElement("span");
-    reloadNote.className = "file-status";
+    // One readout for both verbs. A save that reloads and a reload are the
+    // same question ("what did that actually change, and did it complain?"),
+    // and answering it in a toast alone means the answer is gone in 2.5s --
+    // which is useless when the operator is reading the table below it.
+    const status = document.createElement("span");
+    status.className = "file-status";
+    const report = (changed, errors, okWord) => {
+      if (errors && errors.length) {
+        status.textContent = `${okWord}，但重载有问题：` + errors.join("；");
+        status.style.color = "var(--danger)";
+      } else {
+        status.textContent = `${okWord}；变更：` + ((changed || []).join("、") || "无");
+        status.style.color = "var(--ok)";
+      }
+    };
     reloadBtn.addEventListener("click", async () => {
       try {
         const info = await api("POST", "/api/config/reload");
-        const changed = info.changed || [];
-        const errors = info.errors || [];
-        if (errors.length) {
-          reloadNote.textContent = "重载有问题：" + errors.join("；");
-          reloadNote.style.color = "var(--danger)";
-          toast("配置重载存在问题", "error");
-        } else {
-          reloadNote.textContent = "已重载；变更：" + (changed.join("、") || "无");
-          reloadNote.style.color = "var(--ok)";
-          toast("配置已重载", "ok");
-        }
+        report(info.changed, info.errors, "已重载");
+        if ((info.errors || []).length) toast("配置重载存在问题", "error");
+        else toast("配置已重载", "ok");
       } catch (err) {
-        reloadNote.textContent = String(err.message || err);
-        reloadNote.style.color = "var(--danger)";
+        status.textContent = String(err.message || err);
+        status.style.color = "var(--danger)";
       }
     });
-    reloadBar.append(reloadBtn, reloadNote);
+    reloadBar.append(reloadBtn, status);
     host.appendChild(reloadBar);
 
     const table = document.createElement("table");
     table.className = "config-table";
-    table.innerHTML = "<thead><tr><th>配置项</th><th>生效值</th><th>生效方式</th></tr></thead>";
+    table.innerHTML = "<thead><tr><th>配置项</th><th>值</th><th>生效方式</th><th></th></tr></thead>";
     const tbody = document.createElement("tbody");
     // Three tiers, not two. `new` used to be shown as 热更新, which promised
     // an immediate effect the server never delivered (those settings only
@@ -2574,20 +3848,90 @@
       // The tooltip is the whole point of the middle tier: without it the
       // badge reads like a weaker form of "hot" and the user assumes it landed.
       new: "只影响此后新建的会话、录制或连接。已存在的不受影响，想让旧会话用上新值需重建。",
-      restart: "需要重启服务才生效（网络、TLS、数据目录、日志、Webhook 等）。",
+      restart: "需要重启服务才生效（网络、TLS、数据目录、日志、Webhook 等），不支持在线写入。",
     };
     for (const field of data.fields || []) {
       const tr = document.createElement("tr");
-      const kindLabel = KIND_LABELS[field.kind] || "需重启";
-      tr.innerHTML =
-        `<td>${esc(field.key)}</td>` +
-        `<td class="val">${esc(field.value === "" ? "（空）" : field.value)}</td>` +
-        `<td><span class="kind-badge ${field.kind}" title="${esc(KIND_TIPS[field.kind] || KIND_TIPS.restart)}">${kindLabel}</span></td>`;
+      const writable = field.kind !== "restart";
+      const nameCell = document.createElement("td");
+      nameCell.textContent = field.key;
+      const valCell = document.createElement("td");
+      valCell.className = "val";
+      const kindCell = document.createElement("td");
+      kindCell.innerHTML = `<span class="kind-badge ${field.kind}" title="${esc(KIND_TIPS[field.kind] || KIND_TIPS.restart)}">${KIND_LABELS[field.kind] || "需重启"}</span>`;
+      const actCell = document.createElement("td");
+
+      let control = null;
+      if (writable) {
+        control = configControl(field);
+        valCell.appendChild(control);
+      } else {
+        valCell.textContent = field.value === "" ? "（空）" : String(field.value);
+        valCell.classList.add("readonly");
+      }
+
+      if (writable) {
+        const save = document.createElement("button");
+        save.type = "button";
+        save.className = "text-btn";
+        save.textContent = "保存";
+        // ``element.hidden`` does not hide this: ``.text-btn`` declares
+        // ``display: inline-flex``, which outranks the UA ``[hidden]`` rule.
+        // The project's ``.hidden`` class is ``display: none !important`` and
+        // is what every other toggle in this file uses.
+        save.classList.add("hidden");
+        const mark = () => {
+          let next;
+          try { next = configReadback(field, control); } catch { save.classList.remove("hidden"); return; }
+          save.classList.toggle("hidden", JSON.stringify(next) === JSON.stringify(field.raw));
+        };
+        control.input.addEventListener("input", mark);
+        control.input.addEventListener("change", mark);
+        save.addEventListener("click", async () => {
+          let value;
+          try { value = configReadback(field, control); }
+          catch (err) { toast(String(err.message || err), "error"); return; }
+          const danger = CONFIG_DANGEROUS[field.key];
+          if (danger && danger(value)) {
+            const ok = await confirmDialog(
+              CONFIG_DANGEROUS_WHY[field.key] || `确定修改 ${field.key}？`,
+              "高风险配置", { variant: "warn" },
+            );
+            if (!ok) return;
+          }
+          try {
+            const info = await api("PUT", "/api/config", { items: [{ key: field.key, value }] });
+            field.raw = value;
+            field.value = String(value);
+            save.classList.add("hidden");
+            report(info.changed, info.errors, `已保存 ${field.key}`);
+            const errors = info.errors || [];
+            if (errors.length) toast("已写入，但重载有问题：" + errors.join("；"), "warn");
+            else toast(`已保存 ${field.key}`, "ok");
+          } catch (err) {
+            status.textContent = String(err.message || err);
+            status.style.color = "var(--danger)";
+            toast(String(err.message || err), "error");
+          }
+        });
+        actCell.appendChild(save);
+      } else {
+        const note = document.createElement("span");
+        note.className = "hint";
+        note.textContent = "改配置文件后重启";
+        note.title = KIND_TIPS.restart;
+        actCell.appendChild(note);
+      }
+
+      tr.append(nameCell, valCell, kindCell, actCell);
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
     host.appendChild(table);
-    if (me && me.role !== "admin") adminNote("配置为只读视图", false);
+    if (me && me.role !== "admin") {
+      adminNote("配置为只读视图", false);
+      for (const el of host.querySelectorAll("input,button")) el.disabled = true;
+    }
   }
 
   // -- 录制 -------------------------------------------------------------
@@ -2745,7 +4089,6 @@
     else {
       const s = activeId && sessions.get(activeId);
       if (s) {
-        s.searchHits = []; s.searchPos = -1;
         if (s.searchAddon) s.searchAddon.clearDecorations();
         try { s.term.clearSelection(); } catch { /* 忽略 */ }
       }
@@ -2770,8 +4113,6 @@
   // flood-filled session that is a stutter per character.
   const searchDebounce = { timer: null };
   els.searchInput.addEventListener("input", () => {
-    const s = activeId && sessions.get(activeId);
-    if (s) { s.searchPos = -1; }
     if (searchDebounce.timer !== null) clearTimeout(searchDebounce.timer);
     if (!els.searchInput.value) {
       searchDebounce.timer = null;
@@ -2881,7 +4222,11 @@
 
   function runAction(action) {
     switch (action) {
-      case "new_session": newSession(true).catch(() => {}); break;
+      case "new_session":
+        // Never swallow: a shortcut that fails silently is a shortcut that
+        // looks broken rather than a shortcut that reported a problem.
+        newSession(true).catch((e) => toast(String(e.message || e), "error"));
+        break;
       case "close_session": if (activeId) detachTab(activeId); break;
       case "kill_session": if (activeId) killTab(activeId); break;
       case "next_tab": case "prev_tab": {
@@ -2898,6 +4243,12 @@
       case "font_dec": if (activeId) changeFont(sessions.get(activeId), -1); break;
       case "clear_screen": if (activeId) clearScreen(sessions.get(activeId)); break;
       case "show_help": toggleHotkeyHelp(); break;
+      case "split_right": splitActive("row").catch((e) => toast(String(e.message || e), "error")); break;
+      case "split_down": splitActive("col").catch((e) => toast(String(e.message || e), "error")); break;
+      case "focus_left": moveFocus("left"); break;
+      case "focus_right": moveFocus("right"); break;
+      case "focus_up": moveFocus("up"); break;
+      case "focus_down": moveFocus("down"); break;
       case "toggle_files": {
         const hidden = els.filePanel.classList.toggle("hidden");
         if (!hidden) loadFiles(filePath);
@@ -3003,6 +4354,9 @@
     copy_selection: "复制选区", paste_clipboard: "粘贴剪贴板",
     font_inc: "字号 +", font_dec: "字号 −", clear_screen: "清屏",
     show_help: "快捷键帮助",
+    split_right: "向右分屏", split_down: "向下分屏",
+    focus_left: "焦点向左", focus_right: "焦点向右",
+    focus_up: "焦点向上", focus_down: "焦点向下",
   };
 
   // Discoverability: the bindings existed and were editable, but there was no
@@ -3182,19 +4536,55 @@
     prefs.rightClickMode = els.setRightclick.value;
     applyPrefs();
   });
-  // The renderer is baked into a Terminal when it is constructed, so this
-  // cannot be swapped under a live session. Say so rather than pretending the
-  // change landed: new sessions pick it up at once, existing ones on reload.
+  // The renderer is baked into a Terminal when it is constructed, so a switch
+  // is a rebuild of the terminal object. That used to mean "reload the page";
+  // now every live session is rebuilt in place and asks for a replay, so the
+  // change lands immediately instead of being a promise the user has to
+  // fulfil by pressing F5.
   els.setRenderer.value = prefs.termRenderer || "auto";
   updateRendererNote(activeId && sessions.get(activeId));
   els.setRenderer.addEventListener("change", () => {
     prefs.termRenderer = els.setRenderer.value;
     applyPrefs();
-    toast("渲染器已更改：新建会话立即生效，已有会话刷新页面后生效", "info");
+    let rebuilt = 0;
+    let deferred = 0;
+    for (const s of sessions.values()) {
+      // A suspended tab has no screen to lose; it picks the renderer up when
+      // it is next attached, which replays the scrollback the same way.
+      if (!s.everShown && s.standby) { deferred += 1; continue; }
+      recreateTerminal(s);
+      rebuilt += 1;
+    }
+    const parts = [];
+    if (rebuilt) parts.push(`${rebuilt} 个会话已就地切换`);
+    if (deferred) parts.push(`${deferred} 个未连接会话将在打开时生效`);
+    toast(parts.length ? `渲染器已更改：${parts.join("，")}` : "渲染器已更改", "info");
   });
   els.setTheme.addEventListener("change", () => { prefs.theme = els.setTheme.value; applyPrefs(); });
   els.setFontsize.addEventListener("change", () => { prefs.fontSize = Number(els.setFontsize.value); applyPrefs(); });
   els.setFont.addEventListener("change", () => { prefs.fontFamily = els.setFont.value; applyPrefs(); });
+
+  // Background-presence switches. Reading them back is what keeps the dialog
+  // honest: the state on screen is the state in force.
+  function syncNotifyControls() {
+    if (els.setNotifySound) els.setNotifySound.checked = prefs.notifySound !== false;
+    if (els.setNotifyTitle) els.setNotifyTitle.checked = prefs.notifyTitle !== false;
+    if (els.setNotifySystem) els.setNotifySystem.checked = prefs.notifySystem !== false;
+  }
+  syncNotifyControls();
+  const onNotifyChange = () => {
+    prefs.notifySound = Boolean(els.setNotifySound && els.setNotifySound.checked);
+    prefs.notifyTitle = Boolean(els.setNotifyTitle && els.setNotifyTitle.checked);
+    prefs.notifySystem = Boolean(els.setNotifySystem && els.setNotifySystem.checked);
+    applyPrefs();
+    paintPresence();
+    if (prefs.notifySystem && "Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  };
+  for (const el of [els.setNotifySound, els.setNotifyTitle, els.setNotifySystem]) {
+    if (el) el.addEventListener("change", onNotifyChange);
+  }
   applyPrefs();
 
   // -- 文件面板 ---------------------------------------------------------
@@ -3211,6 +4601,7 @@
   let menuEntry = null;
   let previewPath = null;
   let previewDirtyBase = null;
+  let previewImageUrl = null;
   let uploadXhr = null;
 
   function formatSize(bytes) {
@@ -3236,9 +4627,9 @@
       btn.addEventListener("click", () => { fileOffset = 0; loadFiles(btn.dataset.path); });
     });
     els.fileCrumbs.title = path ? `${path}（回车跳转到任意子路径）` : "根目录";
-    els.fileCrumbs.onclick = (e) => {
-      if (e.target.tagName !== "SPAN" || !e.target.isContentEditable) return;
-    };
+    // No click handler: the crumb *buttons* navigate (wired above) and a
+    // plain click on the bar itself has nothing to do. A handler that
+    // immediately returns is a no-op wearing a handler's clothes.
     els.fileCrumbs.ondblclick = () => {
       els.fileCrumbs.contentEditable = "true";
       els.fileCrumbs.focus();
@@ -3355,9 +4746,7 @@
 
   // -- 上下文菜单 -------------------------------------------------------
   function openFileMenu(x, y) {
-    els.fileMenu.style.left = `${x}px`;
-    els.fileMenu.style.top = `${y}px`;
-    els.fileMenu.classList.remove("hidden");
+    placeMenu(els.fileMenu, x, y);
   }
   function closeFileMenu() { els.fileMenu.classList.add("hidden"); menuEntry = null; }
 
@@ -3408,12 +4797,52 @@
 
 
   // -- 预览 / 编辑 ------------------------------------------------------
+  //
+  // A bitmap used to be download-or-nothing. It is now previewed in place --
+  // and typed by the *server* from the file's leading bytes, because a name
+  // is one `mv` away from lying. SVG is not a bitmap and stays in the text
+  // pane, which is what it is.
+  const IMAGE_NAME = /\.(png|jpe?g|gif|webp|bmp|avif)$/i;
+
+  function showPreviewImage(url, bytes) {
+    els.previewBody.classList.add("hidden");
+    els.previewImage.classList.remove("hidden");
+    els.previewImg.src = url;
+    els.previewSave.disabled = true;
+    els.previewSave.classList.add("hidden");
+    els.previewNote.textContent = `图片 · ${formatSize(bytes)} · 只读`;
+  }
+  function showPreviewText() {
+    els.previewImage.classList.add("hidden");
+    els.previewImg.removeAttribute("src");
+    els.previewBody.classList.remove("hidden");
+    els.previewSave.classList.remove("hidden");
+  }
+
   async function openPreview(rel) {
     previewPath = rel;
     els.previewTitle.textContent = rel.split("/").pop();
     els.previewNote.textContent = "读取中…";
     els.previewBody.value = "";
+    showPreviewText();
     els.previewOverlay.classList.remove("hidden");
+
+    // Bitmaps first. If the server refuses (a script named .png, an oversized
+    // file, an SVG), fall through to the text preview, which explains why in
+    // its own words rather than leaving a blank box.
+    if (IMAGE_NAME.test(rel)) {
+      try {
+        const res = await fetch(`/api/files/image?path=${encodeURIComponent(rel)}`);
+        if (res.ok && (res.headers.get("content-type") || "").startsWith("image/")) {
+          const blob = await res.blob();
+          if (previewImageUrl) URL.revokeObjectURL(previewImageUrl);
+          previewImageUrl = URL.createObjectURL(blob);
+          showPreviewImage(previewImageUrl, blob.size);
+          return;
+        }
+      } catch { /* fall through to the text path */ }
+    }
+
     try {
       const res = await fetch(`/api/files/preview?path=${encodeURIComponent(rel)}`);
       if (!res.ok) {
@@ -3445,6 +4874,8 @@
       previewDirtyBase = null;
       els.previewBody.value = "";
       els.previewSave.disabled = false;
+      showPreviewText();
+      if (previewImageUrl) { URL.revokeObjectURL(previewImageUrl); previewImageUrl = null; }
     };
     if (!force && previewDirtyBase !== null && els.previewBody.value !== previewDirtyBase) {
       confirmDialog("放弃未保存的修改？", "关闭预览", { variant: "warn" }).then((ok) => {
@@ -3605,5 +5036,7 @@
   els.fileInput.addEventListener("change", () => { uploadFiles(els.fileInput.files); els.fileInput.value = ""; });
   els.fileList.addEventListener("dragleave", () => els.fileList.classList.remove("dragover"));
 
+  fillFontSizes();
+  paintPresence();
   bootstrap();
 })();

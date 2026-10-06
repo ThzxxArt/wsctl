@@ -240,6 +240,7 @@ def _key_metrics(metrics: Any) -> dict[str, float]:
         "wsctl_client_frames_shed_total",
         "wsctl_shed_resync_requests_total",
         "wsctl_pty_input_dropped_total",
+        "wsctl_ws_oversized_input_frames_total",
         "wsctl_audit_dropped_total",
         "wsctl_audit_write_errors_total",
         "wsctl_recording_failures_total",

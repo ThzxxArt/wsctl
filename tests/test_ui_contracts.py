@@ -754,3 +754,542 @@ def test_the_lifecycle_env_keys_have_one_definition() -> None:
     assert re.search(
         r"from wsctl\.core\.session import[^\n]*LIFECYCLE_ENV_KEYS", daemon
     ), "cli.daemon must take the keys from core.session"
+
+
+# -- 0.1.24 M84: the declarations and the behaviour must agree ------------
+
+
+def test_the_font_size_has_one_range_in_every_place_that_can_change_it() -> None:
+    """Three sources, three answers -- until there is one source.
+
+    The README promised 12-18, the Settings picker offered 12/13/14/16/18 and
+    the Alt+E/D hotkey clamped at 9-24. A hotkey could therefore reach a size
+    the picker could not show, and neither matched the docs. The picker is
+    generated from the same two constants the hotkey clamps to.
+    """
+    js = _js()
+    html = INDEX.read_text(encoding="utf-8")
+    bounds = {}
+    for name in ("FONT_MIN", "FONT_MAX"):
+        match = re.search(rf"const {name} = (\d+);", js)
+        assert match, f"{name} must be declared once"
+        bounds[name] = int(match.group(1))
+    assert bounds["FONT_MIN"] < bounds["FONT_MAX"]
+    # The hotkey clamps to those constants, not to literals of its own.
+    font_at = js.index("function changeFont(")
+    block = js[font_at : font_at + 500]
+    assert "FONT_MAX" in block and "FONT_MIN" in block, (
+        "changeFont must clamp to the shared bounds rather than its own numbers"
+    )
+    assert re.search(r"Math\.min\(24|Math\.max\(9", block) is None, (
+        "changeFont still carries its own 9-24 range"
+    )
+    # The picker is generated from them, so it cannot offer a size the hotkey
+    # refuses -- and cannot offer fewer sizes than the range allows.
+    assert "for (let size = FONT_MIN; size <= FONT_MAX; size += 1)" in js
+    assert re.search(r"<select id=\"set-fontsize\"></select>", html), (
+        "the picker must be filled from the constants, not hardcoded in HTML"
+    )
+
+
+def test_the_toast_dedupe_window_is_actually_used() -> None:
+    """A constant that nothing reads is a promise the code does not keep.
+
+    ``TOAST_DEDUPE_MS`` was declared and never referenced: the merge key was
+    "is an identical card still alive", so a message repeating every four
+    seconds for an hour was one card with a counter -- and a message repeating
+    once a minute looked like a stream of new problems. The window now decides.
+    """
+    js = _js()
+    match = re.search(r"const TOAST_DEDUPE_MS = (\d+);", js)
+    assert match, "the dedupe window must be declared"
+    assert int(match.group(1)) > 0
+    # It must gate the lookup, and the entry must remember when it last fired
+    # (otherwise a window cannot be measured at all).
+    assert "TOAST_DEDUPE_MS" in js[js.index("function toast(") :], (
+        "the dedupe window must be consulted by toast()"
+    )
+    assert js.count("TOAST_DEDUPE_MS") >= 2, (
+        "TOAST_DEDUPE_MS is declared but never read"
+    )
+    assert "lastAt" in js, "a dedupe window needs a timestamp to measure from"
+
+
+def test_the_renderer_can_be_switched_without_reloading_the_page() -> None:
+    """A setting that only takes effect on F5 is a setting that never does.
+
+    The renderer is baked into a Terminal at construction, so a switch is a
+    rebuild -- which used to be documented as "reload the page". The rebuild
+    now happens in place and asks for a replay, because a rebuilt terminal is
+    blank and bytes cannot reconstruct a TUI screen on their own.
+    """
+    js = _js()
+    assert "function buildTerminal(" in js, (
+        "terminal construction must be reusable, not inline in createTab"
+    )
+    assert "function recreateTerminal(" in js
+    # The rebuild must ask for the replay, or the user gets a blank terminal.
+    rebuild_at = js.index("function recreateTerminal(")
+    block = js[rebuild_at : rebuild_at + 1600]
+    assert "requestResync(s)" in block, (
+        "a rebuilt terminal is blank until a replay lands; the rebuild must ask"
+    )
+    assert "buildTerminal(s.pane)" in block
+    # And the source may not tell the user to reload any more.
+    assert "刷新页面后生效" not in js, (
+        "the renderer switch is in place now; 'reload the page' is a lie"
+    )
+    # A transfer in flight must not have its protocol stream re-rendered as text.
+    assert "if (s.zmodemActive)" in block
+
+
+def test_the_hidden_tab_rule_is_still_the_one_that_keeps_the_box() -> None:
+    """Pinned again here because the split layout rewrites the visibility model.
+
+    ``.term-pane.mounted`` must still keep its layout box; only *which* panes
+    get the ``shown`` class changed (a split shows several at once).
+    """
+    css = APP_CSS.read_text(encoding="utf-8")
+    body = re.search(r"\.term-pane\.mounted\s*\{[^}]*\}", css)
+    assert body is not None
+    assert "visibility: hidden" in body.group(0)
+    assert "display: none" not in body.group(0)
+    assert re.search(r"\.term-pane\.mounted\.shown\s*\{[^}]*visibility: visible", css), (
+        "a mounted pane becomes visible through `.shown`, not by dropping `mounted`"
+    )
+
+
+# -- 0.1.24 M79/M80: split panes ---------------------------------------
+
+
+def test_a_split_is_a_layout_of_panes_not_a_second_terminal_model() -> None:
+    """A tab owns a tree of panes; the session model is untouched.
+
+    Every other part of this product still speaks "one tab per session" and
+    the tests count tabs. Splitting must therefore be a *view*: the same
+    ``sessions`` map, the same terminals, a tree that decides which panes are
+    on screen together. A second model would be a second set of bugs.
+    """
+    js = _js()
+    for name in ("leafIds(", "findLeaf(", "splitPane(", "closePane(", "renderLayout("):
+        assert f"function {name}" in js, f"{name} is the layout's own vocabulary"
+    # The tree has exactly two node shapes: a leaf names a session, a split
+    # has a direction and a ratio. 2x2 is two splits, not a third type.
+    assert '{ type: "leaf", sessionId' in js
+    assert '{ type: "split", dir' in js
+    # Closing a pane is not killing a session (0.1.1's promise).
+    close_at = js.index("function detachTab(")
+    assert "api(\"DELETE\"" not in js[close_at : close_at + 1400], (
+        "detaching a pane must never terminate the session behind it"
+    )
+
+
+def test_a_tab_is_one_entry_however_many_panes_it_shows() -> None:
+    """Two sessions side by side is still one thing in the tab bar.
+
+    Two entries for one visual tab is the failure mode: the label names one
+    session and the count names the other, and closing one leaves the other
+    behind with no tab of its own.
+    """
+    js = _js()
+    # The tab entry is created once and shared by every pane that joins it.
+    create_at = js.index("function createTab(")
+    block = js[create_at : create_at + 3200]
+    assert "tabGroups.get(groupId)" in block, (
+        "a second pane must join the existing tab entry, not add one"
+    )
+    assert block.index("els.tabs.appendChild(tabEl)") > block.index(
+        "tabGroups.get(groupId)"
+    ), "the tab entry is only created when the group has none"
+    # The label names the focused session; the badge names how many there are.
+    assert "function paintGroupTab(" in js
+    assert "pane-count" in js
+
+
+def test_a_split_never_loses_the_visible_pane_on_a_suspend() -> None:
+    """The connection budget may suspend a pane; it may not blank one on screen.
+
+    With several panes visible, "is this the focused one" is no longer the
+    right question -- a split shows siblings that must not be unmounted
+    either. The rule is "is it on screen", and the older form of it is still
+    written out because it is still true.
+    """
+    js = _js()
+    assert "function isPaneShown(" in js
+    suspend_at = js.index("function suspendTab(")
+    block = js[suspend_at : suspend_at + 1200]
+    assert "isPaneShown(s)" in block, (
+        "suspending must consult what is visible, not only what is focused"
+    )
+    assert 'if (s.id !== activeId) s.pane.classList.remove("mounted");' in block
+    # And the resize path fits every visible pane, not just the focused one.
+    fit_at = js.index("function fitActiveSoon(")
+    assert "isPaneShown(" in js[fit_at : fit_at + 900]
+
+
+def test_the_split_shortcuts_are_not_browser_reserved() -> None:
+    """A chord that DevTools or the browser takes is a chord that does nothing.
+
+    ``Alt+\\`` and ``Alt+Shift+\\`` are free; the tab switcher keeps the bare
+    ``Alt+<arrow>`` pair and focus movement takes the ``Alt+Shift`` form.
+    """
+    js = _js()
+    assert 'split_right: "alt+\\\\"' in js
+    assert 'split_down: "alt+shift+\\\\"' in js
+    assert "focus_left:" in js and "focus_right:" in js
+    reserved = js[js.index("const BROWSER_RESERVED") : js.index("const BROWSER_RESERVED") + 900]
+    for chord in ("alt+\\\\", "alt+shift+\\\\", "alt+shift+arrowleft"):
+        assert chord not in reserved.lower(), f"{chord} must not be browser-reserved"
+
+
+def test_the_layout_is_remembered_across_a_reload() -> None:
+    """Sessions outlive connections, so the workbench can be put back exactly.
+
+    The tree references session ids; a session that has ended is dropped from
+    it rather than left as a hole. What is *not* restored is content -- the
+    server replays that on attach, which is the mechanism that already exists.
+    """
+    js = _js()
+    assert 'const LAYOUT_KEY = "wsctl-layout"' in js
+    assert "function saveLayout(" in js and "function loadLayout(" in js
+    assert "function restoreLayout(" in js
+    assert "function deserializeNode(" in js
+    restore_at = js.index("function restoreLayout(")
+    block = js[restore_at : restore_at + 1800]
+    assert "sessions.has(" in block or "sessions.has(id)" in block, (
+        "a layout may only restore panes whose session still exists"
+    )
+    assert "activateTab(" in block
+
+
+# -- 0.1.24 M81: a background session must be able to get your attention --
+
+
+def test_a_background_session_reports_bells_output_and_exits() -> None:
+    """Everything xterm already knew about a background session was thrown away.
+
+    ``onBell``, ``onTitleChange`` and output all existed; nothing listened. A
+    long build in one tab finished silently in another, and the only way to
+    know was to click through every tab.
+    """
+    js = _js()
+    assert "function noteActivity(" in js
+    assert "function paintPresence(" in js
+    wire_at = js.index("function wireTerminal(")
+    block = js[wire_at : wire_at + 1200]
+    assert "onBell(" in block, "BEL is the application asking for attention"
+    assert "onTitleChange(" in block
+    assert "noteActivity(" in block
+    # An exit is the single most useful thing a background session can say.
+    exit_at = js.index('case "exit":')
+    assert "noteActivity(" in js[exit_at : exit_at + 700]
+    # And looking at a pane is what "read" means.
+    assert "clearActivity(" in js
+
+
+def test_a_system_notification_is_opt_in_and_never_an_error() -> None:
+    """A permission prompt is a cost the user chooses to pay.
+
+    Denied or unsupported must be a silent no-op: a feature that throws when
+    the browser says no is a feature that breaks the page.
+    """
+    js = _js()
+    assert "function maybeNotify(" in js
+    notify_at = js.index("function maybeNotify(")
+    block = js[js.index("function maybeNotify(") : notify_at + 1400]
+    assert "Notification.permission" in block
+    assert "prefs.notifySystem" in block
+    # Shared viewers are watching, not operating: no notifications for them.
+    assert "sharedMode" in block
+    assert "catch" in block, "a refused notification must not surface as an error"
+
+
+def test_the_font_size_the_picker_offers_is_the_range_the_hotkey_allows() -> None:
+    """Re-pinned with the split work: the picker is generated, never hardcoded.
+
+    An HTML option list and a JS clamp are two places to get wrong; generating
+    the list from the same constants removes the second one.
+    """
+    html = INDEX.read_text(encoding="utf-8")
+    js = _js()
+    assert re.search(r"<select id=\"set-fontsize\"></select>", html)
+    assert "fillFontSizes(" in js
+    assert "for (let size = FONT_MIN; size <= FONT_MAX; size += 1)" in js
+
+
+def test_the_layout_walk_accumulates_instead_of_rebinding_per_call() -> None:
+    """A tree walk that loses its accumulator collects "no panes at all".
+
+    ``out = out || []`` inside a recursive branch creates a *private* array
+    the caller never sees, so every split collected as empty: no pane-count
+    badge, a tab that looked suspended for no reason, and a "which pane is on
+    screen" answer of "none". The accumulator is created once at the top and
+    threaded through.
+    """
+    js = _js()
+    for name in ("leafIds", "rawLeafIds"):
+        at = js.index(f"function {name}(")
+        block = js[at : at + 420]
+        assert "out = out || [];" in block, (
+            f"{name} must create the accumulator once, before the recursion"
+        )
+        assert "(out = out || []).push" not in block, (
+            f"{name} rebinds the accumulator inside a branch and drops the result"
+        )
+        assert "leafIds(node.a, out)" in block or "rawLeafIds(node.a, out)" in block, (
+            f"{name} must thread the accumulator through both children"
+        )
+
+
+def test_a_presence_signal_is_an_overlay_never_terminal_output() -> None:
+    """The one place an operational notice must never go is the terminal buffer.
+
+    Writing it there is the mistake this product already fixed once for server
+    notices: it is replayed to every reconnect as if the program had printed
+    it, and it scrolls the prompt away mid-command. The presence signals (bell
+    badge, activity glow, page title, favicon) are all DOM state, so the check
+    is that none of the paths that *write to the terminal* grew a notice.
+    """
+    js = _js()
+    # The presence machinery touches classes, the document title and the
+    # favicon -- never ``term.write``.
+    for name in ("function noteActivity(", "function paintPresence(",
+                 "function paintFavicon(", "function maybeNotify("):
+        at = js.index(name)
+        block = js[at : at + 1400]
+        assert "term.write" not in block, (
+            f"{name} writes into the terminal buffer; a presence signal is an overlay"
+        )
+    # And the terminal-writers are unchanged in kind: output, the exit line,
+    # and nothing else.
+    assert js.count('s.term.write(`\\r\\n\\x1b[33m[wsctl]') == 1, (
+        "the exit line is the only control message allowed on screen"
+    )
+
+
+def test_the_layout_is_readable_without_the_dom() -> None:
+    """"Why is this pane here" cannot be answered by reading the page.
+
+    The DOM says two boxes exist; it does not say which tree produced them,
+    which one has the keyboard, or how many sockets are live. That is the
+    first question a support conversation about a split asks, and the answer
+    has to be the same shape a test can assert on.
+    """
+    js = _js()
+    assert "window.__wsctlLayout" in js
+    at = js.index("window.__wsctlLayout")
+    block = js[at : at + 900]
+    for field in ("activeTabId", "activeId", "liveSockets", "tabs"):
+        assert field in block, f"__wsctlLayout must report {field}"
+    assert "serializeNode(" in block, "the tree must be reported as data"
+    assert "leafIds(" in block
+
+
+def test_a_context_menu_is_placed_inside_the_window() -> None:
+    """A menu whose later items fall outside the window has no later items.
+
+    The term menu grew to fifteen entries; near the bottom edge the last ones
+    were unreachable and could not be clicked at all. Placement measures the
+    menu after showing it and clamps -- it does not trust the pointer.
+    """
+    js = _js()
+    assert "function placeMenu(" in js
+    at = js.index("function placeMenu(")
+    block = js[at : js.index("function ", at + 20)]
+    assert "getBoundingClientRect(" in block
+    assert "innerWidth" in block and "innerHeight" in block
+    # Every context menu goes through it; none sets left/top by hand.
+    for name in ("openTermMenu", "openTabMenu", "openFileMenu"):
+        start = js.index(f"function {name}(")
+        end = js.index("\n  function ", start + 10)
+        body = js[start:end]
+        assert "placeMenu(" in body, f"{name} must place itself through placeMenu"
+    assert "els.termMenu.style.left" not in js
+    assert "els.tabMenu.style.left" not in js
+    assert "els.fileMenu.style.left" not in js
+
+
+def test_no_block_comment_is_left_open_in_the_frontend() -> None:
+    """``node --check`` does not catch a comment that swallows the code.
+
+    A ``/**`` written where ``*/` was meant (it happens when a docstring from
+    another language gets pasted in) leaves the block comment open, and the
+    functions after it become comment text. The file is still *syntactically*
+    valid -- the comment closes at the next JSDoc block -- so the parser is
+    happy and the feature is simply missing. This is the check that catches it.
+    """
+    js = _js()
+    depth = 0
+    index = 0
+    while True:
+        open_at = js.find("/*", index)
+        close_at = js.find("*/", index)
+        if open_at == -1 and close_at == -1:
+            break
+        if open_at != -1 and (close_at == -1 or open_at < close_at):
+            depth += 1
+            index = open_at + 2
+        else:
+            depth -= 1
+            assert depth >= 0, f"stray */ at offset {close_at}"
+            index = close_at + 2
+    assert depth == 0, (
+        f"{depth} unterminated block comment(s) in app.js; whatever follows is dead code"
+    )
+    assert '"""' not in js, "a Python docstring terminator has no business in JS"
+
+
+# -- 0.1.24 回归 review：热路径与「回放不是新闻」 -----------------------
+
+
+def test_presence_is_a_derived_view_painted_once_per_frame() -> None:
+    """Per-frame DOM work in the output path is the defect this repo keeps
+    fixing. Frame coalescing, write caps and resize merging (0.1.15–0.1.21)
+    all exist to get it out -- so the presence signals must not put it back.
+
+    ``noteActivity`` records state and schedules **one** paint; the favicon is
+    redrawn only when the number it draws actually changes.
+    """
+    js = _js()
+    at = js.index("function noteActivity(")
+    block = js[at : js.index("\n  function ", at + 10)]
+    assert "schedulePresence()" in block, "noteActivity must schedule, not paint"
+    for forbidden in ("paintPresence()", "paintFavicon(", "document.title"):
+        assert forbidden not in block, (
+            f"noteActivity does {forbidden} inline; that is per-frame work"
+        )
+    # One paint per animation frame, and never two in flight.
+    sched = js[js.index("function schedulePresence(") :]
+    sched = sched[: sched.index("\n  function ")]
+    assert "requestAnimationFrame(" in sched
+    assert "if (presenceFrame) return;" in sched, (
+        "a second call while one is in flight must not queue another paint"
+    )
+    # The favicon is the expensive one: an Image, a canvas pass and a
+    # toDataURL. Only on a change of the number.
+    fav = js[js.index("function paintFavicon(") :]
+    fav = fav[: fav.index("\n  function ")]
+    assert "if (count === lastFaviconCount) return;" in fav, (
+        "the favicon must not be redrawn for the same count"
+    )
+
+
+def test_output_before_attached_is_a_replay_not_news() -> None:
+    """A reconnect re-delivers the screen the user already had.
+
+    The server enqueues the scrollback replay and then ``attached`` under the
+    same lock (``core/session.py``), so ``attached`` is the fact that says the
+    replay is over. Counting replayed bytes as activity made every network
+    blip ring every background tab with "有新输出" -- a false alarm that
+    teaches people to ignore the real ones.
+    """
+    js = _js()
+    at = js.index("function noteActivity(")
+    block = js[at : js.index("\n  function ", at + 10)]
+    assert "if (!s.attached) return;" in block, (
+        "presence must not fire for the attach replay"
+    )
+    # ...nor for the repaint the server triggers right after a replay. That
+    # one is not marked on the wire at all, so it is suppressed by *when* it
+    # arrives -- and the window must be short enough not to swallow an event.
+    assert "ACTIVITY_GRACE_MS" in block, (
+        "the post-attach repaint must not be reported as news"
+    )
+    grace = re.search(r"const ACTIVITY_GRACE_MS = (\d+);", js)
+    assert grace and 0 < int(grace.group(1)) <= 2000, (
+        "the grace window must be long enough for a repaint and short enough "
+        "not to swallow a real one"
+    )
+    # And ``attached`` is the only thing that opens the gate -- reset on every
+    # fresh socket attempt, so each reconnect re-closes it.
+    connect_at = js.index("function connect(s)")
+    assert "s.attached = false;" in js[connect_at : connect_at + 1200]
+    handle_at = js.index('case "attached":')
+    assert "s.attached = true;" in js[handle_at : handle_at + 400]
+
+
+def test_presence_still_paints_when_the_page_is_not_visible() -> None:
+    """``requestAnimationFrame`` is paused for a hidden page.
+
+    That is precisely when the page title and the favicon are the only signals
+    anyone can see -- an operator working in another browser tab is the whole
+    audience for them. Coalescing must therefore survive backgrounding: a
+    timer rides along with the frame callback and whichever fires first paints.
+    """
+    js = _js()
+    sched = js[js.index("function schedulePresence(") :]
+    sched = sched[: sched.index("\n  function ")]
+    assert "requestAnimationFrame(" in sched, "frame-aligned while visible"
+    assert "setTimeout(" in sched, (
+        "a hidden page never fires requestAnimationFrame; the title and "
+        "favicon would freeze at whatever they were when the user left"
+    )
+    # One shared tick, armed once and disarmed by whichever trigger gets
+    # there first -- so an event is one paint however both fire.
+    assert sched.count("const run =") == 1, "the two triggers must share one tick"
+    assert sched.count("presenceFrame = 0;") == 1, (
+        "the tick must disarm itself exactly once, so the second trigger is a no-op"
+    )
+    assert "run();" not in sched, "the tick must only be scheduled, never run inline"
+
+
+def test_presence_marks_are_aggregated_per_tab_not_per_session() -> None:
+    """A split puts several sessions on one tab entry.
+
+    Writing the shared ``tabEl`` from a per-session walk let whichever session
+    the Map reached last win: a live pane's glow was switched off by a quiet
+    sibling, and a sibling with no bells deleted the badge another one had
+    just created. Both end at "the tab says nothing" -- the one outcome this
+    whole feature exists to prevent. The marks are computed per tab entry.
+    """
+    js = _js()
+    paint = js[js.index("function paintPresence(") :]
+    paint = paint[: paint.index("\n  // The favicon carries")]
+    assert "const perTab = new Map();" in paint, (
+        "presence marks must be aggregated per tab entry before being painted"
+    )
+    assert "entry.glow = entry.glow || active;" in paint, (
+        "one live pane must light the tab even if a sibling is quiet"
+    )
+    assert "entry.bells += s.bellCount || 0;" in paint, (
+        "bells must be summed across a split, not overwritten by the last pane"
+    )
+    # The badge is driven from the aggregate, so a pane with no bells can no
+    # longer delete a sibling's.
+    badge_at = paint.index("let badge = tabEl.querySelector")
+    assert "entry.bells > 0" in paint[badge_at : badge_at + 500]
+
+
+def test_opening_a_tab_marks_every_pane_in_it_read() -> None:
+    """Everything on screen has been seen.
+
+    A split shows several panes at once. Clearing only the focused one left
+    its visible siblings reporting unread for output that is right in front
+    of the user.
+    """
+    js = _js()
+    at = js.index("function activateTab(")
+    block = js[at : at + 3200]
+    assert "for (const paneId of leafIds(group.root)) clearActivity(" in block, (
+        "activating a tab must clear the unread state of every pane it shows"
+    )
+    assert block.count("clearActivity(") == 1, (
+        "there must be exactly one call, over the whole group"
+    )
+
+
+def test_the_focus_fallback_never_picks_a_placeholder_pane() -> None:
+    """A leaf whose session is gone cannot take the keyboard.
+
+    ``activateTab`` needs a live session. Handing it a placeholder silently
+    did nothing and left ``activeId`` pointing at the pane that had just been
+    removed, after which every toolbar action quietly no-opped.
+    """
+    js = _js()
+    at = js.index("function detachTab(")
+    block = js[at : js.index("\n  function ", at + 10)]
+    assert "sessions.has(paneId)" in block, (
+        "the focus fallback must skip panes that have no session"
+    )
+    assert "const fallback = nextLive" in block
+    assert block.count("activateTab(") == 1, "exactly one focus handover"

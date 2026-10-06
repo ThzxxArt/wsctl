@@ -6,7 +6,9 @@ Kept out of the route modules so importing one router never drags in another
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -81,3 +83,53 @@ class UserUpdate(BaseModel):
     role: str | None = None
     disabled: bool | None = None
     password: str | None = Field(default=None, max_length=256)
+
+
+#: How big one configuration value may be. Untyped must not mean unbounded:
+#: a megabyte of ``value`` is a megabyte of config file, and the request body
+#: is the only place that can be stopped -- the same principle
+#: ``test_request_bodies_are_bounded_before_they_reach_the_work`` pins for
+#: passwords and upload bodies.
+CONFIG_VALUE_MAX_CHARS = 64 * 1024
+
+
+class ConfigSetItem(BaseModel):
+    """One configuration assignment from the admin panel.
+
+    ``value`` is deliberately untyped: the settings model decides what is
+    acceptable, and ``core.config_edit.check_value`` refuses the rest against
+    that model rather than against a second, drifting schema here. It is
+    bounded, though -- see :data:`CONFIG_VALUE_MAX_CHARS`.
+    """
+
+    key: str = Field(min_length=1, max_length=128)
+    value: Any
+
+    @model_validator(mode="after")
+    def _value_is_bounded(self) -> ConfigSetItem:
+        if _value_size(self.value) > CONFIG_VALUE_MAX_CHARS:
+            raise ValueError(
+                f"配置项 {self.key} 的值过大（上限 {CONFIG_VALUE_MAX_CHARS} 字符）"
+            )
+        return self
+
+
+def _value_size(value: Any) -> int:
+    """Rough size of a value, without serialising it first."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return 1
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, (list, tuple)):
+        return sum(_value_size(item) for item in value) + 2 * len(value)
+    if isinstance(value, dict):
+        return sum(_value_size(k) + _value_size(v) for k, v in value.items())
+    return len(repr(value))
+
+
+class ConfigSetRequest(BaseModel):
+    #: Bounded so one request cannot rewrite the file a hundred times over.
+    items: list[ConfigSetItem] = Field(min_length=1, max_length=64)
+    #: Apply what a reload can reach after publishing. Off means "write the
+    #: file only", which is what an operator editing ahead of a restart wants.
+    reload: bool = True

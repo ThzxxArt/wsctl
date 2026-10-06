@@ -603,8 +603,17 @@ async def _pump(
             if len(data_bytes) > MAX_INPUT_FRAME:
                 # Whole-or-nothing: a frame past the application bound never
                 # reaches the PTY write buffer (which would hold it in full).
+                #
+                # This is *not* ``wsctl_pty_input_dropped_total``. That series
+                # counts writes the PTY refused because the child stopped
+                # reading; this one counts frames the WebSocket layer refused
+                # before they got anywhere near the PTY. Both were counted
+                # under the same name, so ``/metrics`` printed two series with
+                # one name and two different meanings -- and the app.py comment
+                # that warns about exactly this double registration named the
+                # other three counters and missed this one.
                 if metrics is not None:
-                    metrics.inc("wsctl_pty_input_dropped_total")
+                    metrics.inc("wsctl_ws_oversized_input_frames_total")
                 reject_oversized()
                 continue
             if over_limit(len(data_bytes)):
@@ -646,8 +655,10 @@ async def _pump(
                 continue
             chunk = str(data.get("data", "")).encode("utf-8")
             if len(chunk) > MAX_INPUT_FRAME:
+                # Same distinction as the binary path above: a refused frame,
+                # not a refused PTY write.
                 if metrics is not None:
-                    metrics.inc("wsctl_pty_input_dropped_total")
+                    metrics.inc("wsctl_ws_oversized_input_frames_total")
                 reject_oversized()
                 continue
             if over_limit(len(chunk)):

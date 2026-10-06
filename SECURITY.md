@@ -69,6 +69,21 @@ session can run commands as the server's user. Treat it like SSH:
   input when read-only. They are persisted alongside the session (schema v4), so
   a link keeps working across a server restart — the same promise the session
   itself makes. A rename never invalidates a distributed link.
+- Inline image preview decides the media type from the file's **leading bytes**,
+  never from its name, and serves it with `nosniff`. Renaming a script to
+  `.png` therefore does not make it an image and does not make it executable.
+  SVG is deliberately not served inline: it is a document with a scripting
+  surface, and the panel previews it as text (which is what it is).
+  The CSP's `img-src` carries `blob:` for this (an object URL, so an 8 MB
+  picture is not base64-inflated into one string); a `blob:` URL can only name
+  bytes this origin already holds, which is why that is not a widening a
+  script could exploit.
+- Online configuration editing goes through the same writer as `wsctl config
+  set` (`core/config_edit`): the value is type-checked against the settings
+  model, the whole resulting file is validated, and a rejected edit is rolled
+  back rather than published. Only fields a reload can reach are writable; a
+  `restart`-tier field is refused with that reason instead of being accepted
+  and silently doing nothing. Every write is audited (`config_set`).
 
 ## Supported versions
 

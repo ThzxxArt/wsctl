@@ -222,6 +222,52 @@ async def test_t2_eight_sessions_flood_lose_no_viewers() -> None:
 
 
 @pytest.mark.slow
+async def test_t6_a_split_of_many_panes_loses_no_viewer_under_flood() -> None:
+    """A split keeps more sessions live than the client's background budget.
+
+    The browser keeps at most ``AUTO_CONNECT_MAX`` (8) sockets warm for tabs
+    nobody is looking at -- but every pane of a split is *on screen*, so all of
+    them hold a socket at once and the count is whatever the window is showing.
+    Flooding ten concurrent sessions at once is therefore the shape a ten-pane
+    workbench actually produces, and the promise is unchanged: nobody is shed,
+    nobody is evicted, and every stream completes.
+    """
+    from wsctl.core.session import evicted_clients_total, slow_consumer_drops
+
+    panes = 10
+    marker = _done_marker(761)  # 579121 -- outside `seq 1 50000`
+    factor = 761
+    manager = SessionManager()
+    drops_before = slow_consumer_drops()
+    evict_before = evicted_clients_total()
+    sessions = []
+    clients: list[FakeClient] = []
+    try:
+        for index in range(panes):
+            s = await manager.create(SessionSpec(name=f"t6-{index}", argv=[SHELL]))
+            sessions.append(s)
+            c = FakeClient()
+            await s.attach(c)
+            clients.append(c)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        cmd = f"seq 1 50000; echo $(({factor}*{factor}))\n".encode("ascii")
+        for s in sessions:
+            s.write_input(cmd)
+        ok = await wait_for(
+            lambda: all(marker in c.output() for c in clients), timeout=T2_BUDGET
+        )
+        elapsed = loop.time() - started
+        assert ok, "at least one pane never finished inside the budget"
+        assert elapsed <= T2_BUDGET, f"{panes} floods took {elapsed:.2f}s > {T2_BUDGET}s"
+        assert all(s.client_count == 1 for s in sessions), "a viewer was dropped"
+        assert slow_consumer_drops() == drops_before, "backpressure dropped a viewer"
+        assert evicted_clients_total() == evict_before, "memory pressure evicted a viewer"
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.slow
 async def test_t3_event_loop_stays_responsive_under_a_flood() -> None:
     """The loop must not be the thing that freezes.
 

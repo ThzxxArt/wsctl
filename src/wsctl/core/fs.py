@@ -13,7 +13,19 @@ DEFAULT_LIST_LIMIT = 2000
 
 
 class FsError(Exception):
-    """Raised for invalid paths or filesystem operations."""
+    """Raised for invalid paths or filesystem operations.
+
+    ``code`` is for the *caller* to branch on. Matching on the human message
+    works until someone improves the wording, at which point a 404 quietly
+    becomes a 400 -- which is exactly what the image route did before this.
+    """
+
+    #: Nothing of that name here.
+    NOT_FOUND = "not_found"
+
+    def __init__(self, message: str, *, code: str = "invalid") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _lexists(path: Path) -> bool:
@@ -133,6 +145,30 @@ def list_dir(
 PREVIEW_MAX_BYTES = 1024 * 1024
 #: Refuse to accept a whole-file edit larger than this.
 EDIT_MAX_BYTES = 1024 * 1024
+#: Refuse to serve an image larger than this for inline preview.
+IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
+#: What counts as an image, decided by the file's *first bytes*.
+#:
+#: The extension is not evidence: renaming ``evil.html`` to ``evil.png`` is one
+#: ``mv``, and a browser handed ``Content-Type: image/png`` by filename would
+#: still sniff the HTML and execute it. Only the magic number is evidence, and
+#: even then the response is served with ``nosniff`` so the declared type is
+#: the only type it can be.
+#:
+#: SVG is deliberately absent. It is a document with a scripting surface, not
+#: a bitmap, and the panel already previews it as text -- which is what it is.
+_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+#: Both need a look further in than the first bytes, so they are checked after.
+_RIFF_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"WEBP", "image/webp"),
+)
 
 
 def validate_name(name: str) -> str:
@@ -223,6 +259,58 @@ def read_text_file(root: Path, rel: str, *, limit: int = PREVIEW_MAX_BYTES) -> t
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", "replace"), "utf-8"
+
+
+def sniff_image_mime(data: bytes) -> str | None:
+    """Return the media type of ``data`` by its leading bytes, else ``None``.
+
+    Trusting the filename would let anything be served as an image; trusting
+    the first bytes is the only version of this check that a rename cannot
+    defeat. A file that matches nothing is not an image, whatever it is called.
+    """
+    if not data:
+        return None
+    for magic, mime in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return mime
+    if data[:4] == b"RIFF" and len(data) >= 12:
+        for magic, mime in _RIFF_IMAGE_MAGIC:
+            if data[8:12] == magic:
+                return mime
+    # ISO base media (``ftyp`` box at offset 4). ``avif``/``avis`` are the only
+    # brands this panel renders; anything else in the family is refused rather
+    # than guessed at.
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+    return None
+
+
+def read_image_file(
+    root: Path, rel: str, *, limit: int = IMAGE_MAX_BYTES
+) -> tuple[bytes, str]:
+    """Return ``(data, mime)`` for an inline image preview.
+
+    Refuses anything that is not a bitmap by content, anything oversized, and
+    anything that is not a regular file. The mime comes from the bytes and is
+    the only type the caller is allowed to declare.
+    """
+    target = safe_resolve(root, rel)
+    if target.is_symlink():
+        # Checked first and on the *lexical* path: following the link would
+        # serve whatever it points at, which may be outside the panel root.
+        raise FsError("拒绝读取符号链接")
+    if not target.is_file():
+        raise FsError("不是文件", code=FsError.NOT_FOUND)
+    size = target.stat().st_size
+    if size > limit:
+        raise FsError(f"图片过大，无法预览（上限 {limit // (1024 * 1024)} MB）")
+    raw = target.read_bytes()
+    mime = sniff_image_mime(raw)
+    if mime is None:
+        raise FsError("不是可预览的图片格式（支持 PNG/JPEG/GIF/WebP/BMP/AVIF）")
+    return raw, mime
 
 
 def write_text_file(root: Path, rel: str, content: str) -> int:

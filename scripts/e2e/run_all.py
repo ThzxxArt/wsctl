@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Backend end-to-end scenarios for wsctl.
 
-Runs ten scenarios, each against a freshly started server on its own port and
+Runs eleven scenarios, each against a freshly started server on its own port and
 data directory:
 
 1. server    — health, login, WebSocket attach/exec, reconnect replay, metrics,
                file panel (list/upload/download), traversal guard, auth guard
 1b. files    — the file panel surface: mkdir, upload (atomic), rename, preview,
                edit, paging, type filter, delete guards
-1c. selfrestart — restarting from inside your own session: `stop` is refused,
+1c. config_edit — online configuration editing through the shared writer
+1d. selfrestart — restarting from inside your own session: `stop` is refused,
                `stop` of nothing is idempotent, `restart --rolling` never drops
                a /healthz probe
 2. cli       — wsctl login / session new|list|kill
@@ -1049,9 +1050,85 @@ def scenario_selfrestart() -> None:
     print("  selfrestart/rolling-migrate: ok")
 
 
+def scenario_config_edit() -> None:
+    """Online configuration editing: write -> apply -> the running server agrees.
+
+    The panel and ``wsctl config set`` share one writer, so this also pins the
+    promise that makes that sharing worth doing: the author's inline comment
+    survives, a value the server cannot use is refused before it reaches disk,
+    a ``restart``-tier field is refused *with a reason* rather than accepted
+    and ignored, and the change actually reaches the running instance.
+    """
+    data = Path(tempfile.mkdtemp(prefix="wsctl-cfg-"))
+    config = data / "config.toml"
+    config.write_text('max_sessions = 5  # 峰值并发\n', encoding="utf-8")
+    try:
+        with server(
+            extra_env={"WSCTL_CONFIG": str(config), "WSCTL_DATA_DIR": str(data / "d")}
+        ) as (base, _, _):
+            token = login(base)
+            headers = {"Cookie": f"wsctl_session={token}"}
+            with httpx.Client(base_url=base, timeout=10, headers=headers) as http:
+                # A hot field is written, applied and keeps the comment.
+                ok = http.put(
+                    "/api/config", json={"items": [{"key": "max_sessions", "value": 9}]}
+                )
+                assert ok.status_code == 200, ok.text
+                assert "max_sessions" in ok.json()["written"]
+                text = config.read_text(encoding="utf-8")
+                assert "max_sessions = 9  # 峰值并发" in text, text
+                assert "max_sessions = 5" not in text
+
+                # ...and the running server really moved.
+                assert (
+                    http.post("/api/config/reload").status_code == 200
+                )
+                live = {f["key"]: f["raw"] for f in http.get("/api/config").json()["fields"]}
+                assert live["max_sessions"] == 9, live["max_sessions"]
+
+                # A restart-tier field is refused, with the reason, and the
+                # file is untouched.
+                before = config.read_text(encoding="utf-8")
+                refused = http.put(
+                    "/api/config", json={"items": [{"key": "port", "value": 9999}]}
+                )
+                assert refused.status_code == 409, refused.text
+                assert "重启" in refused.json()["detail"]
+                assert config.read_text(encoding="utf-8") == before
+
+                # A value the model will not accept is refused and rolled back.
+                bad = http.put(
+                    "/api/config", json={"items": [{"key": "max_sessions", "value": "many"}]}
+                )
+                assert bad.status_code == 400, bad.text
+                assert config.read_text(encoding="utf-8") == before
+
+                # The CLI's `config set` writes through the *same* writer, so
+                # the comment must survive that path too.
+                cli = subprocess.run(
+                    [PY, "-m", "wsctl", "config", "set", "max_sessions", "7"],
+                    cwd=str(ROOT),
+                    env={
+                        **os.environ,
+                        "WSCTL_CONFIG": str(config),
+                        "WSCTL_DATA_DIR": str(data / "d"),
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                assert cli.returncode == 0, cli.stdout + cli.stderr
+                text = config.read_text(encoding="utf-8")
+                assert "max_sessions = 7  # 峰值并发" in text, text
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+    print("  config_edit: ok")
+
+
 SCENARIOS = {
     "server": scenario_server,
     "files": scenario_files,
+    "config_edit": scenario_config_edit,
     "selfrestart": scenario_selfrestart,
     "cli": scenario_cli,
     "connect": scenario_connect,

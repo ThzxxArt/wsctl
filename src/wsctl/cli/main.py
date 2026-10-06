@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import contextlib
-import difflib
 import json
 import os
-import re
 import secrets
 import shutil
 import socket
@@ -61,6 +59,7 @@ backup_mod = _LazyModule("wsctl.core.backup")
 totp = _LazyModule("wsctl.core.totp")
 user_admin = _LazyModule("wsctl.core.user_admin")
 config_mod = _LazyModule("wsctl.core.config")
+config_edit_mod = _LazyModule("wsctl.core.config_edit")
 logging_mod = _LazyModule("wsctl.core.logging")
 store_mod = _LazyModule("wsctl.core.store")
 client_mod = _LazyModule("wsctl.cli.client")
@@ -1717,10 +1716,10 @@ def config_get(
 ) -> None:
     """打印某个配置项的生效值（默认裸值便于 $( ) 捕获）。"""
     settings = _settings_from(config)
-    if key not in config_mod.Settings.model_fields:
-        suggestion = difflib.get_close_matches(key, set(config_mod.Settings.model_fields), n=1)
-        hint = f"，是否想用 “{suggestion[0]}”？" if suggestion else ""
-        _fail(f"未知的配置项：{key}{hint}")
+    try:
+        config_edit_mod.check_key(key)
+    except config_edit_mod.ConfigEditError as exc:
+        _fail(str(exc))
     value = getattr(settings, key)
     if json_output:
         _print_json({"key": key, "value": value})
@@ -1828,27 +1827,6 @@ def config_edit(config: Annotated[Path | None, typer.Option("--config", "-c")] =
         _fail(f"无法启动编辑器 '{editor}'：{exc}")
 
 
-def _split_trailing_comment(text: str) -> tuple[str, str | None]:
-    """Split ``value  # comment`` into ``(value, comment)``, quote-aware."""
-    in_single = in_double = False
-    for index, ch in enumerate(text):
-        if ch == "'" and not in_double:
-            in_single = not in_single
-        elif ch == '"' and not in_single:
-            in_double = not in_double
-        elif (
-            ch == "#"
-            and not in_single
-            and not in_double
-            and (index == 0 or text[index - 1] in " \t")
-        ):
-            return text[:index].rstrip(), text[index:].strip()
-    return text.rstrip(), None
-
-
-_KEY_LINE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=")
-
-
 @config_app.command("set")
 def config_set(
     key: Annotated[str, typer.Argument(help="配置项名称。")],
@@ -1857,55 +1835,18 @@ def config_set(
     ],
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """在配置文件中设置一个值（保留原有行内注释）。"""
+    """在配置文件中设置一个值（保留原有行内注释）。
+
+    与 Web 管理台的在线写入共用 ``core/config_edit``：同一套「单项校验 →
+    保留行内注释 → 整文件校验 → 失败回滚 → 原子落盘」，两条入口不会分叉。
+    """
     settings = _settings_from(config)
-    known = set(config_mod.Settings.model_fields)
-    if key not in known:
-        suggestion = difflib.get_close_matches(key, known, n=1)
-        hint = f"，是否想用 “{suggestion[0]}”？" if suggestion else ""
-        _fail(f"未知的配置项：{key}{hint}")
     try:
-        parsed = tomllib.loads(f"__value__ = {value}")["__value__"]
-    except tomllib.TOMLDecodeError:
-        _fail('值必须是合法 TOML，例如 8080、"文本"、true、["a", "b"]')
-
-    # Type-check the single value against the settings model before touching the
-    # file, so `port = "abc"` is rejected here rather than at the next start.
-    try:
-        config_mod.Settings(**{key: parsed})
-    except Exception as exc:
-        _fail(f"配置项 {key} 的值无效：{exc}")
-
-    path = settings.config_path
-    original = path.read_text(encoding="utf-8") if path.is_file() else None
-    lines = original.splitlines() if original is not None else []
-    replaced = False
-    for index, line in enumerate(lines):
-        match = _KEY_LINE.match(line)
-        if match is None or match.group(2) != key:
-            continue
-        # Keep the author's trailing comment: editing one key must not strip
-        # the explanation they wrote next to it.
-        _, comment = _split_trailing_comment(line[match.end():])
-        suffix = f"  {comment}" if comment else ""
-        lines[index] = f"{key} = {value}{suffix}"
-        replaced = True
-        break
-    if not replaced:
-        lines.append(f"{key} = {value}")
-    new_text = "\n".join(lines).rstrip("\n") + "\n"
-
-    # Validate the whole file (duplicate keys, conflicting values) and roll back
-    # on failure so a bad edit never leaves the server unable to start.
-    try:
-        data = tomllib.loads(new_text)
-        config_mod.Settings(**data)
-    except Exception as exc:
-        _fail(f"写入后配置无效，已放弃修改：{exc}")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_text, encoding="utf-8")
-    console.print(f"[green]已设置[/] {key} = {value}  [dim]（{path}）[/]")
+        parsed = config_edit_mod.parse_toml_value(value)
+        config_edit_mod.set_key(settings.config_path, key, parsed)
+    except config_edit_mod.ConfigEditError as exc:
+        _fail(str(exc))
+    console.print(f"[green]已设置[/] {key} = {value}  [dim]（{settings.config_path}）[/]")
 
 
 @config_app.command("reload")

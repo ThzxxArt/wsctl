@@ -93,6 +93,12 @@
     <button data-taction="font-">字号 −<span class="kbd">Alt+D</span></button>
     <button data-taction="zmodem">切换 ZMODEM 传输</button>
     <hr class="menu-sep" />
+    <button data-taction="split-r">向右分屏（新建）<span class="kbd">Alt+\</span></button>
+    <button data-taction="split-d">向下分屏（新建）<span class="kbd">Alt+Shift+\</span></button>
+    <button data-taction="split-pick-r">与已有会话向右分屏…</button>
+    <button data-taction="split-pick-d">与已有会话向下分屏…</button>
+    <button data-taction="close-pane">关闭本分屏（保持会话）</button>
+    <hr class="menu-sep" />
     <button data-taction="detach">断开（保持会话）<span class="kbd">Alt+W</span></button>
     <button data-taction="kill" class="danger">终止会话<span class="kbd">Alt+Shift+W</span></button>
   </div>
@@ -151,6 +157,11 @@
       </div>
       <p id="preview-note" class="hint"></p>
       <textarea id="preview-body" rows="18" spellcheck="false"></textarea>
+      <!-- Bitmaps go here instead of the textarea. Typed by the server from
+           the file's leading bytes, never from its name. -->
+      <div id="preview-image" class="preview-image hidden">
+        <img id="preview-img" alt="图片预览" />
+      </div>
       <div class="modal-actions">
         <button type="button" id="preview-cancel">取消</button>
         <button type="button" id="preview-download">下载</button>
@@ -286,10 +297,9 @@
             </select>
           </label>
           <label>字号
-            <select id="set-fontsize">
-              <option value="12">12</option><option value="13">13</option>
-              <option value="14">14</option><option value="16">16</option><option value="18">18</option>
-            </select>
+            <!-- Options are generated from FONT_MIN..FONT_MAX in app.js so the
+                 picker, the Alt+E/D hotkey and the README cannot drift apart. -->
+            <select id="set-fontsize"></select>
           </label>
           <label class="span2">字体
             <select id="set-font">
@@ -338,6 +348,16 @@
       </div>
 
       <div class="field-group">
+        <h3>后台动静提醒</h3>
+        <p class="hint">会话在后台有输出、响铃或退出时如何提醒你。系统通知需要浏览器授权，未授权时自动降级为标签角标与标题提示。</p>
+        <div class="field-row checks">
+          <label class="check"><input type="checkbox" id="set-notify-sound" /> 响铃提示音</label>
+          <label class="check"><input type="checkbox" id="set-notify-title" /> 标题与图标角标</label>
+          <label class="check"><input type="checkbox" id="set-notify-system" /> 系统通知</label>
+        </div>
+      </div>
+
+      <div class="field-group">
         <h3>快捷键</h3>
         <div id="hotkey-list" class="hotkey-list grid"></div>
         <div class="modal-actions">
@@ -369,6 +389,18 @@
         <button type="submit" class="primary">确定</button>
       </div>
     </form>
+  </div>
+
+  <div id="pick-overlay" class="overlay hidden">
+    <div class="modal-card sm">
+      <div class="modal-head"><h2 id="pick-title">选择</h2><button id="pick-close" class="icon-btn" aria-label="关闭"><svg class="ico"><use href="#i-close"/></svg></button></div>
+      <p id="pick-note" class="hint"></p>
+      <select id="pick-select" aria-labelledby="pick-title"></select>
+      <div class="modal-actions">
+        <button id="pick-cancel" type="button" class="ghost">取消</button>
+        <button id="pick-ok" type="button" class="primary">确定</button>
+      </div>
+    </div>
   </div>
 
   <div id="confirm-overlay" class="overlay hidden">

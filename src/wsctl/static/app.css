@@ -170,6 +170,13 @@ body { display: flex; flex-direction: column; }
   color: var(--muted); padding: 0 2px; border-radius: 4px; line-height: 1;
 }
 .tab .close:hover { color: var(--danger); background: var(--bg-4); }
+/* How many panes this tab is showing. A split is still one tab entry, so the
+   count is the only way to see that the label names just one of them. */
+.tab .pane-count {
+  color: var(--muted); font-size: 10px;
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px;
+  flex: none;
+}
 .readonly-badge {
   color: var(--warn); border: 1px solid var(--warn);
   border-radius: 4px; padding: 1px 5px; font-size: 10px;
@@ -183,6 +190,29 @@ body { display: flex; flex-direction: column; }
   border: 1px solid var(--warn);
   border-radius: 4px;
   padding: 1px 5px;
+}
+/* Something happened in this tab while you were elsewhere: output, a bell or
+   a title change. The glow fades on its own so a chatty session does not keep
+   it lit for ever. */
+.tab.activity .dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(79, 156, 249, 0.55);
+  animation: tab-pulse 1.6s ease-out infinite;
+}
+@keyframes tab-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(79, 156, 249, 0.55); }
+  70% { box-shadow: 0 0 0 7px rgba(79, 156, 249, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(79, 156, 249, 0); }
+}
+/* A BEL the user has not answered. Distinct from ordinary activity: the
+   program is explicitly asking for attention. */
+.tab .bell-badge {
+  color: #fff; background: var(--danger);
+  border-radius: 999px; padding: 0 5px; font-size: 10px; line-height: 15px;
+  flex: none; min-width: 15px; text-align: center;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab.activity .dot { animation: none; box-shadow: 0 0 0 2px rgba(79, 156, 249, 0.5); }
 }
 
 .icon-btn, .text-btn {
@@ -219,6 +249,57 @@ body { display: flex; flex-direction: column; }
   min-height: 0;
   background: var(--bg);
 }
+/* A tab owns a host box, and a host owns a layout tree of panes. Keeping the
+   host (rather than each pane) as the absolutely-positioned box is what lets
+   several panes share the screen: they lay out inside the host instead of all
+   claiming ``inset: 0`` of the same parent.
+
+   Hidden hosts keep their layout box for the same reason hidden panes do --
+   see ``.term-pane.mounted`` below. */
+.tab-host {
+  position: absolute;
+  inset: 0;
+  display: none;
+}
+.tab-host.mounted {
+  display: flex;
+  visibility: hidden;
+  pointer-events: none;
+}
+.tab-host.mounted.active {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* Layout tree. ``row`` is a side-by-side split, ``col`` stacks. */
+.split {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.split.row { flex-direction: row; }
+.split.col { flex-direction: column; }
+
+.pane-slot {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+}
+
+/* The divider between two panes. Dragging it resizes both; double-click
+   returns them to an even split. */
+.split-bar {
+  flex: 0 0 5px;
+  background: var(--border);
+  cursor: col-resize;
+  transition: background var(--dur) var(--ease);
+}
+.split.col > .split-bar { cursor: row-resize; }
+.split-bar:hover, .split-bar.dragging { background: var(--accent); }
+
 .term-pane {
   position: absolute; inset: 0;
   padding: 10px 12px;
@@ -232,21 +313,44 @@ body { display: flex; flex-direction: column; }
    descendants too, which sends the measurement straight back to zero.
 
    Only mounted panes pay that cost, so it is bounded by AUTO_CONNECT_MAX (8)
-   rather than by how many tabs exist. */
+   rather than by how many tabs exist. A split shows several at once, so
+   visibility is decided by ``.shown`` (which panes are in the visible tab's
+   layout) rather than by ``.active`` (which one has the keyboard). */
 .term-pane.mounted {
   display: block;
   visibility: hidden;
   pointer-events: none;
 }
-.term-pane.mounted.active {
+.term-pane.mounted.shown {
   visibility: visible;
   pointer-events: auto;
+}
+/* Keyboard focus, not visibility. Exactly one pane has it, and tests point a
+   click at ``.term-pane.active`` -- so this must stay exclusive even when a
+   split puts several panes on screen. */
+.term-pane.focused .xterm {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
 }
 .term-pane .xterm {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 6px;
   background: var(--bg);
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+}
+/* A pane's own problems, marked on the pane rather than only on the tab: in a
+   split you need to see *which* half is incomplete, not just that the tab is. */
+.term-pane.desync .xterm { border-color: var(--warn); }
+.term-pane.desync::after {
+  content: "失步";
+  position: absolute; top: 14px; right: 16px; z-index: 2;
+  color: var(--warn); font-size: 10px;
+  border: 1px solid var(--warn); border-radius: 4px; padding: 1px 5px;
+  background: var(--bg-2);
+  pointer-events: none;
 }
 
 /* 登录品牌 */
@@ -399,9 +503,19 @@ body { display: flex; flex-direction: column; }
   gap: var(--sp-2) var(--sp-3);
 }
 .field-row label.span2, .form-grid label.span2 { grid-column: 1 / -1; }
+/* A row of checkboxes (notification switches): the label is the control, so
+   the whole line is one tap target rather than a 12px box to aim at. */
+.field-row.checks { grid-template-columns: repeat(3, 1fr); }
+.field-row.checks .check {
+  display: inline-flex; align-items: center; gap: 8px;
+  cursor: pointer; font-size: 13px; color: var(--fg);
+  min-height: 32px;
+}
+.field-row.checks .check input { width: 16px; height: 16px; accent-color: var(--accent); }
 @media (max-width: 620px) {
   .field-row, .form-grid { grid-template-columns: 1fr; }
   .field-row label.span2, .form-grid label.span2 { grid-column: auto; }
+  .field-row.checks { grid-template-columns: 1fr; }
 }
 
 /* Button hierarchy. ``primary`` is the one action the dialog is for,
@@ -698,7 +812,20 @@ td.empty { display: table-cell; min-height: 0; }
   font-family: var(--font-mono);
 }
 .config-table th { color: var(--muted); font-weight: 600; font-size: 11px; font-family: var(--font-sans); }
-.config-table td.val { word-break: break-all; }
+.config-table td.val { word-break: break-all; min-width: 220px; }
+.config-table td.val.readonly { color: var(--muted); }
+/* The editor is one control wide and never taller than a row, so a 50-row
+   table stays scannable. The save button appears only when the value differs
+   from what is in force. */
+.config-control { display: block; }
+.config-control .config-input {
+  width: 100%; padding: 4px 7px; font-size: 12px;
+  font-family: var(--font-mono);
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border-input); border-radius: var(--radius-sm);
+}
+.config-control input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+.config-table td:last-child { width: 1%; white-space: nowrap; }
 .kind-badge {
   border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px;
   font-size: 10px; color: var(--muted); font-family: var(--font-sans);
@@ -785,6 +912,44 @@ body.shared .tab .close { display: none; }
   background: var(--bg); color: var(--fg);
   border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-2);
 }
+/* An image preview is read-only and must fit the dialog without being scaled
+   past recognition: contain, never cover. A checkerboard behind it so a
+   transparent PNG is legible on either page theme. */
+.preview-image {
+  min-height: 45vh; max-height: 62vh; overflow: auto;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); border-radius: var(--radius); padding: var(--sp-2);
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(45deg, var(--bg-3) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--bg-3) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--bg-3) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--bg-3) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+.preview-image img {
+  max-width: 100%; max-height: 58vh;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  image-rendering: auto;
+}
+
+/* A pane whose session is gone. The *shape* of the workbench is the user's,
+   so the slot stays and says what happened instead of quietly collapsing the
+   split beside it. */
+.term-pane.ghost {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.term-pane.mounted.ghost.shown { visibility: visible; pointer-events: auto; }
+.ghost-note {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  color: var(--muted); font-size: 12px; text-align: center;
+  padding: var(--sp-3);
+}
+.ghost-note b { color: var(--fg); font-size: 13px; font-weight: 600; }
 .file-list li.dir-over { background: var(--accent-soft); outline: 2px dashed var(--accent); }
 
 /* 搜索选项开关 */
