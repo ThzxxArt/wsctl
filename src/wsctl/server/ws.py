@@ -172,6 +172,14 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         if result is None:
             return
         session, writable, share = result
+        # Shedding is how a slow viewer is kept alive, but the frames it lost
+        # are gone from *its* screen. A full-screen application redraws only
+        # what it believes changed, so the regions it last painted are the ones
+        # nobody paints again -- a sidebar, a status bar, an input box simply
+        # stop existing. That repair is the application's own repaint, and
+        # waiting for a human to click 重新同步 is why a gap could become
+        # permanent. Ask for it the moment the loss is known.
+        client.on_shed = session.request_repaint
         audit.enqueue(
             "session_attach",
             user_id=user_id,

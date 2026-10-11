@@ -303,6 +303,16 @@ body { display: flex; flex-direction: column; }
 .term-pane {
   position: absolute; inset: 0;
   padding: 10px 12px;
+  /* Load-bearing, not a style choice. xterm's fit addon sizes the grid from
+     ``getComputedStyle(parent).width`` minus only the *terminal element's*
+     padding -- it knows nothing about the parent's own padding or about
+     borders anywhere on the chain. With the global ``border-box`` that width
+     already contained this pane's 24px of padding, so every terminal was
+     measured three columns and a row too large, drew past its own box and had
+     the overflow clipped: the 渲染残缺 this used to show. ``content-box``
+     makes the measured width exactly the box ``.xterm`` fills, and the border
+     below costs no layout (see ``.xterm``). */
+  box-sizing: content-box;
   display: none;
 }
 /* Three states, not two. ``display: none`` collapses the box to 0x0, so xterm
@@ -329,11 +339,14 @@ body { display: flex; flex-direction: column; }
    click at ``.term-pane.active`` -- so this must stay exclusive even when a
    split puts several panes on screen. */
 .term-pane.focused .xterm {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 0 2px var(--accent-soft);
 }
 .term-pane .xterm {
-  border: 1px solid var(--border);
+  /* No ``border``: a border is layout, and the fit addon does not subtract it
+     -- one column of every line was then drawn past the right edge and
+     clipped. The ring is painted by a shadow, which costs no layout at all. */
+  border: 0;
+  box-shadow: 0 0 0 1px var(--border);
   border-radius: var(--radius);
   padding: 6px;
   background: var(--bg);
@@ -343,7 +356,7 @@ body { display: flex; flex-direction: column; }
 }
 /* A pane's own problems, marked on the pane rather than only on the tab: in a
    split you need to see *which* half is incomplete, not just that the tab is. */
-.term-pane.desync .xterm { border-color: var(--warn); }
+.term-pane.desync .xterm { box-shadow: 0 0 0 1px var(--warn); }
 .term-pane.desync::after {
   content: "失步";
   position: absolute; top: 14px; right: 16px; z-index: 2;

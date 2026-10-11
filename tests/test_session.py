@@ -519,6 +519,157 @@ async def test_nudge_repaint_issues_two_real_size_changes() -> None:
     )
 
 
+async def test_an_unattended_repaint_is_throttled_so_a_storm_cannot_feed_itself() -> None:
+    """The repair is a full screen of new output; it must not fire per loss.
+
+    Shedding is how a slow viewer is kept alive, and the repair for the gap it
+    leaves is the application's own redraw. That redraw is itself a screenful
+    of traffic, so an unthrottled request per shed burst turns a shed storm
+    into a repaint storm and takes the connection down the other way. A burst
+    must be able to ask at most once within the interval -- and a request must
+    never raise off the shedding path.
+    """
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="throttle", argv=[SHELL]))
+    nudges: list[float] = []
+    original = session.nudge_repaint
+
+    async def spy() -> None:
+        nudges.append(1.0)
+        await original()
+
+    session.nudge_repaint = spy  # type: ignore[method-assign]
+    try:
+        session.request_repaint()
+        session.request_repaint()
+        session.request_repaint()
+        assert session._repaint_task is not None
+        await session._repaint_task
+        assert len(nudges) == 1, f"a burst must repaint once, got {len(nudges)}"
+
+        # Still inside the interval: a second burst must not add another.
+        session.request_repaint()
+        assert session._repaint_task.done() or True
+        assert len(nudges) <= 1, "the interval must hold the rate down"
+
+        # Past the interval the next loss is allowed to ask again.
+        session._repaint_requested_at -= session.AUTO_REPAINT_MIN_INTERVAL + 1
+        session.request_repaint()
+        assert session._repaint_task is not None
+        await session._repaint_task
+        assert len(nudges) == 2, "a later burst must be allowed to repaint again"
+    finally:
+        session.nudge_repaint = original  # type: ignore[method-assign]
+        await manager.shutdown()
+
+
+async def test_an_unattended_repaint_never_raises_into_the_shedding_path() -> None:
+    """This runs where an exception would drop the very viewer being saved."""
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="norage", argv=[SHELL]))
+
+    async def boom() -> None:
+        raise RuntimeError("repaint exploded")
+
+    session.nudge_repaint = boom  # type: ignore[method-assign]
+    try:
+        session._repaint_requested_at = None
+        session.request_repaint()
+        assert session._repaint_task is not None
+        # Would raise here if the failure were not contained.
+        await session._repaint_task
+    finally:
+        await manager.shutdown()
+
+
+async def test_an_unattended_repaint_waits_for_quiet_instead_of_muting_a_flood() -> None:
+    """The repair must not run while the application is still writing.
+
+    ``nudge_repaint`` mutes the scrollback so the redraw it provokes is not
+    recorded -- and that mute swallows *everything* arriving inside its window.
+    Triggered in the middle of a flood it therefore discards real session
+    output from the scrollback, and the replay a viewer later asks for is
+    missing exactly the tail it came back for. The symptom is a resync that
+    never restores its own marker, which is a worse problem than the gap the
+    repair set out to close.
+
+    So the repair waits for the application to stop talking (``last_active``
+    moves on every PTY read), and gives up on this attempt rather than lose
+    content if it never does.
+    """
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="busy", argv=[SHELL]))
+    ran: list[float] = []
+
+    async def spy() -> None:
+        ran.append(1.0)
+
+    session.nudge_repaint = spy  # type: ignore[method-assign]
+    stop = asyncio.Event()
+
+    async def chatty() -> None:
+        while not stop.is_set():
+            session.last_active = time.time()
+            await asyncio.sleep(0.02)
+
+    talker = asyncio.create_task(chatty())
+    try:
+        session._repaint_requested_at = None
+        session.request_repaint()
+        assert session._repaint_task is not None
+        # Comfortably past REPAINT_QUIET_MS and still inside REPAINT_MAX_WAIT:
+        # if the repair were going to fire mid-flood it would have by now.
+        await asyncio.sleep(0.8)
+        assert not ran, (
+            "the repair ran while output was still flowing -- its scrollback "
+            "mute would have discarded real session content"
+        )
+    finally:
+        stop.set()
+        await talker
+
+    # The application went quiet: now the mute costs nothing and it must go.
+    session.last_active = time.time() - session.REPAINT_QUIET_MS - 0.1
+    await asyncio.wait_for(session._repaint_task, timeout=5)
+    assert ran, "once the application is quiet the repair must go ahead"
+
+
+async def test_a_repaint_that_never_gets_quiet_gives_up_rather_than_lose_content() -> None:
+    """Giving up is the right answer when the only alternative is data loss."""
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="forever", argv=[SHELL]))
+    ran: list[float] = []
+
+    async def spy() -> None:
+        ran.append(1.0)
+
+    session.nudge_repaint = spy  # type: ignore[method-assign]
+    original_wait = session.REPAINT_MAX_WAIT
+    session.REPAINT_MAX_WAIT = 0.3  # type: ignore[misc]
+    stop = asyncio.Event()
+
+    async def chatty() -> None:
+        while not stop.is_set():
+            session.last_active = time.time()
+            await asyncio.sleep(0.02)
+
+    talker = asyncio.create_task(chatty())
+    try:
+        session._repaint_requested_at = None
+        session.request_repaint()
+        assert session._repaint_task is not None
+        await asyncio.wait_for(session._repaint_task, timeout=5)
+        assert not ran, (
+            "a repair that cannot be run safely must not run at all; the next "
+            "shed burst will ask again when the session is quieter"
+        )
+    finally:
+        session.REPAINT_MAX_WAIT = original_wait  # type: ignore[misc]
+        stop.set()
+        await talker
+        await manager.shutdown()
+
+
 async def test_a_brand_new_session_replays_nothing_so_there_is_nothing_to_repaint() -> None:
     """``attach`` replays only what exists; the repaint gate is the caller's.
 

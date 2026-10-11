@@ -193,6 +193,51 @@ def test_shed_oldest_gives_up_backlog_before_a_viewer(tmp_path) -> None:
     assert client.closed is False, "shedding backlog must never close the link"
 
 
+def test_shedding_asks_for_the_repair_not_just_the_report() -> None:
+    """Losing frames must schedule the *repair*, not only announce the loss.
+
+    A `desync` bar is a report. Left at that, a full-screen application keeps
+    a gapped screen until a human clicks 重新同步 -- and because such an
+    application redraws only what it believes changed, the regions it last
+    painted (a sidebar, a status bar, an input box) are exactly the ones never
+    painted again. That is the 渲染残缺 this hook exists to remove: the
+    repair is the app's own repaint, and it must not wait for a person.
+    """
+    asked: list[int] = []
+    client = WsClient(_StubWs(), max_bytes=10, on_shed=lambda: asked.append(1))  # type: ignore[arg-type]
+    client.put(b"12345")
+    client.put(b"6789")
+    assert client.pending_bytes == 9
+    client.put(b"xx")
+    assert client.dropped_bytes > 0, "precondition: the overflow must be shed"
+    assert asked, "shedding must request the repaint, not only report the loss"
+    assert any(m.get("type") == "desync" for m in client.queued_controls()), (
+        "the honest report must still be sent -- the repair is in addition to it"
+    )
+
+
+def test_one_shed_burst_asks_once_because_the_repair_is_a_full_redraw() -> None:
+    """A shed storm must not become a repaint storm.
+
+    The repair is a whole screen's worth of *new* output. One repaint per
+    dropped frame would feed the very backlog that caused the shedding, so the
+    request is burst-coalesced the same way the notice is: once while the
+    burst is open, and again after the queues have drained and a new burst
+    begins.
+    """
+    asked: list[int] = []
+    client = WsClient(_StubWs(), max_bytes=10, on_shed=lambda: asked.append(1))  # type: ignore[arg-type]
+    for i in range(40):
+        client.put(f"{i:04d}".encode())
+    assert client.dropped_bytes > 0
+    assert len(asked) == 1, f"one burst, one request -- got {len(asked)}"
+
+    # The queues draining closes the burst; the next loss opens a new one.
+    client._shed_notice_open = False
+    client.put(b"yyyyyyyyyyyy")
+    assert len(asked) == 2, "a new burst must be allowed to ask again"
+
+
 def test_credentials_are_created_private(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

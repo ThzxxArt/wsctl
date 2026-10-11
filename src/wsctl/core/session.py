@@ -203,6 +203,12 @@ class TermSession:
         #: the line the replay just drew, which is how a reconnect could end
         #: with "the bytes were written and the screen is blank".
         self._mute_scrollback = False
+        #: When an *unattended* repaint was last scheduled (see
+        #: :meth:`request_repaint`). Shedding is bursty and a burst must not
+        #: become one repaint per frame -- the repaint is a full-screen redraw
+        #: and would feed the very backlog being shed.
+        self._repaint_requested_at: float | None = None
+        self._repaint_task: asyncio.Task[None] | None = None
         self._on_close = on_close
         self._loop = loop
         self._scrollback = Scrollback(spec.scrollback_bytes)
@@ -356,6 +362,81 @@ class TermSession:
             await asyncio.sleep(0.05)
         finally:
             self._mute_scrollback = False
+
+    #: A shed burst asks for at most one repaint this often. The repaint is a
+    #: full-screen redraw, so an unthrottled one per shed burst would *add* to
+    #: the backlog that caused the shedding.
+    AUTO_REPAINT_MIN_INTERVAL = 2.0
+    #: How long output must have paused before the repair is safe to run.
+    #: :meth:`nudge_repaint` mutes the scrollback so the redraw it provokes is
+    #: not recorded -- and that mute swallows *everything* arriving in its
+    #: window. Mid-flood that discards real session content from the
+    #: scrollback, so a later replay is missing exactly the tail the viewer
+    #: came back for. Waiting for quiet makes the mute cost nothing.
+    REPAINT_QUIET_MS = 0.25
+    #: Give up rather than mute a session that never stops writing. The next
+    #: shed burst asks again; a repair that loses content is worse than a
+    #: delayed one.
+    REPAINT_MAX_WAIT = 3.0
+
+    def request_repaint(self) -> None:
+        """Schedule an unattended :meth:`nudge_repaint`, rate-limited.
+
+        Shedding frames is how a slow viewer is kept alive, and until now the
+        frames it lost were lost for good: the viewer was only *told* its
+        screen was incomplete and left to click 重新同步. For a line-oriented
+        shell that is merely annoying. For a full-screen application it is
+        terminal -- it draws by cursor-addressed overwrites on top of a base
+        the stream no longer carries, so the very regions it last drew (a
+        sidebar, a status bar, an input box) are the ones nobody ever paints
+        again. That is the 渲染残缺 this exists to remove: the repair is the
+        application's own repaint, and it must not wait for a human.
+
+        Rate-limited because the repair is a full screen's worth of new
+        output. Firing it per shed frame turns a shed storm into a repaint
+        storm; once per burst is what :class:`~wsctl.server.client.WsClient`
+        already gives us, and this interval bounds successive bursts.
+
+        Never raises: this runs off the shedding path, where an exception
+        would take the connection down with the very thing meant to save it.
+        """
+        now = time.monotonic()
+        if (
+            self._repaint_requested_at is not None
+            and now - self._repaint_requested_at < self.AUTO_REPAINT_MIN_INTERVAL
+        ):
+            return
+        if self._repaint_task is not None and not self._repaint_task.done():
+            return
+        self._repaint_requested_at = now
+        try:
+            self._repaint_task = self._loop.create_task(self._auto_repaint())
+        except Exception:  # pragma: no cover - loop shutting down
+            self._repaint_task = None
+
+    async def _auto_repaint(self) -> None:
+        try:
+            if not await self._wait_for_quiet():
+                return
+            await self.nudge_repaint()
+        except Exception:
+            log.debug("auto repaint failed for session %s", self.id, exc_info=True)
+
+    async def _wait_for_quiet(self) -> bool:
+        """Hold until output has paused, or give up on this attempt.
+
+        The mute inside :meth:`nudge_repaint` is only free when nothing is
+        being written. ``last_active`` moves on every PTY read, so it is
+        exactly "is the application speaking right now".
+        """
+        deadline = time.monotonic() + self.REPAINT_MAX_WAIT
+        while time.monotonic() < deadline:
+            if self.closed:
+                return False
+            if time.time() - self.last_active >= self.REPAINT_QUIET_MS:
+                return True
+            await asyncio.sleep(self.REPAINT_QUIET_MS / 2)
+        return False
 
     def _enforce_memory_limit(self) -> None:
         """Drop the greediest client once the session is over its memory cap.

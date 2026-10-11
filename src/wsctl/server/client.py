@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import WebSocket
@@ -64,8 +65,17 @@ class WsClient:
         *,
         max_pending: int = MAX_PENDING,
         max_bytes: int = 0,
+        on_shed: Callable[[], None] | None = None,
     ) -> None:
         self._ws = websocket
+        #: Called once per shedding burst, right after the viewer is told its
+        #: screen is incomplete. The notice is not the repair: a full-screen
+        #: application draws on top of a base the dropped frames no longer
+        #: carry, so without a repaint the regions it last drew are never
+        #: painted again. Whoever wires this is expected to ask the session to
+        #: redraw (``TermSession.request_repaint``) rather than wait for a
+        #: human to click 重新同步.
+        self.on_shed = on_shed
         #: ``(seq, payload, ends_inside_escape)`` -- the flag is the streaming
         #: ANSI state *after* that frame. A drop may only land where the state
         #: is outside a sequence, otherwise the surviving stream resumes
@@ -212,6 +222,15 @@ class WsClient:
                     "msg": "输出过快，部分内容已省略（连接未断）",
                 }
             )
+        # The notice above is only the *report*. Left there, the viewer's
+        # screen stays gapped until a human clicks 重新同步 -- and for a
+        # full-screen application "stays gapped" means the regions it last
+        # drew (sidebars, status bars, input boxes) are never painted again,
+        # because it redraws only what it thinks changed. Ask for the repair
+        # now, on the same once-per-burst cadence as the notice.
+        if self.on_shed is not None:
+            with contextlib.suppress(Exception):
+                self.on_shed()
 
     # -- queueing --------------------------------------------------------
 

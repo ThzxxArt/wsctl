@@ -2041,6 +2041,89 @@ def test_browser_cjk_columns_stay_aligned(tmp_path: Path) -> None:
         shutil.rmtree(data, ignore_errors=True)
 
 
+def test_browser_the_painted_screen_fits_the_box_it_is_given(tmp_path: Path) -> None:
+    """No column or row may be drawn past the terminal's own content box.
+
+    xterm's fit addon sizes the grid from ``getComputedStyle(parent).width``
+    minus only the *terminal element's* padding. It knows nothing about the
+    parent's own padding, and nothing about borders anywhere on the chain --
+    so with a padded pane and a bordered terminal every grid was measured a
+    few columns and a row too large and the overflow was clipped: the right
+    edge of every line and the whole bottom row. In a full-screen application
+    those are exactly the sidebar and the input box, which then read as "the
+    sidebar and the input box did not render".
+
+    This asserts the geometry, not the paint: a renderer that clips will show
+    the same symptom from a correct grid, so the boxes must be compared.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(viewport={"width": 1280, "height": 800})
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.wait_for_timeout(600)
+            geom = page.evaluate(
+                """() => {
+                  const pane = document.querySelector(".term-pane.shown");
+                  const xterm = pane && pane.querySelector(".xterm");
+                  const screen = pane && pane.querySelector(".xterm-screen");
+                  if (!pane || !xterm || !screen) return null;
+                  const cs = getComputedStyle(xterm);
+                  const num = (v) => parseFloat(v) || 0;
+                  const contentW = xterm.getBoundingClientRect().width
+                    - num(cs.paddingLeft) - num(cs.paddingRight)
+                    - num(cs.borderLeftWidth) - num(cs.borderRightWidth);
+                  const contentH = xterm.getBoundingClientRect().height
+                    - num(cs.paddingTop) - num(cs.paddingBottom)
+                    - num(cs.borderTopWidth) - num(cs.borderBottomWidth);
+                  const sb = screen.getBoundingClientRect();
+                  return {
+                    contentW, contentH,
+                    screenW: sb.width, screenH: sb.height,
+                    paneW: pane.getBoundingClientRect().width,
+                    panePadL: num(getComputedStyle(pane).paddingLeft),
+                    panePadR: num(getComputedStyle(pane).paddingRight),
+                    paneBoxSizing: getComputedStyle(pane).boxSizing,
+                    xtermBorder: num(cs.borderLeftWidth),
+                  };
+                }"""
+            )
+            assert geom is not None, "no live pane to measure"
+            # The measurement contract the fit addon's arithmetic depends on.
+            assert geom["paneBoxSizing"] == "content-box", (
+                "the pane must expose its content box to getComputedStyle(), "
+                "or the fit addon reads the padding as if it were drawable"
+            )
+            assert geom["xtermBorder"] == 0, (
+                "a border on the terminal element is layout the fit addon "
+                "never subtracts; paint the ring with a shadow instead"
+            )
+            assert geom["screenW"] <= geom["contentW"] + 1, (
+                f"the screen is {geom['screenW']}px wide but only "
+                f"{geom['contentW']}px of it is drawable -- the overflow is "
+                f"clipped and the rightmost columns never appear"
+            )
+            assert geom["screenH"] <= geom["contentH"] + 1, (
+                f"the screen is {geom['screenH']}px tall but only "
+                f"{geom['contentH']}px of it is drawable -- the bottom row is "
+                f"clipped, which is a full-screen app's input box and status bar"
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
 def test_browser_desync_bar_and_resync_recover_the_screen(tmp_path: Path) -> None:
     """A shed must be visible, and the offered resync must actually recover.
 
@@ -2074,11 +2157,30 @@ def test_browser_desync_bar_and_resync_recover_the_screen(tmp_path: Path) -> Non
                     timeout=WAIT_MS,
                 )
                 page.click(".term-pane.active .xterm-screen")
-                page.keyboard.type("seq 1 40000")
-                page.keyboard.press("Enter")
-                # The bar is the contract: shed == say so, on screen, until
-                # acted on.
-                page.wait_for_selector("#desync-bar:not(.hidden)", timeout=WAIT_MS)
+                # Shedding needs the flood to outrun the writer, and a PTY read
+                # is small often enough that one `seq` does not always do it --
+                # which is what made this test a coin flip under suite load
+                # (green in isolation, red about half the full runs). The
+                # contract is not "`seq 1 40000` always sheds"; it is "a shed is
+                # always reported". So drive the flood until a shed is actually
+                # *observed*, and fail loudly if none ever is -- a retry that
+                # silently passed without shedding would prove nothing.
+                observed_shed = False
+                for _ in range(8):
+                    page.keyboard.type("seq 1 40000")
+                    page.keyboard.press("Enter")
+                    try:
+                        page.wait_for_selector(
+                            "#desync-bar:not(.hidden)", timeout=6000
+                        )
+                        observed_shed = True
+                        break
+                    except Exception:
+                        continue
+                assert observed_shed, (
+                    "no shed was ever observed after eight floods; the bar is "
+                    "the contract and it never appeared"
+                )
                 note = page.inner_text("#desync-note")
                 assert "已省略" in note or "省略" in note, note
 

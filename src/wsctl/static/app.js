@@ -898,7 +898,96 @@
     }, RESIZE_MS);
   }
 
+  // -- 盒子观察 ---------------------------------------------------------
+  //
+  // Every way a pane's box can change used to need its own ``fit()`` call,
+  // and every way added later forgot to add one: a window resize, a split bar
+  // dragged, a pane closed beside it, the font swapped, a theme change that
+  // alters the scrollbar, a tab first shown at a width it was never measured
+  // at. Each omission left a terminal drawing a screen that did not fill --
+  // or overflowed -- its own box: columns and rows cut off the right and the
+  // bottom, which is what a TUI's sidebar and input box look like when they
+  // stop existing. Watch the box itself instead of enumerating the reasons it
+  // may change, and no future layout change can forget again.
+  const paneObserver = (typeof ResizeObserver !== "undefined")
+    ? new ResizeObserver(onPaneBoxChanged) : null;
+  const paneFitTimer = new Map();
+
+  function sessionOfPane(pane) {
+    for (const s of sessions.values()) {
+      if (s.pane === pane) return s;
+    }
+    return null;
+  }
+
+  function onPaneBoxChanged(entries) {
+    for (const entry of entries) {
+      const pane = entry.target;
+      const s = sessionOfPane(pane);
+      if (!s) continue;
+      const box = entry.contentRect;
+      // A box that vanished (or is mid-reparent and momentarily 0x0) cannot be
+      // measured. It must be measured when it comes back, so the flag is set,
+      // never cleared -- clearing here is how a pane was left at the geometry
+      // of the day it was created.
+      if (!box || box.width < 1 || box.height < 1) {
+        s.needsRefit = true;
+        continue;
+      }
+      if (!isPaneShown(s)) { s.needsRefit = true; continue; }
+      if (paneFitTimer.get(pane) != null) continue;
+      paneFitTimer.set(pane, setTimeout(() => {
+        paneFitTimer.delete(pane);
+        if (isPaneShown(s)) fitNow(s);
+        else s.needsRefit = true;
+      }, RESIZE_MS));
+    }
+  }
+
+  function watchPaneBox(s) {
+    if (!paneObserver || !s || !s.pane) return;
+    try { paneObserver.observe(s.pane); } catch { /* 旧环境忽略 */ }
+  }
+
+  function unwatchPaneBox(s) {
+    if (!paneObserver || !s || !s.pane) return;
+    const t = paneFitTimer.get(s.pane);
+    if (t != null) { clearTimeout(t); paneFitTimer.delete(s.pane); }
+    try { paneObserver.unobserve(s.pane); } catch { /* 旧环境忽略 */ }
+  }
+
   let windowResizeTimer = null;
+
+  /**
+   * Fit one pane, and say honestly whether it happened.
+   *
+   * ``fit()`` returns *silently* when it can do nothing -- a pane that is
+   * mid-reparent measures 0x0, a pane still hidden has no box. The callers
+   * used to clear ``needsRefit`` regardless, so a pane measured while it had
+   * no box was never measured again once it did: it kept the geometry of the
+   * day it was created and drew a screen that did not fill (or overflowed)
+   * its box. ``proposeDimensions`` is the only side-effect-free way to ask
+   * "would this fit do anything", and it is why the flag is cleared *here*,
+   * on success, and nowhere else.
+   */
+  function fitNow(s) {
+    if (!s || !s.fit) return false;
+    try {
+      const d = s.fit.proposeDimensions();
+      if (!d || !Number.isFinite(d.cols) || !Number.isFinite(d.rows)
+          || d.cols < 2 || d.rows < 1) {
+        s.needsRefit = true;
+        return false;
+      }
+      s.fit.fit();
+      s.needsRefit = false;
+      return true;
+    } catch {
+      s.needsRefit = true;
+      return false;
+    }
+  }
+
   function fitActiveSoon() {
     if (windowResizeTimer !== null) clearTimeout(windowResizeTimer);
     windowResizeTimer = setTimeout(() => {
@@ -913,7 +1002,7 @@
       // holding the keyboard.
       for (const other of sessions.values()) {
         if (!isPaneShown(other)) continue;
-        try { other.fit.fit(); } catch { /* 隐藏时忽略 */ }
+        fitNow(other);
       }
     }, RESIZE_MS);
   }
@@ -1579,8 +1668,7 @@
     for (const id of leafIds(group.root)) {
       const s = sessions.get(id);
       if (!s) continue;
-      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
-      s.needsRefit = false;
+      fitNow(s);
     }
   }
 
@@ -2157,8 +2245,7 @@
     wireTerminal(s);
     s.needsRefit = true;
     if (s.id === activeId) {
-      try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
-      s.needsRefit = false;
+      fitNow(s);
       s.everShown = true;
     }
     updateRendererNote(s);
@@ -2238,6 +2325,10 @@
       tabState: options.autoConnect === false ? "standby" : "connected",
     };
     sessions.set(id, s);
+    // The pane's box is now the authority on when this terminal must be
+    // re-measured. See ``onPaneBoxChanged``: enumerating the operations that
+    // change a box is what let some of them forget to call ``fit()``.
+    watchPaneBox(s);
     renderLayout(group);
 
     tabEl.addEventListener("click", (e) => {
@@ -2370,8 +2461,7 @@
       const s = sessions.get(paneId);
       if (!s) continue;
       if (s.needsRefit || !s.everShown) {
-        try { s.fit.fit(); } catch { /* 隐藏时忽略 */ }
-        s.needsRefit = false;
+        fitNow(s);
         s.everShown = true;
       }
     }
@@ -2509,6 +2599,7 @@
     if (s.zmodemWatchdog) { clearTimeout(s.zmodemWatchdog); s.zmodemWatchdog = null; }
     if (s.ws) { try { s.ws.close(); } catch { /* 忽略 */ } s.ws = null; }
     forgetLive(id);
+    unwatchPaneBox(s);
     s.term.dispose();
     s.pane.remove();
     sessions.delete(id);
