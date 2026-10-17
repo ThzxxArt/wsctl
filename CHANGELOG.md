@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.27] - 2026-10-17
+
+**0.1.26 的 `--tls-self-signed` 在默认安装下起不来。**
+
+用户报告：`wsctl start --host 0.0.0.0 --port 7682 --tls-self-signed` 启动后服务没起来。
+
+### 根因（0.1.26 自伤）
+
+`core/tls.py` 有两个后端：`cryptography` 优先、`openssl` 命令行兜底。而
+
+- **`cryptography` 被我只放进了 `dev` extra**（当时是为了让 CI 做类型检查）；
+- **Windows 上 `openssl` 通常不在 PATH**。
+
+两者都没有 → `_backend()` 抛出
+
+```
+生成自签证书需要 cryptography 或 openssl，两者都没有找到。
+```
+
+→ `_fail` 退出码 1，服务不启动。**本版主打的「一条命令启用 HTTPS」，在默认安装
+（尤其 Windows）上根本走不通**——而这正是它被写出来的原因。
+
+这是典型的「拿测试环境当用户环境」：我的开发机上 `cryptography` 因 `SecretStorage`
+（Linux-only）顺带装着，`openssl` 也在，于是两条路都通，我就没再问一句
+「普通 `pip install` 的机器有吗」。**发布上一版时我刚因为同一个模式在 macOS CI 上
+栽过一次**（`cryptography` 只在 Linux 传递安装），当时只修了类型检查，没有顺藤摸到
+「用户装不到」这一层。
+
+### 修复
+
+- **`cryptography` 提为基础依赖**（不再是 extra）。`wsctl serve --tls-self-signed`
+  开箱即用。选它而不是「加个 `wsctl[tls]` extra」的理由很直接：这个功能的全部意义
+  就是「不用先学会 openssl」，再要求一次额外的 `pip install` 就把它自己的卖点抵消了。
+  各平台（Linux / macOS / Windows，支持的全部 Python 版本）都有轮子。
+- `openssl` 兜底**保留**：它零成本，且在有人 `--no-deps` 安装、或有意剥离依赖时仍然有用。
+- 缺后端时的报错**保留并仍是可行动的**（指出 `--ssl-cert`/`--ssl-key` 这条出路）。
+- mypy 的 `cryptography.*` override **保留**，注释改准：它现在是基础依赖，但
+  `core.tls` 在**运行时**仍把它当可选（有 openssl 退路），所以一个刻意跳过依赖的
+  安装也应当能跑 `mypy src`。
+
+### 新增 · 契约测试
+
+`test_the_advertised_one_command_https_does_not_need_a_second_one`：直接读
+`pyproject.toml`，断言 `cryptography` 在**基础依赖**里。把「一条命令就是一条命令」
+钉死——有人把它挪回 extra，安装就会静默恢复成坏的，而套件里没有别的东西会发现。
+
+另已实测：构建出的 wheel 的 METADATA 含 `Requires-Dist: cryptography>=42`。
+
+### Verified
+
+**603 unit**（含 **59** 条结构契约）· **43 browser** · **7 slow** · **11 e2e** 全绿；
+ruff / mypy strict / `node --check` 通过。
+
+> 复现留证：以「无 `cryptography` + PATH 无 `openssl`」运行 `serve --tls-self-signed`，
+> 退出码 1 与上面那条报错一致；把 `cryptography` 提为基础依赖后，同样条件不再触发
+> （走 `cryptography` 后端）。
+
 ## [0.1.26] - 2026-10-17
 
 **「安全上下文」：一条根因静默禁用一整片功能，就在根上解决。**

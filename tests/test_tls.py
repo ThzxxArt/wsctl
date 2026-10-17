@@ -142,3 +142,26 @@ def test_no_backend_at_all_says_what_to_install(
     message = str(excinfo.value)
     assert "cryptography" in message and "openssl" in message
     assert "--ssl-cert" in message, "an operator needs to be told the way out"
+
+
+def test_the_advertised_one_command_https_does_not_need_a_second_one() -> None:
+    """``--tls-self-signed`` is promised as one command; it must not need two.
+
+    ``cryptography`` lived in the ``dev`` extra only, so a plain
+    ``pip install wsctl`` had neither it nor -- on Windows -- an ``openssl`` on
+    PATH. Both backends missing, and HTTPS refused to start on exactly the
+    machines the feature was written for. It is a normal dependency now, and
+    this pins it: moving it back into an extra would silently restore the
+    broken install, and nothing else in the suite would notice.
+    """
+    import tomllib
+
+    root = Path(__file__).resolve().parent.parent
+    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = data["project"]["dependencies"]
+    names = {d.split(">=")[0].split("[")[0].strip().lower() for d in deps}
+    assert "cryptography" in names, (
+        "cryptography must be a base dependency: without it, and without "
+        "openssl on PATH (Windows), --tls-self-signed can generate nothing "
+        "and the server refuses to start"
+    )

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wsctl"
-version = "0.1.26"
+version = "0.1.27"
 description = "单机部署的 Web 在线终端：多会话、多用户 RBAC、审计、分享、录制与可观测，ttyd 的现代 Python 超集。"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +40,13 @@ dependencies = [
     "pyotp>=2.9",
     "segno>=1.6",
     "websockets>=13",
+    # ``wsctl serve --tls-self-signed`` is advertised as one command, so it
+    # cannot depend on something a plain install does not have. It *did*: this
+    # was in the ``dev`` extra only (for CI type checking), and Windows ships no
+    # ``openssl`` on PATH either, so on a default install both backends were
+    # missing and HTTPS simply refused to start. Wheels exist for every platform
+    # wsctl supports, and the openssl fallback is kept for the rest.
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
@@ -54,11 +61,6 @@ dev = [
     "httpx>=0.27",
     "build>=1.2",
     "twine>=5.1",
-    # The preferred backend for ``wsctl serve --tls-self-signed``. Named
-    # explicitly rather than left to ``twine -> keyring -> SecretStorage``, which
-    # is Linux-only: without this line the type checker and the cryptography
-    # test silently depend on which runner you are on.
-    "cryptography>=42",
 ]
 
 [project.urls]
@@ -110,13 +112,13 @@ strict = true
 files = ["src/wsctl"]
 
 [[tool.mypy.overrides]]
-# ``cryptography`` is an *optional* backend for ``core.tls``: the module falls
-# back to the ``openssl`` command line and says so at runtime. It happens to be
-# installed on Linux as a transitive dependency (``twine`` -> ``keyring`` ->
-# ``SecretStorage``, which is Linux-only) and not at all on macOS -- so without
-# this, ``mypy src`` passed on one runner and failed on another for a reason
-# that had nothing to do with this code. Declaring the import optional is the
-# honest statement of what the module already assumes.
+# ``cryptography`` ships as a normal dependency, but ``core.tls`` still treats
+# it as *optional* at runtime: it falls back to the ``openssl`` command line
+# and says so when neither is available. An install that deliberately skipped
+# dependencies (``--no-deps``, a stripped image) must still be able to run
+# ``mypy src``, so the import is declared optional here too. When the package
+# *is* present -- which is the normal case -- this override does nothing and
+# the module is type-checked as usual.
 module = ["cryptography", "cryptography.*"]
 ignore_missing_imports = true
 
