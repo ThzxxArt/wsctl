@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.29] - 2026-10-17
+
+**「`status` 说没在运行，可网页终端照样能打开」——孤儿实例。**
+
+用户报告：云服务器更新到 0.1.28 后 `wsctl start` 起不来，而 `wsctl stop`/`status`/`doctor`
+都说没在运行；**同时网页终端一直是通的**。
+
+### 根因：记录和进程各说各话
+
+`status`/`stop`/`doctor` 判断「在不在跑」**只看 pid 文件**，从不看端口：
+
+```
+/root/.local/share/wsctl/run/wsctl-7681.pid
+```
+
+那个文件丢了（或记的 pid 对不上）时，工具断定「未运行」——**而进程还活着、端口还占着、
+网页照样打得开**。于是新实例 `EADDRINUSE` 启不来，用户看到的却是「启动失败（退出码 3）」
+加一段以 `address already in use` 结尾的日志，没有任何一句提到那个真正占着端口的进程。
+**端口被自己看不见的东西占着，工具却没有词汇描述这件事。**
+
+### 修复
+
+- **`listener_pid(port)`**：直接读 `/proc/net/tcp{,6}` 找到监听该端口的 socket inode，
+  再在 `/proc/*/fd` 里反查进程。零外部依赖，Linux 专用，其它平台安静返回 `None`
+  （**是诊断，不是门控**：所有调用点都把 `None` 当作「说不出来」）。
+- **`looks_like_wsctl(pid)`**：一切可能结束别人进程的动作都必须先问这一句。
+  `stop --force` 允许清理孤儿，**绝不允许误杀恰好占用同一端口的其它服务**。
+- **`occupied_hint(port)`**：一句话点名占用者，并给出出路；两处失败路径（子进程退出、
+  启动超时）都带上它。
+- **`stop --force` 可清理孤儿**：有端口占用但无管理记录时，`stop` 不再糊弄一句
+  「本就未在运行」，而是**如实说出占用者**；加 `--force` 才真的结束它。没有 `--force`
+  时不动手——那是刻意的，不能默认帮人杀进程。占用者不是 wsctl 时，任何情况下都不动。
+
+### 顺带修掉一个测试抓出来的真缺陷
+
+`ca_bundle_for()`（CLI 客户端信任本机自签证书）用 `resolve_instance` 查「URL 里那个端口
+的实例」。而 `resolve_instance` 在找不到时会**回退到「正在跑的那个实例」**——于是
+`https://host:19999` 会拿到**另一个端口上实例的证书**。改为要求端口精确匹配
+（`port_explicit=True`），没有端口就返回 `None`（走系统信任库，绝不「不验证」）。
+
+### Verified
+
+**613 unit**（含 **59** 条结构契约）· **43 browser** · **7 slow** · **11 e2e** 全绿；
+ruff / mypy strict / `node --check` 通过。
+
+> 端到端留证（本机实跑，人为删掉 pid 文件造出孤儿）：
+> ```
+> doctor 监听端口   → 127.0.0.1:7690（被占用，pid 123475） 警告
+> stop              → 未在运行。端口 7690 已被一个 wsctl 进程（pid 123475）占用…
+>                    用 `wsctl stop --port 7690 --force` 结束它（或直接 kill 123475）
+> start             → 启动失败（退出码 3）。<同一句点名>
+> stop --force      → 已停止 pid 123475  127.0.0.1:7690
+> start             → 已在后台启动 pid 123885
+> ```
+
+> 新增 5 条测试：`listener_pid` 找得到占用者（真实 socket）、空闲端口无提示、
+> 无 `--force` 绝不动孤儿、`--force` 才清、非 wsctl 进程一律不碰。
+
+> **诚实边界**：`listener_pid` 只在 Linux 且有权读取目标进程 `fd` 时可用；
+> 其它情况如实返回「说不出来」，而不是猜一个 pid。
+
 ## [0.1.28] - 2026-10-17
 
 **`--tls-self-signed` 能起来了，但用起来还有三处不对——同一个根因。**

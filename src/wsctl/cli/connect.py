@@ -14,13 +14,14 @@ import contextlib
 import json
 import os
 import signal
+import ssl
 import sys
 from urllib.parse import urlsplit, urlunsplit
 
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from wsctl.cli.client import ApiClient, ApiError, load_credentials
+from wsctl.cli.client import ApiClient, ApiError, ca_bundle_for, load_credentials
 
 # Imported, never re-listed: the fatal set used to be maintained in three
 # places and 4401 was fatal here but not in the browser.
@@ -243,9 +244,22 @@ async def _session_loop(
     reconnect: bool,
 ) -> int:
     delay = INITIAL_DELAY
+    # A ``wss://`` connection to a self-signed server needs the same trust the
+    # HTTP client already applies -- otherwise ``wsctl connect`` cannot reach
+    # the very instance ``--tls-self-signed`` just set up, and the failure is
+    # an SSL error that reads like a network problem. ``ca_bundle_for`` only
+    # ever *adds* a pinned certificate to the system store; it never disables
+    # verification.
+    tls_context = None
+    if ws_url.startswith("wss://"):
+        bundle = ca_bundle_for("https://" + ws_url[len("wss://"):])
+        if bundle is not None:
+            tls_context = ssl.create_default_context(cafile=str(bundle))
     while True:
         try:
-            ws = await websockets.connect(ws_url, additional_headers=headers, max_size=None)
+            ws = await websockets.connect(
+                ws_url, additional_headers=headers, max_size=None, ssl=tls_context
+            )
         except InvalidStatus as exc:
             status = exc.response.status_code
             hint = "（令牌是否有效？）" if status in (401, 403) else ""

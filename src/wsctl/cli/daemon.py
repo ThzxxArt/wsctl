@@ -223,6 +223,94 @@ def _identity_matches(instance: Instance) -> bool:
     return current is None or current == instance.identity
 
 
+# -- who is on this port? ----------------------------------------------
+
+
+def _listening_socket_inodes(port: int) -> set[str]:
+    """Inodes of LISTEN sockets on ``port``, read straight from ``/proc``."""
+    found: set[str] = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        with contextlib.suppress(OSError):
+            for line in Path(name).read_text(encoding="utf-8").splitlines()[1:]:
+                parts = line.split()
+                # sl local_address rem_address st ... uid timeout inode
+                if len(parts) < 10 or parts[3] != "0A":  # 0A == LISTEN
+                    continue
+                try:
+                    local_port = int(parts[1].rsplit(":", 1)[1], 16)
+                except (IndexError, ValueError):
+                    continue
+                if local_port == port:
+                    found.add(parts[9])
+    return found
+
+
+def listener_pid(port: int) -> int | None:
+    """The pid listening on ``port``, when this platform can tell us.
+
+    Only ever used to *explain* a state the pid file cannot describe: a port
+    held by a process this data directory has no record of. Without it
+    ``wsctl start`` fails with "启动失败（退出码 3）" over a log tail ending in
+    ``EADDRINUSE``, while ``wsctl stop`` answers "未在运行" -- a server that is
+    serving, and a tool insisting nothing is there.
+
+    Linux-only, and it must read other processes' ``fd`` directories, so it
+    quietly returns ``None`` anywhere else or without the privilege. This is a
+    diagnostic, never a gate: every caller treats ``None`` as "cannot say".
+    """
+    if sys.platform != "linux":  # pragma: no cover - platform specific
+        return None
+    inodes = _listening_socket_inodes(port)
+    if not inodes:
+        return None
+    want = {f"socket:[{inode}]" for inode in inodes}
+    with contextlib.suppress(OSError):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            with contextlib.suppress(OSError):
+                for fd in (entry / "fd").iterdir():
+                    with contextlib.suppress(OSError):
+                        if os.readlink(fd) in want:
+                            return int(entry.name)
+    return None
+
+
+def looks_like_wsctl(pid: int) -> bool:
+    """Whether ``pid`` is plausibly a wsctl server, before we offer to kill it.
+
+    ``listener_pid`` answers "who holds the port", which is not the same as
+    "a wsctl of ours". Anything that might end someone else's process has to
+    check first -- ``stop --force`` is allowed to clean up an orphan, never to
+    shoot an unrelated service that happens to share the port.
+    """
+    with contextlib.suppress(OSError):
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        return b"wsctl" in cmdline
+    return False
+
+
+def occupied_hint(port: int) -> str:
+    """A sentence naming whatever holds ``port``, or ``""`` if we cannot say.
+
+    "启动失败（退出码 3）" over a log tail ending in ``EADDRINUSE`` is not an
+    explanation, and it is the worst place to leave one: the record
+    ``wsctl stop`` would have used is exactly what is missing, so no command
+    left reports the process at all. Naming the pid is both the explanation
+    and the way out.
+    """
+    pid = listener_pid(port)
+    if pid is None:
+        return ""
+    if looks_like_wsctl(pid):
+        return (
+            f"端口 {port} 已被一个 wsctl 进程（pid {pid}）占用，但它不在本数据目录的"
+            f"管理记录里，所以常规命令都看不到它。"
+            f"用 `wsctl stop --port {port} --force` 结束它（或直接 kill {pid}），再重新启动。"
+        )
+    return f"端口 {port} 被 pid {pid} 占用，而它看起来不是 wsctl。请先确认那是什么。"
+
+
 # -- pid file ----------------------------------------------------------
 
 
@@ -444,8 +532,11 @@ def start(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
+            hint = occupied_hint(settings.port)
             raise DaemonError(
-                f"启动失败（退出码 {proc.returncode}）。日志：{log_path}\n{_tail(log_path)}"
+                f"启动失败（退出码 {proc.returncode}）。"
+                + (f"\n{hint}" if hint else "")
+                + f"\n日志：{log_path}\n{_tail(log_path)}"
             )
         instance = read_instance(settings)
         # The ready gate must identify *who* answered: ``health()`` alone is
@@ -457,13 +548,31 @@ def start(
 
     with contextlib.suppress(OSError, ProcessLookupError):
         os.kill(proc.pid, signal.SIGTERM)
-    raise DaemonError(f"启动超时。日志：{log_path}\n{_tail(log_path)}")
+    hint = occupied_hint(settings.port)
+    raise DaemonError(
+        "启动超时。" + (f"\n{hint}" if hint else "") + f"\n日志：{log_path}\n{_tail(log_path)}"
+    )
 
 
 def stop(settings: Settings, *, timeout: float = 15.0, force: bool = False) -> Instance:
     """Stop the instance gracefully; ``force`` escalates to ``SIGKILL``."""
     instance = read_instance(settings)
     if instance is None:
+        # No record is not the same as nothing there. A process can hold the
+        # port long after its pid file was lost, and then every command insists
+        # the server is not running while it is plainly serving -- leaving the
+        # operator with a port they cannot free and a tool with no vocabulary
+        # for it. ``--force`` is the deliberate way out, and it only ever ends a
+        # process that looks like a wsctl of ours.
+        occupant = listener_pid(settings.port)
+        if occupant is not None and looks_like_wsctl(occupant):
+            if not force:
+                raise DaemonError("未在运行。" + f"\n{occupied_hint(settings.port)}")
+            stop_pid(occupant, timeout=timeout, force=True)
+            return Instance(
+                pid=occupant, host=settings.host, port=settings.port,
+                started_at=0.0, version="?", identity="",
+            )
         raise DaemonError("未在运行")
     with contextlib.suppress(ProcessLookupError):
         os.kill(instance.pid, signal.SIGTERM)

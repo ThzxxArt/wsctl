@@ -497,9 +497,16 @@ def doctor(
 
     if not settings.reuse_port:
         free = _port_free(settings.host, settings.port)
+        if free:
+            detail = "可用"
+        else:
+            # Name the occupant. "被占用" alone is the report that sends
+            # someone hunting a server `status` insists is not running.
+            occupant = daemon_mod.listener_pid(settings.port)
+            detail = f"被占用，pid {occupant}" if occupant is not None else "被占用"
         add(
             "监听端口",
-            f"{settings.host}:{settings.port}（{'可用' if free else '被占用'}）",
+            f"{settings.host}:{settings.port}（{detail}）",
             ok if free else (warn if instance is None else ok),
         )
 
@@ -1500,6 +1507,15 @@ def _resolve_target(
             f"--port {first.port} …"
         )
     elif missing_ok:
+        # "Not running" is only the whole truth when nothing holds the port. A
+        # process can outlive its own record -- that is the state where every
+        # command reports nothing while the terminal is plainly open -- and it
+        # has to reach ``daemon.stop``, which knows how to name it and how to
+        # end it under ``--force``. A stranger on the port is left alone, so the
+        # idempotent `stop && start` contract is unchanged for it.
+        occupant = daemon_mod.listener_pid(settings.port)
+        if occupant is not None and daemon_mod.looks_like_wsctl(occupant):
+            return settings
         # Idempotent, like `rm -f`: stopping something that is not running has
         # reached the requested end state. A non-zero exit here is what silently
         # broke `wsctl stop … && wsctl start …`.

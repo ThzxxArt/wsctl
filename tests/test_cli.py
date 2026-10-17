@@ -662,6 +662,48 @@ def test_doctor_probes_the_running_instance_not_a_stale_credential(
         path.unlink(missing_ok=True)
 
 
+def test_a_self_signed_instance_is_trusted_by_the_cli_client(tmp_path, monkeypatch) -> None:
+    """``--tls-self-signed`` serves a certificate nothing else trusts.
+
+    The CLI is normally talking to an instance on *this* machine whose
+    certificate it can read, so it pins exactly that file -- which is
+    verification, not a bypass. Without it ``wsctl login`` failed with
+    ``CERTIFICATE_VERIFY_FAILED`` while ``doctor`` reported the same server
+    healthy: two commands disagreeing about the same process.
+    """
+    import json as _json
+
+    from wsctl.cli import client as client_mod
+    from wsctl.cli import daemon
+
+    monkeypatch.setenv("WSCTL_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    _missing_config(tmp_path, monkeypatch)
+    cert = tmp_path / "tls" / "cert.pem"
+    cert.parent.mkdir(parents=True, exist_ok=True)
+    cert.write_text("dummy", encoding="utf-8")
+    inst = daemon.Instance(
+        pid=os.getpid(), host="127.0.0.1", port=18111, started_at=0.0,
+        version="0", identity="", ssl_cert=str(cert),
+    )
+    aimed = load_settings().model_copy(update={"host": "127.0.0.1", "port": 18111})
+    path = daemon.pidfile_path(aimed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(daemon.asdict(inst)), encoding="utf-8")
+    try:
+        assert client_mod.ca_bundle_for("https://127.0.0.1:18111") == cert, (
+            "the certificate the local instance is serving must be the one the "
+            "client verifies against"
+        )
+        # Plain HTTP needs no bundle, and an unknown port has no record to read.
+        assert client_mod.ca_bundle_for("http://127.0.0.1:18111") is None
+        assert client_mod.ca_bundle_for("https://127.0.0.1:19999") is None
+        # An explicit bundle covers a remote server with no local record.
+        monkeypatch.setenv("WSCTL_CA_CERT", str(cert))  # type: ignore[attr-defined]
+        assert client_mod.ca_bundle_for("https://10.0.0.9:7681") == cert
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_doctor_falls_back_to_the_credential_and_says_so(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # type: ignore[attr-defined]
     """With nothing running, the cached URL is used -- and identified as such."""

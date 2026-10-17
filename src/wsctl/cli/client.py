@@ -10,12 +10,14 @@ import contextlib
 import http.cookiejar
 import json
 import os
+import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-from wsctl.core.config import default_config_dir
+from wsctl.core.config import default_config_dir, load_settings
 from wsctl.core.net import opener_for
 
 
@@ -28,6 +30,45 @@ class ApiError(RuntimeError):
 
 def credentials_path() -> Path:
     return default_config_dir() / "credentials.json"
+
+
+def ca_bundle_for(base_url: str, *, ca_cert: str | Path | None = None) -> Path | None:
+    """The certificate to verify ``base_url``'s server against, if we know one.
+
+    Self-signed is the *normal* case for this product -- ``--tls-self-signed``
+    exists to make HTTPS one command -- and the CLI is usually talking to an
+    instance on this machine whose certificate it can read: the instance
+    record names the file. Pinning exactly that certificate is *verification*,
+    not a bypass, and it is strictly better than the two alternatives that
+    shipped first: failing with ``CERTIFICATE_VERIFY_FAILED`` while ``doctor``
+    reports the same server healthy, or quietly not verifying at all.
+
+    ``--ca-cert`` / ``WSCTL_CA_CERT`` cover the remote case, where there is no
+    local record to read. With neither, ``None`` means the normal system trust
+    store -- never "do not verify".
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.scheme != "https":
+        return None
+    explicit = ca_cert or os.environ.get("WSCTL_CA_CERT")
+    if explicit:
+        return Path(str(explicit))
+    if parsed.port is None:
+        # Nothing to look a record up by, and guessing is exactly the bug this
+        # shape avoids: ``resolve_instance`` *falls back* to whatever instance
+        # happens to be running, so asking about ``https://host:19999``
+        # returned the certificate of a local instance on a different port.
+        return None
+    with contextlib.suppress(Exception):
+        from wsctl.cli import daemon
+
+        settings = load_settings().model_copy(update={"port": parsed.port})
+        # ``port_explicit`` is what stops the fallback: this must be the
+        # instance on *that* port or nothing.
+        instance = daemon.resolve_instance(settings, port_explicit=True).instance
+        if instance is not None and instance.ssl_cert:
+            return Path(instance.ssl_cert)
+    return None
 
 
 def load_credentials() -> dict[str, Any]:
@@ -66,10 +107,23 @@ def clear_credentials() -> None:
 class ApiClient:
     """Synchronous JSON client bound to a base URL and optional bearer token."""
 
-    def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str | None = None,
+        *,
+        timeout: float = 15.0,
+        ca_cert: str | Path | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        # Verification stays on: the context *adds* the pinned certificate to
+        # the system trust store rather than replacing it. See ca_bundle_for.
+        bundle = ca_bundle_for(self.base_url, ca_cert=ca_cert)
+        self.ssl_context = (
+            ssl.create_default_context(cafile=str(bundle)) if bundle is not None else None
+        )
 
     def request(
         self,
@@ -90,7 +144,9 @@ class ApiClient:
             # Not urlopen(): that honours http_proxy and would send even a local
             # wsctl through the proxy, which answers 502 and looks like a dead
             # server. See core.net.opener_for.
-            with opener_for(self.base_url).open(req, timeout=self.timeout) as resp:
+            with opener_for(self.base_url, ssl_context=self.ssl_context).open(
+                req, timeout=self.timeout
+            ) as resp:
                 payload = resp.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
@@ -118,7 +174,9 @@ class ApiClient:
             headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(f"{self.base_url}{path}", headers=headers, method="GET")
         try:
-            with opener_for(self.base_url).open(req, timeout=self.timeout) as resp:
+            with opener_for(self.base_url, ssl_context=self.ssl_context).open(
+                req, timeout=self.timeout
+            ) as resp:
                 data: bytes = resp.read()
                 return data
         except urllib.error.HTTPError as exc:
@@ -142,7 +200,11 @@ def login(
     rather than a password error, which is how the caller knows to prompt.
     """
     jar = http.cookiejar.CookieJar()
-    opener = opener_for(base_url)
+    bundle = ca_bundle_for(base_url)
+    context = (
+        ssl.create_default_context(cafile=str(bundle)) if bundle is not None else None
+    )
+    opener = opener_for(base_url, ssl_context=context)
     opener.add_handler(urllib.request.HTTPCookieProcessor(jar))
     payload: dict[str, Any] = {"username": username, "password": password}
     if totp:

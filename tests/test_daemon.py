@@ -503,3 +503,74 @@ def test_restart_does_not_silently_downgrade_https_to_http() -> None:
     # top of either would turn a restart into a usage error.
     assert 'not options.has("tls_self_signed")' in main_src
     assert 'not options.has("ssl_cert")' in main_src
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="reads /proc")
+def test_listener_pid_names_whoever_holds_the_port() -> None:
+    """Without this, "something is on the port" has no name.
+
+    It is the only thing that can explain an orphan, because the record
+    ``stop`` reads is exactly what is missing -- so the pid has to come from
+    the operating system, or the operator has nowhere to look.
+    """
+    import socket as _socket
+
+    sock = _socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = int(sock.getsockname()[1])
+    try:
+        assert daemon.listener_pid(port) == os.getpid()
+    finally:
+        sock.close()
+    assert daemon.listener_pid(port) is None, "a closed socket has no listener"
+
+
+def test_a_free_port_produces_no_hint() -> None:
+    import socket as _socket
+
+    sock = _socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = int(sock.getsockname()[1])
+    sock.close()
+    assert daemon.occupied_hint(port) == ""
+
+
+def test_stop_will_not_clear_an_orphan_without_force(tmp_path: Path, monkeypatch) -> None:
+    """``--force`` is the deliberate way out, so it has to be asked for."""
+    settings = settings_for(tmp_path)
+    monkeypatch.setattr(daemon, "listener_pid", lambda port: 4242)
+    monkeypatch.setattr(daemon, "looks_like_wsctl", lambda pid: True)
+
+    def boom(pid: int, **kw: object) -> None:
+        raise AssertionError("must not stop anything without --force")
+
+    monkeypatch.setattr(daemon, "stop_pid", boom)
+    with pytest.raises(daemon.DaemonError) as excinfo:
+        daemon.stop(settings)
+    assert "4242" in str(excinfo.value), excinfo.value
+
+
+def test_stop_force_clears_an_orphan_that_looks_like_wsctl(tmp_path: Path, monkeypatch) -> None:
+    settings = settings_for(tmp_path)
+    stopped: list[int] = []
+    monkeypatch.setattr(daemon, "listener_pid", lambda port: 4242)
+    monkeypatch.setattr(daemon, "looks_like_wsctl", lambda pid: True)
+    monkeypatch.setattr(daemon, "stop_pid", lambda pid, **kw: stopped.append(pid))
+    instance = daemon.stop(settings, force=True)
+    assert instance.pid == 4242
+    assert stopped == [4242]
+
+
+def test_stop_leaves_a_stranger_on_the_port_alone(tmp_path: Path, monkeypatch) -> None:
+    """``stop`` may clean up an orphan, never someone else's service."""
+    settings = settings_for(tmp_path)
+    monkeypatch.setattr(daemon, "listener_pid", lambda port: 4242)
+    monkeypatch.setattr(daemon, "looks_like_wsctl", lambda pid: False)
+
+    def boom(pid: int, **kw: object) -> None:
+        raise AssertionError("must not touch a process that is not wsctl")
+
+    monkeypatch.setattr(daemon, "stop_pid", boom)
+    with pytest.raises(daemon.DaemonError, match="未在运行"):
+        daemon.stop(settings, force=True)
