@@ -30,6 +30,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -168,12 +169,31 @@ def _generate_with_openssl(
         raise TlsError("openssl 未能生成私钥：" + _openssl_detail(gen))
     _write_private(key_path, gen.stdout)
 
-    cmd = [
-        "openssl", "req", "-x509", "-key", str(key_path), "-out", str(cert_path),
-        "-days", str(days), "-subj", "/CN=wsctl",
-        "-addext", f"subjectAltName={san}",
-    ]
-    proc = subprocess.run(cmd, capture_output=True, check=False)
+    # The SAN goes in through a *config file*, not ``-addext``. ``-addext`` is
+    # an OpenSSL 1.1.1 addition and the openssl on macOS is LibreSSL, whose
+    # ``req`` does not take it -- so the flag works everywhere except one of
+    # the platforms this is tested on. The config form is accepted by both.
+    with tempfile.TemporaryDirectory(prefix="wsctl-tls-") as conf_dir:
+        conf = Path(conf_dir) / "openssl.cnf"
+        conf.write_text(
+            "[req]\n"
+            "distinguished_name = dn\n"
+            "x509_extensions = v3_req\n"
+            "prompt = no\n"
+            "[dn]\n"
+            "CN = wsctl\n"
+            "[v3_req]\n"
+            f"subjectAltName = {san}\n"
+            "basicConstraints = critical,CA:TRUE\n",
+            encoding="utf-8",
+        )
+        cmd = [
+            "openssl", "req", "-x509",
+            "-key", str(key_path), "-out", str(cert_path),
+            "-days", str(days),
+            "-config", str(conf), "-extensions", "v3_req",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, check=False)
     if proc.returncode != 0:
         raise TlsError("openssl 未能生成自签证书：" + _openssl_detail(proc))
 

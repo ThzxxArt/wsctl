@@ -54,6 +54,11 @@ dev = [
     "httpx>=0.27",
     "build>=1.2",
     "twine>=5.1",
+    # The preferred backend for ``wsctl serve --tls-self-signed``. Named
+    # explicitly rather than left to ``twine -> keyring -> SecretStorage``, which
+    # is Linux-only: without this line the type checker and the cryptography
+    # test silently depend on which runner you are on.
+    "cryptography>=42",
 ]
 
 [project.urls]
@@ -103,6 +108,17 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 python_version = "3.11"
 strict = true
 files = ["src/wsctl"]
+
+[[tool.mypy.overrides]]
+# ``cryptography`` is an *optional* backend for ``core.tls``: the module falls
+# back to the ``openssl`` command line and says so at runtime. It happens to be
+# installed on Linux as a transitive dependency (``twine`` -> ``keyring`` ->
+# ``SecretStorage``, which is Linux-only) and not at all on macOS -- so without
+# this, ``mypy src`` passed on one runner and failed on another for a reason
+# that had nothing to do with this code. Declaring the import optional is the
+# honest statement of what the module already assumes.
+module = ["cryptography", "cryptography.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
