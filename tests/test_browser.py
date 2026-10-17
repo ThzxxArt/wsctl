@@ -1625,6 +1625,167 @@ def test_browser_alt_c_alt_v_are_the_working_copy_paste(tmp_path: Path) -> None:
         shutil.rmtree(data, ignore_errors=True)
 
 
+def test_browser_copy_survives_a_page_without_the_clipboard_api(tmp_path: Path) -> None:
+    """On plain HTTP at a LAN address there is no ``navigator.clipboard``.
+
+    It is a *secure-context* API: present at ``https://`` and at
+    ``http://localhost``, simply absent at ``http://192.168.x.x`` -- which is
+    how this is normally reached. Absent is not the same as denied: the
+    property is gone, so ``navigator.clipboard.writeText`` throws a
+    **synchronous** TypeError that a trailing ``.catch()`` never sees. Every
+    copy/paste entry point (both right-click menu items, Alt+C/Alt+V, Ctrl+C,
+    Ctrl+Shift+C/V, Ctrl/Shift+Insert) then did nothing and said nothing.
+
+    Copying can be fully restored -- ``document.execCommand('copy')`` was never
+    secure-context gated -- and this asserts it, by reading the text back
+    through the *real* clipboard the page cannot see.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    # What an insecure origin looks like: the property is not there. The real
+    # one is captured first so the test can still read what was copied.
+    hide_clipboard = (
+        "(() => {"
+        "  const d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'clipboard');"
+        "  window.__realClipboard = d && d.get ? d.get.call(navigator) : null;"
+        "  Object.defineProperty(Navigator.prototype, 'clipboard',"
+        "    { get() { return undefined; }, configurable: true });"
+        "})();"
+    )
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+            context.add_init_script(hide_clipboard)
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            assert page.evaluate("() => typeof navigator.clipboard") == "undefined", (
+                "precondition: this test only means something when the Clipboard "
+                "API is absent the way an insecure origin makes it"
+            )
+            page.click(".term-pane.active .xterm-screen")
+            page.keyboard.type("echo INSEP-$((179*181))")
+            page.keyboard.press("Enter")
+            _wait_screen_includes(page, "32399")
+            page.wait_for_timeout(200)
+
+            # Clear the real clipboard so "did it copy" cannot be answered by
+            # whatever happened to be there before.
+            page.evaluate("() => window.__realClipboard.writeText('SENTINEL')")
+            page.wait_for_timeout(150)
+
+            page.click(".term-pane.active .xterm-screen", button="right")
+            page.wait_for_selector("#term-menu:not(.hidden)", timeout=5000)
+            page.click("#term-menu button[data-taction='selectall']")
+            page.wait_for_timeout(150)
+            page.click(".term-pane.active .xterm-screen", button="right")
+            page.wait_for_selector("#term-menu:not(.hidden)", timeout=5000)
+            copy_disabled = page.locator(
+                "#term-menu button[data-taction='copy']").is_disabled()
+            assert not copy_disabled, "a selection exists; copy must be offered"
+            page.click("#term-menu button[data-taction='copy']")
+            page.wait_for_timeout(500)
+
+            body = page.inner_text("#toasts")
+            assert "已复制" in body, (
+                f"copy reported neither success nor a reason: {body!r} -- a "
+                f"silent failure is the bug this test exists for"
+            )
+            copied = page.evaluate("() => window.__realClipboard.readText()")
+            assert "INSEP-32399" in copied or "32399" in copied, (
+                f"the page claimed a copy but the clipboard holds {copied!r}"
+            )
+
+            # Paste cannot be read programmatically here, so the honest outcome
+            # is a message naming the one path that still works -- never
+            # silence.
+            page.locator("#toasts").evaluate("el => el.innerHTML = ''")
+            page.click(".term-pane.active .xterm-screen", button="right")
+            page.wait_for_selector("#term-menu:not(.hidden)", timeout=5000)
+            page.click("#term-menu button[data-taction='paste']")
+            page.wait_for_timeout(500)
+            paste_body = page.inner_text("#toasts")
+            assert paste_body.strip(), (
+                "paste did nothing and said nothing -- the exact silent failure "
+                "an insecure origin used to produce"
+            )
+            assert ("Ctrl+V" in paste_body) or ("HTTP" in paste_body), paste_body
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_settings_name_what_an_insecure_origin_takes_away(tmp_path: Path) -> None:
+    """A degraded *environment* must be stated, not discovered by trial.
+
+    Several APIs exist only in a secure context -- HTTPS, or localhost. Over
+    plain HTTP at a LAN address they are not denied, they are absent, so a
+    paste quietly does nothing and a system notification never arrives. Both
+    read as product bugs. The settings panel is where an operator finds out
+    otherwise, and a one-time notice says so without becoming a permanent nag.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    insecure = (
+        "(() => {"
+        "  Object.defineProperty(window, 'isSecureContext',"
+        "    { get() { return false; }, configurable: true });"
+        "  Object.defineProperty(Navigator.prototype, 'clipboard',"
+        "    { get() { return undefined; }, configurable: true });"
+        "})();"
+    )
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+
+            # 1) The real (secure) shape: everything is available and the panel
+            #    must not cry wolf about it.
+            page = browser.new_context(viewport={"width": 1280, "height": 900}).new_page()
+            _login(page)
+            page.click("#settings-btn")
+            page.wait_for_selector("#env-table .env-row", timeout=WAIT_MS)
+            secure_panel = page.inner_text("#env-table")
+            assert "可用" in secure_panel, secure_panel
+            assert "非安全上下文" not in secure_panel, secure_panel
+            page.click("#settings-close")
+
+            # 2) The insecure shape: the panel names each loss, and the one-time
+            #    notice fired (recorded, so a second load stays quiet).
+            ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+            ctx.add_init_script(insecure)
+            page2 = ctx.new_page()
+            _login(page2)
+            page2.click("#settings-btn")
+            page2.wait_for_selector("#env-table .env-row", timeout=WAIT_MS)
+            panel = page2.inner_text("#env-table")
+            assert "非安全上下文" in panel, panel
+            assert "Ctrl+V" in panel, "the paste route that still works must be named"
+            assert "系统通知" in panel and "禁用" in panel, panel
+            said = page2.evaluate(
+                "() => JSON.parse(localStorage.getItem('wsctl-prefs')"
+                " || '{}').seenInsecureNotice === true"
+            )
+            assert said, "the one-time notice must actually have been raised"
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
 def test_browser_full_screen_app_survives_a_flood(tmp_path: Path) -> None:
     """A shed mid-colour-sequence must not garble the terminal -- and a TUI must
     still draw afterwards.

@@ -34,6 +34,7 @@
     setTheme: $("set-theme"), setFontsize: $("set-fontsize"), setFont: $("set-font"),
     setNotifySound: $("set-notify-sound"), setNotifyTitle: $("set-notify-title"),
     setNotifySystem: $("set-notify-system"),
+    envTable: $("env-table"), envSummary: $("env-summary"),
     settingsClose: $("settings-close"), settingsDone: $("settings-done"),
     recordBtn: $("record-btn"), replayBtn: $("replay-btn"), replayOverlay: $("replay-overlay"),
     replayHost: $("replay-host"), replayNote: $("replay-note"), replayClose: $("replay-close"),
@@ -273,6 +274,10 @@
         // the system notification is the one a browser may refuse, and it
         // degrades to the badge and the title rather than failing.
         notifySound: true, notifyTitle: true, notifySystem: true,
+        // Whether the one-time "this origin is not a secure context" notice has
+        // been shown. Kept in prefs so it is said once per browser rather than
+        // on every load.
+        seenInsecureNotice: false,
       },
     readPrefs(),
   );
@@ -2660,20 +2665,187 @@
     return Boolean(s && s.term && s.term.getSelection && s.term.getSelection());
   }
 
+  // -- 剪贴板 -----------------------------------------------------------
+  //
+  // ``navigator.clipboard`` is a **secure-context** API. It exists at
+  // ``https://`` and at ``http://localhost``; at ``http://<lan-ip>`` -- the
+  // ordinary way this is deployed -- it does not exist *at all*. That is not a
+  // denied permission: the property is absent, so ``navigator.clipboard
+  // .writeText`` throws a **synchronous** TypeError, and a trailing
+  // ``.catch()`` never sees a synchronous throw. Every copy/paste entry point
+  // (Alt+C, Alt+V, Ctrl+C, Ctrl+Shift+C/V, Ctrl/Shift+Insert, and both items in
+  // the terminal right-click menu) therefore did nothing and said nothing.
+  //
+  // Two primitives do survive an insecure origin, and both are used here:
+  //   * ``document.execCommand('copy')`` on a selected textarea -- deprecated,
+  //     but never secure-context gated, so *copying can be fully restored*;
+  //   * the browser's own trusted ``paste`` event, which xterm.js already
+  //     listens for on its helper textarea **and** on ``.xterm`` itself
+  //     (``clipboardData.getData('text/plain')``). So **Ctrl+V keeps working
+  //     unaided** -- it is only the programmatic read that is gone.
+  function clipboardCanWrite() {
+    return Boolean(navigator.clipboard && navigator.clipboard.writeText);
+  }
+  function clipboardCanRead() {
+    return Boolean(navigator.clipboard && navigator.clipboard.readText);
+  }
+  /** Why the clipboard is unavailable, in the terms the user can act on. */
+  function clipboardWhy() {
+    return window.isSecureContext
+      ? "浏览器拒绝了剪贴板访问（请检查站点权限）"
+      : "当前是 HTTP 访问，浏览器只在 HTTPS 或 localhost 下提供剪贴板接口";
+  }
+
+  // -- 运行环境 ---------------------------------------------------------
+  //
+  // Which browser capabilities *this origin* actually has. Several exist only
+  // in a secure context -- HTTPS, or localhost: the Clipboard API, the
+  // Notification API, Service Workers. Reached over plain HTTP at a LAN
+  // address, ``navigator.clipboard`` is not denied, it is **absent**, and the
+  // page cannot read the clipboard at all. Saying so beats letting the user
+  // find out by pressing Ctrl+V in front of nothing.
+  function environmentCaps() {
+    const secure = Boolean(window.isSecureContext);
+    return {
+      secure,
+      clipboardWrite: Boolean(navigator.clipboard && navigator.clipboard.writeText),
+      clipboardRead: Boolean(navigator.clipboard && navigator.clipboard.readText),
+      // The Notification API is secure-context only; ``"Notification" in
+      // window`` alone reports true on an insecure origin in some browsers,
+      // so it is combined with the context rather than trusted on its own.
+      systemNotify: secure && "Notification" in window,
+    };
+  }
+
+  function renderEnvironment() {
+    const table = els.envTable;
+    const summary = els.envSummary;
+    if (!table) return;
+    const caps = environmentCaps();
+    const origin = `${location.protocol}//${location.host}`;
+    const rows = [
+      [
+        "访问方式",
+        caps.secure
+          ? (location.protocol === "https:" ? "HTTPS（安全上下文）"
+            : `${origin}（回环地址，浏览器视为安全上下文）`)
+          : `${origin}（非安全上下文）`,
+        caps.secure ? "ok" : "bad",
+      ],
+      [
+        "剪贴板写入",
+        caps.clipboardWrite ? "可用" : "改用旧接口 execCommand（复制仍可用）",
+        caps.clipboardWrite ? "ok" : "warn",
+      ],
+      [
+        "剪贴板读取",
+        caps.clipboardRead ? "可用" : "不可用，请按 Ctrl+V 粘贴",
+        caps.clipboardRead ? "ok" : "warn",
+      ],
+      [
+        "系统通知",
+        caps.systemNotify ? "可用" : "浏览器已禁用，降级为标签角标与标题",
+        caps.systemNotify ? "ok" : "warn",
+      ],
+    ];
+    table.replaceChildren();
+    for (const [label, value, level] of rows) {
+      const row = document.createElement("div");
+      row.className = "env-row";
+      const name = document.createElement("span");
+      name.className = "env-label";
+      name.textContent = label;
+      const val = document.createElement("span");
+      val.className = `env-value ${level}`;
+      val.textContent = value;
+      row.append(name, val);
+      table.appendChild(row);
+    }
+    if (summary) {
+      summary.textContent = caps.secure
+        ? "当前是安全上下文，剪贴板与系统通知均可正常使用。"
+        : "当前是非安全上下文（HTTP 且非 localhost）。浏览器只在 HTTPS 或 localhost 下"
+          + "提供剪贴板读取、系统通知等接口——这不是权限没给，而是接口根本不存在，"
+          + "页面也无从得知。用 wsctl serve --tls-self-signed 一键启用 HTTPS 即可全部恢复。";
+    }
+  }
+
+  /** Copy through the async API, falling back to the gesture-bound old path. */
+  async function writeClipboard(text) {
+    if (clipboardCanWrite()) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch { /* denied -- the legacy path may still be allowed */ }
+    }
+    return legacyCopy(text);
+  }
+
+  function legacyCopy(text) {
+    // Must run inside the gesture that asked for it; the menu item and every
+    // hotkey are. A detached node cannot be selected, so it goes into the page
+    // for the duration and is removed again.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.left = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    const prev = document.activeElement;
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    ta.remove();
+    if (prev && typeof prev.focus === "function") {
+      try { prev.focus(); } catch { /* 忽略 */ }
+    }
+    return ok;
+  }
+
   function doCopy(s) {
     const sel = s.term.getSelection && s.term.getSelection();
     if (!sel) { toast("没有选中内容", ""); return; }
-    navigator.clipboard.writeText(sel)
-      .then(() => toast("已复制", "ok"))
-      .catch(() => toast("复制失败：浏览器拒绝了剪贴板访问", "error"));
+    writeClipboard(sel)
+      .then((ok) => (ok
+        ? toast("已复制", "ok")
+        : toast(`复制失败：${clipboardWhy()}`, "error")))
+      .catch(() => toast(`复制失败：${clipboardWhy()}`, "error"));
   }
 
   function doPaste(s) {
     if (s.writable === false) { toast("会话为只读", ""); return; }
+    if (!clipboardCanRead()) {
+      // Nothing can read the clipboard *programmatically* here, but the
+      // browser's own paste still can -- xterm is already listening for it.
+      // Point at the one path that works instead of doing nothing.
+      try { s.term.focus(); } catch { /* 忽略 */ }
+      toast(`请按 Ctrl+V 粘贴（${clipboardWhy()}）`, "warn");
+      return;
+    }
     navigator.clipboard.readText()
       .then((text) => { if (text) sendPaste(s, text); else toast("剪贴板为空", ""); })
-      .catch(() => toast("粘贴失败：浏览器拒绝了剪贴板访问", "error"));
+      .catch(() => toast(`粘贴失败：${clipboardWhy()}`, "error"));
   }
+
+  // The browser's own copy path. Wired so a copy the page did not intercept
+  // still carries the *terminal's* selection rather than the (empty) DOM one.
+  //
+  // Scoped to the terminal pane, tightly. xterm keeps its selection in its own
+  // model and does not drop it when focus moves, so a copy made anywhere else
+  // (an admin field, a config box, the share URL) would otherwise be hijacked
+  // by a stale terminal selection the user cannot even see.
+  document.addEventListener("copy", (event) => {
+    const el = event.target;
+    if (!el || !el.closest || !el.closest(".term-pane")) return;
+    const s = activeId && sessions.get(activeId);
+    if (!s || !s.term || !s.term.getSelection) return;
+    const sel = s.term.getSelection();
+    if (!sel || !event.clipboardData) return;
+    event.clipboardData.setData("text/plain", sel);
+    event.preventDefault();
+  });
 
   function quickCopyOrPaste(s) {
     if (hasSelection(s)) doCopy(s);
@@ -3075,8 +3247,11 @@
   els.shareBtn.addEventListener("click", openShare);
   els.shareClose.addEventListener("click", () => els.shareOverlay.classList.add("hidden"));
   els.shareCopy.addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(els.shareUrl.value); showShareNote("已复制到剪贴板"); }
-    catch { els.shareUrl.select(); document.execCommand("copy"); }
+    const ok = await writeClipboard(els.shareUrl.value);
+    // The old fallback selected the input and called ``execCommand`` itself,
+    // which worked but reported nothing when it too was refused.
+    if (ok) showShareNote("已复制到剪贴板");
+    else { els.shareUrl.select(); showShareNote(`复制失败：${clipboardWhy()}`); }
   });
   els.shareRegenerate.addEventListener("click", async () => {
     if (!shareSid) return;
@@ -4346,7 +4521,10 @@
         break;
       }
       case "toggle_sessions": toggleSessions(); break;
-      case "toggle_settings": els.settingsOverlay.classList.toggle("hidden"); break;
+      case "toggle_settings":
+        els.settingsOverlay.classList.toggle("hidden");
+        renderEnvironment();
+        break;
       case "toggle_share": openShare(); break;
       case "search": toggleSearch(); break;
       default: break;
@@ -4509,10 +4687,12 @@
       kbd.title = "点击复制";
       kbd.style.cursor = "pointer";
       kbd.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(`${combo}\t${label}`);
-          toast(`已复制：${combo}`, "ok");
-        } catch { /* 剪贴板不可用时忽略 */ }
+        const ok = await writeClipboard(`${combo}\t${label}`);
+        // The chord label is left alone on failure. Rewriting it to "复制失败"
+        // is permanent -- the user then cannot see which shortcut the row was
+        // even about -- and the toast already says what went wrong.
+        if (ok) toast(`已复制：${combo}`, "ok");
+        else toast(`复制失败：${clipboardWhy()}`, "error");
       });
       row.append(name, kbd);
       els.hotkeyHelp.appendChild(row);
@@ -4522,8 +4702,9 @@
     copyAll.textContent = "复制全部";
     copyAll.addEventListener("click", async () => {
       const text = rows.map(([combo, label]) => `${combo}\t${label}`).join("\n");
-      try { await navigator.clipboard.writeText(text); toast("已复制全部快捷键", "ok"); }
-      catch { /* 剪贴板不可用时忽略 */ }
+      const ok = await writeClipboard(text);
+      if (ok) toast("已复制全部快捷键", "ok");
+      else toast(`复制失败：${clipboardWhy()}`, "error");
     });
     els.hotkeyHelp.appendChild(copyAll);
     els.hotkeyClose.focus();
@@ -4619,6 +4800,7 @@
   els.settingsBtn.addEventListener("click", () => {
     els.settingsOverlay.classList.remove("hidden");
     updateRendererNote(activeId && sessions.get(activeId));
+    renderEnvironment();
   });
   els.settingsClose.addEventListener("click", () => els.settingsOverlay.classList.add("hidden"));
   els.settingsDone.addEventListener("click", () => els.settingsOverlay.classList.add("hidden"));
@@ -4865,8 +5047,9 @@
           toast("已重命名", "ok");
           loadFiles(filePath);
         } else if (action === "copy") {
-          await navigator.clipboard.writeText(rel);
-          toast("已复制路径", "ok");
+          const ok = await writeClipboard(rel);
+          if (ok) toast("已复制路径", "ok");
+          else toast(`复制失败：${clipboardWhy()}`, "error");
         } else if (action === "delete") {
           // Irreversible and un-recursive: type the name back before it happens.
           const ok = await confirmByName(
@@ -5129,5 +5312,22 @@
 
   fillFontSizes();
   paintPresence();
+  renderEnvironment();
+  // A one-time word about a *degraded environment*. Reached over plain HTTP at
+  // a LAN address, the browser silently withholds a whole class of APIs, and
+  // the symptom -- a copy that does nothing, a notification that never arrives
+  // -- reads as a product bug rather than as a policy the operator can change.
+  // Said once per browser: a repeating banner would be its own annoyance, and
+  // the reason is still available under 设置 → 运行环境.
+  if (!window.isSecureContext && !prefs.seenInsecureNotice) {
+    prefs.seenInsecureNotice = true;
+    try { localStorage.setItem("wsctl-prefs", JSON.stringify(prefs)); } catch { /* 忽略 */ }
+    toast(
+      "当前是 HTTP 访问：剪贴板读取与系统通知被浏览器禁用。"
+      + "用 wsctl serve --tls-self-signed 启用 HTTPS 即可全部恢复"
+      + "（设置 → 运行环境）。",
+      "warn",
+    );
+  }
   bootstrap();
 })();

@@ -413,9 +413,22 @@ def test_a_paste_is_sent_in_chunks() -> None:
     assert "function sendPaste(" in js
     assert "PASTE_CHUNK" in js
     assert "bytes.subarray(" in js
-    # The paste path must use it (the keystroke path must not change).
+    # The paste path must use it (the keystroke path must not change). The
+    # window is the *whole* function, not a fixed character count: a
+    # character budget silently stops meaning anything the moment the
+    # function grows a guard in front of the call, and then the contract
+    # fails for the wrong reason.
     do_paste = js.index("function doPaste(")
-    assert "sendPaste(" in js[do_paste : do_paste + 500]
+    do_paste_end = js.index("\n  function ", do_paste + 1)
+    paste_body = js[do_paste:do_paste_end]
+    assert "sendPaste(" in paste_body, (
+        "doPaste must chunk through sendPaste -- a 500 KB paste sent as one "
+        "frame fills the PTY write buffer and every keystroke after it looks "
+        "like a dead keyboard"
+    )
+    assert "s.ws.send(bytes" not in paste_body, (
+        "doPaste must not bypass the chunker by writing to the socket directly"
+    )
 
 
 def test_flushwrite_disarms_its_own_timer_on_every_entry() -> None:

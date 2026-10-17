@@ -207,6 +207,37 @@ def test_serve_requires_ssl_pair(tmp_path: Path, monkeypatch: object) -> None:
     assert "ssl-key" in result.output
 
 
+def test_tls_self_signed_refuses_a_certificate_it_would_have_to_ignore(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """``--tls-self-signed`` *is* the certificate; another one is a contradiction.
+
+    Silently preferring one of two certificates is the worst outcome: the
+    operator cannot tell which is in force.
+    """
+    _missing_config(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        ["serve", "--tls-self-signed", "--ssl-cert", str(tmp_path / "c.pem"),
+         "--ssl-key", str(tmp_path / "k.pem")],
+    )
+    assert result.exit_code == 2
+    assert "tls-self-signed" in result.output
+
+
+def test_a_detached_child_is_told_to_make_the_certificate_too() -> None:
+    """``wsctl start --tls-self-signed`` backgrounds a child on ``serve``.
+
+    Dropping the flag on the way means the child comes up on plain HTTP while
+    the parent was asked for HTTPS -- and the clipboard breaks again, silently.
+    """
+    from wsctl.cli import validate as vmod
+    from wsctl.cli.main import _serve_child_argv
+
+    argv = _serve_child_argv(vmod.Options({"tls_self_signed": True}))
+    assert "--tls-self-signed" in argv
+
+
 def test_serve_rejects_ssh_backend(tmp_path: Path, monkeypatch: object) -> None:
     _missing_config(tmp_path, monkeypatch)
     result = runner.invoke(app, ["serve", "--backend", "ssh"])

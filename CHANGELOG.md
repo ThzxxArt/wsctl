@@ -5,6 +5,92 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.26] - 2026-10-17
+
+**「安全上下文」：一条根因静默禁用一整片功能，就在根上解决。**
+
+用户报告「复制和粘贴的快捷键和右键菜单里面的都没有作用了」。查下去发现那不是一个
+bug，而是一类：
+
+```
+navigator.clipboard 是【安全上下文】API
+  https://...          → 存在
+  http://localhost     → 存在
+  http://192.168.x.x   → 【根本不存在】（你用 IP 访问的常态）
+```
+
+不存在**不等于**被拒绝。属性没了，`navigator.clipboard.writeText(sel)` 就是**同步抛出**
+`TypeError` —— 而 `.catch()` 只能接**被拒绝的 Promise**，**接不住同步异常**。于是八个
+入口（Alt+C / Alt+V / Ctrl+C / Ctrl+Shift+C/V / Ctrl/Shift+Insert / 右键「复制选区」/
+右键「粘贴」）**全部无效、且全部一声不吭**。
+
+**这不是 0.1.25 引入的。** 复制/粘贴代码自 0.1.12 起一行未动（`git log -S` 查证），
+是一直潜伏、只在「HTTP + 非 localhost」下暴露的缺陷。
+
+同一条根因还在咬别的功能：**系统通知**（0.1.24 的「后台动静可见」）也是安全上下文
+API，HTTP 下同样被浏览器禁用。将来任何新的浏览器 API 都会掉进同一个坑。
+
+### 修复 · 复制粘贴（八个入口全部收复）
+
+- **能力检查**：先问 `navigator.clipboard` 在不在，再无守卫地调用它。
+- **复制走 `execCommand('copy')` 退路**：它**从未被安全上下文限制**，实测在 HTTP 下
+  返回 `true`、剪贴板真的拿到了内容 —— **复制被完整修好**。
+- **粘贴如实说明**：HTTP 下**无法程序化读取**剪贴板（浏览器硬限制）。改为**聚焦终端 +
+  明确提示「请按 Ctrl+V 粘贴」并说明原因**。而 Ctrl+V **本来就还能用**：xterm.js 自己
+  在 helper textarea 与 `.xterm` 上监听了原生 `paste` 事件，读 `clipboardData`，
+  不经安全上下文。只有「程序化读取」这条路没了。
+- **失败必出声**：任何一条失败路径都给 toast，不再有静默。
+- **其余四处收口**：分享链接、快捷键单条、快捷键全部、文件路径复制 —— 同样是同步
+  抛出的写法，统一走安全入口。
+- **补原生 `copy` 事件**，让浏览器自己的复制路径也带上终端选区；**收紧到 `.term-pane`
+  之内**，避免 xterm 的选区模型（它不随焦点清空）劫持输入框里的复制。
+
+### 新增 · 运行环境要说出来（设置 → 运行环境）
+
+- 面板逐项列出**当前 origin 实际拥有**的能力：访问方式 / 剪贴板写入 / 剪贴板读取 /
+  系统通知，各带结论与为什么。
+- **一次性提示**：非安全上下文时提示一次（记在 prefs 里，第二次不再打扰），
+  并指出 `--tls-self-signed` 这条出路。
+
+### 新增 · `wsctl serve --tls-self-signed`（HTTPS 从一条命令开始）
+
+HTTPS 才是根治。障碍是「得先学会 openssl」，这个选项把障碍拿掉：
+
+- 自动生成并**复用**自签证书（`<data_dir>/tls/`），SAN 覆盖 `localhost`、回环地址、
+  主机名与各本机地址。**复用是契约不是优化**：每次启动重新生成会让浏览器每次都重新
+  问「要不要信任」，比 HTTP 的问题还烦。
+- 临近过期（≤14 天）或地址集合变化时自动重签；`0.0.0.0`/`::` 这类**绑定地址不进证书**
+  （它们不是浏览器能去的地方，放进去等于看着覆盖了一切、实际一个都覆盖不到）。
+- 私钥**创建即 0600**（`cryptography` 后端）或生成后立即收紧（`openssl` 后端）。
+- 两种后端：优先 `cryptography`（无外部进程，Windows 无 openssl 时唯一可行），否则
+  `openssl` 命令行；两者都没有时如实报错并指出 `--ssl-cert`/`--ssl-key` 这条出路。
+- 与 `--ssl-cert`/`--ssl-key` **互斥**（自己就是证书，再给一个是指令矛盾）；
+  daemon 子进程透传该开关。
+
+### 新增 · 部署自检
+
+- `doctor` 增加「访问安全」一行：HTTPS ✓ / HTTP+回环 ✓ / **HTTP 对外 → 警告并给出修法**。
+- 前台启动时，若以 HTTP 对外提供服务，打印一行 note 说明浏览器将禁用剪贴板读取与
+  系统通知，并给出 `--tls-self-signed`。
+
+### Verified
+
+**602 unit**（含 **59** 条前端/跨端结构契约）· **43 browser** · **7 slow** · **11 e2e**
+全绿；ruff / mypy strict / `node --check` 通过。
+
+> **突变体证毕**（绿→红→绿）：把 `doCopy` 退回「无守卫、无退路」的旧写法，新增的
+> `test_browser_copy_survives_a_page_without_the_clipboard_api` 立刻变红，失败信息正是
+> 「copy reported neither success nor a reason」——**它测的就是这个静默**。
+
+> **修掉一条脆弱的守卫**：`test_a_paste_is_sent_in_chunks` 用「`function doPaste(` 之后
+> 500 字符内必须出现 `sendPaste(`」当作「粘贴必须分块」的代理。`doPaste` 前方加一个
+> 能力检查守卫就足以让它失准 —— 契约于是在**错误的理由**上失败。改为判**整个函数体**，
+> 并补一条「不得绕过分块器直连 socket」的强断言。
+
+> **诚实边界**：HTTP 下**程序化读取**剪贴板是浏览器硬限制，本产品无法绕过；能做的
+> 是让复制照常可用、让粘贴指向 Ctrl+V、并把原因说清楚。要彻底恢复请用 HTTPS
+> （`--tls-self-signed`，自签证书首次仍需在浏览器点一次「继续前往」）。
+
 ## [0.1.25] - 2026-10-11
 
 **「渲染残缺」根治：屏幕不许再有画不出来的角落。**

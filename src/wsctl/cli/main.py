@@ -451,6 +451,25 @@ def doctor(
         ok if reuse_ok else warn,
     )
 
+    # What the *browser* will allow. Several APIs a user reasonably expects --
+    # reading the clipboard, system notifications -- exist only in a secure
+    # context (HTTPS, or localhost). Over plain HTTP at a LAN address they are
+    # not denied, they are *absent*, and the symptom (a paste that does
+    # nothing) reads as a product bug rather than a deployment choice. This is
+    # the command an operator runs when something does not work, so it is
+    # where that sentence belongs.
+    if settings.ssl_cert:
+        add("访问安全", f"HTTPS（{settings.ssl_cert}）——浏览器能力完整", ok)
+    elif settings.host in ("127.0.0.1", "localhost", "::1"):
+        add("访问安全", "HTTP + 回环地址（浏览器视为安全上下文）", ok)
+    else:
+        add(
+            "访问安全",
+            "HTTP：浏览器将禁用剪贴板读取与系统通知；"
+            "用 --tls-self-signed 一键启用 HTTPS",
+            warn,
+        )
+
     if not settings.reuse_port:
         free = _port_free(settings.host, settings.port)
         add(
@@ -613,6 +632,18 @@ SERVE_RULES = [
     ),
     vmod.requires("ssl_cert", "ssl_key", message="--ssl-cert 需要同时提供 --ssl-key"),
     vmod.requires("ssl_key", "ssl_cert", message="--ssl-key 需要同时提供 --ssl-cert"),
+    # ``--tls-self-signed`` *is* the certificate. Handing over another one at
+    # the same time is a contradiction, not a preference.
+    vmod.exclusive(
+        "tls_self_signed",
+        "ssl_cert",
+        message="--tls-self-signed 会自己生成证书，不要再给 --ssl-cert",
+    ),
+    vmod.exclusive(
+        "tls_self_signed",
+        "ssl_key",
+        message="--tls-self-signed 会自己生成证书，不要再给 --ssl-key",
+    ),
     vmod.choices(
         "backend",
         ("local", "tmux"),
@@ -651,6 +682,8 @@ def _serve_child_argv(options: vmod.Options) -> list[str]:
     # value map above (which would emit `--reuse-port True`).
     if options.has("reuse_port"):
         argv.append("--reuse-port")
+    if options.has("tls_self_signed"):
+        argv.append("--tls-self-signed")
     return argv
 
 
@@ -661,6 +694,7 @@ def _serve_settings(
     port: int | None,
     ssl_cert: Path | None,
     ssl_key: Path | None,
+    tls_self_signed: bool = False,
     backend: str | None,
     reuse_port: bool,
     no_auth: bool,
@@ -682,6 +716,18 @@ def _serve_settings(
     settings = _settings_from(config, **overrides)
     if log_level:
         settings.log_level = log_level
+    if tls_self_signed:
+        from wsctl.core import tls as tls_mod
+
+        try:
+            cert, key = tls_mod.ensure_self_signed(
+                settings.data_dir / "tls",
+                tls_mod.local_names(extra=settings.host),
+            )
+        except tls_mod.TlsError as exc:
+            _fail(str(exc))
+        settings.ssl_cert = cert
+        settings.ssl_key = key
     return settings
 
 
@@ -800,6 +846,16 @@ def _serve_foreground(
     )
     if not settings.auth_required:
         err_console.print("[bold yellow]warning:[/] authentication is disabled")
+    # A browser only exposes the Clipboard and Notification APIs in a secure
+    # context. Over plain HTTP on anything but a loopback address they are not
+    # denied but *absent*, so copy/paste and system notifications stop working
+    # with no error anywhere -- the operator sees a product bug, not a policy.
+    # One line here is the cheapest possible fix for that confusion.
+    if not settings.ssl_cert and settings.host not in ("127.0.0.1", "localhost", "::1"):
+        err_console.print(
+            "[bold yellow]note:[/] 当前以 HTTP 对外提供服务，浏览器会禁用剪贴板读取与"
+            "系统通知。加 [cyan]--tls-self-signed[/] 即可自动启用 HTTPS。"
+        )
 
     ssl_certfile = str(settings.ssl_cert) if settings.ssl_cert else None
     ssl_keyfile = str(settings.ssl_key) if settings.ssl_key else None
@@ -862,6 +918,14 @@ def serve(
     ] = None,
     ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
     ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
+    tls_self_signed: Annotated[
+        bool,
+        typer.Option(
+            "--tls-self-signed",
+            help="自动生成并复用自签证书，以 HTTPS 启动。浏览器只在安全上下文"
+            "（HTTPS 或 localhost）下提供剪贴板与系统通知。",
+        ),
+    ] = False,
     log_level: Annotated[str | None, typer.Option(help="日志级别。")] = None,
     log_json: Annotated[bool, typer.Option("--log-json", help="输出 JSON 日志。")] = False,
     new: Annotated[
@@ -894,6 +958,7 @@ def serve(
             "admin_password": admin_password,
             "ssl_cert": ssl_cert,
             "ssl_key": ssl_key,
+            "tls_self_signed": tls_self_signed,
             "log_level": log_level,
             "log_json": log_json,
             "new": new,
@@ -914,6 +979,7 @@ def serve(
         port=port,
         ssl_cert=ssl_cert,
         ssl_key=ssl_key,
+        tls_self_signed=tls_self_signed,
         backend=backend,
         reuse_port=reuse_port,
         no_auth=no_auth,
@@ -947,6 +1013,14 @@ def start(
     ] = None,
     ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
     ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
+    tls_self_signed: Annotated[
+        bool,
+        typer.Option(
+            "--tls-self-signed",
+            help="自动生成并复用自签证书，以 HTTPS 启动。浏览器只在安全上下文"
+            "（HTTPS 或 localhost）下提供剪贴板与系统通知。",
+        ),
+    ] = False,
     log_level: Annotated[str | None, typer.Option(help="日志级别。")] = None,
     log_json: Annotated[bool, typer.Option("--log-json", help="输出 JSON 日志。")] = False,
     new: Annotated[
@@ -979,6 +1053,7 @@ def start(
             "admin_password": admin_password,
             "ssl_cert": ssl_cert,
             "ssl_key": ssl_key,
+            "tls_self_signed": tls_self_signed,
             "log_level": log_level,
             "log_json": log_json,
             "new": new,
@@ -997,6 +1072,7 @@ def start(
         port=port,
         ssl_cert=ssl_cert,
         ssl_key=ssl_key,
+        tls_self_signed=tls_self_signed,
         backend=backend,
         reuse_port=reuse_port,
         no_auth=no_auth,
@@ -1067,6 +1143,14 @@ def restart(
     ] = None,
     ssl_cert: Annotated[Path | None, typer.Option(help="TLS 证书文件。")] = None,
     ssl_key: Annotated[Path | None, typer.Option(help="TLS 私钥文件。")] = None,
+    tls_self_signed: Annotated[
+        bool,
+        typer.Option(
+            "--tls-self-signed",
+            help="自动生成并复用自签证书，以 HTTPS 启动。浏览器只在安全上下文"
+            "（HTTPS 或 localhost）下提供剪贴板与系统通知。",
+        ),
+    ] = False,
     log_level: Annotated[str | None, typer.Option(help="日志级别。")] = None,
     log_json: Annotated[bool, typer.Option("--log-json")] = False,
     new: Annotated[str | None, typer.Option("--new")] = None,
@@ -1102,6 +1186,7 @@ def restart(
             "admin_password": admin_password,
             "ssl_cert": ssl_cert,
             "ssl_key": ssl_key,
+            "tls_self_signed": tls_self_signed,
             "log_level": log_level,
             "log_json": log_json,
             "new": new,
@@ -1118,6 +1203,7 @@ def restart(
         port=port,
         ssl_cert=ssl_cert,
         ssl_key=ssl_key,
+        tls_self_signed=tls_self_signed,
         backend=backend,
         reuse_port=False,
         no_auth=no_auth,

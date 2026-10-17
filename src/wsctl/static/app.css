@@ -606,6 +606,19 @@ button.danger:hover { border-color: var(--danger) !important; background: rgba(2
 }
 .overlay .login-card button[type="submit"] { flex: none; }
 .hint { color: var(--muted); font-size: 12px; margin: 0; line-height: 1.6; }
+
+/* 运行环境：origin 实际拥有的浏览器能力。一行一项，右侧是结论。 */
+.env-table { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-2); }
+.env-row {
+  display: flex; align-items: baseline; gap: var(--sp-2);
+  font-size: 12px; padding: 3px 0; border-bottom: 1px solid var(--border);
+}
+.env-row:last-child { border-bottom: 0; }
+.env-row .env-label { flex: 0 0 96px; color: var(--muted); }
+.env-row .env-value { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.env-row .env-value.ok { color: var(--ok); }
+.env-row .env-value.warn { color: var(--warn); }
+.env-row .env-value.bad { color: var(--danger); }
 .error { color: var(--danger); font-size: 12px; margin: 0; }
 .section-title { font-size: 12px; color: var(--muted); margin-top: var(--sp-1); font-weight: 600; }
 .qr { width: 200px; height: 200px; align-self: center; background: #fff; border-radius: var(--radius); padding: var(--sp-2); }
