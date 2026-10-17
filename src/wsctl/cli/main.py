@@ -186,12 +186,29 @@ def _running_instance_base() -> str | None:
         settings = _settings_from(None)
         resolved = daemon_mod.resolve_instance(settings)
         if resolved.instance is not None:
+            # The scheme belongs to the instance, not to the config: an
+            # instance started with ``--tls-self-signed`` serves HTTPS even
+            # when the config says nothing about TLS.
+            target = daemon_mod.settings_for(resolved.instance, settings)
             host = resolved.instance.host
             if host in ("", "0.0.0.0", "::", "[::]"):
                 host = "127.0.0.1"
-            scheme = "https" if settings.ssl_cert else "http"
+            scheme = "https" if target.ssl_cert else "http"
             return f"{scheme}://{host}:{resolved.instance.port}"
     return None
+
+
+def _display_url(host: str, port: int, settings: Settings) -> str:
+    """The address to open, with the scheme spelled out.
+
+    ``--tls-self-signed`` listens on an *HTTPS* port, but a bare
+    ``0.0.0.0:7682`` invites the reader to try ``http://`` -- which cannot
+    connect, and reads as "the server did not start". A bind-any address is
+    also not somewhere a browser can go, so it is shown as loopback.
+    """
+    shown = "127.0.0.1" if host in ("", "0.0.0.0", "::", "[::]") else host
+    scheme = "https" if settings.ssl_cert else "http"
+    return f"{scheme}://{shown}:{port}"
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -431,18 +448,26 @@ def doctor(
     )
     instance = resolved.instance
     if instance is not None:
+        # Re-point the settings *first*: both the address shown here and every
+        # probe below take their scheme from the instance. Reporting it before
+        # this line printed ``http://`` for a healthy HTTPS server -- the same
+        # lie, one row up from the check that was fixed.
+        settings = daemon_mod.settings_for(instance, settings)
         note = "（已自动选定）" if resolved.fallback else ""
         add(
             "运行状态",
-            f"运行中（pid {instance.pid}，{instance.host}:{instance.port}）{note}",
+            f"运行中（pid {instance.pid}，"
+            f"{_display_url(instance.host, instance.port, settings)}）{note}",
             ok,
         )
-        # Report the address it is really listening on, not the default one.
-        settings = daemon_mod.settings_for(instance, settings)
     else:
         add("运行状态", "未运行", "[dim]-[/]")
         for other in resolved.found:
-            add("其他实例", f"pid {other.pid}  {other.host}:{other.port}", warn)
+            add(
+                "其他实例",
+                f"pid {other.pid}  {_display_url(other.host, other.port, settings)}",
+                warn,
+            )
 
     reuse_ok = hasattr(socket, "SO_REUSEPORT")
     add(
@@ -771,9 +796,14 @@ def _start_background(
         _fail(str(exc))
     console.print(
         f"[green]已在后台启动[/] pid {instance.pid}  "
-        f"[cyan]{instance.host}:{instance.port}[/]"
+        f"[cyan]{_display_url(instance.host, instance.port, settings)}[/]"
     )
     console.print(f"[dim]日志：{daemon_mod.logfile_path(settings)}（wsctl logs -f 可跟踪）[/]")
+    if settings.ssl_cert:
+        console.print(
+            "[bold yellow]注意：[/]这是 [cyan]HTTPS[/] 端口 —— 浏览器里请用 "
+            "[cyan]https://[/]，用 [dim]http://[/] 会连不上。"
+        )
     if not admin_password:
         console.print("[dim]若为首次启动，admin 随机密码打印在日志中。[/]")
 
@@ -1234,6 +1264,21 @@ def restart(
             # to fall back to a one-off migration with a visible gap -- the
             # zero-downtime capability was silently downgraded.
             options.set("reuse_port", True)
+        if (
+            running.instance.ssl_cert
+            and not options.has("ssl_cert")
+            and not options.has("tls_self_signed")
+        ):
+            # And the *transport*. A plain ``restart`` used to drop TLS and
+            # bring the replacement up on HTTP -- silently downgrading exactly
+            # the deployment that was set up for it, and quietly taking the
+            # clipboard and notification APIs back away. Skipped when the
+            # operator asked for a transport on this invocation;
+            # ``--tls-self-signed`` and ``--ssl-cert`` are exclusive, so
+            # inheriting on top of either would be a usage error.
+            options.set("ssl_cert", running.instance.ssl_cert)
+            if running.instance.ssl_key:
+                options.set("ssl_key", running.instance.ssl_key)
     elif running.ambiguous:
         err_console.print(
             f"[yellow]发现 {len(running.found)} 个实例，请用 --port 指定要重启哪一个：[/]"
@@ -1274,7 +1319,10 @@ def restart(
         instance = daemon_mod.restart(settings, argv, timeout=timeout)
     except daemon_mod.DaemonError as exc:
         _fail(str(exc))
-    console.print(f"[green]已重启[/] pid {instance.pid}  [cyan]{instance.host}:{instance.port}[/]")
+    console.print(
+        f"[green]已重启[/] pid {instance.pid}  "
+        f"[cyan]{_display_url(instance.host, instance.port, settings)}[/]"
+    )
 
 
 @app.command()
@@ -1308,11 +1356,15 @@ def status(
                 )
         raise typer.Exit(code=1)
 
+    # Re-point the settings at the instance *first*: the scheme it serves comes
+    # from the instance, so everything below -- the address shown, the health
+    # probe -- agrees with what is actually listening.
+    settings = daemon_mod.settings_for(instance, settings)
     if resolved.fallback:
         err_console.print(
-            f"[dim]已自动跟随正在运行的实例 {instance.host}:{instance.port}[/]"
+            "[dim]已自动跟随正在运行的实例 "
+            f"{_display_url(instance.host, instance.port, settings)}[/]"
         )
-    settings = daemon_mod.settings_for(instance, settings)
     info = daemon_mod.health_info(settings)
     payload: dict[str, object] = {"running": True, **instance.to_dict(), "health": info}
     if json_output:
@@ -1321,7 +1373,7 @@ def status(
     table = Table("项", "值")
     table.add_row("状态", "[green]运行中[/]")
     table.add_row("PID", str(instance.pid))
-    table.add_row("地址", f"{instance.host}:{instance.port}")
+    table.add_row("地址", _display_url(instance.host, instance.port, settings))
     table.add_row("版本", instance.version)
     table.add_row("运行时长", _fmt_duration(instance.uptime))
     if info is not None:

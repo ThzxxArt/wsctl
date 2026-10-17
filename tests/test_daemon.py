@@ -255,6 +255,62 @@ def test_settings_for_repoints_at_the_instance(tmp_path: Path) -> None:
     assert daemon.logfile_path(aimed).name == "wsctl-18111.log"
 
 
+def test_the_pidfile_remembers_that_the_instance_serves_https(tmp_path: Path) -> None:
+    """The scheme belongs to the *instance*, not to the configuration.
+
+    ``--tls-self-signed`` is a command-line flag, so an instance serving HTTPS
+    with a config that says nothing about TLS is entirely normal. While the
+    record did not carry it, every later command took the scheme from the
+    config: ``doctor``'s health probe asked an HTTPS port for ``http://…`` and
+    reported a healthy server as unreachable.
+    """
+    settings = settings_for(tmp_path).model_copy(
+        update={"ssl_cert": tmp_path / "cert.pem", "ssl_key": tmp_path / "key.pem"}
+    )
+    daemon.claim_pidfile(settings)
+    read = daemon.read_instance(settings)
+    assert read is not None
+    assert read.ssl_cert.endswith("cert.pem"), read.ssl_cert
+    assert read.ssl_key.endswith("key.pem"), read.ssl_key
+
+
+def test_settings_for_takes_the_scheme_from_the_instance_not_the_config(tmp_path: Path) -> None:
+    cert = tmp_path / "cert.pem"
+    # The config knows nothing about TLS ...
+    base = settings_for(tmp_path, port=7681)
+    assert base.ssl_cert is None
+    # ... but this instance is serving HTTPS.
+    inst = daemon.Instance(
+        pid=1, host="0.0.0.0", port=18111, started_at=0.0, version="0",
+        identity="", ssl_cert=str(cert),
+    )
+    aimed = daemon.settings_for(inst, base)
+    assert aimed.ssl_cert == cert, (
+        "the health probe builds its URL from this; taking the scheme from the "
+        "config makes it ask an HTTPS port for http:// and call a running "
+        "server down"
+    )
+    assert daemon.health_url(aimed).startswith("https://")
+
+
+def test_a_plain_instance_does_not_inherit_a_certificate_from_the_config(tmp_path: Path) -> None:
+    """The reverse direction, which is the same mistake mirrored.
+
+    An instance running plain HTTP must not be probed over HTTPS just because
+    the configuration names a certificate -- a certificate in the config only
+    matters to the process that was *started* with it.
+    """
+    base = settings_for(tmp_path, port=7681).model_copy(
+        update={"ssl_cert": tmp_path / "cert.pem"}
+    )
+    inst = daemon.Instance(
+        pid=1, host="0.0.0.0", port=18111, started_at=0.0, version="", identity="",
+    )
+    aimed = daemon.settings_for(inst, base)
+    assert aimed.ssl_cert is None
+    assert daemon.health_url(aimed).startswith("http://")
+
+
 def test_found_lists_every_live_instance_even_when_one_matches(tmp_path: Path) -> None:
     """``found`` is "everything live here", not just the one we matched.
 
@@ -425,3 +481,25 @@ def test_restart_replays_reuse_port_from_the_running_instance() -> None:
         "restart must carry the instance's binding mode into the child argv"
     )
     assert "running.instance.reuse_port" in main_src
+
+
+def test_restart_does_not_silently_downgrade_https_to_http() -> None:
+    """The scheme is part of what is *running*, not of the configuration.
+
+    ``--tls-self-signed`` is a command-line flag; nothing in the config records
+    it. A plain ``restart`` therefore used to bring the replacement up on HTTP
+    -- quietly undoing the exact deployment that was set up for the clipboard
+    and notification APIs a secure context provides.
+    """
+    main_src = (
+        Path(__file__).resolve().parent.parent
+        / "src" / "wsctl" / "cli" / "main.py"
+    ).read_text(encoding="utf-8")
+    assert 'options.set("ssl_cert", running.instance.ssl_cert)' in main_src, (
+        "restart must carry the instance's transport into the child argv"
+    )
+    # ... but only when the operator did not name a transport here:
+    # ``--tls-self-signed`` and ``--ssl-cert`` are exclusive, so inheriting on
+    # top of either would turn a restart into a usage error.
+    assert 'not options.has("tls_self_signed")' in main_src
+    assert 'not options.has("ssl_cert")' in main_src

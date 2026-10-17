@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.28] - 2026-10-17
+
+**`--tls-self-signed` 能起来了，但用起来还有三处不对——同一个根因。**
+
+0.1.27 修好了「装不上 cryptography」。用户接着报：
+
+- `doctor` 里服务器连接检查**一直失败**；
+- `wsctl start --tls-self-signed` 「启动不起来」（其实起来了，是拿 `http://` 去访问 HTTPS 端口）。
+
+### 根因：TLS 状态没被记录下来
+
+实例记录（pidfile）只存 `pid/host/port/version/identity/reuse_port`，**没有存 TLS 状态**；
+而 `--tls-self-signed` 是**命令行参数**，不进配置文件。于是任何「事后查询这个实例」的
+命令都以为它在跑 HTTP：
+
+| 症状 | 机理 |
+|---|---|
+| `doctor` 的服务器检查永远失败 | `settings_for()` 只从实例拷 `host`/`port`，协议取自**配置**；配置里没有证书 → 探针去问 HTTPS 端口要 `http://…/healthz` |
+| `start`/`status` 打印的地址**不带协议** | 只打 `0.0.0.0:7682`，读的人自然拼 `http://` → 连不上 → 以为没启动 |
+| `restart` **静默降级成 HTTP** | 子进程 argv 只带命令行参数，不带实例的传输方式 |
+
+三条是同一个错误：**把「实例怎么在跑」当成了「配置怎么写」**。
+
+### 修复
+
+- **实例记录新增 `ssl_cert` / `ssl_key`**（`claim_pidfile` 写入、`read_instance` 读回）。
+  传输方式是**实例的属性**，不是配置的属性——用一个命令行开关启动的服务，配置里
+  什么都不提 TLS，是完全正常的状态。
+- **`settings_for()` 改为从实例取协议**（不再从配置取）。`doctor` / `status` /
+  `_running_instance_base()` 因此全部自动对上。反方向也管住：跑着 HTTP 的实例不会
+  因为配置里写了证书就被按 HTTPS 去探。
+- **地址显示一律带协议**（新增 `_display_url`）：`start` / `restart` / `status` /
+  `doctor` 运行状态。绑定地址 `0.0.0.0` 显示为 `127.0.0.1`（那才是能打开的地方）。
+  HTTPS 启动时**额外打印一行**：「这是 HTTPS 端口，浏览器里请用 https://」。
+- **`restart` 继承传输方式**：不带任何 TLS 参数时沿用实例原有的证书，不再静默降级。
+  沿用 `reuse_port` 的既有先例（「绑定的方式也是实例的一部分，不能静默丢」），TLS 更是。
+  本次显式指定了传输方式时不继承——`--tls-self-signed` 与 `--ssl-cert` 互斥，两个都设
+  会变成用法错误。
+
+### Verified
+
+**607 unit**（含 **59** 条结构契约）· **43 browser** · **7 slow** · **11 e2e** 全绿；
+ruff / mypy strict / `node --check` 通过。
+
+> 端到端留证（本机实跑）：
+> ```
+> start (TLS)     → 已在后台启动 pid … https://127.0.0.1:7696
+>                   注意：这是 HTTPS 端口 —— 浏览器里请用 https://
+> status          → 地址  https://127.0.0.1:7696
+> doctor          → 运行状态  运行中（pid …，https://127.0.0.1:7696） 正常
+>                   服务器    127.0.0.1:7696（版本 0.1.28） 正常      ← 此前永远失败
+> restart（无参数）→ 已重启 pid …  https://127.0.0.1:7695            ← 此前会降级成 HTTP
+> ```
+
+> 新增测试：pidfile 记住 TLS 状态、`settings_for` 从实例取协议（正反两个方向）、
+> 以及 `restart` 不得静默降级。
+
 ## [0.1.27] - 2026-10-17
 
 **0.1.26 的 `--tls-self-signed` 在默认安装下起不来。**

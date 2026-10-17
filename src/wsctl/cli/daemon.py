@@ -48,6 +48,20 @@ class Instance:
     #: without a refused-connection window" is exactly what the operator is
     #: asking when they want to restart the terminal from inside itself.
     reuse_port: bool = False
+    #: The certificate this instance is serving, or ``""`` for plain HTTP.
+    #: Recorded because the listening *scheme* is a property of the instance,
+    #: not of the configuration: ``--tls-self-signed`` is a command-line flag,
+    #: so an instance serving HTTPS with a config that says nothing about TLS
+    #: is entirely normal. Without it every later command -- ``doctor``'s
+    #: health probe, ``status``, the base URL other commands derive -- assumed
+    #: ``http://`` and reported a perfectly healthy server as unreachable.
+    ssl_cert: str = ""
+    #: The matching private key, recorded for the same reason and used only to
+    #: reproduce the invocation on a plain ``restart`` -- which used to drop
+    #: TLS entirely and come back up on HTTP. A path is not a secret (the key
+    #: file itself is 0600, and the data directory already holds the user
+    #: database); silently downgrading a deployment's transport is worse.
+    ssl_key: str = ""
 
     @property
     def uptime(self) -> float:
@@ -111,8 +125,23 @@ def resolve_instance(
 
 
 def settings_for(instance: Instance, base: Settings) -> Settings:
-    """``base`` re-pointed at ``instance``, so paths/health match the target."""
-    return base.model_copy(update={"host": instance.host, "port": instance.port})
+    """``base`` re-pointed at ``instance``, so paths/health match the target.
+
+    The *scheme* comes from the instance too, not from ``base``. A server
+    started with ``--tls-self-signed`` is serving HTTPS while the config says
+    nothing about TLS, and taking the scheme from the config made the health
+    probe ask that HTTPS port for ``http://…`` -- a healthy server reported as
+    down, which is exactly the reading that sends someone hunting a bug that
+    is not there.
+    """
+    update: dict[str, object] = {"host": instance.host, "port": instance.port}
+    if instance.ssl_cert:
+        update["ssl_cert"] = Path(instance.ssl_cert)
+    elif base.ssl_cert is not None:
+        # The instance is not serving TLS, so a certificate path inherited from
+        # the config describes something this process is not doing.
+        update["ssl_cert"] = None
+    return base.model_copy(update=update)
 
 
 # -- paths -------------------------------------------------------------
@@ -243,6 +272,8 @@ def read_instance(settings: Settings) -> Instance | None:
             version=str(data.get("version", "?")),
             identity=str(data.get("identity", "")),
             reuse_port=bool(data.get("reuse_port", False)),
+            ssl_cert=str(data.get("ssl_cert", "")),
+            ssl_key=str(data.get("ssl_key", "")),
         )
     except (KeyError, TypeError, ValueError):
         with contextlib.suppress(OSError):
@@ -278,6 +309,8 @@ def claim_pidfile(
         version=__version__,
         identity=_process_identity(os.getpid()) or "",
         reuse_port=reuse_port,
+        ssl_cert=str(settings.ssl_cert) if settings.ssl_cert else "",
+        ssl_key=str(settings.ssl_key) if settings.ssl_key else "",
     )
     for attempt in range(2):
         existing = read_instance(settings)

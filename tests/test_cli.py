@@ -650,7 +650,12 @@ def test_doctor_probes_the_running_instance_not_a_stale_credential(
     path.write_text(_json.dumps(daemon.asdict(inst)), encoding="utf-8")
     try:
         rows = _doctor_rows(runner.invoke(app, ["doctor", "--json"]))
-        assert "0.0.0.0:18111" in rows["运行状态"]
+        # The address must be the instance actually running. It is shown with
+        # its scheme, and a bind-any address as loopback -- ``0.0.0.0`` is not
+        # somewhere a browser can go, and printing it bare is what made an
+        # HTTPS instance look like a server that had not started. What the
+        # instance *bound* is still reported, by the 监听端口 row.
+        assert "127.0.0.1:18111" in rows["运行状态"], rows["运行状态"]
         assert "18111" in rows["服务器"], rows["服务器"]
         assert "7720" not in rows["服务器"], "the stale login URL must be ignored"
     finally:
