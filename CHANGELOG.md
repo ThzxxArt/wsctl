@@ -5,6 +5,164 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.30] - 2026-10-25
+
+**「按了 Alt+C，什么都没发生」——按键、焦点，以及入口边界。**
+
+用户报告：`Alt+C` 复制在 **HTTPS 下也不起作用**，要求同时体检全部快捷键。查下来，
+`Alt+C` 与 HTTPS、与剪贴板 API 都没有关系：**真正坏掉的是「哪些键算数」和「哪个
+终端算当前会话」这两件事**；审查同一批入口时，又发现了几处比快捷键严重得多的边界
+缺口，它们一起在本版收口。
+
+### 根因一：键位匹配的是「字符」，不是「按键」
+
+`comboOf()` 只用 `event.key` 拼组合键，再与绑定**精确比较**。`event.key` 是**布局
+产出的字符**，不是手指按下的键：
+
+| 绑定 | 真实键盘发出的 | 结果 |
+|---|---|---|
+| `alt+c`（macOS） | `alt+ç` | 不匹配，连提示都没有 |
+| `alt+?` | `alt+shift+?`（`?` 必须按 Shift） | 帮助浮层**永远打不开** |
+| `alt+shift+\` | `alt+shift+|` | 真机按不出来，只有合成事件能过 |
+| `alt+f/e/v/h/d`（Windows） | 被浏览器菜单栏吃掉 | 页面根本收不到 keydown |
+
+守卫之所以没抓到：旧用例 `press("Alt+?")` 合成出来的 `shiftKey` 是 `false`，
+真实键盘永远发不出这种事件；`Alt+C` 的用例不建选区，并且把「没有选中内容」也算通过——
+**它从来没有验证过一次真实复制**。
+
+### 根因二：分屏里「焦点」和「当前会话」是两套真相
+
+只有 `activateTab()` 会更新 `activeId`。点击分屏里的某一栏只移动 DOM 焦点，于是
+复制、搜索、录制、分享、字号、`__wsctlScreen()` 全部作用在**另一台终端**上。选中左栏
+文字、点右栏、按 `Alt+C` → 页面提示「没有选中内容」，剪贴板一个字节没变——这正是
+「HTTPS 下也复制不了」最像的现场。
+
+### 根因三：入口没有边界（服务端）
+
+- `uvicorn` 的 `proxy_headers` 默认 `True`，会在 wsctl 看到请求之前按
+  `X-Forwarded-For` 改写 `scope["client"]`——`trust_proxy=false` 形同虚设，本机任意
+  进程都能伪造来源 IP，绕过 `allowed_ips`、伪造限速 key、污染审计。
+- `is_origin_allowed` 只保护 WebSocket 与二维码；`POST /api/files/upload` 是
+  **CORS 简单请求**（multipart，不触发预检），同站异端口/子域页面一个
+  `fetch(..., {mode:"no-cors"})` 就能覆盖 `~/.ssh/authorized_keys`。
+- 停用/删除用户只删登录 token，**运行中的 shell 与 writable 分享仍然可用**。
+- 登录先收 body 再校验长度；`ip:用户名` 的预算可被轮换用户名绕过，Argon2 无并发帽。
+- owner 打开自己的分享链接后，轮换分享会把 owner 自己 4403 踢掉。
+- 未认证 WebSocket 可无限占用（accept 在前、首帧无超时、无连接上限）。
+- `resync` 无限制：只读访客可反复触发全量回放，并两次改动 owner 的 PTY 尺寸。
+- 会话继承 `WSCTL_ADMIN_PASSWORD`：任何能开终端的人 `env` 就能读到管理员密码。
+- `restore` 可在服务运行时覆盖数据库，且不清 `-wal`/`-shm`（旧 WAL 覆盖新库 = 损坏）。
+- `wsctl_shed_frames_total` 是「已连接客户端计数之和」，客户端断开后计数会**下降**
+  （Prometheus 计数器重置）；非 ASCII 分享 token 让 `compare_digest` 抛 `TypeError` → 500。
+
+### 修复
+
+**按键与焦点（前端）**
+
+- `comboCandidates()`：同时产出字符组合、物理键组合（`event.code`）与「字符本身是
+  Shift 产物时去掉 Shift」的组合，绑定命中任一即可。旧 keybindings 无需改动。
+- `setFocus()` 统一焦点记账：点击分屏里的任一栏即成为当前会话；`focusin` 挂在 pane 上
+  （渲染器重建不丢），不再依赖标签切换。
+- 输入域守卫：焦点在非终端输入框时快捷键不拦截（Ctrl+C 复制的是输入框里的文字）。
+- 键位说真话：`Alt+F/E/V/H/D` 在 Windows 标 ⚠️；默认键位改为 `Alt+Shift+F`、
+  `Alt+Shift+H`、`Alt+=`、`Alt+-`，旧默认**仅在未被修改过时**自动迁移一次。
+- 「设置 → 按键诊断」：最近 10 次 keydown 的 `key`/`code`/修饰键/候选/命中动作，
+  以及「焦点在输入框所以不拦截」——「收不到」与「收到了没匹配」从此可区分。
+- 共享（只读）视图不再静默禁用全部快捷键：复制、帮助、搜索、字号、切标签可用。
+- 帮助表补平台说明，⚠️/❌ 的 title 不再被「点击复制」覆盖。
+
+**入口边界（服务端）**
+
+- `uvicorn.Config(proxy_headers=False)`；新增 `trusted_proxies`（默认仅回环），
+  X-Forwarded-For 只从受信对端采信、从右往左解析，全受信时回退真实对端。
+- 非 GET `/api/*` 校验 `Origin`（缺失时看 `Sec-Fetch-Site`）；文件上传不再可被同站
+  跨源页面驱动。CLI/脚本不带 Origin，行为不变。
+- 账号停用 / 改密 / 删除：立即终止该用户的运行中会话、撤销分享并清库中的 token；
+  维护循环每 5s 兜底 CLI 路径（`wsctl user disable` 无法直接触达运行中的进程）。
+- 登录：`Content-Length` 前置上限 8 KiB（无长度直接 411）、每 IP 失败预算
+  （`3×` 账户预算，最低 20，不因某个账户成功而清零）、Argon2 全局 2–4 并发通道、
+  等待超 10s 返回 503。
+- WebSocket：attach 前 `ConnectionCaps`（全局 512 / 每 IP 64，可配）、5s 握手超时
+  （4408）、control 帧令牌桶（40/s，burst 80）、resync 令牌桶（0.2/s，burst 3）。
+- 会话环境剥离凭据类变量（`WSCTL_ADMIN_PASSWORD` / `WSCTL_TOKEN` / `WSCTL_TOTP`
+  及 `*_PASSWORD`/`*_TOKEN`/`*_SECRET` 后缀），保留 `WSCTL_DATA_DIR`/`WSCTL_PORT`
+  等定位上下文——在会话里敲 `wsctl stop` 需要它才能认出「自己属于哪个实例」；
+  `serve` 读到引导密码后立刻从 `os.environ` 移除。
+- `restore`：拒绝运行中的实例（数据库租约）、用在线备份 API 写 `.bak`、
+  临时文件 + `os.replace` 原子替换、删除旧 `-wal`/`-shm`、`PRAGMA integrity_check`。
+- `shed` 计数改为进程级单调；`share_access` 以字节比较，非 ASCII token 正常返回
+  「无效」而不是 500。
+
+### 复查后补的洞（同一版内收口）
+
+- **默认粘贴键改为 `Alt+Shift+V`**：`Alt+V` 在 Firefox 是 View 菜单，页面收不到——
+  这正是本版要消灭的「广告了一个按不动的键」。旧默认会被迁移一次（见下）。
+- **键位迁移真的只跑一次**：迁移改成按 `keybindingsVersion` 判定并立即写回；此前按
+  「值等于旧默认」在每次加载时重写，用户故意选回 `Alt+F` 也会被静默改掉。
+- **`Alt+Shift+<字母>` 不再冒领 `Alt+<字母>`**：Shift 回退门的大小写判断写成了
+  `[^a-z0-9]`，大写字母能穿过——切输入法时可能开出新建会话、清屏或粘贴。
+- **诊断面板不再记录明文按键**：普通字符记为 `•`、输入框里的键整条隐去（只保留
+  code 为空），避免「截图求助」把 `sudo`/登录密码一起发出去。
+- **同源判断兼容反代端口**：`Host` 不带端口时不再比较 `Origin` 的端口
+  （`https://host:8443` + `proxy_set_header Host $host` 曾被判成跨站，登录 403 被
+  UI 显示成「密码错误」）；`allowed_origins` 改为**额外**受信集，不再取代同源判断。
+- **连接上限改用非致命码 `4413` 并先说明原因**：`4409` 在致命集合里，一次瞬时上限
+  会让整个 NAT 办公室的标签页「永不重连」；新码可重连，且关闭前先发 `error` 帧。
+- **改密跨进程闭环**：`users.password_changed_at` 记录改密时间，维护循环终止
+  「改密之前创建」的会话并撤销分享；`wsctl user passwd` 这类另一进程的操作因此也
+  能在 5s 内生效，而不会误杀用新密码开的新会话。
+- **配置热重载支持「删行即默认」**：此前从文件里删掉 `trust_proxy = true` 会保持旧值
+  并报告「无变更」（fail-open）；现在缺省键按模型默认值比较。
+- **配置校验**：`trusted_proxies` 必须是合法 CIDR（打错不再静默失去代理信任）；
+  `ws_max_connections*`/`login_rate_limit` 拒绝负数；`login_rate_window` 必须为正。
+- **resync 被拒不再留白屏**：客户端改为收到 `resync-begin` 才清屏，服务端把拒绝
+  改成 `resync-rejected` 事件，状态机不再靠 4s 超时自愈。
+- **非对象 JSON 帧不再杀会话**：`null`/`[]`/`"x"` 会让 `.get` 抛 AttributeError 并以
+  4500 关闭；现在忽略。控制帧令牌桶也移到 `json.loads` **之前**，真正限制解析开销。
+- **Argon2 并发帽移到事件循环**：先在协程里抢 lane 再提交线程，避免登录风暴把默认
+  线程池占满、连累 `/api` 的数据库调用；超时返回 503 且不再留下排队线程。
+- **restore 加固**：`.bak` 不再复用（第二次恢复会覆盖唯一原库副本）、安装前二次检查
+  实例租约（解包几分钟期间被拉起的服务不再被覆盖）、`fsync` 文件与目录、
+  `-wal/-shm/-journal` 在替换**之前**删除（消除「新库 + 旧 WAL」窗口）、录制/配置先写
+  数据库最后换。
+- **`X-Forwarded-Proto` 补回**：`proxy_headers=False` 也关掉了 uvicorn 的 scheme 处理，
+  分享二维码等由 `base_url` 生成的链接在 TLS 反代后不再退回 `http://`。
+- **tmux 控制命令加超时**：tmux server 卡死时 `stop()`/`wsctl stop`/停用账号不再挂死。
+- **`/api/files?limit=-5` 不再等于「整个目录」**：分页参数在路由与 `fs` 两层都收口。
+- **WebSocket 传输层上限**：`ws_max_size = 1 MiB`（应用层 256 KiB 之外的第二道）、
+  `limit_concurrency = 1024`；超大帧在传输层即被拒，不会再先让服务端持有 16 MiB。
+- **退出码不再丢失**：会话 `closed` 先于 `exit` 通知写入时，pump 会先等
+  `wait_finalized`（上限 6s）再断开——此前浏览器收不到退出码，重连还会撞上 4404。
+- **分享有效期上限 10 年**：`ttl=10**400` 能通过 Pydantic 校验，随后在 `float()` 里
+  溢出成 500；超长有效期没有业务意义。
+- **`/api/files` 分页硬上限 5000**：查询参数在路由层收口，负值不再等于「全部」。
+- **用户更新先校验后落库**：`PATCH /api/users` 的密码策略在写入前检查；此前 role 已
+  落库、password 校验失败，操作员看到 400 却已经改了一半。
+- **连接名额释放有兜底**：`ConnectionCaps` 改为「令牌 + 幂等释放」并挂任务完成回调——
+  取消发生在 `finally` 的 await 里时名额不会再永久泄漏（实测有一次 15s 后仍占用，
+  正是取消落在 `detach`/`writer` 等待上）。
+- **测试选择器按 marker 名判定**：`-m "not browser"` 不再顺带跑 20 分钟负载套件，
+  `-m "not slow"` 也不再启动 Playwright。
+
+### 迁移与兼容
+
+- 默认快捷键变化（见上）；只有等于旧默认值的绑定会被迁移**一次**——`keybindingsVersion`
+  写回后，用户再改回旧键位不会被再次改写。
+- `trusted_proxies` 默认为空 = 只信本机回环；反代在别的机器上时必须显式填写。
+- 登录 body 超过 8 KiB 现在返回 413（此前会先读进内存）；浏览器 UI 与 CLI 均不受影响。
+- `ws_max_connections` / `ws_max_connections_per_ip` 默认 512 / 64，可按部署调整。
+- 数据库 schema 升到 5：`users.password_changed_at`（旧库自动 `ALTER TABLE` 补列，
+  既有用户该值为 0 = 不触发历史会话清理）。
+- WS 连接上限的关闭码从 `4409` 改为 `4413`（可重连）；按码做判断的客户端请更新。
+
+### 验证
+
+- `pytest`（含新增的入口/账号/恢复/按键用例）、`pytest -m browser`（含真实物理键
+  `code=Slash`、macOS `Option+C → ç`、分屏焦点复制、输入域守卫）、`pytest -m slow`、
+  `python scripts/e2e/run_all.py`（新增 `security` 场景，验证真实 uvicorn 进程下
+  XFF 不被采信、跨站 403、body 413、静默 WS 4408、停用账号断流）、
+  `ruff` + `mypy` + `node --check`。
+
 ## [0.1.29] - 2026-10-17
 
 **「`status` 说没在运行，可网页终端照样能打开」——孤儿实例。**

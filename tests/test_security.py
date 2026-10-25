@@ -80,3 +80,147 @@ def test_a_spoofed_xff_header_cannot_bypass_the_ip_allowlist() -> None:
     assert client_ip(FakeRequest("203.0.113.9, 127.0.0.1", "127.0.0.1"), settings) == (
         "203.0.113.9"
     )
+
+
+# -- 0.1.30: the header is only believed from a trusted peer ------------------
+
+
+class _Req:
+    def __init__(self, forwarded: str | None, peer: str) -> None:
+        self.headers = {} if forwarded is None else {"x-forwarded-for": forwarded}
+        self.client = type("C", (), {"host": peer})()
+
+
+def test_xff_is_ignored_entirely_when_trust_proxy_is_off() -> None:
+    """``trust_proxy=False`` must not merely relabel the header -- it must not be read.
+
+    uvicorn's default ``proxy_headers=True`` rewrote ``scope["client"]`` from
+    the header *before* wsctl saw the request, so this function returned the
+    attacker's address even here. The CLI now starts uvicorn with
+    ``proxy_headers=False``.
+    """
+    from wsctl.core.config import load_settings
+    from wsctl.server.security import client_ip
+
+    settings = load_settings(auth_required=True)  # trust_proxy default: False
+    assert client_ip(_Req("10.0.0.7", "203.0.113.50"), settings) == "203.0.113.50"
+    assert client_ip(_Req("127.0.0.1", "127.0.0.1"), settings) == "127.0.0.1"
+
+
+def test_a_peer_that_is_not_a_trusted_proxy_cannot_forward_anything() -> None:
+    from wsctl.core.config import load_settings
+    from wsctl.server.security import client_ip
+
+    settings = load_settings(
+        auth_required=True, trust_proxy=True, trusted_proxies=["10.9.0.0/16"]
+    )
+    # 10.1.2.3 can reach us, but it is not the proxy we named.
+    assert client_ip(_Req("1.2.3.4", "10.1.2.3"), settings) == "10.1.2.3"
+
+
+def test_a_named_proxy_is_trusted_but_a_loopback_peer_still_is_without_one() -> None:
+    from wsctl.core.config import load_settings
+    from wsctl.server.security import client_ip
+
+    named = load_settings(
+        auth_required=True, trust_proxy=True, trusted_proxies=["10.9.0.0/16"]
+    )
+    assert client_ip(_Req("203.0.113.9", "10.9.1.2"), named) == "203.0.113.9"
+    # Adding a proxy must not revoke the local one: loopback stays trusted.
+    assert client_ip(_Req("203.0.113.9", "127.0.0.1"), named) == "203.0.113.9"
+    # ...but an unrelated peer gains nothing from the list.
+    assert client_ip(_Req("203.0.113.9", "203.0.113.50"), named) == "203.0.113.50"
+
+    default = load_settings(auth_required=True, trust_proxy=True)
+    assert client_ip(_Req("203.0.113.9", "127.0.0.1"), default) == "203.0.113.9"
+
+
+def test_all_hops_trusted_falls_back_to_the_peer_not_the_leftmost_claim() -> None:
+    from wsctl.core.config import load_settings
+    from wsctl.server.security import client_ip
+
+    # A *named* trusted proxy in the last hop, loopback peer. Returning the
+    # leftmost claim (or the proxy itself) would also satisfy a plain
+    # ``127.0.0.1`` fixture -- this one can tell them apart.
+    settings = load_settings(
+        auth_required=True, trust_proxy=True, trusted_proxies=["10.9.0.0/16"]
+    )
+    assert client_ip(_Req("10.9.1.2", "127.0.0.1"), settings) == "127.0.0.1"
+    # Every entry is loopback: nothing here identifies a client, and the
+    # leftmost one is just as likely to be a claim the peer made up.
+    loopback_only = load_settings(auth_required=True, trust_proxy=True)
+    assert client_ip(_Req("127.0.0.1", "127.0.0.1"), loopback_only) == "127.0.0.1"
+
+
+def test_malformed_hops_are_skipped_rather_than_returned() -> None:
+    from wsctl.core.config import load_settings
+    from wsctl.server.security import client_ip
+
+    settings = load_settings(auth_required=True, trust_proxy=True)
+    # The garbage is the *first* hop examined (right-to-left walk); placing it
+    # on the left would never reach the code under test.
+    assert client_ip(_Req("203.0.113.9, garbage", "127.0.0.1"), settings) == (
+        "203.0.113.9"
+    )
+
+
+# -- 0.1.30 review: same-origin must survive a reverse proxy ------------------
+
+
+def test_a_proxied_origin_with_a_port_matches_a_host_without_one() -> None:
+    """nginx's documented ``proxy_set_header Host $host`` drops the port.
+
+    Comparing ``Origin``'s whole netloc with ``Host`` rejected every write
+    (login included) on ``https://term.example.com:8443``, and the UI showed
+    the 403 as "wrong password".
+    """
+    assert is_origin_allowed(
+        "https://term.example.com:8443", "term.example.com", []
+    )
+    # A direct connection carries the port in Host; it must still match.
+    assert is_origin_allowed(
+        "https://term.example.com:8443", "term.example.com:8443", []
+    )
+    assert not is_origin_allowed(
+        "https://term.example.com:8443", "term.example.com:9443", []
+    )
+    assert not is_origin_allowed("https://evil.example", "term.example.com", [])
+    # Case-insensitive hostnames; ``Origin: null`` is never same-origin.
+    assert is_origin_allowed("https://TERM.example.com", "term.example.com", [])
+    assert not is_origin_allowed("null", "term.example.com", [])
+
+
+def test_the_origin_allowlist_is_additional_not_exclusive() -> None:
+    """Configuring the WS whitelist used to break same-origin HTTP entirely."""
+    allow = ["https://ws.example.com"]
+    assert is_origin_allowed("https://ws.example.com", "term.example.com", allow)
+    assert is_origin_allowed("https://term.example.com", "term.example.com", allow)
+    assert not is_origin_allowed("https://evil.example", "term.example.com", allow)
+
+
+def test_forwarded_proto_is_only_believed_from_a_trusted_proxy() -> None:
+    """``proxy_headers=False`` also removed uvicorn's scheme handling.
+
+    Without a replacement, a panel behind a TLS-terminating proxy built
+    ``http://`` share links for every non-browser caller.
+    """
+    from wsctl.core.config import load_settings
+    from wsctl.server.security import forwarded_scheme
+
+    class ProtoReq(_Req):
+        def __init__(self, peer: str, proto: str | None) -> None:
+            super().__init__(None, peer)
+            if proto is not None:
+                self.headers["x-forwarded-proto"] = proto
+
+    named = load_settings(
+        auth_required=True, trust_proxy=True, trusted_proxies=["10.9.0.0/16"]
+    )
+    assert forwarded_scheme(ProtoReq("10.9.1.2", "https"), named) == "https"
+    # Not the proxy we named: its claim is ignored, not just relabelled.
+    assert forwarded_scheme(ProtoReq("203.0.113.9", "https"), named) is None
+    # trust_proxy=False ignores the header entirely.
+    untrusted = load_settings(auth_required=True)
+    assert forwarded_scheme(ProtoReq("127.0.0.1", "https"), untrusted) is None
+    # Garbage is not a scheme.
+    assert forwarded_scheme(ProtoReq("10.9.1.2", "javascript"), named) is None

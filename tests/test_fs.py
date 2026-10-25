@@ -163,6 +163,26 @@ def test_list_dir_paged_filters_by_name_and_kind(tmp_path: Path) -> None:
     assert {e["name"] for e in dirs["entries"]} == {"folder"}
 
 
+def test_a_negative_page_size_is_not_a_page_of_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``?limit=-5`` used to return the whole directory from ``offset`` on.
+
+    ``limit <= 0`` fell into the "no cut" branch, so one authenticated request
+    could pull a million-entry directory as a single response. Asserting
+    ``<= DEFAULT_LIST_LIMIT`` against a five-file directory proved nothing; the
+    default is lowered so the cut is observable.
+    """
+    for i in range(5):
+        (tmp_path / f"f{i}.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(fs, "DEFAULT_LIST_LIMIT", 3)
+    page = fs.list_dir_paged(tmp_path, "", limit=-5)
+    assert page["limit"] == 3
+    assert len(page["entries"]) == 3, "a negative page size must still be a page"
+    zero = fs.list_dir_paged(tmp_path, "", limit=0)
+    assert (zero["limit"], len(zero["entries"])) == (3, 3)
+
+
 def test_make_dir_loses_the_race_gracefully(tmp_path: Path) -> None:
     """A concurrent create must be a 400, not a 500.
 

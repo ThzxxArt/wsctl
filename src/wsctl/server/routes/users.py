@@ -8,13 +8,35 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from wsctl.core import totp, user_admin
+from wsctl.core import passwords, totp, user_admin
 from wsctl.core.store import User
 
 from ..deps import qr_svg, require_admin
 from ..models import TotpConfirm, UserCreate, UserUpdate
 
 router = APIRouter(prefix="/api", tags=["users"])
+
+
+async def _terminate_owned(request: Request, user_id: int, username: str) -> None:
+    """Stop the account's live terminals and revoke their shares.
+
+    Deleting login tokens (``user_admin``) locks the *next* request out but
+    leaves running shells and writable share links untouched -- the account is
+    gone, the access is not. The manager never logs, so the audit entry keeps
+    the story.
+    """
+    ids = await request.app.state.manager.terminate_owned(
+        user_id, reason="账号权限已变更，会话已结束", status="stopped"
+    )
+    # The token is also in the database: a restart rehydrates it, and a
+    # stopped session's row would otherwise still advertise a live share.
+    for sid in ids:
+        await asyncio.to_thread(
+            request.app.state.store.term_session_set_share, sid, token=None
+        )
+    request.app.state.audit.enqueue(
+        "account_sessions_terminated", user_id=user_id, payload=username
+    )
 
 
 @router.get("/users")
@@ -63,12 +85,16 @@ async def create_user(
 async def delete_user(
     username: str, request: Request, actor: User = Depends(require_admin)
 ) -> dict[str, bool]:
+    store_ = request.app.state.store
+    target = await asyncio.to_thread(store_.user_get, username)
     try:
-        await asyncio.to_thread(
-            user_admin.delete, request.app.state.store, username, actor=actor
-        )
+        await asyncio.to_thread(user_admin.delete, store_, username, actor=actor)
     except user_admin.UserAdminError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    # The row is gone, so the id has to come from *before* the delete: the
+    # manager keys on the id it already stored.
+    if target is not None:
+        await _terminate_owned(request, target.id, username)
     request.app.state.audit.enqueue("user_delete", user_id=actor.id, payload=username)
     return {"ok": True}
 
@@ -82,6 +108,18 @@ async def update_user(
             status_code=status.HTTP_400_BAD_REQUEST, detail="没有需要更新的字段"
         )
     store_ = request.app.state.store
+    target = await asyncio.to_thread(store_.user_get, username)
+    # Validate the password *before* mutating anything. The three updates run
+    # in sequence with no transaction: a policy failure at the end used to
+    # leave changes from earlier fields committed and skip the termination
+    # below -- the operator saw a 400 and believed nothing had happened.
+    if body.password is not None:
+        try:
+            passwords.validate_password(body.password)
+        except passwords.PasswordPolicyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
     changed: list[str] = []
     try:
         if body.role is not None:
@@ -102,6 +140,10 @@ async def update_user(
             changed.append("password")
     except user_admin.UserAdminError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    # A disabled account or a rotated password invalidates the *live* access
+    # that logging out cannot reach: running shells, writable shares.
+    if target is not None and (body.disabled or body.password is not None):
+        await _terminate_owned(request, target.id, username)
     request.app.state.audit.enqueue(
         "user_update", user_id=actor.id, payload=f"{username}:{','.join(changed)}"
     )

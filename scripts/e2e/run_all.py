@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backend end-to-end scenarios for wsctl.
 
-Runs eleven scenarios, each against a freshly started server on its own port and
+Runs twelve scenarios, each against a freshly started server on its own port and
 data directory:
 
 1. server    — health, login, WebSocket attach/exec, reconnect replay, metrics,
@@ -19,6 +19,10 @@ data directory:
 6. multiplex — two instances share one data directory without interfering
 7. daemon    — background lifecycle (start/status/logs/reload/restart/stop)
 8. restart   — two instances share a port via SO_REUSEPORT (zero downtime)
+9. security  — the 0.1.30 boundaries through the *real* uvicorn process: forged
+               X-Forwarded-For, cross-origin writes, the login body cap, the
+               silent-socket handshake timeout, account disable, and the
+               per-host login budget
 
 Usage:
     pip install -e ".[dev]"
@@ -49,6 +53,20 @@ import pyotp
 from websockets.sync.client import connect
 
 from wsctl.core import tmux as tmux_mod
+
+#: Every request in this harness goes to an instance it just started on
+#: 127.0.0.1. The developer's proxy must not be part of that -- and not only
+#: for latency: a ``no_proxy`` entry written as ``[::1]`` makes httpx 0.28
+#: build ``URLPattern("all://[::1]")`` and raise
+#: ``InvalidURL: Invalid port: ':1]'`` while constructing the client, before a
+#: single byte is sent. Clearing the variables here covers every bare
+#: ``httpx.post`` in the file (``login`` included), which is where this first
+#: bit: only the newer helpers had been taught ``trust_env=False``.
+for _proxy_var in (
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+):
+    os.environ.pop(_proxy_var, None)
 
 ROOT = Path(__file__).resolve().parents[2]
 PY = sys.executable
@@ -1125,8 +1143,167 @@ def scenario_config_edit() -> None:
     print("  config_edit: ok")
 
 
+def scenario_security() -> None:
+    """0.1.30 entry boundaries against the *real* server process.
+
+    pytest exercises the app through TestClient, which never builds the uvicorn
+    config. The X-Forwarded-For check below is the only place that proves the
+    ``proxy_headers=False`` wiring -- uvicorn's default would have rewritten
+    ``scope["client"]`` before wsctl ever saw the request.
+    """
+    from websockets.exceptions import ConnectionClosed
+
+    # ``local_http`` (trust_env=False), like the rest of the suite: an exported
+    # ``https_proxy`` sends these 127.0.0.1 probes to the proxy, and the
+    # failure is a 502 that has nothing to do with the product.
+    with server() as (base, data, _), local_http() as http:
+        # 1. A forged X-Forwarded-For must not become the recorded client IP.
+        r = http.post(
+            f"{base}/api/login",
+            json={"username": "admin", "password": "definitely-wrong"},
+            headers={"X-Forwarded-For": "203.0.113.77"},
+        )
+        assert r.status_code == 401, r.text
+        conn = sqlite3.connect(data / "wsctl.db")
+        try:
+            ips: list[str] = []
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                ips = [
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT ip FROM audit_logs WHERE event = 'login_failed'"
+                    )
+                ]
+                if ips:
+                    break
+                time.sleep(0.2)
+        finally:
+            conn.close()
+        assert ips, "the failed login was never audited"
+        # Exactly the real peer: ``"203.0.113.77" not in ips`` also passed when
+        # the address was NULL or the proxy's own, which is not the property.
+        assert set(ips) == {"127.0.0.1"}, (
+            f"the audit trail did not record the socket peer: {ips}"
+        )
+
+        # 2. A state-changing request from another origin is refused, even
+        #    though it carries no forged *content* -- only a browser-set header.
+        r = http.post(
+            f"{base}/api/login",
+            json={"username": ADMIN, "password": PASSWORD},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert r.status_code == 403, r.text
+
+        # 3. The login body is capped before it is read.
+        r = http.post(
+            f"{base}/api/login",
+            content=b"x" * 9000,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 413, r.text
+
+        # 4. A socket that never sends ``attach`` is closed, not held forever.
+        token = login(base)
+        ws_url = base.replace("http", "ws") + "/ws"
+        with connect(
+            ws_url,
+            additional_headers={"Cookie": f"wsctl_session={token}"},
+            open_timeout=10,
+        ) as ws:
+            # The denial *sentence* is sent before the close so a human can read
+            # it; drain frames until the socket actually closes.
+            closed_code = None
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                try:
+                    ws.recv(timeout=5)
+                except TimeoutError:
+                    # A quiet second: the handler is still on its 5s clock.
+                    continue
+                except ConnectionClosed as exc:
+                    closed_code = exc.code
+                    break
+            assert closed_code == 4408, (
+                f"a silent socket closed with {closed_code!r}, not a handshake timeout"
+            )
+
+        # 5. Disabling an account ends its live shell and its share link.
+        admin = {"Cookie": f"wsctl_session={token}"}
+        creds = ("bob", "bobpassword1")
+        r = http.post(
+            f"{base}/api/users",
+            json={"username": creds[0], "password": creds[1]},
+            headers=admin,
+        )
+        assert r.status_code == 201, r.text
+        bob = httpx.Client(base_url=base, timeout=10, trust_env=False)
+        try:
+            r = bob.post(
+                "/api/login",
+                json={"username": creds[0], "password": creds[1]},
+            )
+            assert r.status_code == 200, r.text
+            sid = bob.post("/api/sessions", json={}).json()["id"]
+            r = bob.post(f"/api/sessions/{sid}/share", json={"writable": True})
+            assert r.status_code == 200, r.text
+            assert r.json()["token"], r.text
+
+            r = http.patch(
+                f"{base}/api/users/{creds[0]}",
+                json={"disabled": True},
+                headers=admin,
+            )
+            assert r.status_code == 200, r.text
+
+            assert bob.get(f"/api/sessions/{sid}/detail").status_code in (401, 403, 404), (
+                "the disabled account still authenticated"
+            )
+            live = http.get(f"{base}/api/sessions", headers=admin).json()
+            assert sid not in {s["id"] for s in live}, (
+                "the disabled account's terminal is still running"
+            )
+            conn = sqlite3.connect(data / "wsctl.db")
+            try:
+                row = conn.execute(
+                    "SELECT share_token FROM term_sessions WHERE id = ?", (sid,)
+                ).fetchone()
+            finally:
+                conn.close()
+            assert row is not None and row[0] is None, row
+        finally:
+            bob.close()
+
+        # 6. The login budget is keyed on the *real* peer. A rotating forged
+        #    X-Forwarded-For must not buy a fresh budget -- if uvicorn's
+        #    proxy_headers came back, the header would rewrite scope["client"]
+        #    and every attempt would land on a new key (never 429).
+        #
+        #    The budget is 3 × login_rate_limit(10) = 30 failures per host, and
+        #    step 1 already spent one of them, so the 30th ghost attempt (index
+        #    29) is the first 429.
+        #
+        #    Last in the scenario on purpose: it exhausts this host's budget,
+        #    and anything after it would be answered with 429 as well.
+        statuses: list[int] = []
+        for i in range(31):
+            r = http.post(
+                f"{base}/api/login",
+                json={"username": f"ghost{i}", "password": "wrong-pass-1"},
+                headers={"X-Forwarded-For": f"10.0.{i // 256}.{i % 256}"},
+            )
+            statuses.append(r.status_code)
+        assert statuses[:29] == [401] * 29, statuses
+        assert statuses[29] == 429 and statuses[30] == 429, (
+            f"a rotating forged XFF bought fresh budgets: {statuses}"
+        )
+    print("  security: ok")
+
+
 SCENARIOS = {
     "server": scenario_server,
+    "security": scenario_security,
     "files": scenario_files,
     "config_edit": scenario_config_edit,
     "selfrestart": scenario_selfrestart,

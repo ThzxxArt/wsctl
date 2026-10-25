@@ -918,3 +918,49 @@ def test_rolling_preflight_is_empty_when_nothing_is_running(tmp_path) -> None:
         started_at=time.time(), version="0.0.0", identity="", reuse_port=True,
     )
     assert "无运行中的会话" in d.describe_handover(settings, old)
+
+
+def test_serve_consumes_the_bootstrap_password_from_its_environment(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """The password must not stay in ``os.environ`` for every child to inherit.
+
+    It arrives that way because a flag would be world-readable in
+    ``/proc/*/cmdline``; the other half of that trade-off was missing -- the
+    variable stayed in the server's environment, so every terminal it spawned
+    inherited it and ``env`` printed the administrator password.
+    """
+    import typer
+
+    from wsctl.cli import main as cli_main
+    from wsctl.cli.main import _serve_foreground
+
+    monkeypatch.setenv("WSCTL_ADMIN_PASSWORD", "Sup3rSecret!")  # type: ignore[attr-defined]
+
+    def exploded(path: object) -> None:
+        raise OSError("no database here")
+
+    monkeypatch.setattr(cli_main.store_mod, "Store", exploded)  # type: ignore[attr-defined]
+    settings = load_settings(data_dir=tmp_path)
+    try:
+        _serve_foreground(
+            settings, admin_password="Sup3rSecret!", startup_command=None
+        )
+    except typer.Exit:
+        pass
+    else:  # pragma: no cover - the failed open is what makes this exit
+        raise AssertionError("expected the serve path to fail on the database")
+    assert "WSCTL_ADMIN_PASSWORD" not in os.environ
+
+
+def test_the_config_template_mentions_the_connection_limits() -> None:
+    """A knob that exists but is absent from the template is a knob nobody
+    discovers (``config set`` still works; "new config file" does not)."""
+    from wsctl.cli.main import CONFIG_TEMPLATE
+
+    for key in (
+        "trusted_proxies",
+        "ws_max_connections",
+        "ws_max_connections_per_ip",
+    ):
+        assert key in CONFIG_TEMPLATE, key

@@ -42,7 +42,7 @@ from typing import Any
 from fastapi import WebSocket
 
 from wsctl.core.ansi import AnsiTracker
-from wsctl.core.session import ClientGone
+from wsctl.core.session import ClientGone, note_shed_frames
 
 MAX_PENDING = 512
 #: Control frames are small and are never shed for *byte* pressure, so they
@@ -177,6 +177,7 @@ class WsClient:
                 break
         if self.dropped_bytes > before:
             self.dropped_events += 1
+            note_shed_frames()
             self._announce_shed()
         return self.dropped_bytes - before
 
@@ -198,6 +199,7 @@ class WsClient:
             shed = True
         if shed:
             self.dropped_events += 1
+            note_shed_frames()
             self._announce_shed()
 
     def _announce_shed(self) -> None:
@@ -276,6 +278,13 @@ class WsClient:
                 # no second loss branch is reachable.)
                 self.dropped_bytes += len(item)
                 self.dropped_events += 1
+                # Counted like every other loss: this branch is *how* every
+                # frame is lost when ``client_max_bytes`` is configured below
+                # one PTY read (64 KiB), and it used to be the one shedding
+                # path that never reached the process-wide counter -- so the
+                # metrics page showed a healthy zero while the viewer's screen
+                # went blind.
+                note_shed_frames()
                 self._announce_shed()
                 return
             self._shed_for(len(item))

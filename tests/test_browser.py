@@ -73,14 +73,27 @@ def _start_server(data_dir: Path, files_dir: Path) -> subprocess.Popen[bytes]:
 
 
 def _wait_health(timeout: float = 20.0) -> None:
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            if httpx.get(f"{BASE}/healthz", timeout=1.0).status_code == 200:
-                return
-        except httpx.HTTPError:
-            time.sleep(0.2)
-    raise AssertionError("server never became healthy")
+    """Wait for the test server, ignoring any HTTP proxy in the environment.
+
+    ``httpx`` reads ``HTTP_PROXY``/``ALL_PROXY`` by default. On a developer box
+    whose proxy is an IPv6 loopback (``http://[::1]:...``) httpx's proxy-pattern
+    parser raises ``InvalidURL`` -- and all 47 browser tests died in fixture
+    setup with "server never became healthy". The server is local by definition.
+    """
+    import httpx as _httpx
+
+    client = _httpx.Client(trust_env=False, timeout=1.0)
+    try:
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if client.get(f"{BASE}/healthz").status_code == 200:
+                    return
+            except _httpx.HTTPError:
+                time.sleep(0.2)
+        raise AssertionError("server never became healthy")
+    finally:
+        client.close()
 
 
 def _login(page: object) -> None:
@@ -104,11 +117,14 @@ def _admin_headers() -> dict[str, str]:
     """
     global _TOKEN
     if _TOKEN is None:
-        r = httpx.post(
-            f"{BASE}/api/login",
-            json={"username": "admin", "password": "testpass123"},
-            timeout=10,
-        )
+        # ``trust_env=False``, like ``_wait_health``: an exported ``https_proxy``
+        # otherwise sends this 127.0.0.1 login to the proxy and the whole suite
+        # dies on a machine that is working exactly as intended.
+        with httpx.Client(trust_env=False, timeout=10) as http:
+            r = http.post(
+                f"{BASE}/api/login",
+                json={"username": "admin", "password": "testpass123"},
+            )
         r.raise_for_status()
         _TOKEN = r.cookies["wsctl_session"]
     return {"Cookie": f"wsctl_session={_TOKEN}"}
@@ -1486,12 +1502,15 @@ def test_browser_copy_shortcuts_and_help_legend(tmp_path: Path) -> None:
 
             # Alt+? opens the cheatsheet from inside the terminal (a bare `?`
             # must reach the shell instead).
-            page.keyboard.press("Alt+Shift+/")
-            try:
-                page.wait_for_selector("#hotkey-overlay:not(.hidden)", timeout=4000)
-            except Exception:
-                page.keyboard.press("Alt+?")
-                page.wait_for_selector("#hotkey-overlay:not(.hidden)", timeout=4000)
+            #
+            # This is a *real* shifted-slash event (key="?", code="Slash",
+            # Alt+Shift), not ``press("Alt+Shift+/")``: Playwright derives the
+            # key from the string, so that sends key="/" with shift=true -- the
+            # synthetic event the old matcher was built around. The former
+            # ``except: press("Alt+?")`` fallback hid that the real one never
+            # matched.
+            _dispatch_key(page, key="?", code="Slash", modifiers=9)
+            page.wait_for_selector("#hotkey-overlay:not(.hidden)", timeout=5000)
             help_text = page.inner_text("#hotkey-help")
             # The defaults must advertise the *reliable* chord...
             assert "复制选区" in help_text
@@ -1584,7 +1603,13 @@ def test_browser_ctrl_shift_c_is_either_ours_or_the_browsers(tmp_path: Path) -> 
 
 
 def test_browser_alt_c_alt_v_are_the_working_copy_paste(tmp_path: Path) -> None:
-    """The chords we *do* promise must work regardless of the browser."""
+    """The chords we *do* promise must put the selection on the clipboard.
+
+    The previous version of this test accepted "没有选中内容" as a pass without
+    ever building a selection, so it proved that a toast appeared -- not that a
+    copy happened. Here the terminal has a real selection and the clipboard is
+    read back.
+    """
     data = tmp_path / "data"
     files = tmp_path / "files"
     files.mkdir(parents=True)
@@ -1604,21 +1629,314 @@ def test_browser_alt_c_alt_v_are_the_working_copy_paste(tmp_path: Path) -> None:
                 timeout=15000,
             )
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.type("echo $((127*131))")
+            marker = "COPY-MARKER-16637"
+            page.keyboard.type(f"echo {marker}")
             page.keyboard.press("Enter")
-            _wait_screen_includes(page, '16637'),
-            page.wait_for_timeout(200)
-            toasts_before = page.locator("#toasts .toast").count()
-            page.keyboard.press("Alt+c")
-            page.wait_for_timeout(500)
-            toasts_after = page.locator("#toasts .toast").count()
-            # With no selection Alt+C must report "没有选中内容" rather than
-            # silently do nothing -- that is what makes the chord discoverable.
-            assert toasts_after > toasts_before, (
-                "Alt+C must produce feedback (a copy or 'nothing selected')"
+            _wait_screen_includes(page, marker)
+            page.wait_for_function(
+                f"() => window.__wsctlSelectText('{marker}')", timeout=10000
             )
-            body = page.inner_text("#toasts")
-            assert ("已复制" in body) or ("没有选中内容" in body), body
+            page.evaluate("() => navigator.clipboard.writeText('')")
+            page.keyboard.press("Alt+c")
+            page.wait_for_function(
+                "() => navigator.clipboard.readText().then(t => t.includes('COPY-MARKER-16637'))",
+                timeout=10000,
+            )
+            copied = page.evaluate("() => navigator.clipboard.readText()")
+            assert marker in str(copied), f"clipboard holds {copied!r}"
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+#: Windows virtual-key codes for the punctuation a chord test needs. Deriving
+#: them from ``ord(key)`` is wrong for everything outside A-Z/0-9 -- ``ç`` is
+#: not VK 199, and ``?`` is not VK 63 -- so a keyCode-based handler would have
+#: been "tested" with an event a browser never emits.
+_VK_BY_CODE = {
+    "Slash": 191, "Backslash": 220, "Equal": 187, "Minus": 189,
+    "Comma": 188, "Period": 190, "Semicolon": 186, "Quote": 222,
+    "BracketLeft": 219, "BracketRight": 221, "Backquote": 192,
+    "Space": 32, "Enter": 13, "Escape": 27, "Tab": 9,
+    "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40,
+}
+
+
+def _virtual_key(code: str) -> int:
+    if code.startswith("Key") and len(code) == 4:
+        return ord(code[3])
+    if code.startswith("Digit") and len(code) == 6:
+        return ord(code[5])
+    if code.startswith("F") and code[1:].isdigit():
+        return 111 + int(code[1:])
+    return _VK_BY_CODE.get(code, 0)
+
+
+def _dispatch_key(page: object, *, key: str, code: str, modifiers: int) -> None:
+    """Send a real keydown with an explicit physical ``code``.
+
+    Playwright's ``press()`` derives both from one string and cannot express
+    "the key labelled C on a macOS layout", which is exactly the case that was
+    broken. CDP takes them separately, like a browser does.
+    """
+    cdp = page.context.new_cdp_session(page)  # type: ignore[attr-defined]
+    for kind in ("keyDown", "keyUp"):
+        cdp.send(
+            "Input.dispatchKeyEvent",
+            {
+                "type": kind,
+                "key": key,
+                "code": code,
+                "windowsVirtualKeyCode": _virtual_key(code),
+                "modifiers": modifiers,
+            },
+        )
+
+
+def test_browser_alt_letter_reaches_the_page_on_a_mac_layout(tmp_path: Path) -> None:
+    """Option+C produces ``ç``; the physical key is still C.
+
+    macOS users reported every Alt shortcut dead. ``event.key`` is the
+    character the layout produced, so ``alt+c`` never matched -- the matcher
+    now also considers ``event.code``. Asserting a toast is not enough: this
+    builds a real selection and reads the clipboard back, because a silent
+    no-op and a successful copy both produced no error.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            page.click(".term-pane.active .xterm-screen")
+            marker = "MAC-OPTION-COPY-4451"
+            page.keyboard.type(f"echo {marker}")
+            page.keyboard.press("Enter")
+            _wait_screen_includes(page, marker)
+            page.wait_for_function(
+                f"() => window.__wsctlSelectText('{marker}')", timeout=10000
+            )
+            page.evaluate("() => navigator.clipboard.writeText('')")
+            # Alt (1) only: key is ç, code is KeyC.
+            _dispatch_key(page, key="ç", code="KeyC", modifiers=1)
+            page.wait_for_function(
+                f"() => navigator.clipboard.readText().then(t => t.includes('{marker}'))",
+                timeout=10000,
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_help_opens_from_a_real_shifted_slash(tmp_path: Path) -> None:
+    """``alt+?`` is ``Alt+Shift+Slash`` on a real keyboard.
+
+    The binding was written ``alt+?`` but the page received
+    ``alt+shift+?``, so the chord could never fire outside a synthetic test.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(viewport={"width": 1400, "height": 900})
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            page.click(".term-pane.active .xterm-screen")
+            # Alt (1) | Shift (8) = 9, with the physical Slash key.
+            _dispatch_key(page, key="?", code="Slash", modifiers=9)
+            page.wait_for_selector("#hotkey-overlay:not(.hidden)", timeout=5000)
+            page.keyboard.press("Escape")
+            page.wait_for_selector("#hotkey-overlay.hidden", state="attached", timeout=5000)
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_copy_follows_the_focused_pane_in_a_split(tmp_path: Path) -> None:
+    """Clicking a pane is what makes it "the current session".
+
+    Only a tab switch used to update ``activeId``, so in a split the copy (and
+    search, record, share, font) acted on the other terminal -- the terminal
+    with no selection, which reported "没有选中内容" while the text was visible
+    on screen.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            page.click(".term-pane.active .xterm-screen")
+            marker = "SPLIT-COPY-12317"
+            page.keyboard.type(f"echo {marker}")
+            page.keyboard.press("Enter")
+            _wait_screen_includes(page, marker)
+            page.keyboard.press("Alt+\\")
+            page.wait_for_function(
+                "() => document.querySelectorAll('.term-pane.shown').length === 2",
+                timeout=15000,
+            )
+            panes = page.locator(".term-pane.shown")
+            left = panes.nth(0)
+            right = panes.nth(1)
+            left_id = page.evaluate(
+                "() => window.__wsctlLayout().tabs[0].panes[0]"
+            )
+            right_id = page.evaluate(
+                "() => window.__wsctlLayout().tabs[0].panes[1]"
+            )
+            assert left_id != right_id
+
+            # Click the left pane: focus (and activeId) must follow the click.
+            left.click()
+            page.wait_for_function(
+                f"() => window.__wsctlLayout().activeId === {left_id!r}", timeout=5000
+            )
+            right.click()
+            page.wait_for_function(
+                f"() => window.__wsctlLayout().activeId === {right_id!r}", timeout=5000
+            )
+
+            # Select in the left pane, go back to it, copy: the clipboard must
+            # hold the left pane's text, not a stale other-pane selection.
+            left.click()
+            page.wait_for_function(
+                f"() => window.__wsctlLayout().activeId === {left_id!r}", timeout=5000
+            )
+            page.wait_for_function(
+                f"() => window.__wsctlSelectText('{marker}')", timeout=10000
+            )
+            page.evaluate("() => navigator.clipboard.writeText('')")
+            page.keyboard.press("Alt+c")
+            page.wait_for_function(
+                "() => navigator.clipboard.readText().then(t => t.includes('SPLIT-COPY'))",
+                timeout=10000,
+            )
+            copied = page.evaluate("() => navigator.clipboard.readText()")
+            assert marker in str(copied), copied
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_shortcuts_do_not_hijack_text_fields(tmp_path: Path) -> None:
+    """Typing in Settings is not a terminal shortcut.
+
+    The global key handler ran even when the target was an input, so Ctrl+C in
+    a field copied the terminal's stale selection and Alt+C fired our toast
+    under the dialog.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=15000,
+            )
+            # Build a terminal selection first: without one, the old Ctrl+C
+            # branch never fired and the field-copy assertion below could not
+            # tell the guard from its absence.
+            page.click(".term-pane.active .xterm-screen")
+            marker = "TERMINAL-SELECTION-9917"
+            page.keyboard.type(f"echo {marker}")
+            page.keyboard.press("Enter")
+            _wait_screen_includes(page, marker)
+            page.wait_for_function(
+                f"() => window.__wsctlSelectText('{marker}')", timeout=10000
+            )
+
+            page.keyboard.press("Alt+s")
+            page.wait_for_selector("#settings-overlay:not(.hidden)", timeout=5000)
+            page.click("details.custom-theme summary")
+            page.click("#custom-theme-name")
+            page.keyboard.type("my-theme")
+            # Clear first: counting toasts before/after is fooled by one being
+            # added while an older one auto-dismisses, which is exactly what a
+            # broken handler would look like on a timer.
+            page.evaluate("() => document.getElementById('toasts').replaceChildren()")
+            page.keyboard.press("Alt+c")
+            page.wait_for_timeout(300)
+            toast_texts = page.locator("#toasts .toast").all_inner_texts()
+            assert not any(
+                "已复制" in text or "没有选中" in text for text in toast_texts
+            ), f"Alt+C fired while typing in a text field: {toast_texts}"
+            assert page.input_value("#custom-theme-name") == "my-theme"
+
+            # Ctrl+C in the field must copy the field. The terminal selection
+            # exists, so an unguarded handler copies *that* instead.
+            page.keyboard.press("Control+a")
+            page.evaluate("() => navigator.clipboard.writeText('')")
+            page.keyboard.press("Control+c")
+            page.wait_for_function(
+                "() => navigator.clipboard.readText().then(t => t === 'my-theme')",
+                timeout=5000,
+            )
+            copied = page.evaluate("() => navigator.clipboard.readText()")
+            assert marker not in str(copied), (
+                f"Ctrl+C in the field copied the terminal selection: {copied!r}"
+            )
+
+            # The diagnostics panel recorded the key even though no action ran
+            # -- that is what makes "why is it not working" answerable -- but a
+            # key the field consumed is redacted entirely: the ``code`` alone
+            # spells out the characters of a password.
+            entries = page.evaluate("() => window.__wsctlKeys()")
+            assert entries, "no key was recorded"
+            latest = entries[0]
+            assert latest.get("skipped") == "editable", (
+                "the panel must explain that the field took the key"
+            )
+            assert latest.get("masked") is True, entries
+            assert latest.get("code") == "", latest
+            assert latest.get("key") == "«输入»", latest
+            page.click("#settings-close")
             browser.close()
     finally:
         _stop_server(server)
@@ -1982,8 +2300,9 @@ def test_browser_toasts_auto_dismiss_fold_and_dedupe(tmp_path: Path) -> None:
             # Distinct messages: font steps within the supported 12-18 range.
             # Two steps down and five up gives 7 messages with one repeat
             # ("字号 13" both ways), which the dedupe window correctly merges
-            # -- so 6 cards, enough to prove the fold.
-            for key in ("Alt+d", "Alt+d", "Alt+e", "Alt+e", "Alt+e", "Alt+e", "Alt+e"):
+            # -- so 6 cards, enough to prove the fold. (0.1.30 moved the font
+            # chords off Alt+E/D, which the browser menu claims on Windows.)
+            for key in ("Alt+-", "Alt+-", "Alt+=", "Alt+=", "Alt+=", "Alt+=", "Alt+="):
                 page.keyboard.press(key)
                 page.wait_for_timeout(60)
             page.wait_for_function(
@@ -2910,7 +3229,9 @@ def test_browser_large_paste_is_sent_in_chunks(tmp_path: Path) -> None:
             )
             page.evaluate("() => navigator.clipboard.writeText('y'.repeat(100000))")
             page.click(".term-pane.active .xterm-screen")
-            page.keyboard.press("Alt+v")
+            # The default paste chord: Alt+Shift+V. (Alt+V is Firefox's View
+            # menu, which is why the default moved.)
+            page.keyboard.press("Alt+Shift+V")
             page.wait_for_function(
                 "() => window.__binSends >= 3",
                 timeout=WAIT_MS,
@@ -3451,7 +3772,12 @@ def test_browser_layout_tree_splits_merges_and_serialises(tmp_path: Path) -> Non
 
             # Split the *focused* pane downward: the tree nests, and the new
             # leaf is beside the one that had the keyboard.
-            page.keyboard.press("Alt+Shift+\\")
+            #
+            # A real keyboard sends key="|" for Shift+Backslash; Playwright's
+            # ``press("Alt+Shift+\\")`` sends key="\\\\" with shift=true, which
+            # is the synthetic event the *old* matcher was built for. Using it
+            # here left "physical Alt+Shift+\\" untested.
+            _dispatch_key(page, key="|", code="Backslash", modifiers=9)
             page.wait_for_function(
                 "() => window.__wsctlLayout().tabs[0].panes.length === 3", timeout=WAIT_MS
             )
@@ -3810,6 +4136,188 @@ def test_browser_a_reconnect_replay_is_not_reported_as_news(tmp_path: Path) -> N
             assert glowing <= 1, f"replays lit {glowing} tab(s) as new activity"
             notices = page.evaluate("() => window.__replayNotice || []")
             assert not notices, f"a replay sent system notifications: {notices}"
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+# -- 0.1.30 review: the key matcher's edges ---------------------------------
+
+
+def test_browser_old_defaults_migrate_once_and_a_choice_sticks(
+    tmp_path: Path,
+) -> None:
+    """A deliberate binding equal to a retired default must survive a reload.
+
+    The migration keyed off the *value*, so it ran on every load: a user who
+    chose Alt+F (accepting the browser menu) had it rewritten to Alt+Shift+F
+    each time the page opened, and the setting looked broken.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(viewport={"width": 1400, "height": 900})
+            page = context.new_page()
+            page.goto(BASE)
+            page.wait_for_function(
+                "() => typeof window.__wsctlKeybindings === 'function'",
+                timeout=WAIT_MS,
+            )
+            # A 0.1.29 profile: old defaults, no version marker. Written
+            # *after* the first load so the page's own migration (which runs
+            # once on a fresh profile) is not mistaken for the one under test.
+            page.evaluate(
+                "() => localStorage.setItem('wsctl-prefs', JSON.stringify({"
+                "keybindings:{toggle_files:'alt+f', paste_clipboard:'alt+v'}}))"
+            )
+            page.reload()
+            page.wait_for_function(
+                "() => typeof window.__wsctlKeybindings === 'function'",
+                timeout=WAIT_MS,
+            )
+            migrated = page.evaluate("() => window.__wsctlKeybindings()")
+            assert migrated["toggle_files"] == "alt+shift+f", migrated
+            assert migrated["paste_clipboard"] == "alt+shift+v", migrated
+            assert page.evaluate("() => window.__wsctlKeybindingsVersion()") == 2
+
+            # The user now deliberately chooses Alt+F. A reload must keep it:
+            # the migration is one-time, not "every load".
+            page.evaluate(
+                "() => localStorage.setItem('wsctl-prefs', JSON.stringify({"
+                "keybindings:{toggle_files:'alt+f'}, keybindingsVersion:2}))"
+            )
+            page.reload()
+            page.wait_for_function(
+                "() => typeof window.__wsctlKeybindings === 'function'",
+                timeout=WAIT_MS,
+            )
+            kept = page.evaluate("() => window.__wsctlKeybindings()")
+            assert kept["toggle_files"] == "alt+f", (
+                f"a deliberate binding was rewritten on reload: {kept}"
+            )
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_shifted_letter_never_fires_its_unshifted_binding(
+    tmp_path: Path,
+) -> None:
+    """Alt+Shift+N must not open a new session via the ``alt+n`` fallback.
+
+    The "Shift produced this character" fallback checked ``/[^a-z0-9]/``,
+    which matches a *capital* letter -- so every Alt+Shift+<letter> also offered
+    the plain Alt+<letter> chord. On Windows Alt+Shift is the IME switch, so
+    switching input methods opened a dialog, cleared the screen or pasted the
+    clipboard.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.click(".term-pane.active .xterm-screen")
+            marker = "KEEP-SCREEN-3319"
+            page.keyboard.type(f"echo {marker}")
+            page.keyboard.press("Enter")
+            _wait_screen_includes(page, marker)
+            # N/S/R have no Shift variant: each fires only through the buggy
+            # unshifted fallback. (V is *not* in this set -- Alt+Shift+V is the
+            # real paste default and must work.)
+            for key, code in (("N", "KeyN"), ("S", "KeyS"), ("R", "KeyR")):
+                _dispatch_key(page, key=key, code=code, modifiers=9)
+            page.wait_for_timeout(600)
+            assert page.locator("#new-session-overlay").is_hidden(), (
+                "Alt+Shift+N opened the new-session dialog"
+            )
+            assert page.locator("#settings-overlay").is_hidden(), (
+                "Alt+Shift+S opened settings"
+            )
+            screen = page.evaluate("() => window.__wsctlScreen()")
+            assert marker in screen, "Alt+Shift+R cleared the screen (unshifted clear_screen)"
+            browser.close()
+    finally:
+        _stop_server(server)
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_browser_plain_characters_are_not_stored_in_the_key_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """The diagnostics ring buffer must not become a password log.
+
+    It records what arrived so a chord can be explained; a plain character is
+    never a chord, and a support screenshot of the panel used to show whatever
+    the user typed at a password prompt.
+    """
+    data = tmp_path / "data"
+    files = tmp_path / "files"
+    files.mkdir(parents=True)
+    server = _start_server(data, files)
+    try:
+        _wait_health()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(viewport={"width": 1400, "height": 900})
+            page = context.new_page()
+            _login(page)
+            page.wait_for_function(
+                "() => document.getElementById('connection').textContent === '已连接'",
+                timeout=WAIT_MS,
+            )
+            page.click(".term-pane.active .xterm-screen")
+            page.keyboard.type("hunter2")
+            entries = page.evaluate("() => window.__wsctlKeys()")
+            assert entries, "no keys were recorded at all"
+            leaked = [
+                entry["key"]
+                for entry in entries
+                if entry.get("skipped") != "editable"
+                and not (entry.get("ctrl") or entry.get("alt") or entry.get("meta"))
+                and len(str(entry.get("key", ""))) == 1
+                and str(entry.get("key")).isalnum()
+            ]
+            assert not leaked, f"typed characters reached the diagnostics panel: {leaked}"
+            # The candidate list is derived from ``event.key`` too, so masking
+            # only the ``key`` field left the password readable in 候选 -- the
+            # panel's own text promised no plain characters are kept.
+            leaked_candidates = [
+                str(candidate)
+                for entry in entries
+                for candidate in entry.get("candidates") or []
+                if len(str(candidate)) == 1
+                and str(candidate).isalnum()
+                and not (entry.get("ctrl") or entry.get("alt") or entry.get("meta"))
+            ]
+            assert not leaked_candidates, (
+                "typed characters survived in the candidate column: "
+                f"{leaked_candidates}"
+            )
+            assert all(entry.get("masked") for entry in entries[:5]), entries
+            # A chord is still recorded verbatim -- that is the feature.
+            page.keyboard.press("Alt+c")
+            latest = page.evaluate("() => window.__wsctlKeys()")[0]
+            assert latest.get("code") == "KeyC" and not latest.get("masked"), latest
             browser.close()
     finally:
         _stop_server(server)

@@ -1,6 +1,6 @@
 # wsctl 设计文档
 
-> 版本：0.1.29 · 状态：0.1.0–0.1.16、0.1.18–0.1.28 已发布（0.1.17 撤回，由 0.1.18 承载）
+> 版本：0.1.30 · 状态：0.1.0–0.1.16、0.1.18–0.1.29 已发布（0.1.17 撤回，由 0.1.18 承载）
 > 作者：ThzxxArt · 许可：MIT
 
 ## 1. 定位
@@ -253,14 +253,24 @@ pyotp  segno  websockets
 
 ## 9. 安全清单（内建，非可选）
 
-1. 默认强制认证，`argon2` 哈希
+1. 默认强制认证，`argon2` 哈希（全局并发帽：2–4 条 argon2 通道）
 2. 会话 token 存 HttpOnly / Secure / SameSite Cookie；CLI 用 Bearer
-3. WebSocket 握手 Origin 白名单校验（防 CSWSH）
-4. 登录失败限速、IP allowlist
+3. WebSocket 握手 Origin 白名单校验（防 CSWSH）；**HTTP 非 GET 同源校验**（Origin /
+   Sec-Fetch-Site，含 multipart 上传——CORS 简单请求不触发预检，只有 Origin 拦得住）
+4. 登录失败限速（`ip:用户名` 与 **每 IP** 两条独立预算）、登录请求体前置上限
 5. 可选 TOTP 二次验证
 6. 全量审计日志
-7. 会话数 / 空闲超时 / 速率上限
+7. 会话数 / 空闲超时 / 速率上限；**WS 握手 5s 超时、全局/每 IP 连接帽、resync 令牌桶**
 8. HTTPS/WSS：文档首选反向代理，内置 `--ssl` 兜底
+9. **受信代理链**：只有 `trusted_proxies`（默认仅回环）对端携带的 `X-Forwarded-For`
+   才被采信；uvicorn `proxy_headers` 显式关闭（其默认会在应用之前改写 `scope["client"]`）
+10. **账号生命周期闭环**：停用 / 改密 / 删除 → 终止其运行中的会话并撤销分享；改密只
+    终止「改密之前创建」的会话（新凭据开的新会话不该陪葬），跨进程靠
+    `users.password_changed_at` 传递信号
+11. **凭据不随环境下沉**：会话环境剥离凭据类 `WSCTL_*`（`WSCTL_ADMIN_PASSWORD` /
+    `WSCTL_TOKEN` / `WSCTL_TOTP` 及 `*_PASSWORD`/`*_TOKEN`/`*_SECRET` 后缀），
+    `WSCTL_DATA_DIR` 等定位变量保留（会话内的 `wsctl` 命令要认出同一实例）；
+    引导密码读取后立即从 `os.environ` 移除
 
 ## 10. 里程碑
 
@@ -447,6 +457,8 @@ symlink 守卫因 `resolve()` 抹掉链接身份而成死代码，改为词法�
 | **M83** | **配置在线写入**：`core/config_edit.py` 单一事实源（CLI `config set` 与 Web 共用「单项校验→保留行内注释→整文件校验→失败回滚→原子落盘」）；`PUT /api/config` 批量原子写 + 审计；**只放行 `kind ∈ {hot,new}`**，`restart` 类拒绝并说明原因（与三档分类同源，不新增第四档）；危险值保存前二次确认，取消即不发送 |
 | **M84** | **清账五项**：`wsctl_pty_input_dropped_total` 双注册拆为 PTY 写丢弃 + `wsctl_ws_oversized_input_frames_total`；字号 `FONT_MIN/FONT_MAX` 单一事实源（下拉由常量生成）；`TOAST_DEDUPE_MS` 真正参与判定；死状态（`searchHits`/`searchPos`/`fileCrumbs.onclick`）清除；**渲染器热切换**（就地重建终端 + 自动 resync + 服务端 nudge_repaint，不再要求刷新页面） |
 | **M85** | **测试与文档**：53 条结构契约（含分屏是视图/一 tab 一入口/关 pane 不 DELETE/`isPaneShown` 判据/累加器不得重绑/**块注释配对**/字号同源/Toast 时间窗/热切换必须请求回放/通知不入终端缓冲/菜单落在视口内/布局可读钩子）+ 9 条 browser（布局树分割·合并·序列化、并入已有会话、在屏 pane 不被挂起 + 焦点切换 0 resize、已结束占位、后台动静、通知不入缓冲、图片预览与伪装拒绝、配置在线写与危险项确认）+ 1 条 slow（T6：十栏同屏洪峰不失观众）+ 1 条 e2e（`config_edit` 经共享写入器落盘并 reload 生效）。metrics 单一 TYPE、`leafIds` 累加器、块注释配对**三处突变体证毕**；README/DESIGN/CHANGELOG/SECURITY 同步 |
+| **M86** | **入口边界（0.1.30 服务端）**：`proxy_headers=False` + `trusted_proxies` 受信代理链（right-to-left 解析，全受信回退对端）；非 GET `/api/*` 的 Origin / Sec-Fetch-Site 同源校验（multipart 上传不再可被同站跨源打）；账号停用/改密/删除同步终止会话并撤销分享（API 即时 + 维护循环兜底 CLI 路径）；登录请求体 8 KiB 前置上限、每 IP 失败预算（跨用户名）、响应式 Argon2 并发帽；WS attach 前连接帽与 5s 握手超时、control/resync 令牌桶；凭据类 `WSCTL_*` 从会话环境剥离（`WSCTL_DATA_DIR`/`WSCTL_CONFIG` 等定位变量保留，命令要能找到同一个实例）+ 引导密码读取即从环境移除；restore 拒绝运行中实例、清 WAL/SHM、在线快照 `.bak`、`PRAGMA integrity_check`；shed 计数改进程级单调；非 ASCII share token 不再 500 |
+| **M87** | **按键与焦点（0.1.30 前端）**：`comboCandidates()` 同时产出「字符 / 物理键（`event.code`）/ 去 Shift 形态」，`Option+C → ç`、`Alt+? = Alt+Shift+Slash`、`Alt+Shift+\ = |` 全部可命中；`setFocus()` 统一「焦点即当前会话」，分屏点哪栏复制/搜索/录制就作用于哪栏；输入域（非 xterm）不劫持快捷键；默认键位避开 Windows 菜单栏占用的 `Alt+F/E/V/H/D` 并带一次性迁移；帮助表按平台标注 ❌/⚠️，引脚注；「设置 → 按键诊断」记录最近 10 次 keydown 的 key/code/候选/命中/被跳过原因 |
 
 ## 11. Backlog（后续）
 

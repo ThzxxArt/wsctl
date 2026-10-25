@@ -57,19 +57,27 @@ def evicted_clients_total() -> int:
     return _evicted_clients_total
 
 
-def shed_frames_total(manager: SessionManager | None = None) -> int:
-    """Frames discarded across every attached client, for the metrics page.
+# Process-wide, monotonic count of shedding events: a viewer's outbound queue
+# discarded terminal frames to stay connected. See ``shed_frames_total``.
+_shed_events_total = 0
 
-    Shedding is the *good* outcome now -- it is what keeps a slow viewer
-    connected instead of cycling them through reconnect/clear/replay -- so it
-    is worth watching. A high number with low ``wsctl_clients_evicted_total``
-    is healthy; the two rising together is not.
+
+def shed_frames_total(manager: SessionManager | None = None) -> int:
+    """Shedding events across the whole process, for the metrics page.
+
+    Process-wide and monotonic on purpose. This used to sum each attached
+    client's ``dropped_events``; when a client detached -- exactly what happens
+    after a flood -- the sum went *down*, so Prometheus saw a counter reset and
+    ``rate()`` reported nonsense. ``manager`` is accepted for call-site
+    compatibility and no longer needed.
     """
-    total = 0
-    for session in (manager.list_sessions() if manager is not None else []):
-        for entry in session.clients():
-            total += int(entry.get("dropped_events", 0))
-    return total
+    return _shed_events_total
+
+
+def note_shed_frames(count: int = 1) -> None:
+    """Record that an outbound queue discarded terminal frames."""
+    global _shed_events_total
+    _shed_events_total += count
 
 
 def _bump_evicted() -> None:
@@ -150,16 +158,47 @@ class _ClientEntry:
 #: and not the others (see ``core.closecodes``).
 LIFECYCLE_ENV_KEYS = ("WSCTL_DAEMON", "WSCTL_ROLLING_FROM_PID", "WSCTL_LOG_FILE")
 
+#: Credential-shaped variables that must never reach a session shell.
+#: ``WSCTL_DATA_DIR``/``WSCTL_PORT``/``WSCTL_CONFIG`` are deliberately *not*
+#: here: a ``wsctl`` command typed inside a session has to resolve the same
+#: instance (data directory / port / config), and they carry no secret. The
+#: self-stop guard itself does not use them -- it walks ``/proc`` ancestry
+#: (``core.selfwatch``) -- so this is about *addressing*, not about safety.
+#: Only names that *are* the secret are removed, including future
+#: ``WSCTL_*_PASSWORD``/``_TOKEN``/``_SECRET`` spellings, which is why the
+#: suffix rule exists on top of the explicit list.
+SECRET_ENV_KEYS = frozenset({"WSCTL_ADMIN_PASSWORD", "WSCTL_TOKEN", "WSCTL_TOTP"})
+SECRET_ENV_SUFFIXES = ("_PASSWORD", "_TOKEN", "_SECRET")
+
+
+def _is_secret_env_key(key: str) -> bool:
+    if key in SECRET_ENV_KEYS:
+        return True
+    return key.startswith("WSCTL_") and key.endswith(SECRET_ENV_SUFFIXES)
+
 
 def session_env(env: dict[str, str] | None) -> dict[str, str]:
     """The environment a session's child runs with, minus wsctl's own plumbing.
 
     Defaults to a copy of the server's environment, which is the right base
-    (PATH, locale, ssh agent, ...) but also carries the variables the daemon
-    lifecycle uses to talk to *itself* (see :data:`LIFECYCLE_ENV_KEYS`).
+    (PATH, locale, ssh agent, ...). Two groups are removed:
+
+    * lifecycle keys (:data:`LIFECYCLE_ENV_KEYS`) -- a shell that inherits them
+      believes it *is* the daemon;
+    * credentials (:data:`SECRET_ENV_KEYS` and the ``*_PASSWORD``/``*_TOKEN``/
+      ``*_SECRET`` spellings). A bootstrap ``WSCTL_ADMIN_PASSWORD`` used to reach
+      every terminal opened over the web panel, so any user who could open a
+      shell could read the administrator password with ``env``.
+
+    Operational variables (``WSCTL_DATA_DIR``, ``WSCTL_PORT``, ``WSCTL_CONFIG``)
+    stay: a ``wsctl`` command typed inside a session must resolve the same
+    instance. (The self-stop refusal separately walks ``/proc`` ancestry; it
+    does not depend on these variables.)
     """
     base = dict(os.environ if env is None else env)
     for key in LIFECYCLE_ENV_KEYS:
+        base.pop(key, None)
+    for key in [key for key in base if _is_secret_env_key(key)]:
         base.pop(key, None)
     return base
 
@@ -183,6 +222,12 @@ class TermSession:
         self.last_active = self.created_at
         self.exit_code: int | None = None
         self.closed = False
+        #: Set once the finalizer has queued the ``exit`` notice. ``closed``
+        #: alone is not enough: it flips *before* the notice is written, and a
+        #: WebSocket pump that returned on ``closed`` could detach the client
+        #: in that window -- the browser then never saw the exit code and
+        #: reconnected into a 4404.
+        self._finalized = asyncio.Event()
         #: How the session ended, decided by :meth:`stop` (or by the child
         #: exiting on its own). Consumed by the manager's ``on_session_end``
         #: hook so the database row says *why*, not just ``stopped``.
@@ -570,11 +615,24 @@ class TermSession:
 
     def share_access(self, token: str | None) -> str | None:
         """Return ``"write"``, ``"read"`` or ``None`` for a share token."""
-        if not token or self._share_token is None:
+        if not token or not isinstance(token, str) or self._share_token is None:
             return None
         if self._share_expires is not None and time.time() >= self._share_expires:
             return None
-        if not secrets.compare_digest(token, self._share_token):
+        # Compare *bytes*: ``secrets.compare_digest`` raises ``TypeError`` for
+        # a str containing non-ASCII, so a hand-typed share URL with Chinese in
+        # it used to escape as a 500 (and a 4500 close) instead of "not a valid
+        # token". Encoding first makes every token comparable.
+        #
+        # ``surrogatepass`` as well: ``json.loads('"\\ud800"')`` produces a lone
+        # surrogate, and its ``encode("utf-8")`` raises ``UnicodeEncodeError``
+        # -- another way to turn a bad token into a 4500.
+        try:
+            candidate = token.encode("utf-8", "surrogatepass")
+            expected = self._share_token.encode("utf-8")
+        except (UnicodeEncodeError, AttributeError):
+            return None
+        if not secrets.compare_digest(candidate, expected):
             return None
         return "write" if self._share_writable else "read"
 
@@ -754,7 +812,14 @@ class TermSession:
 
     async def _finalize(self) -> None:
         if self.closed:
+            self._finalized.set()
             return
+        try:
+            await self._finalize_impl()
+        finally:
+            self._finalized.set()
+
+    async def _finalize_impl(self) -> None:
         self.closed = True
         await self.stop_recording()
         code = self._pty.poll()
@@ -797,6 +862,19 @@ class TermSession:
             # gives back so the row is written before this coroutine ends.
             if inspect.isawaitable(done):
                 await done
+
+    async def wait_finalized(self, timeout: float | None = None) -> bool:
+        """Wait until the ``exit`` notice has been queued (``False`` on timeout).
+
+        ``stop()`` is bounded (PTY wait 3s + kill 2s), so a caller that sees
+        ``closed`` waits a few seconds at worst; a finalizer stuck longer than
+        that must not hold the WebSocket open indefinitely.
+        """
+        try:
+            await asyncio.wait_for(self._finalized.wait(), timeout=timeout)
+            return True
+        except TimeoutError:
+            return False
 
     # -- lifecycle -----------------------------------------------------
 
@@ -906,6 +984,44 @@ class SessionManager:
                 return_exceptions=True,
             )
         return [s.id for s in expired]
+
+    async def terminate_owned(
+        self,
+        owner_id: int,
+        *,
+        reason: str,
+        status: str = "killed",
+        created_before: float | None = None,
+    ) -> list[str]:
+        """Stop every session owned by ``owner_id`` and revoke their shares.
+
+        Used when an account is disabled or deleted. Revoking the login tokens
+        alone is not enough: a shell that is already running keeps running, and
+        a writable share link keeps working -- for a *different* person, after
+        the account it belonged to was supposed to be locked out.
+
+        ``created_before`` limits the sweep to sessions opened before a
+        password change. Sessions created *after* it belong to the new
+        credential and must survive; on the account-disabled path the caller
+        passes ``None`` (everything goes).
+        """
+        victims = [
+            s
+            for s in self.list_sessions()
+            if s.owner_id == owner_id
+            and (created_before is None or s.created_at < created_before)
+        ]
+        for session in victims:
+            with contextlib.suppress(Exception):
+                session.revoke_share()
+        # Concurrent, like ``reap_expired``: each ``stop`` may wait up to its
+        # timeout for the child to exit, and an admin disabling an account with
+        # ten terminals must not wait ten times over.
+        await asyncio.gather(
+            *(s.stop(reason=reason, status=status) for s in victims),
+            return_exceptions=True,
+        )
+        return [s.id for s in victims]
 
     async def remove(
         self,

@@ -2,25 +2,67 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 
+#: Suites that cost too much for the default run (Playwright, timing load).
+_OPT_IN_MARKERS = ("browser", "slow")
+
+#: tmux refuses to attach under ``TERM=dumb`` ("terminal does not support
+#: clear"), so on a bare environment two session-lifecycle tests failed and
+#: looked like product bugs. The tests are not a terminal; give the children a
+#: usable one unless the caller deliberately chose something better.
+if os.environ.get("TERM", "") in {"", "dumb"}:
+    os.environ["TERM"] = "xterm-256color"
+
+#: The suite only talks to 127.0.0.1, so a developer's proxy must not be part of
+#: it. This is not just hygiene: ``no_proxy`` containing a bracketed ``[::1]``
+#: makes httpx 0.28 build ``URLPattern("all://[::1]")`` and raise
+#: ``InvalidURL: Invalid port: ':1]'`` *before* any request is sent -- nine
+#: browser tests failed on a host whose proxy configuration is perfectly valid
+#: for a browser. Removing the variables here is narrower than auditing every
+#: call site (``trust_env=False`` where the suite remembered, bare ``httpx.get``
+#: elsewhere) and matches how ``scripts/e2e`` already starts its servers.
+_PROXY_ENV = (
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+)
+for _name in _PROXY_ENV:
+    os.environ.pop(_name, None)
+
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip opt-in suites unless explicitly selected (``-m browser`` / ``-m slow``)."""
-    marker_expr = config.getoption("-m", default="") or ""
-    if "browser" not in marker_expr:
-        skip_browser = pytest.mark.skip(reason="browser tests: select with -m browser")
+    """Skip opt-in suites unless the caller named them in ``-m``.
+
+    The rule is per marker name, not "any ``-m`` means the caller is
+    choosing". That first attempt looked right and was wrong in both
+    directions: ``-m "not browser"`` (the example in its own docstring) ran the
+    25-minute load suite, and ``-m "not slow"`` spawned Playwright for the
+    browser suite. A marker is opt-in unless the expression mentions it at all;
+    when it does, pytest's own selection decides and this hook adds nothing.
+    """
+    expression = (config.getoption("-m", default="") or "").strip()
+    for marker in _OPT_IN_MARKERS:
+        if _mentions_marker(expression, marker):
+            continue
+        skip = pytest.mark.skip(reason=f"{marker} tests: select with -m {marker}")
         for item in items:
-            if "browser" in item.keywords:
-                item.add_marker(skip_browser)
-    if "slow" not in marker_expr:
-        skip_slow = pytest.mark.skip(reason="slow tests: select with -m slow")
-        for item in items:
-            if "slow" in item.keywords:
-                item.add_marker(skip_slow)
+            if marker in item.keywords:
+                item.add_marker(skip)
+
+
+def _mentions_marker(expression: str, marker: str) -> bool:
+    """Whether ``-m`` expression names ``marker`` (``not browser`` counts).
+
+    Word-boundary-ish on purpose: marker names must not match inside an
+    identifier (``browserlike``), and ``-``/``_`` are part of marker syntax.
+    """
+    if not expression:
+        return False
+    return re.search(rf"(?<![-\w]){re.escape(marker)}(?![-\w])", expression) is not None
 
 
 @pytest.fixture(autouse=True)

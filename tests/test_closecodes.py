@@ -54,6 +54,8 @@ def test_every_code_is_classified() -> None:
         closecodes.CLOSE_TIMEOUT,
         # output outran one viewer; the session is fine and a reconnect works
         closecodes.CLOSE_SLOW_CONSUMER,
+        # the server is full *right now*; reconnecting later is the whole point
+        closecodes.CLOSE_OVERLOAD,
     }
     assert set(closecodes.ALL_CLOSE_CODES) == (
         set(closecodes.FATAL_CLOSE_CODES) | recoverable

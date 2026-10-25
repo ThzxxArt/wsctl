@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import tarfile
 from pathlib import Path
@@ -166,3 +167,141 @@ def test_a_symlink_in_recordings_does_not_make_the_backup_unrestorable(
     )
     assert (dest / "wsctl.db").is_file()
     assert (dest / "recordings" / "a.cast").is_file()
+
+
+# -- 0.1.30: restoring over a live database, and WAL sidecars ---------------
+
+
+def test_restore_refuses_while_an_instance_lease_is_alive(tmp_path: Path) -> None:
+    """A running server holds its own handle; replacing the file is not safe."""
+    data = tmp_path / "data"
+    data.mkdir()
+    store = _make_store(data / "wsctl.db")
+    store.instance_register("live-instance", pid=os.getpid(), host="here")
+    store.close()
+
+    out = tmp_path / "bak.tar.gz"
+    backup.create_backup(data / "wsctl.db", data / "recordings", out)
+
+    with pytest.raises(backup.BackupError) as excinfo:
+        backup.restore_backup(
+            out, data / "wsctl.db", data / "recordings", force=True, instance_ttl=60
+        )
+    assert "wsctl stop" in str(excinfo.value)
+    assert "live-instance" in str(excinfo.value)
+
+
+def test_restore_drops_wal_sidecars_that_belong_to_the_old_database(
+    tmp_path: Path,
+) -> None:
+    """Replaying the old WAL over the restored file corrupts it.
+
+    The fixture writes junk next to the target: after a restore neither
+    ``-wal`` nor ``-shm`` may survive, or SQLite would apply pages that belong
+    to a database that is no longer there.
+    """
+    data = tmp_path / "data"
+    data.mkdir()
+    store = _make_store(data / "wsctl.db")
+    store.close()
+    out = tmp_path / "bak.tar.gz"
+    backup.create_backup(data / "wsctl.db", data / "recordings", out)
+
+    wal = data / "wsctl.db-wal"
+    shm = data / "wsctl.db-shm"
+    wal.write_bytes(b"\x00" * 64)
+    shm.write_bytes(b"\x00" * 64)
+
+    backup.restore_backup(out, data / "wsctl.db", data / "recordings", force=True)
+
+    assert not wal.exists(), "a stale -wal was left to be replayed"
+    assert not shm.exists(), "a stale -shm was left behind"
+    conn = sqlite3.connect(data / "wsctl.db")
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_restore_rejects_a_database_that_fails_integrity_check(
+    tmp_path: Path,
+) -> None:
+    """The header check accepted a truncated file, which was then installed."""
+    bad = tmp_path / "corrupt.tar.gz"
+    fake = tmp_path / "wsctl.db"
+    fake.write_bytes(b"SQLite format 3\x00" + b"\x00" * 2048)
+    with tarfile.open(bad, "w:gz") as tar:
+        tar.add(fake, arcname="wsctl.db")
+    with pytest.raises(backup.BackupError, match=r"损坏|校验"):
+        backup.restore_backup(bad, tmp_path / "db", tmp_path / "rec", force=True)
+
+
+def test_restore_keeps_a_consistent_copy_of_the_previous_database(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    store = _make_store(data / "wsctl.db")
+    store.close()
+    out = tmp_path / "bak.tar.gz"
+    backup.create_backup(data / "wsctl.db", data / "recordings", out)
+
+    # A second user added after the backup: the .bak must contain them.
+    store = Store(data / "wsctl.db")
+    store.user_create("carol", "password123")
+    store.close()
+
+    backup.restore_backup(out, data / "wsctl.db", data / "recordings", force=True)
+
+    bak = data / "wsctl.db.bak"
+    assert bak.is_file()
+    conn = sqlite3.connect(bak)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        names = {row[0] for row in conn.execute("SELECT username FROM users")}
+    finally:
+        conn.close()
+    assert names == {"alice", "bob", "carol"}
+    # No half-written staging file may be left next to the database.
+    assert not list(data.glob(".*.restore-*.tmp"))
+
+
+def test_a_second_restore_never_overwrites_the_first_backup(
+    tmp_path: Path,
+) -> None:
+    """A retried restore used to eat the only copy of the original database.
+
+    ``.bak`` had one fixed name. Restore #1 replaced it with the original; a
+    second run (an operator who thought the first had hung) then overwrote that
+    snapshot with the *already restored* file -- the original was gone.
+    """
+    data = tmp_path / "data"
+    data.mkdir()
+    store = _make_store(data / "wsctl.db")
+    store.close()
+    out = tmp_path / "bak.tar.gz"
+    backup.create_backup(data / "wsctl.db", data / "recordings", out)
+
+    store = Store(data / "wsctl.db")
+    store.user_create("carol", "password123")
+    store.close()
+    backup.restore_backup(out, data / "wsctl.db", data / "recordings", force=True)
+    original_bak = data / "wsctl.db.bak"
+    assert original_bak.is_file()
+
+    # A second restore: it must keep the first snapshot and write a new one.
+    backup.restore_backup(out, data / "wsctl.db", data / "recordings", force=True)
+    backups = sorted(data.glob("wsctl.db.bak*"))
+    assert len(backups) == 2, [p.name for p in backups]
+
+    def users(path: Path) -> set[str]:
+        conn = sqlite3.connect(path)
+        try:
+            return {row[0] for row in conn.execute("SELECT username FROM users")}
+        finally:
+            conn.close()
+
+    assert users(original_bak) == {"alice", "bob", "carol"}, (
+        "the first backup was overwritten by the second restore"
+    )

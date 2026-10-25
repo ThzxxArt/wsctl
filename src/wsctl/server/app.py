@@ -30,6 +30,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 
 from wsctl import __version__
 from wsctl.core import logrotate as logrotate_mod
+from wsctl.core import passwords as passwords_mod
 from wsctl.core import pty as pty_mod
 from wsctl.core import recording as recording_mod
 from wsctl.core import session as session_mod
@@ -59,11 +60,25 @@ from .security import (
     SECURITY_HEADERS,
     client_ip,
     ip_allowed,
+    is_origin_allowed,
 )
-from .ws import terminal_endpoint
+from .ws import ConnectionCaps, terminal_endpoint
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 MAINTENANCE_INTERVAL = 5.0
+
+#: Methods that cannot change state, so a cross-site request for one is not a
+#: CSRF. ``OPTIONS`` is included for preflight; there is no CORS middleware, so
+#: a preflight never reaches a real handler anyway.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: Login is a JSON object with two short strings. The previous shape bound the
+#: *parsed* fields (``max_length``) but read the whole body into memory first,
+#: so one 100 MB request cost 100 MB of RAM before validation ever ran. The
+#: cap is enforced from ``Content-Length`` before the body is read; a chunked
+#: request is refused outright because neither the browser UI nor the CLI
+#: streams a login.
+MAX_LOGIN_BODY = 8 * 1024
 
 log = logging.getLogger("wsctl.app")
 
@@ -89,6 +104,65 @@ def _install_sighup(app: FastAPI) -> None:
         loop.add_signal_handler(signal.SIGHUP, _request_reload, app)
 
 
+def _cross_site(request: Request, settings: Settings) -> str | None:
+    """Reject a state-changing request that another site's page issued.
+
+    The cookie is ``SameSite=Lax``, which stops a *cross-site* form post but
+    not a same-site one: another port on the same host, or a sibling subdomain,
+    is "same site" to the cookie jar and the browser attaches the session
+    cookie. ``POST /api/files/upload`` is a CORS **simple request** (multipart),
+    so a page could send it with ``mode:"no-cors"`` and no preflight -- and
+    overwrite ``~/.ssh/authorized_keys``. Comparing ``Origin`` against the
+    request's ``Host`` is the check that closes it, and it needs no token
+    because every browser sets ``Origin`` on a non-GET request.
+    """
+    origin = request.headers.get("origin")
+    if origin is not None:
+        if is_origin_allowed(
+            origin, request.headers.get("host"), settings.allowed_origins
+        ):
+            return None
+        return "跨站请求被拒绝"
+    # No Origin. A browser always sends one for a cross-origin non-GET, so this
+    # is either a non-browser client (CLI, script -- allowed, it authenticates)
+    # or a browser request that claims to be cross-origin/same-site without
+    # saying from where. The latter is not something this API serves.
+    if request.headers.get("sec-fetch-site") in {"cross-site", "same-site"}:
+        return "跨站请求被拒绝（缺少 Origin）"
+    return None
+
+
+def _login_body_problem(request: Request) -> tuple[int, str] | None:
+    """Refuse an oversized login body *before* it is read into memory."""
+    raw = request.headers.get("content-length")
+    if raw is None:
+        # Neither the web UI nor the CLI streams a login. A body with no length
+        # would have been buffered in full first, which is the whole bug.
+        return 411, "缺少 Content-Length"
+    try:
+        size = int(raw)
+    except ValueError:
+        return 400, "Content-Length 无效"
+    if size > MAX_LOGIN_BODY:
+        return 413, f"请求体过大（上限 {MAX_LOGIN_BODY} 字节）"
+    return None
+
+
+def _per_ip_login_limit(settings: Settings) -> int:
+    """The per-host login budget derived from the per-account one.
+
+    ``0`` must stay ``0``: an operator who turned login throttling off did not
+    ask for a different limit under another name. The multiplier exists because
+    one host may legitimately try several accounts (a shared NAT office), while
+    an attacker rotating usernames must still hit a ceiling. Three times the
+    account budget, with a floor of 20.
+    """
+    limit = int(settings.login_rate_limit)
+    if limit <= 0:
+        return 0
+    return max(20, limit * 3)
+
+
 def create_app(
     settings: Settings,
     *,
@@ -106,6 +180,11 @@ def create_app(
         if changed or errors:
             limiter.limit = settings.login_rate_limit
             limiter.window = float(settings.login_rate_window)
+            # The per-host budget is derived from the same setting; leaving it
+            # at its startup value made "I raised the login limit" true for one
+            # budget and false for the other.
+            ip_limiter.limit = _per_ip_login_limit(settings)
+            ip_limiter.window = float(settings.login_rate_window)
             # ``session_sliding_ttl`` is read from the store on every
             # resolution, not from ``settings``. Without this the field was
             # listed as hot-reloadable while a reload never reached the code
@@ -177,11 +256,73 @@ def create_app(
         alive = {s.id for s in app.state.manager.list_sessions()}
         app.state.store.term_session_stop_missing(alive, instance_id=instance_id)
         limiter.sweep()
+        # The per-host budget is keyed by an *attacker-chosen* address, so it
+        # needs the same cleanup as the per-account one: without this, every
+        # one-shot source address left a deque behind for the process lifetime.
+        ip_limiter.sweep()
         await asyncio.to_thread(
             _maintenance_db_writes,
             instance_id,
             float(settings.instance_ttl),
         )
+
+    async def _reconcile_accounts() -> None:
+        """Backstop for account changes made outside this process.
+
+        The HTTP API terminates immediately (``routes/users.py``); ``wsctl user
+        disable`` / ``passwd`` / ``user delete`` run in a *different* process
+        and can only touch the database. Without this loop the shell kept
+        running and a writable share kept working until the server was
+        restarted -- for an account that was supposed to be locked out.
+
+        Password rotation is the subtle one: it is not "everything becomes
+        invalid", it is "everything opened under the *old* password becomes
+        invalid". The database records when the password changed, and sessions
+        created before that instant are ended; sessions created after it (with
+        the new credential) are not collateral. Runs every maintenance tick.
+        """
+        if not settings.auth_required:
+            return
+        live = [
+            s
+            for s in app.state.manager.list_sessions()
+            if s.owner_id is not None and s.owner_id > 0
+        ]
+        if not live:
+            return
+        owner_ids = {int(s.owner_id) for s in live if s.owner_id is not None}
+        owners = await asyncio.to_thread(app.state.store.users_by_ids, owner_ids)
+        for owner_id in owner_ids:
+            user = owners.get(owner_id)
+            if user is None:
+                reason = "账号已被删除，会话已结束"
+                cutoff: float | None = None
+            elif user.disabled:
+                reason = "账号已被停用，会话已结束"
+                cutoff = None
+            elif user.password_changed_at > 0:
+                reason = "账号密码已变更，旧会话已结束"
+                cutoff = user.password_changed_at
+            else:
+                continue
+            ids = await app.state.manager.terminate_owned(
+                owner_id,
+                reason=reason,
+                status="stopped",
+                created_before=cutoff,
+            )
+            if not ids:
+                # A rotated password leaves newer sessions legitimate; do not
+                # log or audit a sweep that found nothing every five seconds.
+                continue
+            log.warning("terminating sessions of %s: %s", owner_id, reason)
+            for sid in ids:
+                await asyncio.to_thread(
+                    app.state.store.term_session_set_share, sid, token=None
+                )
+            app.state.audit.enqueue(
+                "account_sessions_terminated", payload=str(owner_id)
+            )
 
     async def _rotate_log() -> None:
         if not settings.log_file or settings.log_max_bytes <= 0:
@@ -203,6 +344,7 @@ def create_app(
                 # Re-register (idempotent upsert) rather than a bare heartbeat:
                 # if a peer pruned our lease while we were paused, this restores it.
                 await _maintenance_db_tick()
+                await _reconcile_accounts()
                 await reconcile_instances(app)
                 await _purge_retention()
                 if app.state.reload_requested:
@@ -376,7 +518,9 @@ def create_app(
     # carried two unrelated numbers. They are separate series now.
     metrics.collect_counter(
         "wsctl_client_frames_shed_total",
-        "Terminal frames discarded to keep a slow viewer connected (never a disconnect)",
+        "Shedding events that discarded terminal frames to keep a slow viewer "
+        "connected (one event may drop several frames; never a disconnect). "
+        "Process-wide and monotonic, so a detach cannot make it go backwards",
         lambda: float(session_mod.shed_frames_total(app.state.manager)),
     )
     metrics.collect_counter(
@@ -437,6 +581,28 @@ def create_app(
 
     limiter = RateLimiter(settings.login_rate_limit, settings.login_rate_window)
     app.state.limiter = limiter
+    #: Per-IP failure budget, separate from the per-``ip:username`` one. The
+    #: latter is reset by a successful login, so rotating usernames used to give
+    #: an attacker a fresh budget per name and an unbounded number of Argon2
+    #: verifications. Three times the account budget (minimum 20) keeps a shared
+    #: NAT office working while still bounding one host.
+    ip_limiter = RateLimiter(
+        _per_ip_login_limit(settings), settings.login_rate_window
+    )
+    app.state.ip_limiter = ip_limiter
+    #: Lanes for password verification, acquired in the *event loop* before a
+    #: worker thread is handed the job. The process-wide semaphore in
+    #: ``core.passwords`` caps CPU, but a thread blocked on it still occupies a
+    #: slot in the default executor -- a login storm could fill all of them and
+    #: starve every other ``to_thread`` call (store queries, backups) while the
+    #: CPU sat idle between lanes. Waiting here costs a coroutine, not a thread.
+    app.state.login_slots = asyncio.Semaphore(passwords_mod.HASH_LANES)
+    app.state.ws_caps = ConnectionCaps()
+    metrics.collect(
+        "wsctl_ws_connections_open",
+        "Terminal WebSockets currently admitted",
+        lambda: float(app.state.ws_caps.total),
+    )
 
     @app.middleware("http")
     async def _guard(request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -444,6 +610,20 @@ def create_app(
         if not ip_allowed(ip, settings.allowed_ips):
             app.state.audit.enqueue("ip_rejected", ip=ip, payload=request.url.path)
             return JSONResponse({"detail": "forbidden"}, status_code=403)
+        if request.method not in SAFE_METHODS and request.url.path.startswith("/api/"):
+            rejection = _cross_site(request, settings)
+            if rejection is not None:
+                app.state.audit.enqueue(
+                    "origin_rejected",
+                    ip=ip,
+                    payload=f"{request.method} {request.url.path}",
+                )
+                return JSONResponse({"detail": rejection}, status_code=403)
+        if request.method == "POST" and request.url.path.rstrip("/") == "/api/login":
+            problem = _login_body_problem(request)
+            if problem is not None:
+                code, detail = problem
+                return JSONResponse({"detail": detail}, status_code=code)
         response = await call_next(request)
         if settings.security_headers:
             for key, value in SECURITY_HEADERS.items():

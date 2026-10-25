@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
-from starlette.websockets import WebSocketState
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from wsctl.core import tmux
 from wsctl.core.audit import AuditWriter
@@ -30,6 +30,7 @@ from wsctl.core.closecodes import (
     CLOSE_FORBIDDEN,
     CLOSE_LIMIT,
     CLOSE_NOT_FOUND,
+    CLOSE_OVERLOAD,
     CLOSE_RATE_LIMITED,
     CLOSE_SERVER_ERROR,
     CLOSE_TIMEOUT,
@@ -59,6 +60,12 @@ MAX_AUDIT_LINE = 512
 MAX_AUDIT_BUFFER = 8192
 ACCESS_RECHECK = 5.0
 
+#: How long a pump waits for a closed session's final ``exit`` notice before
+#: closing the socket anyway. The finalizer itself is bounded (3s PTY wait +
+#: 2s kill wait), so this only covers "just a little longer than the worst
+#: normal case"; a stuck finalizer must not hold the socket forever.
+EXIT_DRAIN_TIMEOUT = 6.0
+
 #: Largest single input frame accepted from a client. The PTY write buffer has
 #: its own hard cap, but that check runs on what is *already buffered* -- one
 #: 16 MiB frame sailed past a 1 MiB "limit" whenever the buffer happened to be
@@ -73,8 +80,90 @@ MAX_INPUT_FRAME = 256 * 1024
 # vanished without a FIN) without ever tripping on a genuinely idle session.
 IDLE_TIMEOUT = 120.0
 
+#: A WebSocket that has not sent its ``attach`` by then is not a terminal. The
+#: endpoint used to await the first frame with no bound at all: one peer (or a
+#: hundred) could open sockets and never speak, holding fds and tasks forever.
+#: The browser and the CLI both send ``attach`` immediately; five seconds is
+#: already generous for a slow link.
+HANDSHAKE_TIMEOUT = 5.0
+
+#: Control frames (``ping`` / ``resize`` / text ``input``) per second and burst.
+#: These are cheap individually, but nothing used to bound them: a client could
+#: queue an unbounded stream of them and keep the loop busy parsing JSON.
+CONTROL_RATE = 40.0
+CONTROL_BURST = 80.0
+
+#: ``resync`` replays up to the whole scrollback (4 MiB by default) and asks
+#: the application to repaint. Three in a burst, one every five seconds
+#: sustained -- a screen cannot become stale faster than a human can notice.
+RESYNC_RATE = 0.2
+RESYNC_BURST = 3.0
+
 #: Consecutive over-limit chunks before the peer is disconnected.
 MAX_RATE_STRIKES = 3
+
+
+class ConnectionCaps:
+    """Open terminal sockets: process-wide, and per peer address.
+
+    Runtimes are single-threaded event loops, so plain counters need no lock.
+    The limits are read from settings on every call, which is what makes them
+    hot-reloadable.
+
+    Every admission is a *token*, and releasing is idempotent. That is not
+    bookkeeping for its own sake: the handler releases the slot at the end of
+    its ``finally``, but a cancellation delivered inside that block (the
+    TestClient cancels the app task when its socket context closes; a server
+    shutdown cancels every task) skips the remaining statements of the
+    ``finally`` -- including a release that was a plain call after an
+    ``await``. A task done-callback releases the same token as a backstop, and
+    because the token is popped, the second release is a no-op instead of a
+    double decrement that would let the process exceed its cap.
+    """
+
+    def __init__(self) -> None:
+        self._total = 0
+        self._by_ip: dict[str, int] = {}
+        self._next_token = 0
+        self._active: dict[int, str] = {}
+
+    @property
+    def total(self) -> int:
+        return self._total
+
+    def for_ip(self, ip: str | None) -> int:
+        return self._by_ip.get(ip or "-", 0)
+
+    def admit(self, ip: str | None, settings: Settings) -> int | None:
+        """Reserve a slot, returning its token (or ``None`` at capacity)."""
+        key = ip or "-"
+        if settings.ws_max_connections > 0 and self._total >= settings.ws_max_connections:
+            return None
+        if (
+            settings.ws_max_connections_per_ip > 0
+            and self._by_ip.get(key, 0) >= settings.ws_max_connections_per_ip
+        ):
+            return None
+        self._next_token += 1
+        token = self._next_token
+        self._active[token] = key
+        self._total += 1
+        self._by_ip[key] = self._by_ip.get(key, 0) + 1
+        return token
+
+    def release(self, token: int | None) -> None:
+        """Give a slot back. Releasing an already-released token is a no-op."""
+        if token is None:
+            return
+        key = self._active.pop(token, None)
+        if key is None:
+            return
+        self._total = max(0, self._total - 1)
+        left = self._by_ip.get(key, 0) - 1
+        if left > 0:
+            self._by_ip[key] = left
+        else:
+            self._by_ip.pop(key, None)
 
 
 def _auth_token(websocket: WebSocket) -> str | None:
@@ -162,13 +251,50 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         await websocket.close(code=CLOSE_UNAUTHORIZED)
         return
 
-    client = WsClient(websocket, max_bytes=settings.client_max_bytes)
-    writer = asyncio.create_task(client.run())
+    # Admission control comes *before* the handshake frame and before any
+    # background task is created: a peer that opens sockets and never speaks
+    # must not be able to hold fds, tasks or memory beyond these bounds.
+    caps: ConnectionCaps = websocket.app.state.ws_caps
+    slot = caps.admit(ip, settings)
+    if slot is None:
+        audit.enqueue("ws_capacity_rejected", ip=ip, payload="ws")
+        metrics.inc("wsctl_ws_capacity_rejected_total")
+        # 4413, not 4409: capacity is transient. A fatal code told every tab in
+        # a NAT office that reconnecting was pointless, so a momentary limit
+        # became a dead tab until a manual reload.
+        #
+        # Say why *before* closing (the socket is accepted, so a control frame
+        # still reaches the client): a bare close with a non-fatal code made
+        # the tab reconnect, but "why did this happen" was unanswerable.
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "error", "msg": "连接数已达上限，请稍后重连"}
+            )
+        await websocket.close(code=CLOSE_OVERLOAD)
+        return
+
+    # Backstop: the ``finally`` below releases the same token, but a
+    # cancellation delivered while that block awaits skips the rest of it.
+    # ``release`` pops the token, so whichever runs first wins and the other is
+    # a no-op.
+    task = asyncio.current_task()
+    if task is not None:
+        task.add_done_callback(lambda _done: caps.release(slot))
+
+    try:
+        client = WsClient(websocket, max_bytes=settings.client_max_bytes)
+        writer = asyncio.create_task(client.run())
+    except BaseException:
+        # Nothing was set up, but the admission slot must not leak.
+        caps.release(slot)
+        raise
     session: TermSession | None = None
     user_id = user.id if user is not None else None
     close_code = 1000
     try:
-        result = await _handshake(websocket, client, settings, manager, user, share_param)
+        result = await _handshake(
+            websocket, client, settings, manager, user, share_param
+        )
         if result is None:
             return
         session, writable, share = result
@@ -193,10 +319,19 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         # replayed is followed by an *application* repaint -- the app holds
         # the only complete model. A brand-new session replays nothing and
         # needs nothing.
+        #
+        # A read-only viewer gets this too: it is the only repair path a TUI
+        # viewer has, and a viewer that joins a running full-screen app would
+        # otherwise see a wrong screen from the first frame. The cost is that
+        # the owner's PTY is resized twice (the application's own repaint), so
+        # repeats are what the ``resync`` token bucket below bounds -- not the
+        # one-off attach.
         if session.has_scrollback:
             await session.nudge_repaint()
         on_line = _input_auditor(audit, settings, user_id, session.id)
         bucket = _input_bucket(settings)
+        control_bucket = TokenBucket(CONTROL_RATE, CONTROL_BURST)
+        resync_bucket = TokenBucket(RESYNC_RATE, RESYNC_BURST)
         # The reason a connection is being closed must reach the client *before*
         # the socket goes away. ``deny`` used to ``websocket.close()`` inline,
         # which raced the outbound writer and lost the explanation: the peer got
@@ -226,6 +361,8 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             recheck=recheck,
             metrics=metrics,
             close_code_out=pending_close,
+            control_bucket=control_bucket,
+            resync_bucket=resync_bucket,
         )
         if pending_close[0] is not None:
             close_code = int(pending_close[0])
@@ -260,6 +397,10 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         if websocket.application_state == WebSocketState.CONNECTED:
             with contextlib.suppress(Exception):
                 await websocket.close(code=final_code)
+        # Released last: the slot should cover the socket, not just the handler.
+        # The done-callback installed at admission releases the same token if a
+        # cancellation skips this line.
+        caps.release(slot)
 
 
 def _access(user: User | None, session: TermSession, share: str | None) -> str | None:
@@ -278,8 +419,19 @@ async def _handshake(
     share_param: str | None = None,
 ) -> tuple[TermSession, bool, str | None] | None:
     try:
-        raw = await websocket.receive_text()
+        # Only the *first frame* is on a clock. Wrapping the whole handshake in
+        # ``wait_for`` also timed session creation and its bookkeeping, and a
+        # timeout there left a freshly created session with no client at all.
+        raw = await asyncio.wait_for(
+            websocket.receive_text(), timeout=HANDSHAKE_TIMEOUT
+        )
         msg = json.loads(raw)
+    except TimeoutError:
+        raise _Denied("握手超时：连接后 5 秒内没有发送 attach", CLOSE_TIMEOUT) from None
+    except WebSocketDisconnect:
+        # A tab closed before it attached. That is not a server error, and it
+        # used to be logged as one (the generic handler turns it into 4500).
+        raise _Denied("客户端在握手期间断开", CLOSE_BAD_REQUEST) from None
     except (json.JSONDecodeError, KeyError, RuntimeError):
         # ``KeyError`` is what Starlette raises for ``message["text"]`` when the
         # first frame is *binary*; ``RuntimeError`` covers a socket torn down
@@ -305,6 +457,12 @@ async def _handshake(
     session: TermSession | None
     writable = True
     created = False
+    #: Whether this connection's authority comes from being the owner (or an
+    #: admin) rather than from the share link it arrived with. A share *link*
+    #: opened by the owner is still an owner connection: making it subject to
+    #: share revocation is what let rotating a share 4403 the owner out of their
+    #: own terminal (and drop their output at the session's broadcast filter).
+    owner_connection = False
     if sid:
         session = manager.get(str(sid))
         if session is None:
@@ -313,6 +471,9 @@ async def _handshake(
         if access is None:
             raise _Denied("无权访问该会话", CLOSE_FORBIDDEN)
         writable = access == "write"
+        owner_connection = user is not None and (
+            user.role == "admin" or session.owner_id == user.id
+        )
     else:
         if user is None:
             raise _Denied("创建会话需要登录", CLOSE_UNAUTHORIZED)
@@ -356,7 +517,9 @@ async def _handshake(
                 "session_create",
                 user_id=user.id,
                 term_session_id=session.id,
-                payload=msg.get("name") or session.spec.name,
+                # Coerced: a JSON object here used to reach the sqlite binder
+                # and take the whole audit batch down with it.
+                payload=str(msg.get("name") or session.spec.name)[:MAX_AUDIT_LINE],
             )
         except Exception:
             # Do not leave a live process/fd behind if post-create setup fails.
@@ -367,14 +530,18 @@ async def _handshake(
     # be able to shrink the owner's window at attach time.
     if writable:
         session.resize(cols, rows)
+    # An owner who arrived through their own share link keeps owner semantics
+    # everywhere downstream: no revocation filter in the broadcast path, and no
+    # ``4403`` when the link is rotated while they are watching.
+    filter_share = None if owner_connection else share
     try:
-        await session.attach(client, writable=writable, share=share)
+        await session.attach(client, writable=writable, share=filter_share)
     except ClientGone as exc:
         # A session we just created has no other owner and must not be leaked.
         if created:
             await manager.remove(session.id)
         raise _Denied(str(exc), CLOSE_LIMIT) from exc
-    return session, writable, share
+    return session, writable, filter_share
 
 
 def _input_auditor(
@@ -414,10 +581,14 @@ async def _pump(
     recheck: Callable[[], Awaitable[User | None]] | None = None,
     metrics: Metrics | None = None,
     close_code_out: list[int | None] | None = None,
+    control_bucket: TokenBucket | None = None,
+    resync_bucket: TokenBucket | None = None,
 ) -> None:
     line_buffer = bytearray()
     read_only_notice = False
     backpressure_notice = False
+    control_notice = False
+    resync_notice = False
     last_rx = time.monotonic()
     # Drives the periodic re-validation. This must be a *clock*, not a side
     # effect of "the receive timed out": the checks used to live only in the
@@ -543,6 +714,37 @@ async def _pump(
                 }
             )
 
+    def reject_control_flood() -> None:
+        """One notice per connection for control frames past the token bucket."""
+        nonlocal control_notice
+        if control_notice:
+            return
+        control_notice = True
+        with contextlib.suppress(ClientGone):
+            client.put(
+                {"type": "notice", "level": "warn", "msg": "控制消息过快，部分已被丢弃"}
+            )
+
+    def reject_resync_flood() -> None:
+        """A resync replays the scrollback; it must not be free to repeat.
+
+        The client clears its terminal when it *sends* a resync (the server's
+        replay is the only complete copy). A refusal that arrived as a generic
+        notice therefore left a blank screen for the timeout window, so the
+        refusal is a typed event the client can settle its state machine on.
+        """
+        nonlocal resync_notice
+        if resync_notice:
+            return
+        resync_notice = True
+        with contextlib.suppress(ClientGone):
+            client.put(
+                {
+                    "type": "resync-rejected",
+                    "msg": "重新同步过于频繁，请稍候再试",
+                }
+            )
+
     def forward_input(data: bytes) -> None:
         """Feed input to the child; report a drop instead of hiding it.
 
@@ -574,6 +776,17 @@ async def _pump(
 
     while True:
         if time.monotonic() - last_recheck >= ACCESS_RECHECK and await enforce_access():
+            return
+        if session.closed:
+            # The session ended (exit, kill, account disabled...). Returning
+            # closes the socket instead of leaving a viewer attached to a dead
+            # terminal for up to the idle timeout.
+            #
+            # Wait for the finalizer's ``exit`` notice first: ``closed`` flips
+            # before that notice is written, and returning on it detached the
+            # client mid-finalize -- the browser never saw the exit code and
+            # reconnected into a 4404 for a session that had simply exited.
+            await session.wait_finalized(timeout=EXIT_DRAIN_TIMEOUT)
             return
         try:
             message = await asyncio.wait_for(websocket.receive(), timeout=ACCESS_RECHECK)
@@ -634,9 +847,23 @@ async def _pump(
         text = message.get("text")
         if not text:
             continue
+        # One budget for every text frame, charged *before* parsing. Bounding
+        # only the handlers left the JSON decoder itself unbounded -- and the
+        # decoder is where a flood actually spends the server's CPU (a frame can
+        # be a megabyte). Malformed frames pay a token too, which is the point.
+        if control_bucket is not None and not control_bucket.allow(1.0):
+            if metrics is not None:
+                metrics.inc("wsctl_control_rate_limited_total")
+            reject_control_flood()
+            continue
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            # ``null``, ``[]`` and ``"text"`` are valid JSON but have no
+            # ``.get``: they raised AttributeError and closed a healthy session
+            # with 4500. A malformed control frame is ignored, not fatal.
             continue
         kind = data.get("type")
         if kind == "resize":
@@ -661,7 +888,12 @@ async def _pump(
             if not writable:
                 reject_readonly()
                 continue
-            chunk = str(data.get("data", "")).encode("utf-8")
+            raw_data = data.get("data", "")
+            if not isinstance(raw_data, str):
+                # Anything else used to be ``str()``-ified and typed into the
+                # shell -- a JSON object became the literal ``{'a': 1}``.
+                continue
+            chunk = raw_data.encode("utf-8")
             if len(chunk) > MAX_INPUT_FRAME:
                 # Same distinction as the binary path above: a refused frame,
                 # not a refused PTY write.
@@ -712,6 +944,15 @@ async def _pump(
             if share_revoked():
                 await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
                 return
+            # A resync replays up to the whole scrollback and (for a writer)
+            # asks the application to repaint. It cannot become stale faster
+            # than a human can notice, so repeats are refused with a notice
+            # rather than served for free.
+            if resync_bucket is not None and not resync_bucket.allow(1.0):
+                if metrics is not None:
+                    metrics.inc("wsctl_resync_rate_limited_total")
+                reject_resync_flood()
+                continue
             if metrics is not None:
                 metrics.inc("wsctl_shed_resync_requests_total")
             try:
@@ -741,7 +982,10 @@ async def _pump(
                 # application to redraw from its own model. Replaying the
                 # same tail into a full-screen app reproduces the same
                 # garbage -- the app is the only party that knows what its
-                # screen is supposed to look like.
+                # screen is supposed to look like. A read-only viewer needs
+                # this as much as a writer (it is the only way its TUI screen
+                # can be repaired); what a viewer must not have is an
+                # *unbounded* supply of it, which is the bucket above.
                 await session.nudge_repaint()
             except ClientGone:
                 return

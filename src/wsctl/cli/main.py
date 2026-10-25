@@ -65,6 +65,17 @@ store_mod = _LazyModule("wsctl.core.store")
 client_mod = _LazyModule("wsctl.cli.client")
 connect_mod = _LazyModule("wsctl.cli.connect")
 
+#: Largest WebSocket message uvicorn will assemble. The application bound for
+#: terminal input is 256 KiB (``server.ws.MAX_INPUT_FRAME``); this transport
+#: ceiling is the second layer, so one client cannot make the server hold a
+#: 16 MiB frame (uvicorn's default) before the protocol ever sees it.
+MAX_WS_FRAME_BYTES = 1024 * 1024
+
+#: Ceiling on simultaneously open HTTP/WebSocket connections. The application
+#: enforces its own per-IP terminal limits; this stops a peer from opening
+#: sockets that never reach the application at all.
+MAX_CONNECTIONS = 1024
+
 app = typer.Typer(
     name="wsctl",
     help="单机部署的 Web 在线终端：多会话、多用户、审计、分享、录制与可观测。",
@@ -627,6 +638,11 @@ def restore(
 ) -> None:
     """从备份恢复数据库与录制。"""
     settings = _settings_from(config)
+    running = daemon_mod.read_instance(settings)
+    if running is not None:
+        _fail(
+            f"服务仍在运行（pid {running.pid}），请先执行 wsctl stop 再恢复"
+        )
     try:
         manifest = backup_mod.restore_backup(
             archive,
@@ -635,6 +651,7 @@ def restore(
             config_path=settings.config_path,
             restore_config=with_config,
             force=force,
+            instance_ttl=float(settings.instance_ttl),
         )
     except backup_mod.BackupError as exc:
         _fail(str(exc))
@@ -838,6 +855,12 @@ def _bind_reuse_with_retry(settings: Settings) -> Any:
 def _serve_foreground(
     settings: Settings, *, admin_password: str | None, startup_command: str | None
 ) -> None:
+    # The bootstrap password arrived through the environment (a flag would be
+    # world-readable in ``/proc/*/cmdline``). Consume it here: leaving it in
+    # ``os.environ`` meant every terminal the server spawned inherited it, and
+    # any web user who could open a shell could read the administrator password
+    # with ``env``. ``session_env`` strips WSCTL_* as a second layer.
+    os.environ.pop("WSCTL_ADMIN_PASSWORD", None)
     logging_mod.configure_logging(settings.log_level, json_output=settings.log_json)
 
     from wsctl.server.app import create_app
@@ -897,15 +920,37 @@ def _serve_foreground(
     ssl_certfile = str(settings.ssl_cert) if settings.ssl_cert else None
     ssl_keyfile = str(settings.ssl_key) if settings.ssl_key else None
 
+    # One Config for both startup paths. ``uvicorn.run`` does not forward every
+    # Config keyword, so using it for the ordinary path and Config+Server for
+    # the reuse-port path is how the two drift -- and it took a failed launch to
+    # notice.
+    #
+    # ``limit_concurrency`` (not ``limit_max_connections``: that keyword only
+    # exists in some uvicorn versions) bounds how many requests are being served
+    # at once. Terminal sockets get their own bound in the application
+    # (``server.ws.ConnectionCaps``, per IP and process-wide), which is where a
+    # silent socket actually waits; idle HTTP keep-alives are bounded in time by
+    # uvicorn's keep-alive timeout.
+    uv_config = uvicorn.Config(
+        application,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+        # uvicorn defaults ``proxy_headers=True`` and rewrites
+        # ``scope["client"]`` from X-Forwarded-For for peers in
+        # ``forwarded_allow_ips`` (loopback by default). That made
+        # ``trust_proxy=False`` a lie -- any local process could claim any
+        # address, pass ``allowed_ips`` and forge the audit trail. wsctl parses
+        # the header itself, after checking that the peer is a trusted proxy.
+        proxy_headers=False,
+        ws_max_size=MAX_WS_FRAME_BYTES,
+        limit_concurrency=MAX_CONNECTIONS,
+    )
+
     try:
         if settings.reuse_port:
-
-            uv_config = uvicorn.Config(
-                application,
-                log_level=settings.log_level,
-                ssl_certfile=ssl_certfile,
-                ssl_keyfile=ssl_keyfile,
-            )
             server = uvicorn.Server(uv_config)
             # SO_REUSEPORT only lets two sockets share a port when *both* set
             # the option. A predecessor started without it still owns the port
@@ -924,14 +969,7 @@ def _serve_foreground(
                 sock.close()
             return
 
-        uvicorn.run(
-            application,
-            host=settings.host,
-            port=settings.port,
-            log_level=settings.log_level,
-            ssl_certfile=ssl_certfile,
-            ssl_keyfile=ssl_keyfile,
-        )
+        uvicorn.Server(uv_config).run()
     finally:
         if instance is not None:
             daemon_mod.release_pidfile(settings, instance)
@@ -1909,8 +1947,10 @@ port = 7681
 # --- 认证与安全 ---
 # auth_required = true
 # session_ttl = 43200
+# session_sliding_ttl = false
 # cookie_secure = false
 # trust_proxy = false
+# trusted_proxies = ["127.0.0.1"]   # 允许携带 X-Forwarded-For 的代理 CIDR（空 = 仅回环）
 # allowed_origins = []
 # allowed_ips = ["10.0.0.0/8"]
 # security_headers = true
@@ -1931,6 +1971,8 @@ port = 7681
 # session_max_clients = 0
 # session_memory_limit = 67108864
 # client_max_bytes = 8388608
+# ws_max_connections = 512
+# ws_max_connections_per_ip = 64
 # input_rate_limit = 0
 # input_rate_burst = 0
 # scrollback_bytes = 4194304

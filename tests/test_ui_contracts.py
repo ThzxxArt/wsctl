@@ -26,6 +26,40 @@ def _js() -> str:
     return APP_JS.read_text(encoding="utf-8")
 
 
+def _function_body(source: str, name: str) -> str:
+    """The balanced ``{...}`` body of ``function name(...)``.
+
+    Fixed character windows are brittle in both directions: a comment added
+    inside the function flipped a ``count()`` assertion, and a call that moved
+    past the window turned a correct implementation red.
+    """
+    match = re.search(rf"function\s+{re.escape(name)}\s*\(", source)
+    if match is None:
+        raise AssertionError(f"function {name} not found in app.js")
+    start = source.index("{", match.end())
+    depth = 0
+    quote = ""
+    index = start
+    while index < len(source):
+        char = source[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+        elif char in "\"'`":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+        index += 1
+    raise AssertionError(f"unbalanced body for {name}")
+
+
 def _read(rel: str) -> str:
     """Read any source file in the repository, for cross-file contracts."""
     return (ROOT / rel).read_text(encoding="utf-8")
@@ -1279,15 +1313,22 @@ def test_opening_a_tab_marks_every_pane_in_it_read() -> None:
     A split shows several panes at once. Clearing only the focused one left
     its visible siblings reporting unread for output that is right in front
     of the user.
+
+    0.1.30 moved the focus bookkeeping into ``setFocus`` so a click inside a
+    split updates the same state a tab switch does; the rule now lives there,
+    and ``activateTab`` must go through it rather than duplicating it.
     """
     js = _js()
-    at = js.index("function activateTab(")
-    block = js[at : at + 3200]
+    block = _function_body(js, "setFocus")
     assert "for (const paneId of leafIds(group.root)) clearActivity(" in block, (
-        "activating a tab must clear the unread state of every pane it shows"
+        "focusing a pane must clear the unread state of every pane it shows"
     )
     assert block.count("clearActivity(") == 1, (
         "there must be exactly one call, over the whole group"
+    )
+    activate = _function_body(js, "activateTab")
+    assert "setFocus(id)" in activate, (
+        "a tab switch must share the focus bookkeeping, not fork it"
     )
 
 

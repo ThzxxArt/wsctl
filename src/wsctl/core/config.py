@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -64,11 +64,45 @@ class Settings(BaseSettings):
     session_sliding_ttl: bool = False
     cookie_secure: bool = False
     trust_proxy: bool = False
+    #: Only these peers may speak ``X-Forwarded-For``. Empty means "loopback
+    #: only", which is the shape of a reverse proxy on the same machine.
+    #: Enabling ``trust_proxy`` without a real proxy lets any *local* process
+    #: claim any client address -- so the hop that is allowed to append the
+    #: header is a decision that has to be written down, not inferred.
+    #:
+    #: Validated at load: a typo (``10.0.0.0/33``) used to be dropped silently
+    #: by the header parser, so the proxy stopped being trusted, every user
+    #: shared the proxy's address as their rate-limit key, and the audit trail
+    #: named the proxy for everyone -- while ``config validate`` said "valid".
+    trusted_proxies: list[str] = Field(default_factory=list)
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _check_trusted_proxies(cls, value: list[str]) -> list[str]:
+        """Refuse a malformed CIDR instead of silently distrusting the proxy."""
+        import ipaddress
+
+        cleaned: list[str] = []
+        for entry in value:
+            text = str(entry).strip()
+            if not text:
+                continue
+            try:
+                ipaddress.ip_network(text, strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    f"trusted_proxies 里的 {text!r} 不是合法的 IP/CIDR"
+                ) from exc
+            cleaned.append(text)
+        return cleaned
 
     allowed_ips: list[str] = Field(default_factory=list)
     security_headers: bool = True
-    login_rate_limit: int = 10
-    login_rate_window: int = 300
+    #: ``0`` disables throttling on purpose. A negative value is not "more
+    #: off": it silently disabled the limiter too, because ``limit <= 0`` is
+    #: the off switch. Refuse it instead of pretending it means something.
+    login_rate_limit: int = Field(default=10, ge=0)
+    login_rate_window: int = Field(default=300, gt=0)
     audit_input: bool = False
     totp_issuer: str = APP_NAME
 
@@ -85,6 +119,12 @@ class Settings(BaseSettings):
     session_max_clients: int = 0
     session_memory_limit: int = 64 * 1024 * 1024
     client_max_bytes: int = 8 * 1024 * 1024
+    #: Bounds on *unauthenticated* WebSocket sockets, checked before the
+    #: handshake frame is read. Without them one peer could hold an unlimited
+    #: number of sockets open by sending nothing at all. ``0`` = unlimited;
+    #: a negative number is a typo that would have meant "unlimited" silently.
+    ws_max_connections: int = Field(default=512, ge=0)
+    ws_max_connections_per_ip: int = Field(default=64, ge=0)
     input_rate_limit: int = 0
     input_rate_burst: int = 0
     # 0 is *not* "unlimited" here: Scrollback requires a positive budget and
@@ -208,6 +248,9 @@ HOT_IMMEDIATE = frozenset(
         "term_session_retention_days",
         "tmux_preserve_on_shutdown",
         "trust_proxy",
+        "trusted_proxies",
+        "ws_max_connections",
+        "ws_max_connections_per_ip",
     }
 )
 
@@ -298,7 +341,15 @@ def reload_settings_file(settings: Settings) -> tuple[list[str], list[str]]:
         # including explicitly-set empty values.
         if f"WSCTL_{key.upper()}" in os.environ:
             continue
-        if key in data and getattr(settings, key) != getattr(candidate, key):
-            setattr(settings, key, getattr(candidate, key))
+        # Compare unconditionally: deleting a line must mean "back to the
+        # default", not "keep whatever this process started with". The old
+        # ``key in data`` guard made removing ``trust_proxy = true`` a no-op
+        # reported as "no changes" -- a fail-open silence for a security knob.
+        # ``candidate`` was built from the file alone, so an absent key is
+        # already its model default.
+        current = getattr(settings, key)
+        wanted = getattr(candidate, key)
+        if current != wanted:
+            setattr(settings, key, wanted)
             changed.append(key)
     return changed, []

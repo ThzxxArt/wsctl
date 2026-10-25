@@ -13,6 +13,7 @@ from wsctl.core.session import (
     ClientGone,
     SessionManager,
     SessionSpec,
+    session_env,
     within_user_quota,
 )
 
@@ -548,9 +549,18 @@ async def test_an_unattended_repaint_is_throttled_so_a_storm_cannot_feed_itself(
         assert len(nudges) == 1, f"a burst must repaint once, got {len(nudges)}"
 
         # Still inside the interval: a second burst must not add another.
+        # Asserted structurally (no new task is scheduled) and then again after
+        # a moment; the old form was a bare 50ms sleep whose only teeth were
+        # "the nudge did not happen to fire in that window".
+        task_after_first = session._repaint_task
         session.request_repaint()
-        assert session._repaint_task.done() or True
-        assert len(nudges) <= 1, "the interval must hold the rate down"
+        assert session._repaint_task is task_after_first, (
+            "a burst inside the interval scheduled a second repaint"
+        )
+        await asyncio.sleep(0.05)
+        assert len(nudges) == 1, (
+            "the interval must hold the rate down (a second burst nudged again)"
+        )
 
         # Past the interval the next loss is allowed to ask again.
         session._repaint_requested_at -= session.AUTO_REPAINT_MIN_INTERVAL + 1
@@ -747,6 +757,10 @@ def test_a_session_shell_does_not_inherit_the_daemon_s_lifecycle_env() -> None:
     start a "managed" instance that steals it, or point ``log_file`` at the
     daemon's log and truncate it on rotation. The very accident e2e once had
     from a leaked ``WSCTL_DAEMON=1`` in a developer's shell.
+
+    0.1.30 found that a bootstrap ``WSCTL_ADMIN_PASSWORD`` was inherited by
+    every terminal, so credential-shaped names are now removed as well (see
+    ``SECRET_ENV_KEYS``). Operational variables keep working.
     """
     import os
 
@@ -755,14 +769,16 @@ def test_a_session_shell_does_not_inherit_the_daemon_s_lifecycle_env() -> None:
     os.environ["WSCTL_DAEMON"] = "1"
     os.environ["WSCTL_ROLLING_FROM_PID"] = "4242"
     os.environ["WSCTL_LOG_FILE"] = "/tmp/daemon.log"
+    os.environ["WSCTL_ADMIN_PASSWORD"] = "Sup3rSecret!"
     os.environ["WSCTL_SOMETHING_HARMLESS"] = "keep-me"
     try:
         env = session_env(None)
         assert "WSCTL_DAEMON" not in env
         assert "WSCTL_ROLLING_FROM_PID" not in env
         assert "WSCTL_LOG_FILE" not in env
+        assert "WSCTL_ADMIN_PASSWORD" not in env
         assert env.get("WSCTL_SOMETHING_HARMLESS") == "keep-me", (
-            "only the lifecycle variables are stripped"
+            "operational WSCTL_* values are not secrets and must survive"
         )
         assert env.get("PATH"), "the ordinary environment must still be there"
     finally:
@@ -770,6 +786,7 @@ def test_a_session_shell_does_not_inherit_the_daemon_s_lifecycle_env() -> None:
             "WSCTL_DAEMON",
             "WSCTL_ROLLING_FROM_PID",
             "WSCTL_LOG_FILE",
+            "WSCTL_ADMIN_PASSWORD",
             "WSCTL_SOMETHING_HARMLESS",
         ):
             os.environ.pop(key, None)
@@ -812,6 +829,88 @@ async def test_a_repaint_is_a_refresh_not_content_so_it_stays_out_of_the_scrollb
         # ...but live viewers did receive it: the refresh is for them.
         assert b"REPAINT" in client.output(), (
             "the repaint must still reach attached viewers"
+        )
+    finally:
+        await manager.shutdown()
+
+
+# -- 0.1.30: credentials, account lifecycle, hostile share tokens ------------
+
+
+def test_session_env_strips_credentials_but_keeps_operational_context() -> None:
+    """A shell must not inherit secrets -- and must still find its instance.
+
+    Only the three lifecycle keys were removed before 0.1.30, so a bootstrap
+    ``WSCTL_ADMIN_PASSWORD`` was inherited by every terminal opened from the
+    web panel. Removing *every* ``WSCTL_*`` would be simpler but wrong:
+    ``WSCTL_DATA_DIR``/``WSCTL_PORT`` are how a command typed inside the
+    session resolves the instance it is running in (the "stop must not saw off
+    its own branch" guard depends on it), and they carry no secret.
+    """
+    env = session_env(
+        {
+            "PATH": "/bin",
+            "HOME": "/home/x",
+            "WSCTL_DATA_DIR": "/data/wsctl",
+            "WSCTL_PORT": "7681",
+            "WSCTL_ADMIN_PASSWORD": "Sup3rSecret!",
+            "WSCTL_TOKEN": "bearer-token",
+            "WSCTL_TOTP": "123456",
+            "WSCTL_SMTP_PASSWORD": "future-secret",
+            "WSCTL_DAEMON": "1",
+            "WSCTL_ROLLING_FROM_PID": "42",
+            "WSCTL_LOG_FILE": "/tmp/wsctl.log",
+        }
+    )
+    assert env["PATH"] == "/bin"
+    assert env["WSCTL_DATA_DIR"] == "/data/wsctl"
+    assert env["WSCTL_PORT"] == "7681"
+    for secret in (
+        "WSCTL_ADMIN_PASSWORD",
+        "WSCTL_TOKEN",
+        "WSCTL_TOTP",
+        "WSCTL_SMTP_PASSWORD",
+        "WSCTL_DAEMON",
+        "WSCTL_ROLLING_FROM_PID",
+        "WSCTL_LOG_FILE",
+    ):
+        assert secret not in env, f"{secret} must not reach a session shell"
+
+
+async def test_terminate_owned_stops_its_sessions_and_revokes_shares() -> None:
+    manager = SessionManager()
+    alice = await manager.create(SessionSpec(name="a", argv=[SHELL]), owner_id=1)
+    bob = await manager.create(SessionSpec(name="b", argv=[SHELL]), owner_id=2)
+    token = alice.create_share(writable=True)
+    try:
+        assert alice.share_valid(token)
+        killed = await manager.terminate_owned(1, reason="account disabled")
+        assert killed == [alice.id]
+        assert alice.closed
+        assert not alice.share_valid(token), "a disabled account must not keep a live share"
+        assert bob.is_alive, "another account's terminal is not collateral"
+    finally:
+        await manager.shutdown()
+
+
+async def test_share_access_rejects_non_ascii_tokens_without_raising() -> None:
+    """A hand-typed share URL with Chinese in it used to be a 500 / 4500.
+
+    ``secrets.compare_digest`` raises ``TypeError`` for non-ASCII ``str``, and
+    the exception escaped the handshake as an internal error. A lone surrogate
+    (``json.loads('"\\ud800"')``) is the same bug one layer down:
+    ``encode("utf-8")`` raises ``UnicodeEncodeError``.
+    """
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="s", argv=[SHELL]))
+    try:
+        token = session.create_share()
+        assert session.share_valid(token)
+        assert session.share_access("中文令牌") is None
+        assert session.share_valid("中文令牌") is False
+        assert session.share_access("not-the-token") is None
+        assert session.share_access("\ud800") is None, (
+            "a lone surrogate from JSON must be an invalid token, not a crash"
         )
     finally:
         await manager.shutdown()

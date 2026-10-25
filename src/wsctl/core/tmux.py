@@ -76,16 +76,28 @@ def wrap_argv(name: str, argv: list[str]) -> list[str]:
     return [tmux, "new-session", "-A", "-s", name, *argv]
 
 
+#: How long a tmux control command may take. These commands are trivial for a
+#: healthy server, so a wait past a few seconds means the server (or the socket
+#: on a dead network mount) is wedged -- and an unbounded ``subprocess.run``
+#: there hangs ``TermSession.stop()``, which in turn hangs ``wsctl stop`` and an
+#: administrator's "disable this account" request.
+TMUX_TIMEOUT = 5.0
+
+
 def has_session(name: str) -> bool:
     tmux = tmux_path()
     if tmux is None:
         return False
-    result = subprocess.run(
-        [tmux, "has-session", "-t", name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [tmux, "has-session", "-t", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=TMUX_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False
     return result.returncode == 0
 
 
@@ -93,12 +105,18 @@ def kill_session(name: str) -> None:
     tmux = tmux_path()
     if tmux is None:
         return
-    subprocess.run(
-        [tmux, "kill-session", "-t", name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        subprocess.run(
+            [tmux, "kill-session", "-t", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=TMUX_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        # The local PTY detach continues below; a wedged tmux server must not
+        # turn "stop this session" into an infinite wait.
+        return
 
 
 def list_sessions() -> list[str]:
@@ -106,12 +124,16 @@ def list_sessions() -> list[str]:
     tmux = tmux_path()
     if tmux is None:
         return []
-    result = subprocess.run(
-        [tmux, "list-sessions", "-F", "#{session_name}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [tmux, "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=TMUX_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return []
     if result.returncode != 0:
         return []
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]

@@ -7,7 +7,9 @@
 # 因此这里用 `${VAR:?...}` 在缺省时直接报错退出。
 #
 # 生产环境请置于 TLS 反向代理之后，并设置 WSCTL_TRUST_PROXY=true、
-# WSCTL_COOKIE_SECURE=true（见 contrib/nginx/wsctl.conf）。
+# WSCTL_COOKIE_SECURE=true，同时把代理地址写进 WSCTL_TRUSTED_PROXIES
+# （JSON 数组；容器里的代理通常不是回环，例如 Docker 默认网桥 172.17.0.1
+# ——不写这一项时 X-Forwarded-For 会被忽略，见 contrib/nginx/wsctl.conf）。
 services:
   wsctl:
     # 构建上下文是**仓库根**，确保装到的是本地源码。
@@ -25,7 +27,9 @@ services:
       WSCTL_HOST: 0.0.0.0
       WSCTL_PORT: "7681"
       WSCTL_ADMIN_PASSWORD: ${WSCTL_ADMIN_PASSWORD:?请设置环境变量 WSCTL_ADMIN_PASSWORD}
-      # 位于反向代理后时开启
+      # 位于反向代理后时开启；代理不是回环时还必须填写它的地址：
+      # WSCTL_TRUSTED_PROXIES: '["172.17.0.1"]'
       WSCTL_TRUST_PROXY: "false"
+      WSCTL_TRUSTED_PROXIES: "[]"
       WSCTL_COOKIE_SECURE: "false"
     restart: unless-stopped

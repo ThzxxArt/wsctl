@@ -116,6 +116,9 @@ async def list_files(
     reach entry 2001.
     """
     root = request.app.state.settings.files_root
+    # Bound the page at the edge too: ``limit`` is query input, and a negative
+    # value used to mean "no limit" all the way down.
+    limit = max(0, min(limit, 5000))
     try:
         page = await asyncio.to_thread(
             fs_mod.list_dir_paged,

@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from wsctl.core import ssh, tmux
+from wsctl.core.closecodes import CLOSE_OVERLOAD, FATAL_CLOSE_CODES
 from wsctl.core.config import load_settings
 from wsctl.core.session import SessionManager
 from wsctl.core.store import Store
@@ -2752,4 +2753,777 @@ def test_session_sliding_ttl_reload_reaches_the_store(tmp_path: Path) -> None:
         assert store.sliding_ttl is True, (
             "the reload updated Settings but never reached the store -- the "
             "field stays advertised as hot-reloadable while nothing honours it"
+        )
+
+
+# -- 0.1.30: entry boundaries ---------------------------------------------
+#
+# Each of these is a request an ordinary browser could be made to send. The
+# checks do not rely on a header the attacker cannot set (they can set every
+# header a page could); they rely on values the *browser itself* fills in --
+# Origin, Sec-Fetch-Site -- which a page cannot forge.
+
+
+def _next_control(ws: object, kind: str, limit: int = 40) -> dict[str, object]:
+    """Read control frames until ``kind``, skipping terminal bytes.
+
+    A freshly created session replays its prompt as binary before ``attached``;
+    ``receive_text`` would blow up on those.
+    """
+    for _ in range(limit):
+        frame = ws.receive()  # type: ignore[attr-defined]
+        if frame.get("type") == "websocket.close":
+            raise AssertionError(f"connection closed while waiting for {kind}: {frame}")
+        text = frame.get("text")
+        if not text:
+            continue
+        message = json.loads(text)
+        if message.get("type") == kind:
+            return message
+    raise AssertionError(f"no {kind} within {limit} frames")
+
+def test_cross_site_post_is_rejected_even_with_a_valid_session(tmp_path: Path) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        r = client.post(
+            "/api/sessions",
+            json={},
+            headers={"origin": "http://evil.example"},
+        )
+        assert r.status_code == 403, r.text
+        assert "跨站" in r.json()["detail"]
+
+        # The same request from the page's own origin is fine.
+        r = client.post(
+            "/api/sessions", json={}, headers={"origin": "http://testserver"}
+        )
+        assert r.status_code == 201, r.text
+
+
+def test_missing_origin_but_cross_site_fetch_metadata_is_rejected(
+    tmp_path: Path,
+) -> None:
+    with TestClient(build_app(tmp_path)) as client:
+        r = client.post(
+            "/api/login",
+            json={"username": "admin", "password": "adminpw123"},
+            headers={"sec-fetch-site": "cross-site"},
+        )
+        assert r.status_code == 403, r.text
+
+
+def test_non_browser_clients_without_origin_still_work(tmp_path: Path) -> None:
+    """The CLI sends no Origin; refusing it would break every automation."""
+    with TestClient(build_app(tmp_path)) as client:
+        r = client.post(
+            "/api/login", json={"username": "admin", "password": "adminpw123"}
+        )
+        assert r.status_code == 200, r.text
+
+
+def test_upload_is_refused_for_a_cross_site_page(tmp_path: Path) -> None:
+    """The exact attack: a same-site page POSTs multipart to the file API.
+
+    It is a CORS *simple request*, so ``mode:"no-cors"`` needs no preflight and
+    the cookie is attached. Writing ``~/.ssh/authorized_keys`` through it used
+    to be one fetch call away.
+    """
+    app = build_app(tmp_path, file_root=tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        r = client.post(
+            "/api/files/upload",
+            files={"file": ("evil.txt", b"pwned", "text/plain")},
+            data={"path": "", "overwrite": "true"},
+            headers={"origin": "http://evil.example"},
+        )
+        assert r.status_code == 403, r.text
+        assert not (tmp_path / "evil.txt").exists()
+
+        r = client.post(
+            "/api/files/upload",
+            files={"file": ("ok.txt", b"ok", "text/plain")},
+            data={"path": "", "overwrite": "true"},
+            headers={"origin": "http://testserver"},
+        )
+        assert r.status_code == 201, r.text
+        assert (tmp_path / "ok.txt").read_bytes() == b"ok"
+
+
+def test_oversized_login_body_is_refused_before_it_is_parsed(tmp_path: Path) -> None:
+    from wsctl.server.app import MAX_LOGIN_BODY
+
+    with TestClient(build_app(tmp_path)) as client:
+        r = client.post(
+            "/api/login",
+            json={"username": "admin", "password": "x" * (MAX_LOGIN_BODY + 1)},
+        )
+        assert r.status_code == 413, r.text
+        assert "过大" in r.json()["detail"]
+
+
+def test_login_is_capped_per_ip_across_usernames(tmp_path: Path) -> None:
+    """Rotating usernames used to grant a fresh Argon2 budget per name."""
+    app = build_app(tmp_path, login_rate_limit=2)
+    with TestClient(app) as client:
+        statuses = [
+            client.post(
+                "/api/login", json={"username": f"u{i}", "password": "nope12345"}
+            ).status_code
+            for i in range(25)
+        ]
+        assert 429 in statuses, statuses
+        first_block = statuses.index(429)
+        # max(20, 2*3) = 20 failures for one host, then the 21st is refused.
+        assert first_block == 20, statuses
+
+
+def test_turning_login_throttling_off_turns_it_off_for_the_whole_host(
+    tmp_path: Path,
+) -> None:
+    """``login_rate_limit = 0`` means off, not "20 of something else"."""
+    app = build_app(tmp_path, login_rate_limit=0)
+    with TestClient(app) as client:
+        for _ in range(25):
+            r = client.post(
+                "/api/login", json={"username": "someone", "password": "nope12345"}
+            )
+            assert r.status_code == 401, r.text
+
+
+def test_reload_updates_the_per_host_login_budget(tmp_path: Path) -> None:
+    """The derived per-IP budget must follow the setting it is derived from."""
+    app = build_app(tmp_path)
+    settings = app.state.settings
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        assert app.state.ip_limiter.limit == 30  # 3 × the default 10
+        settings.config_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.config_path.write_text("login_rate_limit = 4\n", encoding="utf-8")
+        r = client.post("/api/config/reload")
+        assert r.status_code == 200, r.text
+        assert app.state.ip_limiter.limit == 20, (
+            "the account budget changed but the host budget kept its old value"
+        )
+        # ...and the new budget is what actually answers requests, not just
+        # what an attribute says.
+        statuses = [
+            client.post(
+                "/api/login", json={"username": f"ghost{i}", "password": "wrong-pass-1"}
+            ).status_code
+            for i in range(21)
+        ]
+        assert statuses[:20] == [401] * 20, statuses
+        assert statuses[20] == 429, statuses
+
+
+def test_the_two_connection_caps_are_independent(tmp_path: Path) -> None:
+    """Either cap alone must be able to reject; the old test set both to 1.
+
+    With both at 1, deleting one of the two checks still passed -- the suite
+    could not tell which limit did the rejecting.
+    """
+    for index, (total, per_ip) in enumerate(((10, 1), (1, 10))):
+        data = tmp_path / f"caps{index}"
+        data.mkdir()
+        app = build_app(
+            data, ws_max_connections=total, ws_max_connections_per_ip=per_ip
+        )
+        with TestClient(app) as client:
+            login(client, ADMIN)
+            with (
+                client.websocket_connect("/ws"),
+                client.websocket_connect("/ws") as second,
+            ):
+                reason = second.receive()
+                assert reason["type"] == "websocket.send", reason
+                assert second.receive()["code"] == CLOSE_OVERLOAD
+
+
+def test_ws_handshake_timeout_closes_a_silent_socket(tmp_path: Path) -> None:
+    """A socket that never sends ``attach`` must not be held forever."""
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as ws:
+            first = ws.receive()
+            assert first["type"] == "websocket.send", first
+            assert "握手超时" in json.loads(first["text"])["msg"], first
+            closing = ws.receive()
+            assert closing["type"] == "websocket.close", closing
+            assert closing["code"] == 4408, closing
+
+
+def test_ws_connection_cap_rejects_with_a_recoverable_overload_code(
+    tmp_path: Path,
+) -> None:
+    """Capacity is transient, so its close code must not be fatal.
+
+    4409 (``CLOSE_LIMIT``) is in the browser's fatal set: a momentary limit
+    told every tab in a NAT office that reconnecting was pointless, and they
+    never came back until a manual reload. 4413 is deliberately recoverable.
+    """
+    app = build_app(tmp_path, ws_max_connections=1, ws_max_connections_per_ip=1)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as first:
+            with client.websocket_connect("/ws") as second:
+                # The reason is sent before the close, so the user is told why
+                # and that retrying is worthwhile.
+                reason = second.receive()
+                assert reason["type"] == "websocket.send", reason
+                assert "上限" in json.loads(reason["text"])["msg"], reason
+                message = second.receive()
+                assert message["type"] == "websocket.close", message
+                assert message["code"] == CLOSE_OVERLOAD, message
+                assert message["code"] not in FATAL_CLOSE_CODES
+            # The admitted connection is unaffected.
+            first.send_text(
+                json.dumps({"type": "attach", "cols": 80, "rows": 24})
+            )
+            attached = _next_control(first, "attached")
+            assert attached["writable"] is True, attached
+
+
+def test_a_closed_terminal_releases_its_connection_slot(tmp_path: Path) -> None:
+    """A leaked admission slot would eventually reject every reconnect.
+
+    ``ConnectionCaps.release`` lives in a ``finally``; deleting it would still
+    pass the rejection test (which never reconnects) and would only show up as
+    "after 512 reconnects nobody can connect any more".
+    """
+    app = build_app(tmp_path, ws_max_connections=1, ws_max_connections_per_ip=1)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        with client.websocket_connect("/ws") as first:
+            first.send_text(json.dumps({"type": "attach", "cols": 80, "rows": 24}))
+            assert _next_control(first, "attached")["type"] == "attached"
+
+        # Probe the *observable* promise: a new connection can be admitted.
+        # The retry waits for the counter (a timing detail) but never for an
+        # arbitrary exception: an earlier version caught every AssertionError
+        # here, so "closed while waiting for attached" / "no attached within
+        # 10 frames" was retried for 15s and then reported as "the slot
+        # leaked" -- a wrong diagnosis for a different product defect.
+        deadline = time.time() + 15.0
+        admitted = False
+        while time.time() < deadline and not admitted:
+            if app.state.ws_caps.total:
+                # Still at capacity: the previous slot has not come back yet.
+                time.sleep(0.05)
+                continue
+            with client.websocket_connect("/ws") as second:
+                second.send_text(
+                    json.dumps({"type": "attach", "cols": 80, "rows": 24})
+                )
+                admitted = (
+                    _next_control(second, "attached", limit=10)["type"] == "attached"
+                )
+        assert admitted, (
+            "the admission slot leaked: no new connection was admitted within 15s"
+        )
+
+        # After the probe closes, the counter must be back at zero too.
+        deadline = time.time() + 10.0
+        while time.time() < deadline and app.state.ws_caps.total:
+            time.sleep(0.02)
+        assert app.state.ws_caps.total == 0, (
+            f"the admission slot leaked (total={app.state.ws_caps.total})"
+        )
+
+
+def test_a_slot_release_is_idempotent_and_per_ip_accounting_follows() -> None:
+    """The inline release and the task done-callback both fire; that is safe.
+
+    The handler releases at the end of its ``finally`` and a task done-callback
+    releases as the backstop for a cancellation that skips the rest of that
+    block. Without idempotency the second call would decrement ``total`` again
+    and admit one connection over the cap forever.
+    """
+    from wsctl.server.ws import ConnectionCaps
+
+    settings = load_settings(
+        auth_required=True, ws_max_connections=1, ws_max_connections_per_ip=1
+    )
+    caps = ConnectionCaps()
+    token = caps.admit("127.0.0.1", settings)
+    assert token is not None
+    assert caps.admit("127.0.0.1", settings) is None, "the cap did not apply"
+    caps.release(token)
+    caps.release(token)  # the backstop, after the inline release
+    assert caps.total == 0
+    assert caps.for_ip("127.0.0.1") == 0
+    assert caps.admit("127.0.0.1", settings) is not None
+    # A release with no token is the "we were never admitted" path.
+    caps.release(None)
+    assert caps.total == 1
+
+
+def test_the_login_body_guard_covers_missing_and_bogus_lengths(
+    tmp_path: Path,
+) -> None:
+    """413 was the only branch tested; 411 and 400 are the other two.
+
+    A chunked request has no Content-Length and used to be buffered in full
+    before validation -- the exact cost the cap exists to avoid.
+    """
+    from wsctl.server.app import _login_body_problem
+
+    class FakeRequest:
+        def __init__(self, content_length: str | None) -> None:
+            self.headers = (
+                {} if content_length is None else {"content-length": content_length}
+            )
+
+    assert _login_body_problem(FakeRequest(None)) == (411, "缺少 Content-Length")
+    assert _login_body_problem(FakeRequest("abc")) == (400, "Content-Length 无效")
+    assert _login_body_problem(FakeRequest("9000"))[0] == 413
+    assert _login_body_problem(FakeRequest("100")) is None
+
+
+def test_owner_opening_their_own_share_link_survives_rotation(
+    tmp_path: Path,
+) -> None:
+    """A share URL the owner opened is still an *owner* connection.
+
+    Rotating the link used to drop the owner's output (the session's broadcast
+    filter treated them as a viewer) and then 4403 them out of their own
+    terminal.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": False}
+        ).json()["token"]
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "attach",
+                        "session": sid,
+                        "share": token,
+                        "cols": 80,
+                        "rows": 24,
+                    }
+                )
+            )
+            attached = _next_control(ws, "attached")
+            assert attached["writable"] is True, attached
+
+            assert client.delete(f"/api/sessions/{sid}/share").status_code == 200
+            # A pong alone proves nothing about the output filter: the reported
+            # bug had two halves (the owner's frames were dropped from the
+            # broadcast, *then* 4403 on rotation). Keeping the filter and
+            # skipping the revocation check would still answer ping.
+            ws.send_text(json.dumps({"type": "ping"}))
+            ws.send_bytes(b"echo AFTER-ROTATION\r")
+            seen = ""
+            pong = False
+            for _ in range(80):
+                frame = ws.receive()
+                if frame.get("type") == "websocket.close":
+                    break
+                text = frame.get("text")
+                if text:
+                    message = json.loads(text)
+                    pong = pong or message.get("type") == "pong"
+                chunk = frame.get("bytes")
+                if chunk:
+                    seen += chunk.decode("utf-8", "replace")
+                if "AFTER-ROTATION" in seen and pong:
+                    break
+            assert "AFTER-ROTATION" in seen, (
+                "the owner stopped receiving output after rotating their own share"
+            )
+            assert pong, "the owner was kicked after rotating the share"
+
+
+def test_read_only_viewer_is_kicked_when_the_share_is_revoked(
+    tmp_path: Path,
+) -> None:
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": False}
+        ).json()["token"]
+        client.post("/api/logout")
+        login(client, BOB)
+        with client.websocket_connect(f"/ws?share={token}") as ws:
+            ws.send_text(
+                json.dumps(
+                    {
+                        "type": "attach",
+                        "session": sid,
+                        "share": token,
+                        "cols": 80,
+                        "rows": 24,
+                    }
+                )
+            )
+            attached = _next_control(ws, "attached")
+            assert attached["writable"] is False, attached
+
+            session = app.state.manager.get(sid)
+            assert session is not None
+            session.revoke_share()
+            ws.send_text(json.dumps({"type": "ping"}))
+            kicked = False
+            for _ in range(10):
+                frame = ws.receive()
+                if frame.get("type") == "websocket.close":
+                    break
+                text = frame.get("text")
+                if not text:
+                    continue
+                message = json.loads(text)
+                if message.get("type") == "error" and "撤销" in message["msg"]:
+                    kicked = True
+                    break
+            assert kicked, "a revoked share viewer kept its connection"
+
+
+def test_resync_is_rate_limited(tmp_path: Path) -> None:
+    """A resync replays the scrollback; repeats are refused, not served.
+
+    Read every response (a final ``ping`` gives a terminal frame to stop on)
+    so the counts are exact: three replays, one typed refusal, and no fourth
+    replay slipping through.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(
+                json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24})
+            )
+            assert _next_control(ws, "attached")["type"] == "attached"
+            for _ in range(6):
+                ws.send_text(json.dumps({"type": "resync"}))
+            ws.send_text(json.dumps({"type": "ping"}))
+            begins = resynced = rejected = 0
+            for _ in range(500):
+                frame = ws.receive()
+                if frame.get("type") == "websocket.close":
+                    break
+                text = frame.get("text")
+                if not text:
+                    continue
+                message = json.loads(text)
+                kind = message.get("type")
+                if kind == "resync-begin":
+                    begins += 1
+                elif kind == "resynced":
+                    resynced += 1
+                elif kind == "resync-rejected":
+                    rejected += 1
+                elif kind == "pong":
+                    break
+            assert (begins, resynced, rejected) == (3, 3, 1), (
+                f"expected exactly 3 replays and 1 typed refusal, got "
+                f"begins={begins} resynced={resynced} rejected={rejected}"
+            )
+
+
+def test_disabling_an_account_stops_its_terminals_and_shares(tmp_path: Path) -> None:
+    """Disable had the same hole as delete: login tokens died, the shell did not.
+
+    The attached viewer is asserted as well. Stopping the session but leaving
+    the tab connected to a dead terminal is not "locked out" -- the delete path
+    already proved its own socket close, and disable had no such check.
+    """
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, BOB)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": True}
+        ).json()["token"]
+        session = app.state.manager.get(sid)
+        assert session is not None and session.share_valid(token)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(
+                json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24})
+            )
+            assert _next_control(ws, "attached")["type"] == "attached"
+
+            client.post("/api/logout")
+            login(client, ADMIN)
+            r = client.patch("/api/users/bob", json={"disabled": True})
+            assert r.status_code == 200, r.text
+
+            assert session.closed, "the disabled account's shell kept running"
+            assert not session.share_valid(token), "the writable share kept working"
+            row = next(
+                s
+                for s in app.state.store.term_session_list()  # type: ignore[attr-defined]
+                if s["id"] == sid
+            )
+            assert row["share_token"] is None, (
+                "the revoked share would come back on restart"
+            )
+            closed = False
+            for _ in range(50):
+                if ws.receive().get("type") == "websocket.close":
+                    closed = True
+                    break
+            assert closed, "the disabled account's viewer kept its connection"
+
+
+def test_deleting_an_account_stops_its_terminals_and_shares(tmp_path: Path) -> None:
+    """Delete had the same hole as disable and no test exercised it.
+
+    ``_terminate_owned`` in the delete path was entirely uncovered: removing a
+    user killed the login tokens and left the shell (and its writable share)
+    running.
+    """
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, BOB)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        token = client.post(
+            f"/api/sessions/{sid}/share", json={"writable": True}
+        ).json()["token"]
+        session = app.state.manager.get(sid)
+        assert session is not None and session.share_valid(token)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(
+                json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24})
+            )
+            assert _next_control(ws, "attached")["type"] == "attached"
+
+            client.post("/api/logout")
+            login(client, ADMIN)
+            r = client.delete("/api/users/bob")
+            assert r.status_code == 200, r.text
+
+            assert session.closed, "the deleted account's shell kept running"
+            assert not session.share_valid(token), "the writable share kept working"
+            row = next(
+                s
+                for s in app.state.store.term_session_list()  # type: ignore[attr-defined]
+                if s["id"] == sid
+            )
+            assert row["share_token"] is None
+            # The attached viewer is closed too, not left staring at a dead
+            # terminal. The pump notices ``closed`` on its next receive tick,
+            # so a handful of frames (notice, exit) precede the close.
+            closed = False
+            for _ in range(50):
+                if ws.receive().get("type") == "websocket.close":
+                    closed = True
+                    break
+            assert closed, "the deleted account's viewer kept its connection"
+
+
+def test_maintenance_stops_sessions_of_an_account_disabled_out_of_band(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``wsctl user disable`` runs in another process and can only touch the DB."""
+    import wsctl.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "MAINTENANCE_INTERVAL", 0.05)
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, BOB)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        session = app.state.manager.get(sid)
+        assert session is not None
+
+        # What the CLI does, with no access to this process's memory.
+        app.state.store.user_set_disabled("bob", True)
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not session.closed:
+            time.sleep(0.05)
+        assert session.closed, "out-of-band disable never reached the live shell"
+
+
+# -- 0.1.30 review: the parts the first pass missed ------------------------
+
+
+def test_a_non_object_json_frame_does_not_kill_a_healthy_session(
+    tmp_path: Path,
+) -> None:
+    """``null`` / ``[]`` / ``"x"`` used to raise AttributeError -> close 4500.
+
+    They are valid JSON with no ``.get``; a client (or a stray debugging line)
+    could take a whole terminal down with one frame.
+    """
+    with TestClient(build_app(tmp_path)) as client:
+        login(client, ADMIN)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(
+                json.dumps({"type": "attach", "session": sid, "cols": 80, "rows": 24})
+            )
+            assert _next_control(ws, "attached")["type"] == "attached"
+            for junk in ("null", "[]", '"text"', "42"):
+                ws.send_text(junk)
+            ws.send_text(json.dumps({"type": "ping"}))
+            pong = False
+            for _ in range(30):
+                frame = ws.receive()
+                assert frame.get("type") != "websocket.close", frame
+                text = frame.get("text")
+                if text and json.loads(text).get("type") == "pong":
+                    pong = True
+                    break
+            assert pong, "a non-object JSON frame closed the connection"
+
+
+def test_argon2_lanes_are_held_by_coroutines_not_worker_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At most ``HASH_LANES`` verifications may be *inside* the executor.
+
+    The earlier version of this test accepted any 503 after a 0.02s timeout
+    against a 0.3s stub -- it proved that ``asyncio.timeout`` fires, not that
+    the lane is acquired before ``to_thread``. Moving the acquisition back
+    inside the worker thread (a thread blocked on the semaphore still occupies
+    an executor slot, which is the starvation this exists to prevent) left it
+    green.
+
+    Here every request blocks inside the stubbed verification and the number
+    that got there is counted. A thread-side gate admits ``len(requests)``;
+    a coroutine-side gate admits ``HASH_LANES``.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from wsctl.core import passwords
+
+    app = build_app(tmp_path)
+    store = app.state.store
+    lanes = passwords.HASH_LANES
+    started = 0
+    lock = threading.Lock()
+    gate = threading.Event()
+
+    def slow_verify(*_args: object, **_kwargs: object) -> None:
+        nonlocal started
+        with lock:
+            started += 1
+        gate.wait(timeout=20.0)
+        return None
+
+    monkeypatch.setattr(store, "user_authenticate", slow_verify)
+    attempts = lanes + 6
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=attempts) as pool:
+        futures = [
+            pool.submit(
+                client.post,
+                "/api/login",
+                json={"username": f"lanes{i}", "password": "x" * 12},
+            )
+            for i in range(attempts)
+        ]
+        deadline = time.time() + 10.0
+        while time.time() < deadline and started < lanes:
+            time.sleep(0.02)
+        # Give any *extra* thread that a broken gate would have admitted a
+        # moment to reach the counter before the bound is asserted.
+        time.sleep(0.3)
+        observed = started
+        gate.set()
+        for future in futures:
+            future.result(timeout=30)
+    assert observed == lanes, (
+        f"{observed} verifications ran concurrently with {lanes} lanes; the "
+        "lane must be taken in the event loop, or each waiter consumes an "
+        "executor slot while the CPU sits idle"
+    )
+
+
+def test_every_shedding_path_reaches_the_process_wide_counter() -> None:
+    """A frame larger than the whole client budget was the one silent loss.
+
+    ``client_max_bytes`` below one PTY read makes *every* frame take this
+    branch, so the metrics page read a healthy zero while the viewer's screen
+    went blind.
+    """
+    from wsctl.core.session import shed_frames_total
+    from wsctl.server.client import WsClient
+
+    client = WsClient(None, max_bytes=1024)  # type: ignore[arg-type]
+    before = shed_frames_total()
+    client.put(b"x" * 4096)
+    assert client.dropped_events == 1
+    assert shed_frames_total() > before, (
+        "the oversized-frame shed never reached wsctl_client_frames_shed_total"
+    )
+
+
+def test_reload_removing_a_security_setting_restores_its_default(
+    tmp_path: Path,
+) -> None:
+    """Deleting a line must mean "default", not "keep the old value".
+
+    ``trust_proxy = true`` removed from the file used to stay in effect while
+    the reload reported "no changes" -- a fail-open silence for the switch that
+    decides whether X-Forwarded-For is believed at all.
+    """
+    app = build_app(tmp_path)
+    settings = app.state.settings
+    with TestClient(app) as client:
+        login(client, ADMIN)
+        settings.config_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.config_path.write_text(
+            'trust_proxy = true\ntrusted_proxies = ["10.9.0.0/16"]\n',
+            encoding="utf-8",
+        )
+        r = client.post("/api/config/reload")
+        assert r.status_code == 200, r.text
+        assert settings.trust_proxy is True
+
+        settings.config_path.write_text("", encoding="utf-8")
+        r = client.post("/api/config/reload")
+        assert r.status_code == 200, r.text
+        assert settings.trust_proxy is False, (
+            "removing trust_proxy from the file left it enabled"
+        )
+        assert settings.trusted_proxies == [], (
+            "removing trusted_proxies left the old list in effect"
+        )
+
+
+def test_a_password_rotation_out_of_band_ends_only_the_old_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``wsctl user passwd`` runs elsewhere; the database is the only signal.
+
+    Killing *every* owned session would also kill terminals opened with the
+    new password, so the sweep is limited to sessions created before the
+    recorded change.
+    """
+    import wsctl.server.app as app_mod
+
+    monkeypatch.setattr(app_mod, "MAINTENANCE_INTERVAL", 0.05)
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client, BOB)
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        old = app.state.manager.get(sid)
+        assert old is not None
+
+        # What the CLI does: a store write in another process.
+        app.state.store.user_set_password(BOB[0], "rotated-password-1")
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not old.closed:
+            time.sleep(0.05)
+        assert old.closed, "a rotated password kept the old shell running"
+
+        # A session created with the *new* password must survive the sweep.
+        r = client.post(
+            "/api/login",
+            json={"username": BOB[0], "password": "rotated-password-1"},
+        )
+        assert r.status_code == 200, r.text
+        new_sid = client.post("/api/sessions", json={}).json()["id"]
+        fresh = app.state.manager.get(new_sid)
+        assert fresh is not None
+        time.sleep(0.4)  # several maintenance ticks
+        assert not fresh.closed, (
+            "the sweep killed a session opened after the password change"
         )

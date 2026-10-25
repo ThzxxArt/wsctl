@@ -35,6 +35,7 @@
     setNotifySound: $("set-notify-sound"), setNotifyTitle: $("set-notify-title"),
     setNotifySystem: $("set-notify-system"),
     envTable: $("env-table"), envSummary: $("env-summary"),
+    keyDiag: $("key-diag"), keyDiagClear: $("key-diag-clear"),
     settingsClose: $("settings-close"), settingsDone: $("settings-done"),
     recordBtn: $("record-btn"), replayBtn: $("replay-btn"), replayOverlay: $("replay-overlay"),
     replayHost: $("replay-host"), replayNote: $("replay-note"), replayClose: $("replay-close"),
@@ -66,19 +67,29 @@
     nsSshIdentity: $("ns-ssh-identity"), nsSshOptions: $("ns-ssh-options"),
   };
 
-  // Copy/paste live on Alt+C / Alt+V, not Ctrl+Shift+C / Ctrl+Shift+V.
+  // Copy/paste live on Alt+C / Alt+Shift+V, not Ctrl+Shift+C / Ctrl+Shift+V.
   // Chrome, Edge and Firefox reserve Ctrl+Shift+C for the DevTools inspector
   // and handle it at the browser level -- `preventDefault()` in the page never
   // gets the chance, so the terminal's copy silently became "open the console".
-  // Alt+C / Alt+V are unclaimed by every browser and complete the mnemonic set
-  // this product already uses (Alt+N/W/F/S/H/L).
+  // Alt+C / Alt+V used to be described as "unclaimed by every browser". That
+  // was true of Chrome, and false of Firefox: its View menu answers Alt+V, so
+  // the default paste chord opened a menu instead of pasting there. The
+  // default is Alt+Shift+V now -- still a mnemonic pair with Alt+C, and no
+  // desktop menu claims it.
   const DEFAULT_KEYS = {
     new_session: "alt+n", close_session: "alt+w", kill_session: "alt+shift+w",
-    next_tab: "alt+ArrowRight", prev_tab: "alt+ArrowLeft", toggle_files: "alt+f",
-    toggle_sessions: "alt+l", toggle_settings: "alt+s", toggle_share: "alt+h",
+    next_tab: "alt+ArrowRight", prev_tab: "alt+ArrowLeft",
+    // Alt+F and Alt+H are the Windows/Linux *menu bar*. A page never receives
+    // those keydowns there, so the defaults moved to the Shift variants, which
+    // no browser claims. The physical-key matcher means "alt+shift+f" is
+    // reachable on every layout and on macOS (where Option+F produces ƒ).
+    toggle_files: "alt+shift+f",
+    toggle_sessions: "alt+l", toggle_settings: "alt+s", toggle_share: "alt+shift+h",
     search: "ctrl+shift+f",
-    copy_selection: "alt+c", paste_clipboard: "alt+v",
-    font_inc: "alt+e", font_dec: "alt+d", clear_screen: "alt+r",
+    copy_selection: "alt+c", paste_clipboard: "alt+shift+v",
+    // Font size used to be Alt+E / Alt+D: browser menu ("Edit") and address
+    // bar. On a layout where "=" needs Shift, the matcher still accepts it.
+    font_inc: "alt+=", font_dec: "alt+-", clear_screen: "alt+r",
     show_help: "alt+?",
     // Split panes. ``Alt+\`` splits the current pane to the right,
     // ``Alt+Shift+\`` splits it downward -- a mnemonic pair on the same key,
@@ -88,6 +99,23 @@
     split_right: "alt+\\", split_down: "alt+shift+\\",
     focus_left: "alt+shift+ArrowLeft", focus_right: "alt+shift+ArrowRight",
     focus_up: "alt+shift+ArrowUp", focus_down: "alt+shift+ArrowDown",
+  };
+
+  //: How many times the default keymap has changed in a way that must be
+  //: migrated. Bumping this is what makes "one-time" true: the migration used
+  //: to key off the *value* alone, so someone who deliberately bound a chord
+  //: equal to a retired default had it silently rewritten on every reload.
+  const KEYBINDINGS_VERSION = 2;
+
+  // Chords that were a *default* before 0.1.30 and are not any more. A stored
+  // map that still holds the old default verbatim was probably never
+  // customised, so it is migrated -- once, guarded by KEYBINDINGS_VERSION.
+  const LEGACY_DEFAULT_KEYS = {
+    toggle_files: "alt+f",
+    toggle_share: "alt+h",
+    paste_clipboard: "alt+v",
+    font_inc: "alt+e",
+    font_dec: "alt+d",
   };
 
   // Which chords a browser may swallow before the page ever sees them. The
@@ -136,10 +164,31 @@
     "ctrl+tab", "ctrl+shift+tab",
   ]);
 
+  // The platform's *menu-bar / address-bar* chords. Firefox answers
+  // Alt+F/E/V/H with its File/Edit/View/Help menus on every desktop OS;
+  // Chrome and Edge claim Alt+F/E/D (and their menu bar on Linux). A page never
+  // receives those keydowns, so a binding there is a promise it cannot keep.
+  // Graded per platform rather than listed as broken everywhere: macOS menu
+  // accelerators are Ctrl+F2, so Option chords are not stolen there.
+  const PLATFORM_IS_MAC = /Mac|iPhone|iPad/i.test(navigator.userAgent || "");
+  const PLATFORM_HAS_MENU_BAR = !PLATFORM_IS_MAC
+    && /Windows|Linux|X11/i.test(navigator.userAgent || "");
+  const MENU_BAR_CHORDS = new Set([
+    "alt+f", "alt+e", "alt+v", "alt+h", "alt+d",
+  ]);
+
+  // Delivered to the page, but the browser also acts on them (history
+  // navigation). ``preventDefault`` usually wins; "usually" is a warning, not
+  // a promise.
+  const HISTORY_CHORDS = new Set(["alt+arrowleft", "alt+arrowright"]);
+
   /** Reliable (ok) / partially claimed (warn) / browser-reserved (bad). */
   function chordGrade(action, combo) {
     if (!combo) return "ok";  // unbound: nothing can swallow a chord that is not there
-    if (BROWSER_RESERVED.has(String(combo).toLowerCase())) return "bad";
+    const value = String(combo).toLowerCase();
+    if (BROWSER_RESERVED.has(value)) return "bad";
+    if (PLATFORM_HAS_MENU_BAR && MENU_BAR_CHORDS.has(value)) return "warn";
+    if (HISTORY_CHORDS.has(value)) return "warn";
     if (action && CHORD_RELIABILITY[action]) return "warn";
     return "ok";
   }
@@ -148,6 +197,39 @@
   const sharedSession = params.get("session");
   const shareToken = params.get("share");
   const sharedMode = Boolean(sharedSession && shareToken);
+
+  //: Canonical modifier order. The matcher emits ctrl, alt, shift, meta; a
+  //: binding written ``shift+alt+n`` used to be stored verbatim and could
+  //: therefore never match anything.
+  const MODIFIER_ORDER = ["ctrl", "alt", "shift", "meta"];
+
+  //: Chords the key handler answers *before* the binding table (copy/paste with
+  //: a selection, Ctrl+Shift+C/V, Ctrl/Shift+Insert). Storing one of these as a
+  //: custom binding produced an entry that could never win -- the editor now
+  //: says so instead of pretending it saved.
+  const APP_FIXED_CHORDS = new Set([
+    "ctrl+c", "ctrl+shift+c", "ctrl+shift+v", "ctrl+insert", "shift+insert",
+  ]);
+
+  /**
+   * Canonical form of a user-typed chord, or ``null`` when it is not a chord.
+   *
+   * Accepts ``Alt + C``/``shift+alt+n``/``alt+ArrowRight``; an empty string
+   * means "unbind". One key and any number of modifiers are required.
+   */
+  function normalizeChord(raw) {
+    const parts = String(raw || "").split("+").map((part) => part.trim()).filter(Boolean);
+    if (!parts.length) return "";
+    const mods = new Set();
+    const keys = [];
+    for (const part of parts) {
+      const lower = part.toLowerCase();
+      if (MODIFIER_ORDER.includes(lower)) mods.add(lower);
+      else keys.push(part);
+    }
+    if (keys.length !== 1) return null;
+    return [...MODIFIER_ORDER.filter((mod) => mods.has(mod)), keys[0]].join("+");
+  }
 
   // Application close codes that mean "do not reconnect": the failure is
   // permanent and the reason was already delivered as a control message.
@@ -281,7 +363,38 @@
       },
     readPrefs(),
   );
-  prefs.keybindings = Object.assign({}, DEFAULT_KEYS, prefs.keybindings);
+  // Only known actions with string values survive. A leftover action name from
+  // an older release used to be matched while being invisible in Settings, and
+  // one non-string value threw on *every* keydown -- killing all shortcuts.
+  const storedKeybindings =
+    prefs.keybindings && typeof prefs.keybindings === "object" ? prefs.keybindings : {};
+  const knownActions = new Set(Object.keys(DEFAULT_KEYS));
+  const cleanKeybindings = {};
+  for (const [action, binding] of Object.entries(storedKeybindings)) {
+    if (knownActions.has(action) && typeof binding === "string") {
+      cleanKeybindings[action] = binding;
+    }
+  }
+  prefs.keybindings = Object.assign({}, DEFAULT_KEYS, cleanKeybindings);
+  // Migrate once. Writing the version back immediately is the point: a reload
+  // must not migrate a second time, or a chord the user deliberately chose
+  // (e.g. they *want* Alt+F and accept the browser menu cost) would be
+  // rewritten on every page load and the setting would appear not to stick.
+  //
+  // ``|| 0`` is load-bearing: a real 0.1.29 profile has no such field, and
+  // ``Number(undefined)`` is ``NaN`` -- ``NaN < 2`` is *false*, so the
+  // migration silently never ran for the exact users it exists for.
+  if (Number(prefs.keybindingsVersion || 0) < KEYBINDINGS_VERSION) {
+    for (const [action, legacy] of Object.entries(LEGACY_DEFAULT_KEYS)) {
+      if (String(prefs.keybindings[action] || "").toLowerCase() === legacy) {
+        prefs.keybindings[action] = DEFAULT_KEYS[action];
+      }
+    }
+    prefs.keybindingsVersion = KEYBINDINGS_VERSION;
+    try {
+      localStorage.setItem("wsctl-prefs", JSON.stringify(prefs));
+    } catch { /* 忽略 */ }
+  }
   prefs.customThemes = prefs.customThemes || {};
   // A stored value outside the supported range is a value the picker cannot
   // represent; clamp it rather than let the hotkey and the picker disagree
@@ -336,7 +449,29 @@
         s.needsRefit = true;
       }
     }
+    paintMenuShortcuts();
     try { localStorage.setItem("wsctl-prefs", JSON.stringify(prefs)); } catch { /* 忽略 */ }
+  }
+
+  // The right-click menu prints a chord next to each item. Those labels were
+  // hard-coded in the HTML and had already drifted (font size still advertised
+  // Alt+E after the default moved to Alt+=), so they now come from the same
+  // keybindings the matcher uses.
+  const MENU_ACTION_CHORDS = {
+    copy: "copy_selection", paste: "paste_clipboard", find: "search",
+    clear: "clear_screen", "font+": "font_inc", "font-": "font_dec",
+    "split-r": "split_right", "split-d": "split_down",
+    detach: "close_session", kill: "kill_session",
+  };
+
+  function paintMenuShortcuts() {
+    if (!els.termMenu) return;
+    for (const [taction, action] of Object.entries(MENU_ACTION_CHORDS)) {
+      const kbd = els.termMenu.querySelector(
+        `button[data-taction="${taction}"] .kbd`,
+      );
+      if (kbd) kbd.textContent = prefs.keybindings[action] || "";
+    }
   }
 
   window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
@@ -1068,7 +1203,6 @@
     if (s.writeTimer !== null) { clearTimeout(s.writeTimer); s.writeTimer = null; }
     s.writeQueue = [];
     s.resyncing = true;
-    resetTerm(s, "requestResync");
     sendControl(s, { type: "resync" });
     // The bar stays up until the replay actually lands. Clearing it on the
     // *request* left a failed resync with a blank screen and no way to know
@@ -1367,7 +1501,28 @@
         // replay is about to repeat, so it was dropped; from here on the frames
         // *are* the replay and must be written. (Asking for a resync and then
         // dropping the answer is what the first version managed to do.)
+        //
+        // Clearing happens *now*, not when the request was sent: a refused
+        // resync (token bucket) never reaches this marker, and clearing on the
+        // request turned "try again in a moment" into a blank terminal.
+        //
+        // The 4s "no reply" timer belongs to the *request* and dies here: the
+        // reply arrived, and leaving it armed made a replay that took longer
+        // than 4s (a full 4 MiB scrollback over a slow link) raise "重新同步未完成"
+        // on top of a replay that was still streaming in. Completion is
+        // "resynced"'s job; a stuck connection is caught by the heartbeat.
+        if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
+        resetTerm(s, "resync-begin");
         s.resyncing = false;
+        break;
+      case "resync-rejected":
+        // The server refused the request (too many in a burst). Nothing was
+        // cleared, so the screen is exactly as it was; release the write lock
+        // and say why instead of leaving the state machine to its 4s timeout.
+        s.resyncing = false;
+        if (s.resyncTimer) { clearTimeout(s.resyncTimer); s.resyncTimer = null; }
+        if (s.desynced) showDesyncBar(msg.msg || "重新同步过于频繁，请稍候再试");
+        else toast(msg.msg || "重新同步过于频繁，请稍候再试", "warn");
         break;
       case "resynced":
         // The replay has been fully enqueued behind this marker. Live output
@@ -2261,6 +2416,11 @@
     const options = opts || {};
     const pane = document.createElement("div");
     pane.className = "term-pane";
+    // Focus is the truth about "which terminal is current". ``focusin``
+    // bubbles from xterm's helper textarea and from any control inside the
+    // pane, and the pane element survives a renderer rebuild -- so this is
+    // wired once per pane, not once per Terminal instance.
+    pane.addEventListener("focusin", () => focusPane(id));
 
     const built = buildTerminal(pane);
     const { term, fit, renderer, unicodeVersion } = built;
@@ -2411,12 +2571,18 @@
     return s;
   }
 
-  function activateTab(id) {
+  // Which pane *the keyboard is in* is the same thing as "the current
+  // session". Only ``activateTab`` used to update ``activeId``; clicking a pane
+  // inside a split moved DOM focus and nothing else, so every active-session
+  // action (copy, search, record, share, font size, the screen dump) ran
+  // against a different terminal than the one being typed into. That is the
+  // "Alt+C did nothing" report that is not about the clipboard at all.
+  function setFocus(id) {
     const focused = sessions.get(id);
-    if (!focused) return;
-    activeId = id;
+    if (!focused) return null;
     const group = groupOf(focused);
-    if (!group) return;
+    if (!group) return null;
+    activeId = id;
     activeTabId = group.id;
     group.focus = id;
     // One tab entry per group. Highlighting it per session would toggle the
@@ -2427,6 +2593,37 @@
       if (g.id === group.id) g.host.classList.add("mounted");
     }
     syncLayoutClasses(group);
+    for (const paneId of leafIds(group.root)) {
+      const s = sessions.get(paneId);
+      if (s) s.pane.classList.add("mounted");
+    }
+    els.recordBtn.classList.toggle("rec-on", Boolean(focused.recording));
+    // Looking at a *tab* is what "read" means for everything it shows. A split
+    // puts several panes on screen at once, and clearing only the focused one
+    // left its visible siblings still reporting unread -- for output that is
+    // right in front of the user.
+    for (const paneId of leafIds(group.root)) clearActivity(sessions.get(paneId));
+    if (focused.desynced) showDesyncBar(); else hideDesyncBar();
+    syncZmodemButton(focused);
+    updateRendererNote(focused);
+    saveLayout();
+    return { focused, group };
+  }
+
+  /** A focus move inside an already-visible tab: no reconnect, no re-fit. */
+  function focusPane(id) {
+    if (!id || id === activeId) return;
+    const state = setFocus(id);
+    if (!state) return;
+    paintConnection(state.focused);
+  }
+
+  function activateTab(id) {
+    const focused = sessions.get(id);
+    if (!focused) return;
+    const state = setFocus(id);
+    if (!state) return;
+    const group = state.group;
     // Mount *before* measuring. `.term-pane` is `display:none` until then, and
     // `.term-pane.mounted.shown` is what makes it visible at all -- so a tab
     // activated before its socket finished opening (a standby tab, or the
@@ -2434,16 +2631,6 @@
     // zero size and painted as nothing. A split shows several panes at once,
     // so every pane in the tab is brought online and measured, not just the
     // one holding the keyboard.
-    for (const paneId of leafIds(group.root)) {
-      const s = sessions.get(paneId);
-      if (s) s.pane.classList.add("mounted");
-    }
-    els.recordBtn.classList.toggle("rec-on", Boolean(focused.recording));
-    // Looking at a *tab* is what "read" means for everything it shows. A
-    // split puts several panes on screen at once, and clearing only the
-    // focused one left its visible siblings still reporting unread -- for
-    // output that is right in front of the user.
-    for (const paneId of leafIds(group.root)) clearActivity(sessions.get(paneId));
     // Opening a tab is the user saying "show me these". A split with a
     // suspended half is a split with a blank half.
     for (const paneId of leafIds(group.root)) {
@@ -2472,11 +2659,7 @@
     }
     try { focused.term.refresh(0, Math.max(0, focused.term.rows - 1)); } catch { /* 忽略 */ }
     scheduleResize(focused, focused.term.cols, focused.term.rows);
-    if (focused.desynced) showDesyncBar(); else hideDesyncBar();
-    syncZmodemButton(focused);
-    updateRendererNote(focused);
     requestAnimationFrame(() => focused.term.focus());
-    saveLayout();
   }
 
   // "Which renderer am I actually on" is not a guess: WebGL falls back silently
@@ -2511,6 +2694,30 @@
       if (line) lines.push(line.translateToString(true));
     }
     return lines.join("\n");
+  };
+
+  // Select the first occurrence of ``needle`` in the focused terminal's buffer.
+  //
+  // A support hook like ``__wsctlScreen``: a browser test can verify that a
+  // copy puts *the terminal's* selection on the clipboard without guessing
+  // pixel coordinates for a drag. Returns false when the text is not there, so
+  // a test can wait for output instead of racing it.
+  window.__wsctlSelectText = (needle) => {
+    const s = activeId && sessions.get(activeId);
+    if (!s || !s.term || !s.term.buffer) return false;
+    const text = String(needle || "");
+    if (!text) return false;
+    const buf = s.term.buffer.active;
+    for (let row = 0; row < buf.length; row += 1) {
+      const line = buf.getLine(row);
+      if (!line) continue;
+      const col = line.translateToString(true).indexOf(text);
+      if (col >= 0) {
+        s.term.select(col, row, text.length);
+        return true;
+      }
+    }
+    return false;
   };
 
   // Per-session connection state, for support and for the reconnect/resync
@@ -2767,6 +2974,55 @@
         : "当前是非安全上下文（HTTP 且非 localhost）。浏览器只在 HTTPS 或 localhost 下"
           + "提供剪贴板读取、系统通知等接口——这不是权限没给，而是接口根本不存在，"
           + "页面也无从得知。用 wsctl serve --tls-self-signed 一键启用 HTTPS 即可全部恢复。";
+    }
+    renderKeyDiagnostics();
+  }
+
+  /** Readable form of one diagnostic entry. */
+  function keyDiagLabel(entry) {
+    const mods = [];
+    if (entry.ctrl) mods.push("Ctrl");
+    if (entry.alt) mods.push("Alt");
+    if (entry.shift) mods.push("Shift");
+    if (entry.meta) mods.push("Meta");
+    return [...mods, entry.key].join("+");
+  }
+
+  /** Render the last few keydowns: what the browser sent, and what matched. */
+  function renderKeyDiagnostics() {
+    const table = els.keyDiag;
+    if (!table) return;
+    table.replaceChildren();
+    if (!keyLog.length) {
+      const empty = document.createElement("p");
+      empty.className = "hint";
+      empty.textContent = "还没有按键记录。按住想排查的组合键即可。";
+      table.appendChild(empty);
+      return;
+    }
+    for (const entry of keyLog) {
+      const row = document.createElement("div");
+      row.className = "env-row";
+      const name = document.createElement("span");
+      name.className = "env-label";
+      name.textContent = `${keyDiagLabel(entry)} · code=${entry.code || "—"}`;
+      const val = document.createElement("span");
+      const skipped = entry.skipped === "editable" || entry.skipped === "dialog";
+      val.className = "env-value " + (
+        entry.matched ? "ok" : (skipped ? "warn" : (entry.candidates.length ? "warn" : "bad"))
+      );
+      const outcome = entry.matched
+        ? `→ ${HOTKEY_LABELS[entry.matched] || entry.matched}`
+        : entry.skipped === "editable"
+          ? "焦点在输入框，快捷键不拦截（这是正确的）"
+          : entry.skipped === "dialog"
+            ? "确认对话框打开中，快捷键不拦截（这是正确的）"
+            : (entry.candidates.length
+              ? "页面收到了，但没有绑定匹配"
+              : "未参与匹配（修饰键或输入法）");
+      val.textContent = `${outcome}　候选：${entry.candidates.join(" / ") || "—"}`;
+      row.append(name, val);
+      table.appendChild(row);
     }
   }
 
@@ -4486,7 +4742,19 @@
 
   // -- 快捷键 -----------------------------------------------------------
 
+  // A read-only share view still needs to select-and-copy and to open its own
+  // help; the blanket ``if (sharedMode) return`` that used to sit at the top of
+  // the key handler disabled *every* shortcut there, silently.
+  const SHARED_MODE_ACTIONS = new Set([
+    "copy_selection", "paste_clipboard", "show_help", "search",
+    "font_inc", "font_dec", "next_tab", "prev_tab",
+  ]);
+
   function runAction(action) {
+    if (sharedMode && !SHARED_MODE_ACTIONS.has(action)) {
+      toast("共享视图不支持该操作", "");
+      return;
+    }
     switch (action) {
       case "new_session":
         // Never swallow: a shortcut that fails silently is a shortcut that
@@ -4496,11 +4764,16 @@
       case "close_session": if (activeId) detachTab(activeId); break;
       case "kill_session": if (activeId) killTab(activeId); break;
       case "next_tab": case "prev_tab": {
-        const ids = Array.from(sessions.keys());
-        if (!ids.length) break;
-        const idx = Math.max(0, ids.indexOf(activeId));
+        // One step per *tab*, not per session. A split puts two panes of the
+        // same tab next to each other in insertion order, so cycling sessions
+        // moved focus inside the tab while the tab bar stood still -- the
+        // chord is advertised as "next tab".
+        const groups = Array.from(tabGroups.values());
+        if (!groups.length) break;
+        const idx = Math.max(0, groups.findIndex((g) => g.id === activeTabId));
         const step = action === "next_tab" ? 1 : -1;
-        activateTab(ids[(idx + step + ids.length) % ids.length]);
+        const next = groups[(idx + step + groups.length) % groups.length];
+        if (next && next.focus) activateTab(next.focus);
         break;
       }
       case "copy_selection": if (activeId) doCopy(sessions.get(activeId)); break;
@@ -4531,54 +4804,250 @@
     }
   }
 
-  function comboOf(event) {
+  // -- chord resolution -------------------------------------------------
+  //
+  // Matching used ``event.key`` alone, which is the *character the layout
+  // produced*, not the key the finger pressed. Three consequences, all real:
+  //
+  //   * macOS: Option+C is "ç", so ``alt+c`` never matched (12 defaults dead);
+  //   * ``alt+?`` needs Shift, so the page received ``alt+shift+?`` and the
+  //     binding could never fire;
+  //   * ``alt+shift+\`` arrives as ``alt+shift+|``; only synthetic events
+  //     (the old tests) produced the literal binding.
+  //
+  // The matcher now produces *candidates*: the character combo, the physical
+  // key combo (``event.code``), and -- for characters that only exist because
+  // Shift is held -- the same combo with Shift dropped. A binding matches if
+  // any candidate matches, so stored keybindings keep working unchanged.
+  const CODE_TO_KEY = {
+    Slash: "/", Backslash: "\\", Equal: "=", Minus: "-", Comma: ",",
+    Period: ".", Semicolon: ";", Quote: "'", BracketLeft: "[",
+    BracketRight: "]", Backquote: "`", Space: " ",
+    ArrowLeft: "ArrowLeft", ArrowRight: "ArrowRight",
+    ArrowUp: "ArrowUp", ArrowDown: "ArrowDown",
+    Enter: "Enter", Tab: "Tab", Escape: "Escape", Backspace: "Backspace",
+    Delete: "Delete", Home: "Home", End: "End",
+    PageUp: "PageUp", PageDown: "PageDown", Insert: "Insert",
+  };
+
+  function physicalKeyOf(code) {
+    if (!code) return null;
+    if (CODE_TO_KEY[code]) return CODE_TO_KEY[code];
+    if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+    if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+    if (/^F([1-9]|1[0-2])$/.test(code)) return code;
+    if (/^Numpad[0-9]$/.test(code)) return code.slice(6);
+    if (code === "NumpadAdd") return "+";
+    if (code === "NumpadSubtract") return "-";
+    if (code === "NumpadMultiply") return "*";
+    if (code === "NumpadDivide") return "/";
+    if (code === "NumpadEnter") return "Enter";
+    return null;
+  }
+
+  function comboFrom(event, key, dropShift) {
     const keys = [];
     if (event.ctrlKey) keys.push("ctrl");
     if (event.altKey) keys.push("alt");
-    if (event.shiftKey) keys.push("shift");
+    if (event.shiftKey && !dropShift) keys.push("shift");
     if (event.metaKey) keys.push("meta");
-    if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) return null;
-    let key = event.key;
-    if (key.length === 1) key = key.toLowerCase();
-    keys.push(key);
+    let value = key;
+    if (value.length === 1) value = value.toLowerCase();
+    keys.push(value);
     return keys.join("+");
   }
 
+  function comboCandidates(event) {
+    const physical = physicalKeyOf(event.code);
+    // AltGr produces a character via Ctrl+Alt; matching it as a chord would
+    // steal keys the user typed (``@`` on many European layouts is AltGr+Q).
+    // Only give up when it actually produced a *different* character: Windows
+    // synthesises AltGraph for every Ctrl+Alt press, and bailing out on the
+    // state alone made every ``ctrl+alt+<key>`` binding unreachable there
+    // while the settings page kept calling it valid.
+    if (typeof event.getModifierState === "function"
+        && event.getModifierState("AltGraph")
+        && event.key.length === 1
+        && physical
+        && event.key.toLowerCase() !== physical.toLowerCase()) {
+      return { exact: [], loose: [], all: [] };
+    }
+    if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) {
+      return { exact: [], loose: [], all: [] };
+    }
+    const exact = [];
+    const loose = [];
+    const add = (list, value) => { if (value && !list.includes(value)) list.push(value); };
+    add(exact, comboFrom(event, event.key, false));
+    if (physical) add(exact, comboFrom(event, physical, false));
+    // A shifted *character* (``?`` ``|`` ``+`` ``!`` ...) already implies
+    // Shift; requiring the modifier in the binding made those chords
+    // unreachable from a real keyboard. Letters and digits are excluded so
+    // Shift+A does not silently match a binding for plain A.
+    //
+    // The test must be case-insensitive: ``Alt+Shift+N`` produces ``key="N"``,
+    // and ``/[^a-z0-9]/`` matches a capital -- so the fallback fired and
+    // Alt+Shift+N opened a new session, Alt+Shift+R cleared the screen and
+    // Alt+Shift+S opened settings (the exact chords a Windows user presses
+    // while switching IMEs).
+    //
+    // These are *fallbacks*, not equals: with both forms in one set,
+    // ``Alt+Shift+\`` also offers ``alt+\\``, which is the binding for the
+    // neighbouring "split right" action -- and whichever was declared first
+    // won. Exact forms are matched first, so the shift-modified binding is
+    // never shadowed by its unshifted neighbour.
+    if (event.shiftKey && event.key.length === 1 && !/^[A-Za-z0-9]$/.test(event.key)) {
+      add(loose, comboFrom(event, event.key, true));
+      if (physical) add(loose, comboFrom(event, physical, true));
+    }
+    return { exact, loose, all: [...exact, ...loose] };
+  }
+
+  //: Input types that own a text cursor. A checkbox is an ``<input>`` too, and
+  //: treating it as a text field meant clicking a toggle in Settings silently
+  //: disabled every shortcut until focus moved elsewhere.
+  const TEXT_INPUT_TYPES = new Set([
+    "text", "search", "url", "email", "password", "number", "tel",
+    "date", "datetime-local", "month", "time", "week",
+  ]);
+
+  /** Is the event aimed at a text field rather than at the page/terminal? */
+  function isEditableTarget(target) {
+    if (!target) return false;
+    if (target.isContentEditable) return true;
+    const tag = String(target.tagName || "").toUpperCase();
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag === "INPUT") {
+      return TEXT_INPUT_TYPES.has(String(target.type || "text").toLowerCase());
+    }
+    return Boolean(target.closest && target.closest("[contenteditable='true']"));
+  }
+
+  // -- key diagnostics --------------------------------------------------
+  //
+  // "My shortcut does not work" used to be unanswerable without a screen
+  // share: the page may never have received the key, may have received a
+  // different character, or may have matched a different action. The ring
+  // buffer records what actually arrived, and Settings renders it.
+  const KEY_LOG_LIMIT = 10;
+  const keyLog = [];
+
+  function recordKeyEvent(event, candidates, matched, skipped) {
+    // Plain characters are masked. The panel exists to explain *chords*; a
+    // ring buffer full of raw characters would also be a ring buffer full of
+    // whatever the user typed at a password prompt or `sudo`, and the support
+    // workflow is "send me a screenshot". Modified keys (the only kind that can
+    // be a shortcut) are recorded verbatim; a field that took the key is
+    // redacted entirely, because its ``code`` still spells out the password.
+    const editable = skipped === "editable";
+    const plainCharacter = !event.ctrlKey && !event.altKey && !event.metaKey
+      && typeof event.key === "string" && event.key.length === 1;
+    // The candidate list is derived from ``event.key``, so masking the key and
+    // keeping the candidates leaks the very characters the mask is for: typing
+    // "p", "w" … at a `sudo` prompt produced ten log rows whose "候选" column
+    // spelled the password back out (and ``__wsctlKeys`` handed it to support).
+    // A masked event keeps no payload at all; the outcome column still says
+    // whether the chord matched.
+    const masked = editable || plainCharacter;
+    keyLog.unshift({
+      key: editable ? "«输入»" : (plainCharacter ? "•" : event.key),
+      code: masked ? "" : (event.code || ""),
+      ctrl: Boolean(event.ctrlKey),
+      alt: Boolean(event.altKey),
+      shift: Boolean(event.shiftKey),
+      meta: Boolean(event.metaKey),
+      target: (event.target && event.target.tagName) || "",
+      masked,
+      candidates: masked ? [] : candidates.slice(),
+      matched: matched || "",
+      skipped: skipped || "",
+      at: Date.now(),
+    });
+    if (keyLog.length > KEY_LOG_LIMIT) keyLog.length = KEY_LOG_LIMIT;
+    // Live update, but only when the panel is on screen: rendering into a
+    // hidden dialog on every keystroke would be work nobody can see.
+    if (els.settingsOverlay && !els.settingsOverlay.classList.contains("hidden")) {
+      renderKeyDiagnostics();
+    }
+  }
+
+  window.__wsctlKeys = () => keyLog.slice();
+
+  // What the matcher actually believes, plus the migration marker. The browser
+  // tests use these to prove that an untouched old default is migrated exactly
+  // once and that a deliberate choice survives a reload.
+  window.__wsctlKeybindings = () => Object.assign({}, prefs.keybindings);
+  window.__wsctlKeybindingsVersion = () => Number(prefs.keybindingsVersion) || 0;
+
   document.addEventListener("keydown", (event) => {
-    if (sharedMode) return;
+    // A keystroke aimed at a text field belongs to that field. The handler used
+    // to run everywhere, so typing in Settings and pressing Ctrl+C copied the
+    // terminal's stale selection (or Alt+C did) *underneath* the field the user
+    // was looking at. The xterm helper textarea is inside ``.xterm`` and is
+    // explicitly not "editable" for this purpose: keyboard input to the
+    // terminal must keep reaching the shortcuts.
+    const inTerminal = Boolean(
+      event.target && event.target.closest && event.target.closest(".xterm"),
+    );
+    if (confirmDialogOpen || renamePromptOpen) {
+      // A destructive confirmation is a scope of its own. Without this, Alt+W
+      // closed the tab *behind* the "terminate session?" dialog, and Alt+Shift+W
+      // stacked a second confirmation on top of the first. The dialog's own
+      // buttons and Escape still work.
+      recordKeyEvent(event, [], "", "dialog");
+      return;
+    }
+    if (!inTerminal && isEditableTarget(event.target)) {
+      // Still recorded: "I pressed it in the settings box and nothing
+      // happened" is a diagnostic the panel should be able to answer.
+      recordKeyEvent(event, [], "", "editable");
+      return;
+    }
+
     const s = activeId && sessions.get(activeId);
     const sel = s && s.term && s.term.getSelection ? s.term.getSelection() : "";
+    // Physical ``code`` first: on a Cyrillic or Greek layout the C key reports
+    // ``key="ц"``/``"ψ"``, so a ``key``-based check neither copied nor
+    // preventDefaulted -- Ctrl+C fell through and sent SIGINT to the shell.
+    const isKeyC = event.code === "KeyC" || event.key.toLowerCase() === "c";
+    const isKeyV = event.code === "KeyV" || event.key.toLowerCase() === "v";
+    const isInsert = event.code === "Insert" || event.key === "Insert";
 
     // Ctrl+C with a selection is the terminal convention and is safe.
-    if (s && sel && event.ctrlKey && !event.shiftKey && !event.altKey
-        && event.key.toLowerCase() === "c") {
+    if (s && sel && event.ctrlKey && !event.shiftKey && !event.altKey && isKeyC) {
       event.preventDefault();
+      recordKeyEvent(event, ["ctrl+c"], "copy_selection");
       doCopy(s);
       return;
     }
     // Ctrl+Shift+C / Ctrl+Shift+V are handled here on a best-effort basis.
     // Chrome, Edge and Firefox reserve Ctrl+Shift+C for the DevTools inspector
     // *at the browser level*, so this code often never runs -- which is why the
-    // defaults moved to Alt+C / Alt+V and the help sheet marks these unreliable.
-    if (s && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "c") {
+    // defaults moved to Alt+C / Alt+Shift+V and the help sheet marks these
+    // unreliable.
+    if (s && event.ctrlKey && event.shiftKey && isKeyC) {
       event.preventDefault();
+      recordKeyEvent(event, ["ctrl+shift+c"], "copy_selection");
       doCopy(s);
       return;
     }
-    if (s && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "v") {
+    if (s && event.ctrlKey && event.shiftKey && isKeyV) {
       event.preventDefault();
+      recordKeyEvent(event, ["ctrl+shift+v"], "paste_clipboard");
       doPaste(s);
       return;
     }
     // The traditional xterm pair. Unclaimed by every browser, so this is the
     // one keyboard path DevTools cannot steal.
-    if (s && event.ctrlKey && event.key === "Insert") {
+    if (s && event.ctrlKey && isInsert) {
       event.preventDefault();
+      recordKeyEvent(event, ["ctrl+Insert"], "copy_selection");
       doCopy(s);
       return;
     }
-    if (s && event.shiftKey && !event.ctrlKey && event.key === "Insert") {
+    if (s && event.shiftKey && !event.ctrlKey && isInsert) {
       event.preventDefault();
+      recordKeyEvent(event, ["shift+Insert"], "paste_clipboard");
       doPaste(s);
       return;
     }
@@ -4596,23 +5065,57 @@
     // `?` opens the cheatsheet -- but only when the user is not typing into a
     // terminal. It used to swallow the keystroke unconditionally, so `?` never
     // reached the shell (`ls ?` became an overlay).
-    const typingInTerminal = Boolean(
-      event.target && event.target.closest && event.target.closest(".xterm"),
-    );
     if (event.key === "?" && !event.ctrlKey && !event.altKey && !event.metaKey
-        && !typingInTerminal) {
+        && !inTerminal) {
       event.preventDefault(); event.stopPropagation();
+      recordKeyEvent(event, ["?"], "show_help");
       toggleHotkeyHelp();
       return;
     }
 
-    const combo = comboOf(event);
-    if (!combo) return;
-    for (const [action, binding] of Object.entries(prefs.keybindings)) {
-      if (binding && binding.toLowerCase() === combo.toLowerCase()) {
-        event.preventDefault(); event.stopPropagation(); runAction(action); return;
+    const candidates = comboCandidates(event);
+    if (!candidates.all.length) return;
+    // Compare case-insensitively. ``event.code`` spells names like
+    // ``ArrowRight``/``Insert`` with capitals, while every stored binding is
+    // compared in lower case -- mixing the two made Alt+→ stop switching tabs
+    // the moment the matcher started looking at physical keys.
+    //
+    // Iterate the *known* actions, not whatever localStorage happens to hold:
+    // a leftover action name from an older version used to be matched (and
+    // swallowed, since ``runAction`` has no case for it) while being invisible
+    // in Settings, and a non-string value threw on every keydown, killing every
+    // shortcut at once.
+    const bindings = Object.keys(DEFAULT_KEYS)
+      .map((action) => [action, String(prefs.keybindings[action] || "").toLowerCase()])
+      .filter((entry) => entry[1]);
+    const exact = new Set(candidates.exact.map((value) => value.toLowerCase()));
+    const loose = new Set(candidates.all.map((value) => value.toLowerCase()));
+    let matchedAction = null;
+    // Exact forms first: a fallback (Shift dropped) must never shadow a
+    // binding that asked for Shift explicitly.
+    for (const [action, binding] of bindings) {
+      if (exact.has(binding)) {
+        matchedAction = action;
+        break;
       }
     }
+    if (!matchedAction) {
+      for (const [action, binding] of bindings) {
+        if (loose.has(binding)) {
+          matchedAction = action;
+          break;
+        }
+      }
+    }
+    if (matchedAction) {
+      event.preventDefault(); event.stopPropagation();
+      recordKeyEvent(event, candidates.all, matchedAction);
+      runAction(matchedAction);
+      // ``runAction`` is synchronous here; a second entry in the log for the
+      // same key would make the diagnostics page lie about repeats.
+      return;
+    }
+    recordKeyEvent(event, candidates.all, "");
   }, true);
 
   const HOTKEY_LABELS = {
@@ -4649,6 +5152,26 @@
       "<span><b>⚠️</b> 部分浏览器可用</span>" +
       "<span><b>❌</b> 浏览器占用，请改用其它键</span>";
     els.hotkeyHelp.appendChild(legend);
+    const platformNote = document.createElement("p");
+    platformNote.className = "legend";
+    const diagHint = "按不动某个组合键时，打开「设置 → 按键诊断」能看到浏览器实际收到了什么。";
+    if (PLATFORM_HAS_MENU_BAR) {
+      platformNote.textContent =
+        "当前系统：浏览器的菜单栏会先吃掉 Alt+F/E/V/H，地址栏会吃掉 Alt+D"
+        + "（本页标 ⚠️）。" + diagHint;
+    } else if (PLATFORM_IS_MAC) {
+      platformNote.textContent =
+        "当前系统：macOS 的 Option 会产出特殊字符（如 Option+C 是 ç），本页按物理键匹配，"
+        + "不需要改键。" + diagHint;
+    } else {
+      platformNote.textContent = "当前系统：" + diagHint;
+    }
+    if (sharedMode) {
+      // 只读分享视图没有设置入口（toggle_settings 不在允许清单里），
+      // 让帮助指路指到一扇锁着的门不如直说。
+      platformNote.textContent += "共享视图没有「设置」入口，按键诊断可请会话管理员查看。";
+    }
+    els.hotkeyHelp.appendChild(platformNote);
     // Fixed chords, in raw form so the grade comes from the same source
     // (``chordGrade`` → ``BROWSER_RESERVED``) as the editable ones. Hardcoded
     // grades here are how the sheet and the reserved set drifted apart.
@@ -4680,11 +5203,14 @@
       const kbd = document.createElement("kbd");
       kbd.textContent =
         (grade === "bad" ? "❌ " : grade === "warn" ? "⚠️ " : "") + combo;
-      if (grade === "bad") kbd.title = "该组合键被浏览器占用（例如 DevTools），页面拦不住";
-      else if (grade === "warn") kbd.title = "已尽力接管，但部分浏览器会抢先处理";
-      // The help sheet is for reading *and* for taking away: click a chord to
-      // copy it (someone pastes these into their own notes or a wiki).
-      kbd.title = "点击复制";
+      // The reason and the affordance share the title: assigning it twice used
+      // to leave only "点击复制", so the ⚠️/❌ marks had no explanation.
+      const reason = grade === "bad"
+        ? "该组合键被浏览器占用（例如 DevTools），页面拦不住"
+        : grade === "warn"
+          ? "已尽力接管，但部分浏览器/平台会抢先处理"
+          : "";
+      kbd.title = `${reason ? reason + " · " : ""}点击复制`;
       kbd.style.cursor = "pointer";
       kbd.addEventListener("click", async () => {
         const ok = await writeClipboard(`${combo}\t${label}`);
@@ -4721,24 +5247,46 @@
       const input = document.createElement("input");
       input.value = prefs.keybindings[action] || "";
       input.addEventListener("change", () => {
-        const value = input.value.trim();
+        const value = normalizeChord(input.value);
+        if (value === null) {
+          // One key plus optional modifiers. "shift+alt+n" is normalised, not
+          // rejected; "alt + c + d" and "ctrl+alt" (no key) are refused before
+          // they can be stored in a form the matcher never emits.
+          toast("快捷键格式无效：例如 alt+c、ctrl+shift+f（留空表示取消绑定）", "error");
+          input.value = prefs.keybindings[action] || "";
+          return;
+        }
+        const lower = value.toLowerCase();
         const clash = Object.entries(prefs.keybindings).find(
           ([other, binding]) => other !== action && binding && value
-            && binding.toLowerCase() === value.toLowerCase());
+            && binding.toLowerCase() === lower);
         if (clash) {
           toast(`快捷键与「${HOTKEY_LABELS[clash[0]] || clash[0]}」冲突`, "error");
           input.value = prefs.keybindings[action] || "";
           return;
         }
-        // Also warn when the chord is one the browser claims first. Without
-        // this the setting accepted it happily and the shortcut never worked.
-        // The set is lowercase; the field is not necessarily (``alt+ArrowRight``).
-        if (value && BROWSER_RESERVED.has(value.toLowerCase())) {
+        if (APP_FIXED_CHORDS.has(lower)) {
+          toast(`❌ ${value} 是应用固定快捷键（终端复制/粘贴），不能改绑`, "error");
+          input.value = prefs.keybindings[action] || "";
+          return;
+        }
+        // Warn when the chord is one the browser claims first. Without this
+        // the setting accepted it happily and the shortcut never worked. The
+        // grade comes from ``chordGrade``, the same source as the help sheet,
+        // so the two cannot drift apart again.
+        const grade = chordGrade(action, value);
+        if (grade === "bad") {
           toast(
-            `⚠️ ${value} 被浏览器占用（例如 DevTools / 关闭标签页），实际会拦不住。建议换一组键`,
+            `❌ ${value} 被浏览器占用（例如 DevTools / 关闭标签页），页面收不到。建议换一组键`,
             "error",
           );
+          // Roll the field back too: leaving the rejected text visible made
+          // the dialog claim a binding that was never saved.
+          input.value = prefs.keybindings[action] || "";
           return;
+        }
+        if (grade === "warn") {
+          toast(`⚠️ ${value} 在部分平台会被浏览器占用，可能不生效`, "warn");
         }
         prefs.keybindings[action] = value;
         applyPrefs();
@@ -4752,6 +5300,12 @@
     renderHotkeys(); applyPrefs();
   });
   renderHotkeys();
+  if (els.keyDiagClear) {
+    els.keyDiagClear.addEventListener("click", () => {
+      keyLog.length = 0;
+      renderKeyDiagnostics();
+    });
+  }
 
   function renderThemeGallery() {
     els.themeGallery.innerHTML = "";

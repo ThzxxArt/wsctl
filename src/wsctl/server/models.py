@@ -63,9 +63,11 @@ class SessionRename(BaseModel):
 
 class SessionShare(BaseModel):
     #: ``None`` means "no expiry". 0 and negatives used to be accepted and
-    # produced a share that was already dead on arrival -- a 200 with a token
-    # that could never work.
-    ttl: int | None = Field(default=None, ge=1)
+    #: produced a share that was already dead on arrival -- a 200 with a token
+    #: that could never work. The upper bound is real as well: ``int`` accepts
+    #: ``10**400``, and ``float(10**400)`` then raised ``OverflowError`` inside
+    #: the handler, escaping as a 500.
+    ttl: int | None = Field(default=None, ge=1, le=10 * 365 * 24 * 3600)
     writable: bool = False
 
 

@@ -182,3 +182,53 @@ def test_new_objects_tier_is_not_advertised_as_immediate() -> None:
         assert key in HOT_NEW_OBJECTS, key
         assert key not in HOT_IMMEDIATE, key
         assert kind_of(key) == "new", key
+
+
+def test_reload_removing_a_key_restores_its_default(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    """Deleting a line must mean "default", not "keep the running value".
+
+    The old code skipped every key absent from the file. Removing
+    ``trust_proxy = true`` therefore left X-Forwarded-For trusted while the
+    reload reported no changes -- a fail-open silence on a security switch.
+    """
+    config = tmp_path / "config.toml"
+    config.write_text("trust_proxy = true\n", encoding="utf-8")
+    monkeypatch.setenv("WSCTL_CONFIG", str(config))  # type: ignore[attr-defined]
+    settings = load_settings()
+    assert settings.trust_proxy is True
+
+    config.write_text("", encoding="utf-8")
+    changed, errors = reload_settings_file(settings)
+    assert errors == []
+    assert "trust_proxy" in changed
+    assert settings.trust_proxy is False
+
+
+def test_a_malformed_trusted_proxy_is_refused_at_load() -> None:
+    """A typo must not silently stop trusting the proxy.
+
+    ``10.0.0.0/33`` used to be dropped by the header parser: the proxy's own
+    address became every client's rate-limit key, and ``config validate`` said
+    the file was fine.
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="trusted_proxies"):
+        Settings(trusted_proxies=["10.0.0.0/33"])
+
+
+def test_negative_connection_limits_are_refused() -> None:
+    """A negative cap is a typo; treating it as "unlimited" hid the mistake."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        Settings(ws_max_connections=-1)
+    with pytest.raises(ValueError):
+        Settings(ws_max_connections_per_ip=-1)
+    with pytest.raises(ValueError):
+        Settings(login_rate_limit=-1)
+    # 0 still means "unlimited/off"; that is a documented choice.
+    assert Settings(ws_max_connections=0).ws_max_connections == 0
+    assert Settings(login_rate_limit=0).login_rate_limit == 0

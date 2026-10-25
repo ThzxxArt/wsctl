@@ -399,22 +399,29 @@ WSCTL_TOTP=123456 wsctl login http://host:7681        # 脚本里用环境变量
   自动降级为标签角标与标题提示。
 
 > 默认快捷键：`Alt+N` 新建、`Alt+W` 断开标签、`Alt+Shift+W` 终止会话、
-> `Alt+→/←` 切换标签、`Alt+L` 会话列表、`Alt+F` 文件、`Alt+S` 设置、`Alt+H` 分享、
-> **`Alt+C` 复制选区、`Alt+V` 粘贴**、`Alt+E`/`Alt+D` 字号 ±、`Alt+R` 清屏、
+> `Alt+→/←` 切换标签、`Alt+L` 会话列表、**`Alt+Shift+F` 文件**、`Alt+S` 设置、
+> **`Alt+Shift+H` 分享**、**`Alt+C` 复制选区、`Alt+Shift+V` 粘贴**、
+> **`Alt+=` / `Alt+-` 字号 ±**、`Alt+R` 清屏、
 > **`Alt+\` 向右分屏、`Alt+Shift+\` 向下分屏**、`Alt+Shift+←/→/↑/↓` 移动分屏焦点。
 > 按 **`Alt+?`** 随时打开快捷键一览表（终端未聚焦时单按 **`?`** 也可以）；
 > 表中会用 ✅/⚠️/❌ 标出每个组合键是否会被浏览器占用；全部快捷键可在「设置」中修改。
+> 键位按**物理键**匹配：macOS 上 `Option+C` 产出的是 `ç`、`Alt+?` 实际发出的是
+> `Alt+Shift+?`，这些以前都匹配不上，现在都能正常触发，无需改键。
 >
->
-> **取舍说明**：`Alt+C` / `Alt+V` 会从 shell 手里接过这两个键。bash/readline 的
-> `Alt+C` 是「首字母大写」、`Alt+V` 另有绑定，改用本组合键后这些就用不了了。
-> 这与既有 `Alt+N`/`Alt+W`/`Alt+F` 是同一取舍；若不能接受，**全部快捷键可在
+> **取舍说明**：`Alt+C` 会从 shell 手里接过这个键（bash/readline 的 `Alt+C` 是
+> 「首字母大写」，改绑后这一条就用不了了）。`Alt+Shift+V` 与 readline 的 `Alt+V`
+> 是两个不同的键，后者的绑定不受影响。
+> 这与既有 `Alt+N`/`Alt+W` 是同一取舍；若不能接受，**全部快捷键可在
 > 「设置」里改回**，或改用**终端右键菜单**与 `Ctrl/Shift+Insert`——它们不抢任何键。
+> 0.1.30 起默认键位避开了浏览器菜单栏/地址栏占用的 `Alt+F/E/V/H/D`
+> （旧默认只自动迁移一次，之后自己改过的键位不再被改写）。
 >
 > 复制粘贴**不用 `Ctrl+Shift+C`**——那是 Chrome/Edge/Firefox 的 DevTools 检查器，
 > 浏览器在页面之前就截获了，拦不住。终端里**右键**会弹出操作菜单（复制/粘贴/全选/
 > 查找/清屏/字号/断开/终止），右键行为可在设置里改为「快捷复制粘贴」或「始终粘贴」。
 > 传统终端的 `Ctrl+Insert` / `Shift+Insert` 也可用。
+> 某个组合键按不动时，打开 **「设置 → 按键诊断」**：那里显示浏览器实际收到的
+> `key` / `code`、命中的动作，以及「焦点在输入框所以不拦截」这类原因。
 
 ### 2. 从命令行使用
 
@@ -514,8 +521,10 @@ Web 端点击 **录制** 开始/停止，**回放** 在浏览器内用 asciinema
 
 - **主题**：内置 10 套终端主题（dracula、solarized、nord、gruvbox、monokai、
   one-dark、tokyo-night 等），也可粘贴 JSON 自定义。
-- **字体**：字号 **12–18**（热键 `Alt+E`/`Alt+D` 与设置里的选择器是同一个范围），
+- **字体**：字号 **12–18**（热键 `Alt+=`/`Alt+-` 与设置里的选择器是同一个范围），
   字体族可选系统等宽 / JetBrains Mono / Fira Code 等。
+- **按键诊断**：最近 10 次按键的 `key`/`code`/修饰键/候选与命中动作。按不动某个
+  组合键时先看这里：能区分「浏览器没把键交给页面」和「页面收到了但没匹配绑定」。
 - **渲染器**：自动（WebGL → Canvas → DOM）或强制指定。**切换后立即生效**——就地
   重建终端并自动重新同步屏幕，不需要刷新页面；设置里会实时显示当前实际用的是哪个。
 - **后台动静提醒**：响铃提示音 / 标题与图标角标 / 系统通知，三者可分别开关。
@@ -648,10 +657,12 @@ session_ttl = 43200           # 登录态有效期（秒）
 session_sliding_ttl = false   # true 时活动中的登录态自动续期
 cookie_secure = false         # 走 HTTPS 时置 true
 trust_proxy = false           # 位于反向代理后时置 true，读取 X-Forwarded-For
-allowed_origins = []          # WebSocket Origin 白名单（空 = 同源）
+trusted_proxies = []          # 允许携带 XFF 的代理 CIDR（空 = 仅本机回环）
+allowed_origins = []          # 额外的同源白名单（WS 与 HTTP 写请求共用；空 = 仅同源）
 allowed_ips = []              # CIDR 白名单（空 = 允许全部）
 security_headers = true       # nosniff / frame-deny / CSP 等响应头
-login_rate_limit = 10         # 登录失败次数阈值
+login_rate_limit = 10         # 登录失败次数阈值（每个 ip:用户名；另有每 IP 预算 = 3×，最低 20，
+                              # 防止轮换用户名购买新预算；0 = 关闭限速）
 login_rate_window = 300       # 滑动窗口（秒）
 audit_input = false           # 是否审计提交的命令行
 totp_issuer = "wsctl"         # TOTP 认证器里的发行方名称
@@ -668,6 +679,8 @@ max_sessions_per_user = 0     # 每用户会话上限（0 = 不限）
 session_max_clients = 0       # 单会话最大客户端数（0 = 不限）
 session_memory_limit = 67108864  # 单会话缓冲上限（字节）
 client_max_bytes = 8388608    # 单客户端积压上限（字节）
+ws_max_connections = 512      # 全局终端 WebSocket 连接上限（0 = 不限）
+ws_max_connections_per_ip = 64  # 单个来源 IP 的连接上限（0 = 不限）
 input_rate_limit = 0          # 单连接输入速率（字节/秒，0 = 不限）
 input_rate_burst = 0          # 令牌桶容量（默认等于速率）
 scrollback_bytes = 4194304    # 回放缓冲上限（字节）
@@ -748,7 +761,7 @@ wsctl start|stop|restart|status|logs|reload
                                   后台生命周期（非 systemd；status 支持 --json）
 wsctl doctor                      环境/配置/运行状态自检（--json；--host/--port 选定实例）
 wsctl backup FILE.tar.gz          一致性备份数据库与录制（--include-config）
-wsctl restore FILE.tar.gz         从备份恢复（--force 覆盖，原库存为 .bak）
+wsctl restore FILE.tar.gz         从备份恢复（须先 wsctl stop；--force 覆盖，原库另存 .bak）
 wsctl --version                   显示版本
 wsctl connect [URL] [-s ID]       把本地终端连接到服务（断线自动重连；--no-reconnect）
 wsctl login URL                   登录并缓存凭据（--totp CODE 支持两步验证）
@@ -874,10 +887,25 @@ location / {
 }
 ```
 
-位于代理后请设 `trust_proxy = true`（让限速与 IP 白名单看到真实客户端 IP）。
-> `X-Forwarded-For` 取的是**最右非本机跳**——该头会被每一跳代理**追加**（上面的
+位于代理后请设 `trust_proxy = true`，并把代理地址写进 `trusted_proxies`
+（例如 `trusted_proxies = ["10.0.0.0/8"]`；二者缺一，限速、IP 白名单与审计看到的
+就只是代理自己的地址）。
+> `X-Forwarded-For` 取的是**最右一个非受信跳**——该头会被每一跳代理**追加**（上面的
 > `proxy_add_x_forwarded_for` 正是如此），最左项是客户端自带、不可信。此语义假定
 > **单个**可信追加式代理；多跳链路需要另行约定。
+>
+> 只有 `trusted_proxies` 里列出的对端**加上本机回环**携带的 `X-Forwarded-For` 才会被
+> 采信。**0.1.30 起 uvicorn 的 `proxy_headers` 已显式关闭**——它的默认值会在 wsctl
+> 看到请求之前就按该头改写 `scope["client"]`，导致 `trust_proxy = false` 形同虚设：
+> 本机任意进程都能带着 `X-Forwarded-For: 1.2.3.4` 通过 `allowed_ips` 或伪造审计 IP。
+> 反代在另一台机器上时，请把它的地址写进 `trusted_proxies`；不写则一律按真实对端处理。
+>
+> 0.1.30 起 HTTP 的非 GET 请求还会校验 `Origin` 与 `Host` 是否同源（防 CSRF，文件上传
+> 尤其依赖它）。上面的配置**保留了 `proxy_set_header Host $host`**，这正是同源判断
+> 能通过的前提；`Host` 不带端口时，`Origin` 的端口不参与比较（否则 `https://host:8443`
+> 会被误判为跨站）；`Host` 明确带端口时则必须一致。`allowed_origins` 是**额外**受信集，
+> 不会取代同源判断——反代把 `Host` 改写成别的主机名时才需要它，例如
+> `allowed_origins = ["https://term.example.com"]`。
 生产环境请用 HTTPS/WSS 并设 `cookie_secure = true`。
 
 ### 零停机重启
@@ -900,7 +928,8 @@ tmux 会话也按 `data_dir` 命名空间隔离。配合 **tmux 后端**，连�
 
 ```bash
 wsctl backup ~/wsctl-$(date +%F).tar.gz --include-config   # 一致性快照（含 WAL 已提交数据）
-wsctl restore ~/wsctl-2026-01-01.tar.gz --force            # 覆盖前原库保存为 .bak
+wsctl stop                                                # 服务在跑时恢复会被拒绝
+wsctl restore ~/wsctl-2026-01-01.tar.gz --force            # 覆盖前原库另存为 .bak（重名则加时间戳）
 ```
 
 ## 安全
@@ -911,7 +940,8 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 - 密码策略：新建/改密强制非空且至少 8 位（API 与 CLI 同源强制）。
 - 可选 TOTP 双因子（`wsctl user totp <用户>`，启用需输入一次验证码确认）。
 - 登录失败限速；`allowed_ips` 限制来源网段。
-- WebSocket 握手校验 Origin 白名单（防 CSWSH）。
+- WebSocket 握手校验 Origin 白名单（防 CSWSH）；HTTP 的非 GET `/api/*` 也做同源校验
+  （含 multipart 上传，挡住同站跨源 CSRF）。
 - 分享链接不可猜测、可设有效期、可撤销；只读链接拒绝输入；链接跨服务重启仍有效
   （token 与会话一同持久化）。
 - 文件面板防目录穿越（含符号链接），上传有大小限制。
@@ -988,13 +1018,18 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 
 **Q：备份会不会漏掉刚写入的数据？恢复会覆盖现有数据吗？**
 不会漏：`wsctl backup` 使用 SQLite 在线备份 API 生成一致快照（含 WAL 中已提交的
-数据）。恢复时若数据库已存在，必须显式 `--force`，且原库会先保存为 `.bak`。
+数据）。恢复**要求服务先停止**（运行中的进程持有数据库连接，运行中恢复会被拒绝，
+异常退出请等约 30 秒让实例租约过期）；数据库已存在时必须显式 `--force`，原库会先
+另存为 `.bak`（重名时加时间戳，不会覆盖上一次的备份）。
 
 **Q：上传大文件失败？**
 调整 `file_max_upload`；注意反向代理可能也有请求体大小限制。
 
 **Q：复制、粘贴没反应？右键菜单里的「复制选区 / 粘贴」也没用？**
-看地址栏：如果是 `http://<IP>:端口`（既不是 `https://` 也不是 `localhost`），浏览器
+先排除**焦点**：分屏里点哪一栏，复制/搜索/录制就作用于哪一栏（0.1.30 起）；
+更早的版本点分屏只移动了浏览器焦点，`Alt+C` 会去另一台终端里找选区，于是
+「什么都没发生」——这与 HTTPS 无关。若仍然无效，再看地址栏：如果是
+`http://<IP>:端口`（既不是 `https://` 也不是 `localhost`），浏览器
 **不提供**剪贴板接口——不是权限没给，而是接口**根本不存在**，页面连"被拒绝"都无从得知。
 于是所有复制粘贴入口全都没反应，且一句提示都没有。
 

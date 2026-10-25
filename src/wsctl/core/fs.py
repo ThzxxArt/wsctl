@@ -371,9 +371,12 @@ def list_dir_paged(
     if kind in ("dir", "file"):
         entries = [e for e in entries if e["type"] == kind]
     total = len(entries)
-    if limit is None:
+    # A page size is never "everything". ``limit <= 0`` used to fall into the
+    # ``else`` branch and return the whole directory, so ``?limit=-5`` asked a
+    # million-entry directory for a single unbounded response.
+    if limit is None or limit <= 0:
         limit = DEFAULT_LIST_LIMIT
-    entries = entries[offset : offset + limit] if limit > 0 else entries[offset:]
+    entries = entries[offset : offset + limit]
     return {
         "entries": entries,
         "total": total,

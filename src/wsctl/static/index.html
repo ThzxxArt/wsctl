@@ -83,14 +83,14 @@
 
   <div id="term-menu" class="context-menu hidden">
     <button data-taction="copy">复制选区<span class="kbd">Alt+C</span></button>
-    <button data-taction="paste">粘贴<span class="kbd">Alt+V</span></button>
+    <button data-taction="paste">粘贴<span class="kbd">Alt+Shift+V</span></button>
     <button data-taction="selectall">全选</button>
     <hr class="menu-sep" />
     <button data-taction="find">查找…<span class="kbd">Ctrl+Shift+F</span></button>
     <button data-taction="clear">清屏<span class="kbd">Alt+R</span></button>
     <hr class="menu-sep" />
-    <button data-taction="font+">字号 +<span class="kbd">Alt+E</span></button>
-    <button data-taction="font-">字号 −<span class="kbd">Alt+D</span></button>
+    <button data-taction="font+">字号 +<span class="kbd">Alt+=</span></button>
+    <button data-taction="font-">字号 −<span class="kbd">Alt+-</span></button>
     <button data-taction="zmodem">切换 ZMODEM 传输</button>
     <hr class="menu-sep" />
     <button data-taction="split-r">向右分屏（新建）<span class="kbd">Alt+\</span></button>
@@ -361,6 +361,19 @@
         <h3>运行环境</h3>
         <p class="hint" id="env-summary"></p>
         <div class="env-table" id="env-table"></div>
+      </div>
+
+      <div class="field-group">
+        <h3>按键诊断</h3>
+        <p class="hint">
+          按住要排查的组合键，这里显示浏览器<strong>实际收到</strong>的 key / code 与命中的动作。
+          「收不到」和「收到了但没匹配」是两类不同的问题，这里能直接看出来。
+          普通字符会被隐去（只保留组合键），输入框里按下的键也不会显示具体字符。
+        </p>
+        <div class="env-table" id="key-diag"></div>
+        <div class="modal-actions">
+          <button id="key-diag-clear" type="button" class="text-btn">清空记录</button>
+        </div>
       </div>
 
       <div class="field-group">

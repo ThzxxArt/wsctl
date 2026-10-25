@@ -142,14 +142,17 @@ def test_every_key_the_model_knows_can_be_written(tmp_path: Path) -> None:
     sample: dict[str, object] = {
         "host": "127.0.0.1", "port": 1, "auth_required": True,
         "session_ttl": 1, "session_sliding_ttl": True, "cookie_secure": True,
-        "trust_proxy": True, "allowed_ips": ["127.0.0.1"], "security_headers": True,
+        "trust_proxy": True, "trusted_proxies": ["127.0.0.1"],
+        "allowed_ips": ["127.0.0.1"], "security_headers": True,
         "login_rate_limit": 1, "login_rate_window": 1, "audit_input": True,
         "totp_issuer": "x", "default_shell": "/bin/sh", "default_cwd": "/tmp",
         "default_backend": "local", "tmux_preserve_on_shutdown": True,
         "allowed_origins": ["http://x"], "idle_timeout": 1, "max_life": 1,
         "max_sessions": 1, "max_sessions_per_user": 1, "session_max_clients": 1,
         "session_memory_limit": 1, "client_max_bytes": 1, "input_rate_limit": 1,
-        "input_rate_burst": 1, "scrollback_bytes": 1, "instance_ttl": 1,
+        "input_rate_burst": 1, "ws_max_connections": 1,
+        "ws_max_connections_per_ip": 1,
+        "scrollback_bytes": 1, "instance_ttl": 1,
         "audit_retention_days": 1, "term_session_retention_days": 1,
         "recordings_retention_days": 1, "recordings_max_bytes": 1,
         "data_dir": "/tmp/d", "config_path": "/tmp/c.toml", "ssl_cert": "/tmp/c",
@@ -219,5 +222,9 @@ def test_clearing_a_setting_that_cannot_be_unset_is_refused() -> None:
 def test_clearing_the_only_key_leaves_a_valid_empty_file() -> None:
     out = apply_key('default_cwd = "/srv"\n', "default_cwd", None)
     assert out == ""
-    # ...and a file with nothing in it is still a legal config.
-    assert Settings(**{}) is not None
+    # ...and a file with nothing in it is still a legal config. (Asserting the
+    # object "is not None" was a guard that could not fail: the constructor
+    # never returns None. Pin an actual default instead.)
+    empty = Settings(**{})
+    assert empty.auth_required is True
+    assert empty.port == 7681

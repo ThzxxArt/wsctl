@@ -11,7 +11,7 @@ from wsctl.core.store import User
 
 from ..deps import current_user, owned_session, qr_svg
 from ..models import SessionShare
-from ..security import is_origin_allowed
+from ..security import forwarded_scheme, is_origin_allowed
 
 router = APIRouter(prefix="/api", tags=["share"])
 
@@ -80,7 +80,14 @@ async def share_qr(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该会话未分享")
     settings = request.app.state.settings
     allowed = is_origin_allowed(origin, request.headers.get("host"), settings.allowed_origins)
-    base = origin if (origin and allowed) else str(request.base_url).rstrip("/")
+    if origin and allowed:
+        base = origin
+    else:
+        base_url = request.base_url
+        scheme = forwarded_scheme(request, settings)
+        if scheme and scheme != base_url.scheme:
+            base_url = base_url.replace(scheme=scheme)
+        base = str(base_url).rstrip("/")
     url = f"{base}/?session={sid}&share={token}"
     # ``qr_svg`` already emits a standalone SVG document (with xmlns), so it
     # renders both inside an ``<img src>`` and via ``innerHTML``.

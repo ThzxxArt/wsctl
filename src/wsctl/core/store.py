@@ -24,7 +24,7 @@ from .passwords import (
     verify_password,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS users (
     role          TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
     totp_secret   TEXT,
     disabled      INTEGER NOT NULL DEFAULT 0,
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    password_changed_at REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -109,6 +110,12 @@ class User:
     role: str
     disabled: bool
     created_at: float
+    #: Wall-clock time of the last password change (0 = never recorded).
+    #: The server uses it to end terminals opened under the old password: a
+    #: rotation done by ``wsctl user passwd`` runs in *another* process and
+    #: cannot reach this one's live shells, so the database is the only signal
+    #: both processes share.
+    password_changed_at: float = 0.0
 
 
 def _is_lock_contention(exc: BaseException) -> bool:
@@ -197,6 +204,9 @@ class Store:
     def _migrate(self) -> None:
         """Add columns introduced after the initial schema (idempotent)."""
         additions = {
+            "users": {
+                "password_changed_at": "REAL NOT NULL DEFAULT 0",
+            },
             "term_sessions": {
                 "argv": "TEXT",
                 "env": "TEXT",
@@ -246,6 +256,7 @@ class Store:
             role=str(row["role"]),
             disabled=bool(row["disabled"]),
             created_at=float(row["created_at"]),
+            password_changed_at=float(row["password_changed_at"] or 0.0),
         )
 
     # -- users ---------------------------------------------------------
@@ -266,11 +277,19 @@ class Store:
         now = time.time()
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "INSERT INTO users(username, password_hash, role, created_at) VALUES(?, ?, ?, ?)",
-                (username, password_hash, role, now),
+                "INSERT INTO users(username, password_hash, role, created_at,"
+                " password_changed_at) VALUES(?, ?, ?, ?, ?)",
+                (username, password_hash, role, now, now),
             )
             user_id = int(cur.lastrowid or 0)
-        return User(id=user_id, username=username, role=role, disabled=False, created_at=now)
+        return User(
+            id=user_id,
+            username=username,
+            role=role,
+            disabled=False,
+            created_at=now,
+            password_changed_at=now,
+        )
 
     def user_get(self, username: str) -> User | None:
         with self._lock:
@@ -319,13 +338,15 @@ class Store:
         validate_password(password)
         # See user_create: hash outside the lock.
         password_hash = hash_password(password)
+        now = time.time()
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT id FROM users WHERE username = ?", (username,)
             ).fetchone()
             cur = self._conn.execute(
-                "UPDATE users SET password_hash = ? WHERE username = ?",
-                (password_hash, username),
+                "UPDATE users SET password_hash = ?, password_changed_at = ?"
+                " WHERE username = ?",
+                (password_hash, now, username),
             )
         self._invalidate_user(int(row["id"]) if row else None)
         return cur.rowcount > 0

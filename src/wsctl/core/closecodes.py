@@ -21,6 +21,11 @@ CLOSE_NOT_FOUND = 4404
 CLOSE_TIMEOUT = 4408
 #: A quota is exhausted (session count, per-user quota, client count).
 CLOSE_LIMIT = 4409
+#: The server is at capacity: too many terminal sockets from this peer or in
+#: total. Deliberately *not* fatal. The condition is transient -- a NAT office
+#: at lunch, fifty tabs reconnecting after a blip -- and a client that treats it
+#: as permanent never comes back until someone reloads the page.
+CLOSE_OVERLOAD = 4413
 #: Input kept arriving faster than the configured rate limit.
 CLOSE_RATE_LIMITED = 4429
 #: Output arrived faster than this client could drain it. The *session* is
@@ -39,6 +44,7 @@ ALL_CLOSE_CODES: tuple[int, ...] = (
     CLOSE_NOT_FOUND,
     CLOSE_TIMEOUT,
     CLOSE_LIMIT,
+    CLOSE_OVERLOAD,
     CLOSE_RATE_LIMITED,
     CLOSE_SERVER_ERROR,
     CLOSE_SLOW_CONSUMER,
