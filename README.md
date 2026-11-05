@@ -74,14 +74,14 @@
 - **可观测**：`/healthz`、`/readyz`、Prometheus `/metrics`、JSON 日志、请求 ID、
   可选 OpenTelemetry；维护循环与事件循环延迟都进入指标。
 
-> **边界要诚实**：0.2.0 只支持 **SQLite**。PostgreSQL 在 0.3 提供，配置成其他
+> **边界要诚实**：0.2.x 只支持 **SQLite**。PostgreSQL 在 0.3 提供，配置成其他
 > `database_url` 会在启动时明确拒绝，不会“半支持”。纯 Python 转发也不以原始吞吐
 > 对标 C/libuv 终端；wsctl 的稳定来自会话解耦、有界缓冲与背压，而不是单连接速度。
 
 ## 界面
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/02-terminal.png" alt="wsctl 0.2.0 终端工作台：标签、分屏、命令块与会话侧栏" width="100%">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/02-terminal.png" alt="WsCTL 0.2.x 终端工作台：标签、分屏、命令块与会话侧栏" width="100%">
   <br>
   <sub>终端工作台 · 标签 / 分屏 / 命令块 / 会话侧栏 / 实时状态</sub>
 </p>
@@ -106,7 +106,7 @@
   <br>
   <sub>登录 · 主题 / 快捷键 / 服务器配置</sub>
   <br>
-  <sub>以上截图均来自 wsctl 0.2.0 实际界面</sub>
+  <sub>以上截图均来自 WsCTL 0.2.x 实际界面</sub>
 </p>
 
 ## 快速开始
@@ -158,20 +158,20 @@ wsctl status
 `doctor` 会检查 Python、数据目录、数据库、配置文件、shell、tmux/ssh、端口占用、
 磁盘空间、日志轮转与系统时间（TOTP 依赖时钟）；`--json` 适合脚本消费。
 
-## 0.2.0 亮点
+## 0.2.x 亮点
 
-| 领域 | 0.2.0 |
+| 领域 | 0.2.x |
 | :--- | :--- |
 | 前端 | 重写为 **Vue 3.5 + TypeScript 5.9 + Vite 8 + Pinia + Naive UI + xterm.js 6**；标签、分屏、命令面板、文件编辑、主题导入、PWA 与移动端工具栏 |
 | 协议 | **`/ws/v2` + `wsctl.terminal.v2`**；序号、ACK、精确续传、gap、屏幕快照；旧 `/ws` 保留一版兼容别名，但只发送原始字节 |
-| 数据 | **SQLAlchemy 2.1 + Alembic**；schema v6，head `0004_session_exit_code`；迁移前自动一致性备份；0.2.0 唯一支持 SQLite |
+| 数据 | **SQLAlchemy 2.1 + Alembic**；schema v6，head `0004_session_exit_code`；迁移前自动一致性备份；0.2.x 唯一支持 SQLite |
 | 配置 | 分节 TOML，支持 `"8MiB"` / `"12h"`；`wsctl config migrate` 保留注释并备份；热更新 / 仅新对象 / 需重启三档如实标注 |
 | 安全 | Argon2、TOTP、API Key scope、分享 token 哈希、Origin + scheme 校验、CSP/SRI、请求体上限、IP/登录限速、数据库与录制文件 `0600` |
 | 观测 | structlog、prometheus-client、OpenTelemetry（可选）、请求 ID、`/readyz`、审计哈希链、Webhook |
 | 质量 | pytest **728**、Vitest **40**、Playwright Chromium / Firefox / WebKit / 移动端、视觉回归、后端 e2e 全场景 |
 
 > 从 0.1.x 升级前请先备份并按 [迁移指南](https://github.com/ThzxxArt/wsctl/blob/main/docs/MIGRATION-0.2.0.md)
-> 执行 `config migrate` → `migrate --apply` → 启动演练。0.2.0 数据库不能直接回退到 0.1.x。
+> 执行 `config migrate` → `migrate --apply` → 启动演练。0.2.x 数据库不能直接回退到 0.1.x。
 
 ## 架构
 
@@ -220,7 +220,7 @@ pip install -e ".[dev]"
 
 ## 配置
 
-配置文件默认在 `~/.config/wsctl/config.toml`。0.2.0 使用分节 TOML：
+配置文件默认在 `~/.config/wsctl/config.toml`。0.2.x 使用分节 TOML：
 
 ```toml
 [server]
@@ -591,7 +591,7 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 
 开发机上的可重复 smoke 基线（真实 PTY + `/ws/v2`，Python 3.13）：
 
-| 指标 | 0.2.0 |
+| 指标 | 0.2.0 基线 |
 | :--- | ---: |
 | `seq 1 200000` 单会话 | **236 ms** |
 | 8 个会话各 20 万行 | **1758 ms** |
