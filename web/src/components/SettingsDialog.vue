@@ -493,39 +493,47 @@ onMounted(() => {
               v-for="(fields, section) in schema?.sections ?? {}"
               :key="section"
               size="small"
-              :title="section"
+              :title="schema?.section_titles?.[section] ?? section"
             >
               <div class="config-grid">
                 <div v-for="field in fields" :key="field.key" class="config-field">
-                  <div class="config-label">
-                    <code>{{ field.key }}</code>
-                    <NTag
-                      size="tiny"
-                      :type="
-                        field.apply === 'restart'
-                          ? 'warning'
-                          : field.apply === 'new'
-                            ? 'info'
-                            : 'success'
-                      "
-                    >
-                      {{
-                        field.apply === "hot"
-                          ? t("settings.apply")
-                          : field.apply === "new"
-                            ? t("settings.newSessions")
-                            : t("settings.restart")
-                      }}
-                    </NTag>
+                  <div class="config-main">
+                    <div class="config-copy">
+                      <div class="config-title">{{ field.title || field.key }}</div>
+                      <code class="config-key">{{ field.key }}</code>
+                      <p v-if="field.description" class="config-desc">
+                        {{ field.description }}
+                      </p>
+                    </div>
+                    <div class="config-side">
+                      <NTag
+                        size="tiny"
+                        :type="
+                          field.apply === 'restart'
+                            ? 'warning'
+                            : field.apply === 'new'
+                              ? 'info'
+                              : 'success'
+                        "
+                      >
+                        {{
+                          field.apply === "hot"
+                            ? t("settings.apply")
+                            : field.apply === "new"
+                              ? t("settings.newSessions")
+                              : t("settings.restart")
+                        }}
+                      </NTag>
+                      <NSwitch
+                        v-if="field.type === 'bool'"
+                        :value="drafts[field.key] === 'true'"
+                        :disabled="field.apply === 'restart'"
+                        @update:value="(value: boolean) => (drafts[field.key] = String(value))"
+                      />
+                    </div>
                   </div>
-                  <NSwitch
-                    v-if="field.type === 'bool'"
-                    :value="drafts[field.key] === 'true'"
-                    :disabled="field.apply === 'restart'"
-                    @update:value="(value: boolean) => (drafts[field.key] = String(value))"
-                  />
                   <NInput
-                    v-else
+                    v-if="field.type !== 'bool'"
                     :value="drafts[field.key]"
                     :disabled="field.apply === 'restart'"
                     :placeholder="field.secret ? '已隐藏；输入新值以覆盖' : field.default"
@@ -600,24 +608,55 @@ onMounted(() => {
 }
 .config-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 12px;
 }
 .config-field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-.config-label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   gap: 8px;
-  font-size: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
 }
-.config-label code {
-  font-family: var(--term-font-family);
+.config-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.config-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.config-title {
   color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  /* Match the switch's 22px box so the two centres share one line. */
+  line-height: 22px;
+}
+.config-key {
+  color: var(--muted);
+  font-family: var(--term-font-family);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.config-desc {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.config-side {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
 }
 .tips {
   font-size: 12px;

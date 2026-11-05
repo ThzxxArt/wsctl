@@ -2,13 +2,13 @@ import { createI18n } from "vue-i18n";
 
 const zh = {
   app: {
-    title: "wsctl 终端工作台",
+    title: "WsCTL 终端工作台",
     login: "登录",
     logout: "退出登录",
     username: "用户名",
     password: "密码",
     totp: "一次性验证码",
-    loginHint: "使用 wsctl 账号登录",
+    loginHint: "使用 WsCTL 账号登录",
     loginFailed: "登录失败",
     loading: "加载中…",
     retry: "重试",
@@ -129,13 +129,13 @@ const zh = {
 
 const en = {
   app: {
-    title: "wsctl Terminal Workspace",
+    title: "WsCTL Terminal Workspace",
     login: "Sign in",
     logout: "Sign out",
     username: "Username",
     password: "Password",
     totp: "One-time code",
-    loginHint: "Sign in with your wsctl account",
+    loginHint: "Sign in with your WsCTL account",
     loginFailed: "Sign-in failed",
     loading: "Loading…",
     retry: "Retry",

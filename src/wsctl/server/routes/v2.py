@@ -487,6 +487,7 @@ async def config_schema(
     return {
         "version": 2,
         "config_path": str(settings.config_path),
+        "section_titles": config_v2.SECTION_TITLES,
         "sections": sections,
     }
 

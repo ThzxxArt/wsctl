@@ -58,7 +58,7 @@ const stateLabel = computed(() => {
     <div class="right">
       <span>{{ sessions.live.length }} 会话</span>
       <span class="sep">{{ prefs.prefs.fontSize }}px</span>
-      <span class="sep">wsctl {{ version }}</span>
+      <span class="sep">WsCTL {{ version }}</span>
     </div>
   </footer>
 </template>

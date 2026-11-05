@@ -110,6 +110,55 @@ test.describe("terminal workspace", () => {
     await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
   });
 
+  test("ended-session overlay buttons are clickable", async ({ page }) => {
+    const created = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/v2/sessions") && response.request().method() === "POST",
+    );
+    await page.getByTitle("新建会话").first().click();
+    const sid = (await (await created).json()).id;
+    const pane = page.locator(".ws-pane").first();
+    await expect(pane).toHaveAttribute("data-state", "connected");
+
+    await page.evaluate(async (id) => fetch(`/api/v2/sessions/${id}`, { method: "DELETE" }), sid);
+    const ghost = page.locator(".pane-ghost");
+    await expect(ghost).toBeVisible();
+    // The xterm link-layer canvas used to sit on top of this overlay and eat
+    // every click: the buttons looked present but did nothing.
+    await ghost.getByRole("button", { name: "关闭分屏" }).click();
+    await expect(ghost).toHaveCount(0);
+  });
+
+  test("ended-session overlay can open the session picker", async ({ page }) => {
+    const created = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/v2/sessions") && response.request().method() === "POST",
+    );
+    await page.getByTitle("新建会话").first().click();
+    const sid = (await (await created).json()).id;
+    const pane = page.locator(".ws-pane").first();
+    await expect(pane).toHaveAttribute("data-state", "connected");
+    await page.evaluate(async (id) => fetch(`/api/v2/sessions/${id}`, { method: "DELETE" }), sid);
+
+    const ghost = page.locator(".pane-ghost");
+    await expect(ghost).toBeVisible();
+    await ghost.getByRole("button", { name: "连接其他会话" }).click();
+    await expect(page.locator(".picker-overlay")).toBeVisible();
+  });
+
+  test("brand and sidebar toggle are centered on one line", async ({ page, isMobile }) => {
+    test.skip(isMobile === true, "the brand is hidden on narrow screens");
+    const brand = page.locator(".brand");
+    await expect(brand).toHaveText("WsCTL");
+    const toggle = page.locator(".sidebar-toggle");
+    const [brandBox, toggleBox] = await Promise.all([brand.boundingBox(), toggle.boundingBox()]);
+    expect(brandBox && toggleBox).toBeTruthy();
+    if (!brandBox || !toggleBox) return;
+    const brandCenter = brandBox.y + brandBox.height / 2;
+    const toggleCenter = toggleBox.y + toggleBox.height / 2;
+    expect(Math.abs(brandCenter - toggleCenter)).toBeLessThan(2);
+  });
+
   test("uses the in-app dialog for prompts and confirmations", async ({ page }) => {
     await page.getByTitle("文件", { exact: true }).click();
     await expect(page.getByText("名称", { exact: true })).toBeVisible();

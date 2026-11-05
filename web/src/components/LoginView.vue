@@ -31,7 +31,7 @@ async function submit(): Promise<void> {
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">$_</span>
         <div>
-          <h1 id="login-title">wsctl</h1>
+          <h1 id="login-title">WsCTL</h1>
           <p>{{ t("app.loginHint") }}</p>
         </div>
       </div>

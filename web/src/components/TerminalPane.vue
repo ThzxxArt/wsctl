@@ -1448,6 +1448,7 @@ onBeforeUnmount(() => {
 }
 .pane-ghost {
   position: absolute;
+  z-index: 10;
   inset: 0;
   display: flex;
   flex-direction: column;

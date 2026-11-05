@@ -359,10 +359,13 @@ def test_config_schema_is_grouped_and_typed(tmp_path: Path) -> None:
         assert schema.status_code == 200
         body = schema.json()
         assert body["version"] == 2
+        assert body["section_titles"]["server"] == "服务器"
         assert "server" in body["sections"]
         port = next(field for field in body["sections"]["server"] if field["key"] == "port")
         assert port["type"] == "int"
         assert port["apply"] == "restart"
+        assert port["title"] == "监听端口"
+        assert "TCP 端口" in port["description"]
 
 
 def test_audit_chain_verifies_and_records_login(tmp_path: Path) -> None:

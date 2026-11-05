@@ -17,6 +17,11 @@ export const useSessionsStore = defineStore("sessions", () => {
   const live = ref<SessionInfo[]>([]);
   const history = ref<HistoryRow[]>([]);
   const loading = ref(false);
+  //: True after the first successful list load for this login. The workspace
+  //: may auto-bind a blank pane only on that first load; binding on every
+  //: ``live.length`` change raced ``create()`` and put one newly created
+  //: session into two tabs at once.
+  const initialized = ref(false);
   const error = ref("");
   const sseConnected = ref(false);
   let source: EventSource | null = null;
@@ -39,6 +44,7 @@ export const useSessionsStore = defineStore("sessions", () => {
       if (epoch !== generation) return;
       live.value = current;
       history.value = past;
+      initialized.value = true;
     } catch (err) {
       if (epoch !== generation) return;
       error.value = (err as Error).message;
@@ -123,6 +129,7 @@ export const useSessionsStore = defineStore("sessions", () => {
     history.value = [];
     error.value = "";
     loading.value = false;
+    initialized.value = false;
   }
 
   async function create(body: Record<string, unknown>): Promise<SessionInfo> {
@@ -161,6 +168,7 @@ export const useSessionsStore = defineStore("sessions", () => {
     live,
     history,
     loading,
+    initialized,
     error,
     sseConnected,
     byId,

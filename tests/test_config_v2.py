@@ -16,6 +16,24 @@ def test_every_setting_has_a_section_and_an_apply_tier() -> None:
         assert config_v2.apply_tier(key) == config_mod.kind_of(key), key
 
 
+def test_every_setting_has_human_readable_copy() -> None:
+    """A new option must not ship as a bare English key in the UI."""
+    import re
+
+    fields = set(config_mod.Settings.model_fields)
+    assert fields == set(config_v2.FIELD_META)
+    assert set(config_v2.SECTION_TITLES) == set(config_v2.SECTIONS)
+    chinese = re.compile(r"[\u4e00-\u9fff]")
+    for key, (title, description) in config_v2.FIELD_META.items():
+        assert title.strip() and description.strip(), key
+        assert title != key, key
+        # Titles may be product names (Web Push / OpenTelemetry), but the
+        # sentence explaining what the switch does must be Chinese.
+        assert chinese.search(description), key
+    for section, title in config_v2.SECTION_TITLES.items():
+        assert title.strip(), section
+
+
 def test_human_units_are_normalised() -> None:
     assert config_v2.coerce_value("scrollback_bytes", "8MiB") == 8 * 1024 * 1024
     assert config_v2.coerce_value("session_ttl", "12h") == 12 * 3600

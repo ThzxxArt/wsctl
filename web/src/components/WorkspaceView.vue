@@ -240,7 +240,7 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 function resetTitle(): void {
-  document.title = "wsctl · 终端工作台";
+  document.title = "WsCTL · 终端工作台";
 }
 
 const installEvent = ref<{ prompt: () => Promise<void> } | null>(null);
@@ -335,11 +335,14 @@ async function openShareFromUrl(): Promise<void> {
   }
 }
 
+let autoBoundInitialSession = false;
 watch(
-  () => sessions.live.length,
-  (count) => {
+  () => sessions.initialized,
+  (ready) => {
+    if (!ready || autoBoundInitialSession) return;
+    autoBoundInitialSession = true;
+    if (sessions.live.length === 0) return;
     if (
-      count > 0 &&
       workspace.tabs.every((tab) => leavesOf(tab.root).every((leaf) => leaf.sessionId === null))
     ) {
       const first = sessions.live[0];
@@ -376,16 +379,19 @@ onBeforeUnmount(() => {
   <div class="ws-shell">
     <div v-if="offline" class="offline-bar" role="status">网络已断开，恢复后会自动重连</div>
     <header class="topbar">
-      <button
-        v-if="!shareOnly"
-        class="ws-icon-btn"
-        :title="$t('app.sessions')"
-        :aria-label="$t('app.sessions')"
-        @click="ui.sidebarOpen = !ui.sidebarOpen"
-      >
-        ☰
-      </button>
-      <span class="brand">wsctl</span>
+      <div class="topbar-left">
+        <button
+          v-if="!shareOnly"
+          class="ws-icon-btn sidebar-toggle"
+          :title="ui.sidebarOpen ? '收起会话侧栏' : '展开会话侧栏'"
+          :aria-label="ui.sidebarOpen ? '收起会话侧栏' : '展开会话侧栏'"
+          :aria-expanded="ui.sidebarOpen"
+          @click="ui.sidebarOpen = !ui.sidebarOpen"
+        >
+          ☰
+        </button>
+        <span class="brand">WsCTL</span>
+      </div>
       <span v-if="shareOnly" class="share-only-label">分享会话</span>
       <TabBar v-if="!shareOnly" />
       <div v-if="!shareOnly" class="top-actions">
@@ -505,12 +511,31 @@ onBeforeUnmount(() => {
 .topbar {
   display: flex;
   align-items: flex-end;
-  gap: 6px;
+  gap: 8px;
   height: 48px;
-  padding: 8px 8px 0;
+  padding: 8px 10px 0;
   border-bottom: 1px solid var(--border);
   background: var(--bg-elevated);
   user-select: none;
+}
+.topbar-left {
+  display: flex;
+  flex-shrink: 0;
+  align-self: center;
+  align-items: center;
+  gap: 8px;
+}
+.sidebar-toggle {
+  width: 30px;
+  height: 30px;
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text);
+  font-size: 15px;
+}
+.sidebar-toggle:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
 }
 .offline-bar {
   padding: 4px 10px;
@@ -521,13 +546,13 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 .brand {
-  align-self: center;
-  padding: 0 6px;
+  padding: 0 4px;
   color: var(--accent);
   font-family: var(--term-font-family);
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 1;
 }
 .share-only-label {
   align-self: center;
@@ -541,9 +566,9 @@ onBeforeUnmount(() => {
 .top-actions {
   display: flex;
   align-items: center;
+  align-self: center;
   gap: 2px;
   margin-left: auto;
-  padding-bottom: 6px;
 }
 .layout-select {
   height: 26px;

@@ -126,6 +126,188 @@ SECTION_MAP: dict[str, str] = {
     "web_push_subject": "push",
 }
 
+#: Human-readable section names for the web editor and future CLI help.
+SECTION_TITLES: dict[str, str] = {
+    "server": "服务器",
+    "auth": "认证",
+    "security": "安全",
+    "terminal": "终端",
+    "files": "文件",
+    "recording": "录制",
+    "observability": "可观测性",
+    "data": "数据",
+    "database": "数据库",
+    "push": "Web Push",
+}
+
+#: One Chinese title and one plain-language description per setting. The key
+#: remains the stable machine identifier; this is what a person reads in the
+#: settings dialog. A test asserts every ``Settings`` field has an entry, so a
+#: newly added option cannot ship as a bare English key again.
+FIELD_META: dict[str, tuple[str, str]] = {
+    # server
+    "host": ("监听地址", "服务绑定的 IP。0.0.0.0 允许所有网卡访问，127.0.0.1 仅本机。"),
+    "port": ("监听端口", "Web 页面与 WebSocket 共用的 TCP 端口。"),
+    "reuse_port": (
+        "端口复用",
+        "允许使用 SO_REUSEPORT：滚动重启时新旧实例可短暂共享端口，避免连接被拒绝。",
+    ),
+    "ssl_cert": ("TLS 证书", "HTTPS 证书文件路径。留空表示由反向代理终止 TLS。"),
+    "ssl_key": ("TLS 私钥", "HTTPS 私钥文件路径，必须与上面的证书匹配。"),
+    # auth
+    "auth_required": (
+        "启用登录认证",
+        "关闭后任何人无需登录即可访问终端，只应在本机临时排障时使用。",
+    ),
+    "session_ttl": ("登录有效期", "登录会话的存活时间，例如 12h；到期后需要重新登录。"),
+    "session_sliding_ttl": (
+        "滑动续期",
+        "每次请求都顺延登录有效期；关闭后从登录时刻固定计算。",
+    ),
+    "cookie_secure": (
+        "仅 HTTPS Cookie",
+        "只在 HTTPS 连接中发送登录 Cookie。纯 HTTP 访问时必须关闭。",
+    ),
+    "totp_issuer": ("两步验证名称", "认证器中显示的发行方名称，便于区分多个站点。"),
+    # security
+    "trust_proxy": (
+        "信任反向代理",
+        "从可信代理读取 X-Forwarded-For / X-Forwarded-Proto；仅在 nginx、Caddy 等代理后开启。",
+    ),
+    "trusted_proxies": (
+        "可信代理地址",
+        "允许提供转发头的代理 IP/CIDR。留空表示信任所有直连代理。",
+    ),
+    "allowed_ips": ("允许的来源 IP", "只允许这些 IP/CIDR 访问；留空表示不限制。"),
+    "allowed_origins": ("允许的 Origin", "允许跨站访问的 Origin；留空只允许同源。"),
+    "security_headers": ("安全响应头", "添加 CSP、X-Frame-Options 等浏览器安全头。"),
+    "login_rate_limit": (
+        "登录失败次数",
+        "统计窗口内允许的失败登录次数，超过后暂时拒绝该来源。",
+    ),
+    "login_rate_window": ("登录限流窗口", "统计失败登录的时间窗口，单位秒。"),
+    # terminal
+    "default_shell": ("默认 Shell", "新建本地会话时启动的 shell；留空使用系统默认。"),
+    "default_cwd": ("默认工作目录", "新建会话时的工作目录；留空使用服务进程所在目录。"),
+    "default_backend": (
+        "默认后端",
+        "新会话默认使用 local（本地 PTY）或 tmux（可跨服务重启恢复）。",
+    ),
+    "tmux_preserve_on_shutdown": (
+        "关闭时保留 tmux",
+        "服务停止时不结束 tmux 会话，下次启动可以重新接管。",
+    ),
+    "idle_timeout": ("空闲超时", "会话无输入输出多久后自动结束；0 表示不限制。"),
+    "max_life": ("最长寿命", "会话从创建起最多存活多久；0 表示不限制。"),
+    "max_sessions": ("最大会话数", "整个实例允许同时存在的终端会话总数；0 表示不限制。"),
+    "max_sessions_per_user": (
+        "每用户会话上限",
+        "单个用户允许同时存在的会话数；0 表示不限制。",
+    ),
+    "session_max_clients": (
+        "每会话客户端上限",
+        "单个会话允许同时连接的浏览器/CLI 数量；0 表示不限制。",
+    ),
+    "session_memory_limit": (
+        "会话内存上限",
+        "该会话所有客户端输出队列的总内存上限，超过时丢弃最旧输出。",
+    ),
+    "client_max_bytes": (
+        "单客户端缓冲",
+        "每个连接允许积压的输出字节数，超过时丢弃最旧帧并触发重新同步。",
+    ),
+    "ws_max_connections": ("WebSocket 连接上限", "整个实例允许的 WebSocket 连接总数。"),
+    "ws_max_connections_per_ip": (
+        "单 IP 连接上限",
+        "每个来源 IP 允许的 WebSocket 连接数。",
+    ),
+    "input_rate_limit": (
+        "输入速率限制",
+        "每个连接每秒允许的输入字节数；0 表示不限制。",
+    ),
+    "input_rate_burst": ("输入突发上限", "允许瞬时超过速率的字节数。"),
+    "scrollback_bytes": (
+        "回滚缓冲",
+        "每个会话保留的原始输出字节数，用于断线续传和屏幕快照。",
+    ),
+    "snapshot_mode": (
+        "快照模式",
+        "auto 仅在全屏应用时启用影子屏幕；always 始终启用；off 只回放原始字节。",
+    ),
+    "shell_integration": (
+        "Shell 集成",
+        "注入 OSC 133/633 脚本，提供命令块、工作目录、耗时和退出码。",
+    ),
+    # files
+    "file_root": ("文件根目录", "文件面板可访问的根目录；留空使用数据目录。"),
+    "file_max_upload": ("单文件上传上限", "单次上传允许的最大字节数。"),
+    # recording
+    "auto_record": ("自动录制", "新会话创建时自动开始 asciinema 录制。"),
+    "record_input": (
+        "记录键盘输入",
+        "录制时同时保存输入内容；可能包含密码，敏感环境慎用。",
+    ),
+    "recordings_retention_days": (
+        "录制保留天数",
+        "超过天数的录制自动删除；0 表示永久保留。",
+    ),
+    "recordings_max_bytes": (
+        "录制总容量",
+        "录制目录允许占用的最大字节数；0 表示不限制。",
+    ),
+    # observability
+    "metrics_enabled": ("Prometheus 指标", "暴露 /metrics 指标端点。"),
+    "metrics_require_auth": (
+        "指标需要认证",
+        "访问 /metrics 时必须登录；关闭后对网络公开。",
+    ),
+    "log_level": ("日志级别", "debug / info / warning / error，级别越低输出越多。"),
+    "log_json": ("JSON 日志", "以 JSON 行输出日志，便于采集和检索。"),
+    "log_file": ("日志文件", "日志写入的文件路径；留空输出到标准错误。"),
+    "log_max_bytes": ("单个日志上限", "日志轮转前允许的最大字节数。"),
+    "log_backup_count": ("日志保留份数", "轮转后保留的旧日志文件数量。"),
+    "webhook_url": ("事件 Webhook", "会话和审计事件推送到的 HTTP 地址；留空关闭。"),
+    "audit_input": (
+        "审计键盘输入",
+        "将输入内容写入审计日志；可能包含密码，敏感环境慎用。",
+    ),
+    "audit_retention_days": (
+        "审计保留天数",
+        "超过天数的审计记录自动删除；0 表示永久保留。",
+    ),
+    "otel_enabled": ("OpenTelemetry", "启用 OpenTelemetry 追踪导出。"),
+    "otel_endpoint": ("OTLP 端点", "OpenTelemetry Collector 的 OTLP HTTP 地址。"),
+    "otel_sample_ratio": ("采样比例", "0 到 1 之间的追踪采样比例。"),
+    # data
+    "data_dir": (
+        "数据目录",
+        "数据库、录制、日志、自签证书等运行数据的存放目录。",
+    ),
+    "config_path": ("配置文件", "当前加载的 TOML 配置文件路径。"),
+    "instance_ttl": ("实例心跳有效期", "实例注册信息的过期时间，用于发现残留进程。"),
+    "term_session_retention_days": (
+        "会话历史保留天数",
+        "已结束会话记录保留天数；0 表示永久保留。",
+    ),
+    # database
+    "database_url": (
+        "数据库 URL",
+        "SQLAlchemy 连接串；留空使用 data_dir 下的 SQLite 数据库。",
+    ),
+    "database_echo": ("SQL 日志", "输出每条 SQL 语句，仅用于调试。"),
+    # push
+    "web_push_enabled": ("Web Push", "启用浏览器会话结束和长命令完成通知。"),
+    "web_push_vapid_public": (
+        "VAPID 公钥",
+        "Web Push 的公开密钥，可用 wsctl push keys 生成。",
+    ),
+    "web_push_vapid_private": ("VAPID 私钥", "Web Push 的私有密钥，必须保密。"),
+    "web_push_subject": (
+        "VAPID 联系地址",
+        "VAPID 要求的 mailto: 或 https: 联系地址。",
+    ),
+}
+
 #: Tiers, mirroring ``config.HOT_*``. Declared here so the API can label a
 #: field without importing the server. ``config.kind_of`` remains the runtime
 #: authority and a test asserts the two agree.
@@ -519,10 +701,14 @@ def sectioned_metadata(model_fields: dict[str, Any]) -> list[dict[str, Any]]:
     for key in sorted(model_fields):
         field = model_fields[key]
         annotation = field.annotation
+        title, description = FIELD_META.get(key, (key, ""))
         out.append(
             {
                 "key": key,
                 "section": section_of(key),
+                "section_title": SECTION_TITLES.get(section_of(key), section_of(key)),
+                "title": title,
+                "description": description,
                 "apply": apply_tier(key),
                 "type": _type_name(annotation),
                 "default": _default_text(field, format_toml_value),
@@ -566,8 +752,10 @@ def _default_text(field: Any, renderer: Any) -> str:
 __all__ = [
     "APPLY_IMMEDIATE",
     "APPLY_NEW",
+    "FIELD_META",
     "SECTIONS",
     "SECTION_MAP",
+    "SECTION_TITLES",
     "ConfigV2Error",
     "apply_tier",
     "canonical_key",

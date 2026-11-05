@@ -55,6 +55,9 @@ export interface ShareRecord {
 export interface ConfigField {
   key: string;
   section: string;
+  section_title?: string;
+  title: string;
+  description: string;
   apply: "hot" | "new" | "restart";
   type: "bool" | "int" | "float" | "string" | "list" | "path";
   default: string;
@@ -65,6 +68,7 @@ export interface ConfigField {
 export interface ConfigSchema {
   version: number;
   config_path: string;
+  section_titles?: Record<string, string>;
   sections: Record<string, ConfigField[]>;
 }
 
