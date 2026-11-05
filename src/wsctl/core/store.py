@@ -800,7 +800,15 @@ class Store:
                 " snapshot_mode, shell_integration)"
                 " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET"
-                " name=excluded.name, status=excluded.status,"
+                " name=excluded.name,"
+                # A command can exit before the create request finishes its
+                # INSERT. The finalizer then writes the real terminal row and
+                # the late create upsert must not reset it to running -- the
+                # maintenance sweep would file a clean exit as a crash and
+                # lose the exit code.
+                " status=CASE"
+                "  WHEN excluded.status='running' AND term_sessions.status<>'running'"
+                "  THEN term_sessions.status ELSE excluded.status END,"
                 " instance_id=excluded.instance_id, last_active=excluded.last_active,"
                 " generation=excluded.generation, snapshot_mode=excluded.snapshot_mode,"
                 " shell_integration=excluded.shell_integration",
@@ -860,8 +868,8 @@ class Store:
         status: str,
         reason: str | None = None,
         exit_code: int | None = None,
-    ) -> None:
-        """Record how a session ended.
+    ) -> int:
+        """Record how a session ended; return the number of rows updated.
 
         ``reason`` is the human half of ``status``: "killed" says *what*
         happened, "被管理员终止" says *why*. Without it the history list showed
@@ -870,11 +878,12 @@ class Store:
         so it is stored here rather than recomputed later.
         """
         with self._lock, self._conn:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE term_sessions SET status = ?, end_reason = ?, exit_code = ?,"
                 " last_active = ? WHERE id = ?",
                 (status, reason, exit_code, time.time(), sid),
             )
+            return int(cur.rowcount)
 
     def term_session_set_instance(self, sid: str, instance_id: str | None) -> None:
         with self._lock, self._conn:

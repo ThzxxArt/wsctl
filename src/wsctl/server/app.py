@@ -638,13 +638,39 @@ def create_app(
             await asyncio.to_thread(
                 app.state.store.term_session_set_seq, session.id, session.end_seq
             )
-            await asyncio.to_thread(
+            updated = await asyncio.to_thread(
                 app.state.store.term_session_set_status,
                 session.id,
                 session.end_status,
                 session.end_reason,
                 session.exit_code,
             )
+            if updated == 0:
+                # The child exited before the create endpoint's INSERT landed.
+                # Write the final row ourselves; the late INSERT then conflicts
+                # and ``term_session_upsert`` preserves this terminal status.
+                spec = session.spec
+                await asyncio.to_thread(
+                    app.state.store.term_session_upsert,
+                    session.id,
+                    name=spec.name,
+                    owner_id=session.owner_id,
+                    backend=spec.backend,
+                    command=spec.command,
+                    argv=spec.argv,
+                    env=spec.env,
+                    cwd=spec.cwd,
+                    idle_timeout=spec.idle_timeout,
+                    max_life=spec.max_life,
+                    status=session.end_status,
+                    instance_id=getattr(app.state, "instance_id", None),
+                    generation=session.generation,
+                    snapshot_mode=spec.snapshot_mode,
+                    shell_integration=spec.shell_integration,
+                )
+                await asyncio.to_thread(
+                    app.state.store.term_session_set_seq, session.id, session.end_seq
+                )
             # A link to a session that has ended must not stay resolvable.
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(

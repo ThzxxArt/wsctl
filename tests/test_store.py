@@ -11,6 +11,30 @@ def make_store(tmp_path: Path) -> Store:
     return Store(tmp_path / "test.db")
 
 
+def test_late_create_upsert_cannot_resurrect_a_finished_row(tmp_path: Path) -> None:
+    """A command that exits before its INSERT must keep its terminal row."""
+    store = make_store(tmp_path)
+    try:
+        store.term_session_upsert("fast", name="fast", owner_id=None, status="stopped")
+        assert (
+            store.term_session_set_status(
+                "fast", "stopped", "进程退出（退出码 3）", 3
+            )
+            == 1
+        )
+        # The create endpoint's INSERT can land after finalization. It must
+        # not overwrite the real status/reason/exit code with "running".
+        store.term_session_upsert("fast", name="fast", owner_id=None, status="running")
+        row = store.term_session_get("fast")
+        assert row is not None
+        assert row["status"] == "stopped"
+        assert row["exit_code"] == 3
+        assert "3" in row["end_reason"]
+        assert store.term_session_set_status("missing", "stopped") == 0
+    finally:
+        store.close()
+
+
 def test_user_lifecycle(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:
