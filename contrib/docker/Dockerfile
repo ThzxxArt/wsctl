@@ -34,7 +34,7 @@ RUN apt-get update \
 WORKDIR /build
 
 # 先只拷贝打包元数据，依赖层可复用缓存；再拷贝源码装本体。
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./
 COPY src ./src
 # 预构建前端覆盖源码树里的静态目录：用户拿到的镜像不需要 Node。
 COPY --from=web /web/dist ./src/wsctl/static
