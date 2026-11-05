@@ -128,8 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **协议**：新增 `FLAG_DISPLAY`，清屏/重绘不再冒充可续传快照；快照分块只在
   `FLAG_LAST` 渲染完成后推进恢复游标；每次丢帧 burst 只发一条 `gap`；
   `resync` 会报告已被淘汰、无法恢复的头部区间。
-- **稳定性**：finalizer 单任务化，`stop` 等待在途 finalize；PTY `close` 移出
-  事件循环；tmux 控制命令捕获 `OSError`；客户端重连退避在 `attached` 后才重置。
+- **稳定性**：finalizer 单任务化，先持久化历史行再回收会话；`stop` 等待在途
+  finalize；PTY `close` 移出事件循环；tmux 控制命令捕获 `OSError`；客户端重连
+  退避在 `attached` 后才重置。
 - **视觉**：修复空 `fontFamily` 传给 xterm 导致的比例字体回退（字符间出现空格）；
   重新生成 0.2.0 截图；生产构建不再发布 sourcemap。
 - **CLI**：窗口 resize 使用协议 v2 控制帧；短写循环写满；stdin EOF sentinel

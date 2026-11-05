@@ -1268,6 +1268,11 @@ class TermSession:
         # write that has not happened yet.
         await self._notify({"type": "exit", "code": self.exit_code})
 
+    @property
+    def finalized(self) -> bool:
+        """Whether the exit notice and history row have been written."""
+        return self._finalized.is_set()
+
     async def wait_finalized(self, timeout: float | None = None) -> bool:
         """Wait until the ``exit`` notice has been queued (``False`` on timeout).
 
@@ -1478,19 +1483,30 @@ class SessionManager:
         self._sessions.clear()
 
     def _on_session_close(self, session: TermSession) -> Any:
-        # Called from the read loop; the entry is pruned lazily via _reap().
-        self._sessions.pop(session.id, None)
-        # Persist *now*, while ``end_status``/``end_reason``/``exit_code`` are
-        # still the truth. The maintenance loop's ``stop_missing`` only sees
-        # "not in memory" and would write a bare ``stopped`` with no reason --
-        # which is how a clean ``exit`` came to be filed as "服务退出或实例崩溃".
-        if self._on_session_end is not None:
-            return self._on_session_end(session)
-        return None
+        """Persist the final row, then remove the session from the manager.
+
+        Removing first left ``stop_missing`` free to file a bare ``stopped``
+        row while the real persistence was still in flight -- how a clean
+        ``exit 3`` became "服务退出或实例崩溃", losing the exit code.
+        """
+        async def finish() -> None:
+            try:
+                if self._on_session_end is not None:
+                    done = self._on_session_end(session)
+                    if inspect.isawaitable(done):
+                        await done
+            finally:
+                self._sessions.pop(session.id, None)
+
+        return finish()
 
     def _reap(self) -> None:
         for sid, session in list(self._sessions.items()):
-            if session.closed:
+            # ``closed`` flips at the start of finalization, before the exit
+            # code/history row is persisted. Reaping on it alone let the
+            # maintenance sweep file a clean exit as "instance crashed" and
+            # lose the exit code. Wait for the finalizer's event.
+            if session.closed and session.finalized:
                 del self._sessions[sid]
 
     def _new_id(self) -> str:
