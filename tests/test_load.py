@@ -363,12 +363,19 @@ async def test_t4_sustained_flood_loses_no_viewers() -> None:
             # Only the tail: ``c.output()`` joins the whole buffer, and calling
             # it every 50ms against megabytes of flood made the *test* the
             # bottleneck (O(n^2) copying) rather than the code under test.
+            # Join the tail items first: a PTY read may split the six-byte
+            # marker across two frames, and checking each frame alone made this
+            # gate fail on a fast runner through no fault of the product.
             return all(
-                any(isinstance(i, bytes) and marker in i for i in c.items[-4:])
+                marker in b"".join(i for i in c.items[-8:] if isinstance(i, bytes))
                 for c in clients
             )
 
-        ok = await wait_for(finished, timeout=25.0)
+        # 8 sessions × 2 MB on a shared CI runner: the command itself is capped
+        # at 10s, but draining and scanning eight sinks needs headroom. 25s was
+        # hit at 26.9s on a loaded runner; 45s still fails a real hang while
+        # not turning machine speed into a product verdict.
+        ok = await wait_for(finished, timeout=45.0)
         assert ok, "a sustained flood never finished inside the budget"
         assert all(s.client_count == 1 for s in sessions), "a viewer was dropped"
         assert slow_consumer_drops() == drops_before, "backpressure dropped a viewer"
