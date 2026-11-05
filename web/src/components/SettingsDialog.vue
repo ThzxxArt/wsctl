@@ -22,6 +22,7 @@ import { useUiStore } from "@/stores/ui";
 import { useWorkspaceStore } from "@/stores/workspace";
 import { parseTheme } from "@/utils/themes";
 import { useI18n } from "vue-i18n";
+import { promptDialog } from "@/dialogs";
 
 const emit = defineEmits<{ close: [] }>();
 const prefs = usePrefsStore();
@@ -261,7 +262,12 @@ async function disablePush(): Promise<void> {
 }
 
 async function saveServerLayout(): Promise<void> {
-  const name = window.prompt("布局名称", "default");
+  const name = await promptDialog({
+    title: "保存布局",
+    message: "布局名称",
+    defaultValue: "default",
+    placeholder: "布局名称",
+  });
   if (!name) return;
   try {
     await layoutsApi.put(name, workspace.snapshot());
@@ -272,7 +278,12 @@ async function saveServerLayout(): Promise<void> {
 }
 
 async function loadServerLayout(): Promise<void> {
-  const name = window.prompt("要加载的布局名称", "default");
+  const name = await promptDialog({
+    title: "加载布局",
+    message: "要加载的布局名称",
+    defaultValue: "default",
+    placeholder: "布局名称",
+  });
   if (!name) return;
   try {
     const record = await layoutsApi.get(name);

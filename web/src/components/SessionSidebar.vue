@@ -7,6 +7,7 @@ import { usePresenceStore } from "@/stores/presence";
 import { useAuthStore } from "@/stores/auth";
 import { recordings, sessions as api } from "@/api";
 import type { SessionInfo } from "@/api/types";
+import { confirmDialog, promptDialog } from "@/dialogs";
 
 const sessions = useSessionsStore();
 const workspace = useWorkspaceStore();
@@ -98,7 +99,13 @@ async function createSession(): Promise<void> {
 }
 
 async function stop(session: SessionInfo): Promise<void> {
-  if (!window.confirm(`终止会话「${session.name}」？正在运行的任务会结束。`)) return;
+  const confirmed = await confirmDialog({
+    title: "终止会话",
+    message: `终止会话「${session.name}」？正在运行的任务会结束。`,
+    confirmText: "终止",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await sessions.remove(session.id);
     ui.notify(`已终止 ${session.name}`, "success");
@@ -108,7 +115,12 @@ async function stop(session: SessionInfo): Promise<void> {
 }
 
 async function rename(session: SessionInfo): Promise<void> {
-  const name = window.prompt("新的会话名称", session.name);
+  const name = await promptDialog({
+    title: "重命名会话",
+    message: "新的会话名称",
+    defaultValue: session.name,
+    placeholder: "会话名称",
+  });
   if (!name || name === session.name) return;
   try {
     await sessions.rename(session.id, name);

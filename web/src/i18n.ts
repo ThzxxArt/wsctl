@@ -117,6 +117,14 @@ const zh = {
     verified: "审计链完整",
     broken: "审计链损坏",
   },
+  dialogs: {
+    confirmTitle: "请确认",
+    promptTitle: "请输入",
+    required: "不能为空",
+    minLength: "至少需要 {n} 个字符",
+    passwordMismatch: "两次输入的密码不一致",
+    passwordConfirmPlaceholder: "再次输入密码",
+  },
 };
 
 const en = {
@@ -235,6 +243,14 @@ const en = {
     verify: "Verify audit chain",
     verified: "Audit chain intact",
     broken: "Audit chain broken",
+  },
+  dialogs: {
+    confirmTitle: "Confirm",
+    promptTitle: "Enter a value",
+    required: "This field is required",
+    minLength: "Must be at least {n} characters",
+    passwordMismatch: "The passwords do not match",
+    passwordConfirmPlaceholder: "Re-enter password",
   },
 };
 

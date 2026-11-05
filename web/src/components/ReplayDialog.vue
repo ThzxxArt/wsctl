@@ -5,6 +5,7 @@ import { recordings } from "@/api";
 import type { RecordingInfo } from "@/api/types";
 import { useUiStore } from "@/stores/ui";
 import { useI18n } from "vue-i18n";
+import { confirmDialog } from "@/dialogs";
 
 const props = defineProps<{ session: string }>();
 const emit = defineEmits<{ close: [] }>();
@@ -54,7 +55,13 @@ async function play(name: string): Promise<void> {
 }
 
 async function remove(name: string): Promise<void> {
-  if (!window.confirm(`删除录制 ${name}？`)) return;
+  const confirmed = await confirmDialog({
+    title: "删除录制",
+    message: `删除录制 ${name}？`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await recordings.remove(name);
     if (selected.value === name) {

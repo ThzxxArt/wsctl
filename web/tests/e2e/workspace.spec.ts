@@ -91,6 +91,51 @@ test.describe("terminal workspace", () => {
     await expect(page.getByText("名称", { exact: true })).toBeVisible();
   });
 
+  test("maximize and restore keep the terminal connected", async ({ page, isMobile }) => {
+    test.skip(isMobile === true, "the session sidebar is an overlay on mobile");
+    await page.getByTitle("新建会话").first().click();
+    const pane = page.locator(".ws-pane").first();
+    await expect(pane).toHaveAttribute("data-state", "connected");
+
+    await pane.getByRole("button", { name: "最大化" }).click();
+    await expect(page.locator(".ws-pane")).toHaveCount(1);
+    await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
+
+    // The remount must not leave a stale viewer behind that the 5s auth/access
+    // recheck would evict.
+    await page.waitForTimeout(6_000);
+    await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
+
+    await page.locator(".ws-pane").first().getByRole("button", { name: "最大化" }).click();
+    await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
+  });
+
+  test("uses the in-app dialog for prompts and confirmations", async ({ page }) => {
+    await page.getByTitle("文件", { exact: true }).click();
+    await expect(page.getByText("名称", { exact: true })).toBeVisible();
+
+    const name = `e2e-${Date.now()}`;
+    await page.getByRole("button", { name: "新建文件夹" }).click();
+    const dialog = page.locator(".n-modal").filter({ has: page.locator(".app-dialog") });
+    await expect(dialog.getByText("新建文件夹", { exact: true })).toBeVisible();
+    await dialog.locator("input").fill(name);
+    await dialog.getByRole("button", { name: "确定" }).click();
+
+    const row = page.locator(".frow").filter({ hasText: name });
+    await expect(row).toBeVisible();
+
+    await row.getByRole("button", { name: "删除", exact: true }).click();
+    await expect(dialog.getByText("目录必须为空", { exact: false })).toBeVisible();
+    await dialog.getByRole("button", { name: "取消" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(row).toBeVisible();
+
+    // Leave the directory clean for the next run.
+    await row.getByRole("button", { name: "删除", exact: true }).click();
+    await dialog.getByRole("button", { name: "删除", exact: true }).click();
+    await expect(row).toHaveCount(0);
+  });
+
   test("has no critical accessibility violations on the workspace", async ({ page }) => {
     await page.getByTitle("新建会话").first().click();
     const results = await new AxeBuilder({ page })

@@ -25,6 +25,8 @@ import LoginView from "@/components/LoginView.vue";
 import WorkspaceView from "@/components/WorkspaceView.vue";
 import ToastHost from "@/components/ToastHost.vue";
 import CommandPalette from "@/components/CommandPalette.vue";
+import AppDialog from "@/components/AppDialog.vue";
+import { confirmDialog, resetDialogs } from "@/dialogs";
 
 function asyncDialog(loader: () => Promise<unknown>) {
   return defineAsyncComponent({
@@ -37,9 +39,13 @@ function asyncDialog(loader: () => Promise<unknown>) {
       else {
         console.warn("dialog chunk failed to load", error);
         fail();
-        if (window.confirm("页面资源已更新，需要刷新后继续。现在刷新？")) {
-          location.reload();
-        }
+        void confirmDialog({
+          title: "资源已更新",
+          message: "页面资源已更新，需要刷新后继续。现在刷新？",
+          confirmText: "刷新",
+        }).then((reload) => {
+          if (reload) location.reload();
+        });
       }
     },
   });
@@ -120,6 +126,7 @@ watch(
       presence.viewers = {};
       ui.toasts = [];
       ui.filesOpen = false;
+      resetDialogs();
       queryClient.clear();
       closeTransient();
       ui.shareSession = null;
@@ -184,6 +191,7 @@ function closeTransient(): void {
             ui.quickSwitchOpen = false;
           "
         />
+        <AppDialog />
       </NMessageProvider>
     </NDialogProvider>
   </NConfigProvider>

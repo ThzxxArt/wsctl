@@ -6,6 +6,7 @@ import type { ShareRecord } from "@/api/types";
 import { useUiStore } from "@/stores/ui";
 import { useI18n } from "vue-i18n";
 import { formatDateTime } from "@/utils/format";
+import { confirmDialog } from "@/dialogs";
 
 const props = defineProps<{ session: string }>();
 const emit = defineEmits<{ close: [] }>();
@@ -63,7 +64,13 @@ async function create(): Promise<void> {
 }
 
 async function revoke(row: ShareRecord): Promise<void> {
-  if (!window.confirm(`撤销分享链接 #${row.id}？已打开的观众会立即失去访问。`)) return;
+  const confirmed = await confirmDialog({
+    title: "撤销分享",
+    message: `撤销分享链接 #${row.id}？已打开的观众会立即失去访问。`,
+    confirmText: "撤销",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await shares.revoke(row.id);
     // Keep the one-time link visible when a *different* link was revoked;

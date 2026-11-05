@@ -6,6 +6,7 @@ import type { FileEntry } from "@/api/types";
 import { useUiStore } from "@/stores/ui";
 import { useI18n } from "vue-i18n";
 import { formatDateTime } from "@/utils/format";
+import { confirmDialog, promptDialog } from "@/dialogs";
 import EditorDialog from "./EditorDialog.vue";
 
 const emit = defineEmits<{ close: [] }>();
@@ -135,7 +136,11 @@ async function save(content: string): Promise<void> {
 }
 
 async function makeDir(): Promise<void> {
-  const name = window.prompt("新文件夹名称");
+  const name = await promptDialog({
+    title: "新建文件夹",
+    message: "新文件夹名称",
+    placeholder: "名称",
+  });
   if (!name) return;
   try {
     await files.mkdir(path.value, name);
@@ -146,7 +151,12 @@ async function makeDir(): Promise<void> {
 }
 
 async function rename(entry: FileEntry): Promise<void> {
-  const name = window.prompt("新名称", entry.name);
+  const name = await promptDialog({
+    title: "重命名",
+    message: `重命名 ${entry.name}`,
+    defaultValue: entry.name,
+    placeholder: "新名称",
+  });
   if (!name || name === entry.name) return;
   try {
     await files.rename(join(path.value, entry.name), name);
@@ -157,7 +167,13 @@ async function rename(entry: FileEntry): Promise<void> {
 }
 
 async function remove(entry: FileEntry): Promise<void> {
-  if (!window.confirm(`删除 ${entry.name}？目录必须为空。`)) return;
+  const confirmed = await confirmDialog({
+    title: "删除",
+    message: `删除 ${entry.name}？目录必须为空。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await files.remove(path.value, entry.name);
     await load();
@@ -215,14 +231,17 @@ async function uploadFiles(list: File[], target = path.value): Promise<void> {
       try {
         await send(false);
       } catch (error) {
-        if (
-          (error as { status?: number }).status === 409 &&
-          window.confirm(`${file.name} 已存在，覆盖它？`)
-        ) {
-          await send(true);
-        } else {
-          throw error;
-        }
+        if ((error as { status?: number }).status !== 409) throw error;
+        const overwrite = await confirmDialog({
+          title: "覆盖文件",
+          message: `${file.name} 已存在，覆盖它？`,
+          confirmText: "覆盖",
+          danger: true,
+        });
+        // Keep the original 409 as the job's failure reason when the user
+        // declines, matching the previous confirm-then-abort behaviour.
+        if (!overwrite) throw error;
+        await send(true);
       }
       job.status = "done";
       job.ratio = 1;

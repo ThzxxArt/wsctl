@@ -20,6 +20,7 @@ import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 import { markdown } from "@codemirror/lang-markdown";
 import { NButton, NModal, NSpace } from "naive-ui";
+import { confirmDialog } from "@/dialogs";
 
 const props = defineProps<{ path: string; content: string }>();
 const emit = defineEmits<{ close: []; save: [content: string] }>();
@@ -29,8 +30,19 @@ const current = ref(props.content);
 const dirty = ref(false);
 let view: EditorView | null = null;
 
-function requestClose(): void {
-  if (dirty.value && !window.confirm("有未保存的修改，确定关闭？")) return;
+async function requestClose(): Promise<void> {
+  if (
+    dirty.value &&
+    !(await confirmDialog({
+      title: "未保存的修改",
+      message: "有未保存的修改，确定关闭？",
+      confirmText: "放弃修改",
+      cancelText: "继续编辑",
+      danger: true,
+    }))
+  ) {
+    return;
+  }
   emit("close");
 }
 

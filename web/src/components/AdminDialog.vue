@@ -22,6 +22,7 @@ import { useUiStore } from "@/stores/ui";
 import { useAuthStore } from "@/stores/auth";
 import { useI18n } from "vue-i18n";
 import { formatDateTime } from "@/utils/format";
+import { confirmDialog, promptDialog } from "@/dialogs";
 
 const emit = defineEmits<{ close: [] }>();
 const ui = useUiStore();
@@ -100,7 +101,14 @@ async function createUser(): Promise<void> {
 }
 
 async function resetPassword(user: User): Promise<void> {
-  const password = window.prompt(`为 ${user.username} 设置新密码（至少 8 位）`);
+  const password = await promptDialog({
+    title: "重置密码",
+    message: `为 ${user.username} 设置新密码（至少 8 位）`,
+    type: "password",
+    minLength: 8,
+    confirmValue: true,
+    placeholder: "新密码",
+  });
   if (!password) return;
   try {
     await users.update(user.username, { password });
@@ -130,7 +138,13 @@ async function toggleDisabled(user: User): Promise<void> {
 }
 
 async function removeUser(user: User): Promise<void> {
-  if (!window.confirm(`删除用户 ${user.username}？该用户的所有会话会结束。`)) return;
+  const confirmed = await confirmDialog({
+    title: "删除用户",
+    message: `删除用户 ${user.username}？该用户的所有会话会结束。`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await users.remove(user.username);
     await loadUsers();
@@ -142,7 +156,13 @@ async function removeUser(user: User): Promise<void> {
 async function setupTotp(user: User): Promise<void> {
   try {
     if (user.totp) {
-      if (!window.confirm(`关闭 ${user.username} 的两步验证？`)) return;
+      const confirmed = await confirmDialog({
+        title: "关闭两步验证",
+        message: `关闭 ${user.username} 的两步验证？`,
+        confirmText: "关闭",
+        danger: true,
+      });
+      if (!confirmed) return;
       await users.disableTotp(user.username);
       await loadUsers();
       return;
@@ -200,7 +220,13 @@ async function createKey(): Promise<void> {
 }
 
 async function removeKey(key: ApiKeyRecord): Promise<void> {
-  if (!window.confirm(`删除 API Key「${key.name || key.id}」？`)) return;
+  const confirmed = await confirmDialog({
+    title: "删除 API Key",
+    message: `删除 API Key「${key.name || key.id}」？`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await keys.remove(key.id);
     await loadKeys();
@@ -210,7 +236,13 @@ async function removeKey(key: ApiKeyRecord): Promise<void> {
 }
 
 async function removeRecording(name: string): Promise<void> {
-  if (!window.confirm(`删除录制 ${name}？`)) return;
+  const confirmed = await confirmDialog({
+    title: "删除录制",
+    message: `删除录制 ${name}？`,
+    confirmText: "删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await recordings.remove(name);
     await loadRecordings();
