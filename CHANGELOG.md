@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-11-05
+
+0.2.1 的界面补丁：服务端配置中文化并对齐开关，修复会话结束遮罩按钮被
+xterm 画布拦截，以及新建会话被自动绑定到两个标签的问题。
+
+### 修复
+
+- **服务端配置可读性**：schema 为每个配置项返回中文标题和一句话说明，并返回
+  中文分组名；设置弹框显示中文标题、字段 key、说明和生效级别，开关与标题在
+  同一行，文本输入在说明下方，卡片间距统一。测试保证每个 `Settings` 字段都有
+  非空中文说明，新增配置项不能再以裸英文 key 出现在界面上。
+- **会话结束遮罩**：`pane-ghost` 建立独立层叠上下文，不再被 xterm 的
+  link-layer 画布盖住；“关闭分屏”和“连接其他会话”恢复可点击。
+- **自动绑定竞态**：只在首次会话列表加载完成后自动绑定空白分屏，不再在
+  “新建会话”的 refresh 窗口里把同一个会话绑进两个标签；删除会话后不会残留
+  另一个已结束标签。
+- **品牌区**：左上角改为 `WsCTL`，折叠按钮与标题垂直居中并提高对比度；
+  文档标题、PWA manifest、登录页和状态栏同步使用 `WsCTL`。
+
+### 测试
+
+- pytest **734 passed / 8 skipped**；slow **7 passed**。
+- Vitest **51 passed**。
+- Playwright **45 passed / 7 skipped**（Chromium / Firefox / WebKit / 移动端）。
+
 ## [0.2.1] - 2026-11-05
 
 0.2.0 的补丁版本：修复 v2 重同步崩溃导致的“连接失败 / 重开标签无效”，并把
