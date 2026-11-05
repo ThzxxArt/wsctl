@@ -10,7 +10,10 @@ const DB_NAME = "wsctl-workspace-v2";
 const STORE = "screens";
 //: Bumped when the meaning of ``lastSeq`` changed (snapshots no longer count
 //: their rendered payload as stream bytes). Old entries must not be resumed.
-const VERSION = 1;
+//: v2 also discards screens written by 0.2.0, whose snapshot chunks could be
+//: shed independently and leave a cursor that claims a half-painted screen is
+//: complete. Resuming one of those would faithfully restore the corruption.
+const VERSION = 2;
 //: A long-lived tab used to retain the full serialized screen of every session
 //: it had ever opened. Bound the in-memory tier; IndexedDB is purged on logout
 //: and on session removal.
@@ -32,10 +35,14 @@ function openDatabase(): Promise<IDBDatabase | null> {
   if (database !== null) return database;
   database = new Promise((resolve) => {
     const request = indexedDB.open(DB_NAME, VERSION);
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: "session" });
+      } else if (event.oldVersion < 2 && request.transaction) {
+        // Entries written by 0.2.0 may be gapped. A fresh snapshot is cheaper
+        // than trusting a resume cursor that encodes a broken screen.
+        request.transaction.objectStore(STORE).clear();
       }
     };
     request.onsuccess = () => {

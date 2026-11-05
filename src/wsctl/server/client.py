@@ -180,11 +180,34 @@ class WsClient:
 
         Returns ``False`` when nothing terminal-shaped is left to give up.
         """
+        if not self._binary:
+            return False
+
+        # A snapshot is one atomic repaint split into 1 MiB chunks. Dropping
+        # only a prefix leaves the client with an incomplete screen and -- if
+        # the tail still carries FLAG_LAST -- a resume cursor that claims it is
+        # whole. Give up the *entire remaining group* instead; the client then
+        # has no LAST, stays in "resyncing", and our gap control asks it to
+        # fetch a fresh snapshot.
+        _order, _item, _inside, anchor, flags = self._binary[0]
+        if anchor is not None and flags & FLAG_SNAPSHOT:
+            while self._binary:
+                _o, item, _ends, data_seq, frame_flags = self._binary[0]
+                if data_seq != anchor or not frame_flags & FLAG_SNAPSHOT:
+                    break
+                self._binary.popleft()
+                self._pending_bytes = max(0, self._pending_bytes - len(item))
+                self.dropped_bytes += len(item)
+                if self._lost_from is None:
+                    self._lost_from = anchor
+                self._lost_to = max(self._lost_to or 0, anchor + len(item))
+            return True
+
         while self._binary:
             _order, item, ends_inside, data_seq, frame_flags = self._binary.popleft()
             self._pending_bytes = max(0, self._pending_bytes - len(item))
             self.dropped_bytes += len(item)
-            if data_seq is not None and not frame_flags & (FLAG_DISPLAY | FLAG_SNAPSHOT):
+            if data_seq is not None and not frame_flags & FLAG_DISPLAY:
                 if self._lost_from is None:
                     self._lost_from = data_seq
                 self._lost_to = data_seq + len(item)
@@ -313,9 +336,65 @@ class WsClient:
         if seq > self.last_acked_seq:
             self.last_acked_seq = int(seq)
 
-    def put_data(
-        self, seq: int, payload: bytes, flags: int = 0, *, _chunk: bool = False
-    ) -> None:
+    def _record_drop(self, seq: int, size: int, *, announce: bool = True) -> None:
+        """Count a dropped frame; optionally tell the viewer what it lost.
+
+        A snapshot rejected *before* anything was queued is different from a
+        queued group later evicted under pressure: the caller falls back to a
+        raw replay, so a client-side "request another snapshot" here would
+        only create a repair loop.
+        """
+        self.dropped_bytes += size
+        self.dropped_events += 1
+        note_shed_frames()
+        if announce:
+            if self._lost_from is None:
+                self._lost_from = seq
+            self._lost_to = seq + size
+            self._announce_shed()
+
+    def _queue_snapshot(self, seq: int, payload: bytes, flags: int) -> None:
+        """Queue a snapshot as one atomic unit: all chunks or none.
+
+        A snapshot is a full-screen repaint. The client atomically adopts the
+        anchor only on ``FLAG_LAST``; a prefix followed by LAST (the old
+        per-chunk queueing let backpressure drop just the middle) painted a
+        half-screen and advanced the resume cursor as if it were whole. That
+        is the redraw corruption this method exists to prevent.
+        """
+        chunks = [
+            payload[offset : offset + MAX_DATA_FRAME]
+            for offset in range(0, len(payload), MAX_DATA_FRAME)
+        ]
+        total = len(payload)
+
+        # Make room before touching the queue. Shedding can drop a previous
+        # (now obsolete) snapshot group and old live frames.
+        self._shed_for(total)
+        fits_bytes = self._max_bytes <= 0 or self._pending_bytes + total <= self._max_bytes
+        fits_frames = self.queue_len + len(chunks) <= self._max_pending
+        if not fits_bytes or not fits_frames:
+            # Never enqueue a partial snapshot. The caller (attach/resync)
+            # sees dropped_events and falls back to a raw replay. Do not emit
+            # a gap: no snapshot bytes were sent, and asking the client to
+            # request another snapshot would fight the fallback.
+            self._record_drop(seq, total, announce=False)
+            return
+
+        self._pending_bytes += total
+        for index, chunk in enumerate(chunks):
+            chunk_flags = flags
+            if index == len(chunks) - 1:
+                chunk_flags |= FLAG_LAST
+            self._seq += 1
+            # Snapshots are display-only, not source-stream bytes: feeding
+            # them to the ANSI tracker would make a later live-frame cut
+            # depend on a repaint the stream never contained. The group is
+            # dropped atomically, so every chunk is a safe cut point.
+            self._binary.append((self._seq, chunk, False, int(seq), int(chunk_flags)))
+        self._wakeup.set()
+
+    def put_data(self, seq: int, payload: bytes, flags: int = 0) -> None:
         """Queue one sequenced terminal frame (protocol v2)."""
         if self._closed:
             raise ClientGone("连接已关闭")
@@ -326,37 +405,20 @@ class WsClient:
             # before every PTY read and rendered it as garbage.
             self.put(payload)
             return
-        if flags & FLAG_SNAPSHOT and not _chunk and len(payload) > MAX_DATA_FRAME:
-            # A large screen (up to 1000×1000) can serialize to more than one
-            # protocol frame. The writer would otherwise raise inside
-            # ``encode_data`` and drop the connection. Chunks keep the same
-            # snapshot anchor; only the final one is marked LAST so the client
-            # does not adopt the anchor while earlier chunks are still queued.
-            chunks = [
-                payload[offset : offset + MAX_DATA_FRAME]
-                for offset in range(0, len(payload), MAX_DATA_FRAME)
-            ]
-            for index, chunk in enumerate(chunks):
-                chunk_flags = flags
-                if index == len(chunks) - 1:
-                    chunk_flags |= FLAG_LAST
-                self.put_data(seq, chunk, chunk_flags, _chunk=True)
+        if flags & FLAG_SNAPSHOT:
+            self._queue_snapshot(seq, payload, flags)
             return
-        if flags & FLAG_SNAPSHOT and not _chunk:
-            # This is the only (or final) chunk; it completes the screen.
-            flags |= FLAG_LAST
         ends_inside = self._tracker.feed(payload)
         if self._max_bytes > 0 and len(payload) > self._max_bytes:
-            self.dropped_bytes += len(payload)
-            self.dropped_events += 1
-            note_shed_frames()
-            # Display-only and snapshot bytes are not resumable stream content:
-            # dropping them must not manufacture a "lost range" in the stream.
-            if not flags & (FLAG_DISPLAY | FLAG_SNAPSHOT):
-                if self._lost_from is None:
-                    self._lost_from = seq
-                self._lost_to = seq + len(payload)
-            self._announce_shed()
+            # Display-only bytes are not resumable stream content; dropping
+            # them must not manufacture a "lost range" in the stream.
+            if flags & FLAG_DISPLAY:
+                self.dropped_bytes += len(payload)
+                self.dropped_events += 1
+                note_shed_frames()
+                self._announce_shed()
+            else:
+                self._record_drop(seq, len(payload))
             return
         self._shed_for(len(payload))
         self._pending_bytes += len(payload)

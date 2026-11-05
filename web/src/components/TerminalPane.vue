@@ -175,6 +175,18 @@ function createTerminal(): Terminal {
   return instance;
 }
 
+function attachCanvasRenderer(): void {
+  if (!term) return;
+  try {
+    const canvas = new CanvasAddon();
+    term.loadAddon(canvas);
+    renderer = canvas;
+  } catch {
+    // xterm's built-in renderer remains; it is slower but never blank.
+    renderer = null;
+  }
+}
+
 function attachRenderer(): void {
   if (!term) return;
   renderer?.dispose();
@@ -184,7 +196,22 @@ function attachRenderer(): void {
   if (mode === "auto" || mode === "webgl") {
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
+      webgl.onContextLoss(() => {
+        // A lost GPU context leaves the canvas blank or stale. Dispose it,
+        // fall back immediately, and force a snapshot so the new renderer
+        // has a complete screen rather than repainting whatever was last
+        // uploaded.
+        if (renderer === webgl) renderer = null;
+        try {
+          webgl.dispose();
+        } catch {
+          /* already disposed */
+        }
+        if (!term) return;
+        attachCanvasRenderer();
+        term.refresh(0, term.rows - 1);
+        socket?.requestSnapshot();
+      });
       term.loadAddon(webgl);
       renderer = webgl;
       return;
@@ -194,50 +221,11 @@ function attachRenderer(): void {
       }
     }
   }
-  try {
-    const canvas = new CanvasAddon();
-    term.loadAddon(canvas);
-    renderer = canvas;
-  } catch {
-    /* DOM renderer remains */
-  }
+  attachCanvasRenderer();
 }
 
-function flushWrites(): void {
-  writeFrame = null;
-  if (writeTimer !== null) {
-    window.clearTimeout(writeTimer);
-    writeTimer = null;
-  }
-  if (!term || writeQueue.length === 0) return;
-  const queued = writeQueue;
-  writeQueue = [];
-  writeBytes = 0;
-  const total = queued.reduce((sum, item) => sum + item.payload.byteLength, 0);
-  const combined = new Uint8Array(total);
-  let offset = 0;
-  for (const item of queued) {
-    combined.set(item.payload, offset);
-    offset += item.payload.byteLength;
-  }
-  term.write(combined, () => {
-    for (const item of queued) item.ack();
-    if (followOutput.value) term?.scrollToBottom();
-  });
-}
-
-function enqueueWrite(payload: Uint8Array, ack: () => void): void {
-  writeQueue.push({ payload, ack });
-  writeBytes += payload.byteLength;
-  if (writeBytes >= WRITE_BATCH) {
-    if (writeFrame !== null) {
-      cancelAnimationFrame(writeFrame);
-      writeFrame = null;
-    }
-    flushWrites();
-    return;
-  }
-  if (writeFrame !== null || writeTimer !== null) return;
+function scheduleFlush(): void {
+  if (writeFrame !== null || writeTimer !== null || writeQueue.length === 0) return;
   // A background tab gets no animation frames. Holding the ACK until the tab
   // is visible again makes the server believe the viewer is slow: its queue
   // grows, frames are shed, and the tab returns to a gapped terminal. A short
@@ -251,6 +239,50 @@ function enqueueWrite(payload: Uint8Array, ack: () => void): void {
     return;
   }
   writeFrame = requestAnimationFrame(flushWrites);
+}
+
+function flushWrites(): void {
+  writeFrame = null;
+  if (writeTimer !== null) {
+    window.clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+  if (!term || writeQueue.length === 0) return;
+
+  // Parse at most one batch per frame. The old version joined the entire
+  // backlog (a burst could be several MiB) into one xterm.write, freezing the
+  // UI and delaying every ACK behind it. Bounding the input keeps scrolling
+  // responsive while the rest waits for the next frame.
+  const queued: Array<{ payload: Uint8Array; ack: () => void }> = [];
+  let total = 0;
+  while (writeQueue.length > 0) {
+    const next = writeQueue[0];
+    if (queued.length > 0 && total + next.payload.byteLength > WRITE_BATCH) break;
+    writeQueue.shift();
+    queued.push(next);
+    total += next.payload.byteLength;
+    if (total >= WRITE_BATCH) break;
+  }
+  if (total === 0) return;
+  writeBytes = Math.max(0, writeBytes - total);
+
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const item of queued) {
+    combined.set(item.payload, offset);
+    offset += item.payload.byteLength;
+  }
+  term.write(combined, () => {
+    for (const item of queued) item.ack();
+    if (followOutput.value) term?.scrollToBottom();
+    scheduleFlush();
+  });
+}
+
+function enqueueWrite(payload: Uint8Array, ack: () => void): void {
+  writeQueue.push({ payload, ack });
+  writeBytes += payload.byteLength;
+  scheduleFlush();
 }
 
 function scheduleCache(): void {
@@ -277,7 +309,10 @@ function scheduleCache(): void {
       serialized,
       updatedAt: Date.now(),
     });
-  }, 1200);
+    // Serializing 10k scrollback lines is synchronous main-thread work. Doing
+    // it 1.2s after every command produced a visible hitch; wait for a longer
+    // quiet period so interactive typing and TUIs are never competing with it.
+  }, 5_000);
 }
 
 function refreshSize(): void {
@@ -930,6 +965,7 @@ function contextAction(action: string): void {
   if (action === "copy") void copySelection();
   else if (action === "paste") void paste();
   else if (action === "clear") clearTerminal();
+  else if (action === "repaint") socket?.requestSnapshot();
   else if (action === "split") void split("row");
   else if (action === "search") toggleSearch();
 }

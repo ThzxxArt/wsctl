@@ -6,7 +6,7 @@ const emit = defineEmits<{ action: [action: string]; close: [] }>();
 
 const style = computed(() => ({
   left: `${Math.max(8, Math.min(props.x, window.innerWidth - 168))}px`,
-  top: `${Math.max(8, Math.min(props.y, window.innerHeight - 208))}px`,
+  top: `${Math.max(8, Math.min(props.y, window.innerHeight - 250))}px`,
 }));
 
 function onKeydown(event: KeyboardEvent): void {
@@ -23,6 +23,7 @@ const items = [
   { key: "copy", label: "复制" },
   { key: "paste", label: "粘贴" },
   { key: "clear", label: "清屏" },
+  { key: "repaint", label: "强制重绘" },
   { key: "split", label: "向右分屏" },
   { key: "search", label: "搜索" },
 ];

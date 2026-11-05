@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from wsctl.core.protocol import FLAG_LAST, FLAG_SNAPSHOT, MAX_DATA_FRAME
 from wsctl.server.client import WsClient
 
 
@@ -177,6 +178,52 @@ def test_a_dropped_frame_still_advances_the_sequence_tracker(tmp_path) -> None:
     assert ends_inside is False, (
         "the tracker was not advanced by the discarded frame: the state after "
         "PLAIN is being computed from a stream that never saw the sequence tail"
+    )
+
+
+def test_snapshot_is_queued_as_one_atomic_group() -> None:
+    payload = b"s" * (MAX_DATA_FRAME + 123)
+    client = WsClient(_StubWs(), max_bytes=len(payload) + 1024, protocol_version=2)
+    client.put_data(7, payload, FLAG_SNAPSHOT)
+
+    frames = list(client._binary)
+    assert len(frames) == 2
+    assert all(frame[4] & FLAG_SNAPSHOT for frame in frames)
+    assert not frames[0][4] & FLAG_LAST
+    assert frames[-1][4] & FLAG_LAST
+    assert client.pending_bytes == len(payload)
+    assert not any(frame[4] & FLAG_LAST for frame in frames[:-1])
+
+
+def test_snapshot_that_cannot_fit_is_dropped_whole_and_reported() -> None:
+    payload = b"s" * (MAX_DATA_FRAME + 1)
+    client = WsClient(_StubWs(), max_bytes=MAX_DATA_FRAME, protocol_version=2)
+    client.put_data(9, payload, FLAG_SNAPSHOT)
+
+    assert not list(client._binary), "a partial snapshot must never be queued"
+    assert client.dropped_bytes == len(payload)
+    assert client.dropped_events == 1
+    # The attach/resync caller sees dropped_events and falls back to raw
+    # replay; a gap here would ask the client to request another snapshot.
+    assert not any(message.get("type") == "gap" for message in client.queued_controls())
+
+
+def test_shedding_a_snapshot_drops_every_remaining_chunk() -> None:
+    """Never leave a prefix plus FLAG_LAST: that paints half a screen."""
+    client = WsClient(
+        _StubWs(), max_bytes=MAX_DATA_FRAME * 2, protocol_version=2
+    )
+    snapshot = b"s" * (MAX_DATA_FRAME + 100)
+    client.put_data(5, snapshot, FLAG_SNAPSHOT)
+
+    # The live frame pushes the queue over budget. The snapshot is the oldest
+    # group; losing only its first chunk would leave the second chunk (which
+    # carries LAST) looking complete to the client.
+    client.put_data(5 + len(snapshot), b"x" * MAX_DATA_FRAME)
+
+    assert all(not (frame[4] & FLAG_SNAPSHOT) for frame in client._binary)
+    assert any(
+        message.get("type") == "gap" for message in client.queued_controls()
     )
 
 
