@@ -170,9 +170,13 @@ class AnsiTracker:
         n = len(buf)
         while i < n:
             if self._state is None:
-                if buf[i] != ESC:
-                    i += 1
-                    continue
+                # Plain text dominates terminal traffic and the old byte loop
+                # spent a Python iteration on every character. ``bytes.find``
+                # jumps the whole run at C speed; only an actual ESC starts
+                # the state machine.
+                i = buf.find(b"\x1b", i)
+                if i < 0:
+                    return False
                 if i + 1 >= n:
                     self._state = "esc"
                     return True
