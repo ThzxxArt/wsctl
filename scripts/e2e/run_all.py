@@ -127,6 +127,14 @@ def spawn(port: int, data: Path, *, extra_env: dict[str, str] | None = None,
           reuse_port: bool = False) -> subprocess.Popen[bytes]:
     extra = dict(extra_env or {})
     extra["WSCTL_DATA_DIR"] = str(data)
+    # Isolate the config directory too. ``WSCTL_DATA_DIR`` alone still let the
+    # child read the developer's ``~/.config/wsctl/config.toml``; a local
+    # ``trust_proxy=true`` then honoured the forged X-Forwarded-For below and
+    # the security scenario failed for a reason that had nothing to do with the
+    # code under test.
+    config_home = data / "config-home"
+    config_home.mkdir(parents=True, exist_ok=True)
+    extra.setdefault("XDG_CONFIG_HOME", str(config_home))
     env = _clean_env(extra)
     cmd = [PY, "-m", "wsctl", "serve", "--port", str(port), "--host", "127.0.0.1",
            "--admin-password", PASSWORD, "--log-level", "warning"]

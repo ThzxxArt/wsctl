@@ -38,7 +38,9 @@ CLOSE_SLOW_CONSUMER = 4410
 CLOSE_PROTOCOL_VERSION = 4426
 #: A snapshot was requested but the session's provider cannot produce one.
 CLOSE_SNAPSHOT_UNAVAILABLE = 4427
-#: The server failed while serving this connection.
+#: The server failed while serving this connection. Recoverable: the failure
+#: may be transient (a restart, a bug triggered by one frame), and reconnecting
+#: with backoff is the only way a tab can heal without a full logout.
 CLOSE_SERVER_ERROR = 4500
 
 ALL_CLOSE_CODES: tuple[int, ...] = (
@@ -69,6 +71,5 @@ FATAL_CLOSE_CODES = frozenset(
         CLOSE_LIMIT,
         CLOSE_RATE_LIMITED,
         CLOSE_PROTOCOL_VERSION,
-        CLOSE_SERVER_ERROR,
     }
 )

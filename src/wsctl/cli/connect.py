@@ -57,8 +57,9 @@ def run_connect(
 ) -> int:
     """Bridge the local terminal to a remote session; return a process exit code.
 
-    A fatal close (revoked login, forbidden, missing session, server error) is
-    a *failure* and must say so through the exit status. Returning normally
+    A fatal close (revoked login, forbidden, missing session, rate limit) is
+    a *failure* and must say so through the exit status. A 4500 server error is
+    retried with backoff, the same as the browser. Returning normally
     made ``wsctl session attach … && echo ok`` print "ok" after an
     authentication failure -- a script could not tell success from "the
     server threw me out".

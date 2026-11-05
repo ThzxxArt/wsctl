@@ -191,8 +191,16 @@ class SessionActor:
         self._stop_task = asyncio.get_running_loop().create_task(run_stop())
         await asyncio.shield(self._stop_task)
 
-    async def resync(self, client: Any, *, requested: bool = True) -> dict[str, Any]:
-        return dict(await self._call("resync", client, requested=requested))
+    async def resync(
+        self,
+        client: Any,
+        *,
+        requested: bool = True,
+        last_seq: int | None = None,
+    ) -> dict[str, Any]:
+        return dict(
+            await self._call("resync", client, requested=requested, last_seq=last_seq)
+        )
 
     async def start_recording(self, path: Any, *, record_input: bool = False) -> Any:
         return await self._call("start_recording", path, record_input=record_input)

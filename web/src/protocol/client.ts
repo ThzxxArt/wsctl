@@ -34,7 +34,7 @@ export interface TerminalOptions {
   onAck?: (seq: number) => void;
 }
 
-const FATAL_CODES = new Set([4400, 4401, 4403, 4404, 4409, 4426, 4429, 4500]);
+const FATAL_CODES = new Set([4400, 4401, 4403, 4404, 4409, 4426, 4429]);
 const INITIAL_DELAY = 500;
 const MAX_DELAY = 30_000;
 const PING_INTERVAL = 25_000;

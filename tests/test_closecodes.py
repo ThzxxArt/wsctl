@@ -64,6 +64,9 @@ def test_every_code_is_classified() -> None:
         closecodes.CLOSE_OVERLOAD,
         # no snapshot available: the client falls back to a raw replay
         closecodes.CLOSE_SNAPSHOT_UNAVAILABLE,
+        # an unexpected server failure, possibly transient: retry with backoff
+        # instead of leaving the tab permanently dead until logout
+        closecodes.CLOSE_SERVER_ERROR,
     }
     assert set(closecodes.ALL_CLOSE_CODES) == (
         set(closecodes.FATAL_CLOSE_CODES) | recoverable

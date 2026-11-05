@@ -454,6 +454,42 @@ def test_exact_resume_replays_without_clearing_the_screen(tmp_path: Path) -> Non
             assert all(frame.flags & FLAG_SNAPSHOT == 0 for frame in frames)
 
 
+def test_v2_resync_accepts_last_seq_without_dropping_the_connection(
+    tmp_path: Path,
+) -> None:
+    """A v2 resync must reach ``SessionActor.resync`` with ``last_seq``.
+
+    The actor used to expose ``resync(client, requested=...)`` while the v2
+    pump always passed ``last_seq=...``. Every manual resync or gap repair
+    therefore raised ``TypeError`` inside the endpoint, closed the socket with
+    4500, and left the browser unable to recover until a fresh login cleared
+    its cached screen.
+    """
+    app = build_app(tmp_path)
+    with TestClient(app) as client:
+        login(client)
+        with client.websocket_connect("/ws/v2", subprotocols=[SUBPROTOCOL]) as ws:
+            ws.send_text(encode_control({"type": "attach", "cols": 80, "rows": 24}))
+            recv_control(ws, "attached")
+            ws.send_bytes(encode_input(b"printf 'REPAIR-MARKER\\n'\r"))
+            _output, _seq, end_seq = recv_output(ws, b"REPAIR-MARKER")
+            ws.send_text(encode_control({"type": "ack", "seq": end_seq}))
+
+            for request in ("resync", "snapshot-request"):
+                ws.send_text(
+                    encode_control({"type": request, "last_seq": end_seq})
+                )
+                begin = recv_control(ws, "resync-begin")
+                assert begin["seq"] >= end_seq
+                done = recv_control(ws, "resynced")
+                assert done["seq"] >= end_seq
+                assert done["incomplete"] is False
+
+            # The socket must still be usable after both repairs.
+            ws.send_text(encode_control({"type": "ping", "nonce": 7}))
+            assert recv_control(ws, "pong")["nonce"] == 7
+
+
 def test_legacy_websocket_enforces_api_key_scopes(tmp_path: Path) -> None:
     app = build_app(tmp_path)
     with TestClient(app) as client:
