@@ -125,8 +125,16 @@ def test_v2_snapshot_is_used_when_the_ring_has_evicted_the_head(tmp_path: Path) 
             attached = recv_control(ws, "attached")
             session_id = attached["session"]
             generation = attached["generation"]
-            ws.send_bytes(encode_input(b"printf '0123456789%.0s' $(seq 1 40)\r"))
-            recv_output(ws, b"0123456789")
+            # Wait for a marker at the *end* of the output: matching the first
+            # digits only proves the head arrived, while last_seq=0 is still
+            # resumable if the ring has not evicted it yet. The echoed command
+            # contains ``TAIL-%s``, so only the command's own output matches.
+            ws.send_bytes(
+                encode_input(
+                    b"printf '0123456789%.0s' $(seq 1 40); printf 'TAIL-%s\\n' MARKER\r"
+                )
+            )
+            recv_output(ws, b"TAIL-MARKER")
 
         with client.websocket_connect("/ws/v2") as ws:
             ws.send_text(
