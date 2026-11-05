@@ -76,7 +76,7 @@ jobs:
           pip install cyclonedx-bom
           cyclonedx-py environment -o dist/wsctl-${{ github.ref_name }}-sbom.json
       - name: Sign artifacts
-        uses: sigstore/gh-action-sigstore-python@v3
+        uses: sigstore/gh-action-sigstore-python@v3.5.0
         with:
           inputs: |
             ./dist/*.whl
