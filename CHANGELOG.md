@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-11-06
+
+0.2.2 的补丁：修复瞬间退出会话被误报为“服务退出或实例崩溃”的历史行竞态，
+并把 README / SVG banner 的版本展示收口到 0.2.x 家族。
+
+### 修复
+
+- **历史行终态竞态**：命令瞬间退出时，finalizer 可能先于创建接口的 INSERT
+  写入终态，随后创建接口又以 `running` 覆盖，维护扫描便把它误判成崩溃并丢掉
+  退出码。`term_session_upsert` 现在保留已有终态；`term_session_set_status`
+  返回行数，行尚不存在时 finalizer 补写完整终态与退出码。
+- **README 版本展示**：PyPI 徽章继续使用 shields.io 动态读取；截图说明、亮点
+  标题和平台边界改为 `0.2.x`，具体迁移/ROADMAP/benchmark 文档链接保持 0.2.0。
+- **SVG banner**：静态 SVG 不再固定补丁号，改为 `0.2.x stable`，品牌统一为
+  `WsCTL`；新增文档契约测试，防止以后再次把 banner 写死到某个补丁版本。
+
+### 测试
+
+- pytest **737 passed / 8 skipped**；slow **7 passed**。
+- Vitest **51 passed**。
+- Playwright **45 passed / 7 skipped**。
+
 ## [0.2.2] - 2026-11-05
 
 0.2.1 的界面补丁：服务端配置中文化并对齐开关，修复会话结束遮罩按钮被
