@@ -492,7 +492,7 @@ def doctor(
 
     reuse_ok = hasattr(socket, "SO_REUSEPORT")
     add(
-        "SO_REUSEPORT（零停机重启）",
+        "SO_REUSEPORT（端口不拒连的滚动重启）",
         "支持" if reuse_ok else "不支持",
         ok if reuse_ok else warn,
     )
@@ -1111,7 +1111,7 @@ def serve(
     ] = None,
     reuse_port: Annotated[
         bool,
-        typer.Option("--reuse-port", help="以 SO_REUSEPORT 绑定，实现零停机重启。"),
+        typer.Option("--reuse-port", help="以 SO_REUSEPORT 绑定，滚动重启时端口不拒连。"),
     ] = False,
     daemon: Annotated[
         bool, typer.Option("--daemon", help="后台运行（等价于 wsctl start）。")
@@ -1214,7 +1214,7 @@ def start(
         bool,
         typer.Option(
             "--reuse-port",
-            help="以 SO_REUSEPORT 绑定：此后 `restart --rolling` 可零停机。",
+            help="以 SO_REUSEPORT 绑定：此后 `restart --rolling` 端口不拒连。",
         ),
     ] = False,
 ) -> None:
@@ -1335,7 +1335,7 @@ def restart(
         bool,
         typer.Option(
             "--rolling",
-            help="零停机滚动重启：新实例先接管端口，健康检查通过后再停旧实例。",
+            help="端口不拒连的滚动重启：新实例先接管，健康检查通过后再停旧实例。",
         ),
     ] = False,
     drop_my_connection: Annotated[
@@ -1348,9 +1348,11 @@ def restart(
 ) -> None:
     """重启后台运行的 wsctl。
 
-    ``--rolling`` 先起后停，**不切断任何连接**，可以在 wsctl 自己的终端里安全执行
-    （这也是升级 `pipx upgrade wsctl` 之后推荐的重启方式）。默认的 ``stop`` 再
-    ``start`` 会有停机窗口，且在自家终端里执行等于锯断自己坐的树枝。
+    ``--rolling`` 先起后停，**端口不出现拒绝连接的空窗**，可以在 wsctl 自己的
+    终端里安全执行（这也是升级 `pipx upgrade wsctl` 之后推荐的重启方式）。
+    tmux 后端的会话可以继续存活；本地 PTY、SSH 会话和 WebSocket 连接仍会随
+    旧进程结束并需要重连。默认的 ``stop`` 再 ``start`` 会有停机窗口，且在自家
+    终端里执行等于锯断自己坐的树枝。
     """
     options = vmod.Options(
         {

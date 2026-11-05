@@ -21,7 +21,9 @@
   <a href="#快速开始">🚀 快速开始</a> ·
   <a href="#界面">🖼️ 界面</a> ·
   <a href="#配置">⚙️ 配置</a> ·
+  <a href="#cli">⌨️ CLI</a> ·
   <a href="#部署">📦 部署</a> ·
+  <a href="#完整卸载">🧹 卸载</a> ·
   <a href="#文档">📚 文档</a>
 </p>
 
@@ -68,7 +70,7 @@
 - **后端**：本地 PTY、tmux（跨重启恢复）、SSH（跳板）；`ssh -o` 选项有本地命令执行白名单。
 - **运维**：`wsctl start/stop/status/logs/restart/reload` 内置后台生命周期；
   systemd、Docker、nginx 反向代理示例随仓库提供；`restart --rolling` 配合
-  `--reuse-port` 可零停机切换。
+  `--reuse-port` 可做到端口不拒连的滚动切换（tmux 会话存活；本地/SSH 会话仍会结束）。
 - **可观测**：`/healthz`、`/readyz`、Prometheus `/metrics`、JSON 日志、请求 ID、
   可选 OpenTelemetry；维护循环与事件循环延迟都进入指标。
 
@@ -123,7 +125,8 @@ pipx install wsctl
 WSCTL_ADMIN_PASSWORD='换成你的强密码' wsctl start --reuse-port
 ```
 
-`--reuse-port` 让之后的 `wsctl restart --rolling` 可以零停机。首次运行会在
+`--reuse-port` 让之后的 `wsctl restart --rolling` 不再出现端口拒连窗口；tmux
+会话可以存活，本地/SSH 会话仍会随旧进程结束。首次运行会在
 `~/.local/share/wsctl/` 建库、创建 `admin`；不传密码环境变量时会生成随机密码，
 用 `wsctl logs` 查看。
 
@@ -268,11 +271,14 @@ Web 管理面的“配置”页签按**立即生效 / 仅新会话 / 需重启**
 
 ## CLI
 
+> 每个命令的完整选项、环境变量、组合工作流与故障恢复见
+> **[CLI 完整教程](docs/CLI.md)**。下面是速查表。
+
 | 命令 | 用途 |
 | :--- | :--- |
 | `wsctl serve` | 前台启动；`--daemon` 转后台 |
 | `wsctl start / stop / status / logs / restart / reload` | 内置后台生命周期，无需 systemd |
-| `wsctl restart --rolling` | 零停机滚动重启（首次启动需 `--reuse-port`） |
+| `wsctl restart --rolling` | 端口不拒连的滚动重启（首次启动需 `--reuse-port`；tmux 会话可活，本地/SSH 会话会结束） |
 | `wsctl doctor` | 环境、配置、依赖与实例自检 |
 | `wsctl connect [URL] [-s ID]` | 把当前终端接入远程会话，断线自动重连 |
 | `wsctl session list / new / rename / attach / kill` | 会话管理 |
@@ -369,6 +375,198 @@ wsctl serve --tls-self-signed
 浏览器只在安全上下文（HTTPS 或 localhost）提供剪贴板与系统通知。自签证书适合内网；
 公网请用正式证书或反向代理终止 TLS。
 
+## 完整卸载
+
+> **先备份，再删除。** `wsctl backup` 生成的 tar.gz 是恢复历史、录制和分享配置的
+> 唯一完整副本；`rm -rf` 之后无法找回。
+
+```bash
+# 删除前先确认路径（不要凭记忆猜）
+wsctl config get config_path
+wsctl config get data_dir
+```
+
+默认路径通常是：
+
+| 内容 | 默认位置 |
+| :--- | :--- |
+| 配置、凭据、Shell Integration | `~/.config/wsctl/` |
+| 数据库、录制、run 日志、自签证书 | `~/.local/share/wsctl/` |
+| systemd 数据目录（示例） | `/var/lib/wsctl/` |
+| systemd 日志（若配置） | `/var/log/wsctl/` |
+| Docker 数据 / 工作区 | `/data`、`/workspace` |
+
+如果设置了 `XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`WSCTL_CONFIG` 或
+`WSCTL_DATA_DIR`，以 `wsctl config get` 的输出为准。
+
+### 1. 停止服务
+
+**内置后台实例**：
+
+```bash
+wsctl stop
+# 如果提示“不能自断后路”，并且你确认要停止：
+wsctl stop --i-know-this-drops-my-connection
+```
+
+**systemd**：
+
+```bash
+sudo systemctl disable --now wsctl
+sudo rm -f /etc/systemd/system/wsctl.service
+sudo systemctl daemon-reload
+
+# 如果装的是用户级 unit：
+systemctl --user disable --now wsctl 2>/dev/null || true
+rm -f ~/.config/systemd/user/wsctl.service
+systemctl --user daemon-reload 2>/dev/null || true
+```
+
+**Docker Compose**：
+
+```bash
+cd contrib/docker
+# compose 文件要求该变量存在，down 也需提供（值不会用于已有容器）
+WSCTL_ADMIN_PASSWORD=unused docker compose down
+# 同时删除 compose 创建的命名卷（如果有）：
+WSCTL_ADMIN_PASSWORD=unused docker compose down -v
+docker rm -f wsctl 2>/dev/null || true
+docker rmi wsctl:latest 2>/dev/null || true
+```
+
+如果使用 bind mount（本仓库示例的 `./data`、`./workspace`），`down -v` 不会
+删除宿主机目录，需要手动删除（见第 3、4 步）。
+
+### 2. 卸载程序
+
+按你当初的安装方式选一条：
+
+```bash
+# pipx
+pipx uninstall wsctl
+
+# uv tool
+uv tool uninstall wsctl
+
+# 普通 venv / 系统 pip
+python3 -m pip uninstall wsctl
+# 或直接删除专用 venv：
+rm -rf /opt/wsctl/venv
+
+# 源码安装
+cd /path/to/wsctl
+python3 -m pip uninstall wsctl
+cd ..
+rm -rf /path/to/wsctl
+```
+
+确认命令已经消失：
+
+```bash
+command -v wsctl || echo "wsctl 已从 PATH 移除"
+```
+
+### 3. 删除配置与凭据
+
+```bash
+rm -rf ~/.config/wsctl
+```
+
+这会删除：
+
+- `config.toml`
+- `credentials.json`（`wsctl login` 缓存的 token）
+- `shell-integration/`
+- `config.toml.v1.bak` 等迁移备份
+
+如果你设置了自定义路径，先确认再删；不要直接删除配置文件的整个父目录，那里
+可能有其他程序的文件：
+
+```bash
+CONFIG_PATH=$(wsctl config get config_path)
+rm -f "$CONFIG_PATH"
+rm -f "$(dirname "$CONFIG_PATH")/credentials.json"
+rm -rf "$(dirname "$CONFIG_PATH")/shell-integration"
+```
+
+### 4. 删除数据
+
+```bash
+rm -rf ~/.local/share/wsctl
+```
+
+这会删除 SQLite 数据库、WAL/SHM、录制、`run/` 日志与 PID、自签 TLS 证书，
+以及恢复时产生的 `.bak` 文件。**删除前务必确认已经备份。**
+
+自定义数据目录：
+
+```bash
+wsctl config get data_dir
+# 例如输出 /srv/wsctl-data，则：
+sudo rm -rf /srv/wsctl-data
+```
+
+systemd 部署通常还要清理：
+
+```bash
+sudo rm -rf /var/lib/wsctl /var/log/wsctl
+```
+
+Docker 部署清理宿主机挂载目录：
+
+```bash
+rm -rf ./data ./workspace
+```
+
+### 5. 清理 Shell 集成与补全
+
+如果安装过 `wsctl shell-integration install --write-rc`，从对应 rc 文件删除
+`# wsctl shell integration` 及其后的 `source` 行：
+
+```bash
+grep -n "wsctl shell integration" ~/.bashrc ~/.zshrc \
+  ~/.config/fish/config.fish 2>/dev/null
+```
+
+然后删除集成脚本：
+
+```bash
+rm -rf ~/.config/wsctl/shell-integration
+```
+
+补全脚本由 `wsctl completion install` 写入；删除 rc 中与 `_WSCTL_COMPLETE`
+相关的行，并删除该命令输出中提示的补全文件即可：
+
+```bash
+grep -n "_WSCTL_COMPLETE" ~/.bashrc ~/.zshrc 2>/dev/null
+```
+
+### 6. 确认已清理
+
+```bash
+command -v wsctl
+ls ~/.config/wsctl ~/.local/share/wsctl 2>/dev/null
+systemctl status wsctl 2>/dev/null
+docker ps -a | grep wsctl || true
+```
+
+### 7. 保留数据迁移到新机器
+
+如果只是想换机器而不是彻底删除：
+
+```bash
+# 旧机器
+wsctl backup /tmp/wsctl-move.tar.gz --include-config
+
+# 新机器：安装后恢复
+wsctl restore /tmp/wsctl-move.tar.gz --with-config
+wsctl doctor
+wsctl start --reuse-port
+```
+
+完整的命令组合、选项解释与故障恢复见
+[CLI 完整教程](docs/CLI.md)。
+
 ## 安全
 
 Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对待它：
@@ -437,6 +635,7 @@ python scripts/e2e/run_all.py
 
 | 文档 | 内容 |
 | :--- | :--- |
+| [CLI 完整教程](https://github.com/ThzxxArt/wsctl/blob/main/docs/CLI.md) | 全部命令、选项、组合工作流、环境变量与故障恢复 |
 | [ROADMAP-0.2.0](https://github.com/ThzxxArt/wsctl/blob/main/docs/ROADMAP-0.2.0.md) | 0.2.0 范围、实施结果、审查修复与明确边界 |
 | [MIGRATION-0.2.0](https://github.com/ThzxxArt/wsctl/blob/main/docs/MIGRATION-0.2.0.md) | 0.1.x → 0.2.0 备份、配置、数据库与回退 |
 | [DESIGN](https://github.com/ThzxxArt/wsctl/blob/main/DESIGN.md) | 产品边界、架构与关键取舍 |
