@@ -1,11 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import {
-  confirmDialog,
-  dialogState,
-  promptDialog,
-  resetDialogs,
-  resolveDialog,
-} from "@/dialogs";
+import { confirmDialog, dialogState, promptDialog, resetDialogs, resolveDialog } from "@/dialogs";
 
 function drain(): void {
   while (dialogState().current) resolveDialog(null);
