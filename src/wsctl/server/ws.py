@@ -75,6 +75,11 @@ ACCESS_RECHECK = 5.0
 #: normal case"; a stuck finalizer must not hold the socket forever.
 EXIT_DRAIN_TIMEOUT = 6.0
 
+#: A detach only pops a viewer from the session's client map. If the actor is
+#: already terminating, waiting forever would keep the socket open and the
+#: browser would never learn that the connection is gone.
+DETACH_TIMEOUT = 2.0
+
 #: Largest single input frame accepted from a client. The PTY write buffer has
 #: its own hard cap, but that check runs on what is *already buffered* -- one
 #: 16 MiB frame sailed past a 1 MiB "limit" whenever the buffer happened to be
@@ -456,7 +461,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     finally:
         if session is not None:
             with contextlib.suppress(Exception):
-                await session.detach(client)
+                await asyncio.wait_for(session.detach(client), timeout=DETACH_TIMEOUT)
             audit.enqueue(
                 "session_detach", user_id=user_id, term_session_id=session.id, ip=ip
             )

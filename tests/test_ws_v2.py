@@ -86,7 +86,11 @@ def test_v2_attach_streams_sequenced_frames_and_resumes(tmp_path: Path) -> None:
             session_id = attached["session"]
             generation = attached["generation"]
             assert attached["writable"] is True
-            ws.send_bytes(encode_input(b"printf 'FIRST-MARKER\\n'\r"))
+            # Build the marker in the shell instead of spelling it in the
+            # command: the PTY echoes the command back, so a literal marker
+            # would satisfy ``recv_output`` before the command's own output
+            # existed, and ``end_seq`` would point at a half-delivered frame.
+            ws.send_bytes(encode_input(b"printf 'FIRST-%s\\n' MARKER\r"))
             _output, _seq, end_seq = recv_output(ws, b"FIRST-MARKER")
             ws.send_text(encode_control({"type": "ack", "seq": end_seq}))
 
@@ -106,7 +110,7 @@ def test_v2_attach_streams_sequenced_frames_and_resumes(tmp_path: Path) -> None:
             attached = recv_control(ws, "attached")
             assert attached["snapshot_required"] is False
             assert attached["seq"] >= end_seq
-            ws.send_bytes(encode_input(b"printf 'SECOND-MARKER\\n'\r"))
+            ws.send_bytes(encode_input(b"printf 'SECOND-%s\\n' MARKER\r"))
             output, seq, _ = recv_output(ws, b"SECOND-MARKER")
             assert b"FIRST-MARKER" not in output
             assert seq >= end_seq

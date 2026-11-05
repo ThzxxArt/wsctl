@@ -74,7 +74,31 @@ class SessionActor:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         await self._mailbox.put((op, args, kwargs, future))
+        # ``stop`` can run between the check above and this point (the queue
+        # was full, or the worker had not marked itself closed yet). In that
+        # window the item is already queued, so raising here would leak the
+        # future; ``_run`` drains the mailbox on stop, and this check covers
+        # the case where the drain already happened.
+        if self._closed and not future.done():
+            future.cancel()
+            raise RuntimeError("session actor is closed")
         return await future
+
+    def _fail_pending(self) -> None:
+        """Fail everything still queued after ``stop``.
+
+        A detach can be enqueued while ``stop`` is still waiting for the PTY
+        read loop. The worker then exits on the stop command; without this
+        drain its final ``detach`` future would never resolve and the WebSocket
+        endpoint would wait forever before it could send a close frame.
+        """
+        while True:
+            try:
+                _op, _args, _kwargs, future = self._mailbox.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if not future.done():
+                future.set_exception(RuntimeError("session actor is closed"))
 
     async def _run(self) -> None:
         while True:
@@ -95,6 +119,7 @@ class SessionActor:
                     future.set_result(result)
             if op == "stop":
                 self._closed = True
+                self._fail_pending()
                 return
 
     async def _dispatch(self, op: str, *args: Any, **kwargs: Any) -> Any:

@@ -79,6 +79,7 @@ from .ws import (
     ACCESS_RECHECK,
     CONTROL_BURST,
     CONTROL_RATE,
+    DETACH_TIMEOUT,
     EXIT_DRAIN_TIMEOUT,
     HANDSHAKE_TIMEOUT,
     IDLE_TIMEOUT,
@@ -240,7 +241,7 @@ async def terminal_endpoint_v2(websocket: WebSocket) -> None:
     finally:
         if session is not None:
             with contextlib.suppress(Exception):
-                await session.detach(client)
+                await asyncio.wait_for(session.detach(client), timeout=DETACH_TIMEOUT)
             audit.enqueue(
                 "session_detach", user_id=user_id, term_session_id=session.id, ip=ip
             )
