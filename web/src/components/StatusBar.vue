@@ -4,6 +4,9 @@ import { useWorkspaceStore, findLeaf } from "@/stores/workspace";
 import { useSessionsStore } from "@/stores/sessions";
 import { useTerminalStore } from "@/stores/terminal";
 import { usePrefsStore } from "@/stores/prefs";
+import pkg from "../../package.json";
+
+const version = pkg.version;
 
 const workspace = useWorkspaceStore();
 const sessions = useSessionsStore();
@@ -55,7 +58,7 @@ const stateLabel = computed(() => {
     <div class="right">
       <span>{{ sessions.live.length }} 会话</span>
       <span class="sep">{{ prefs.prefs.fontSize }}px</span>
-      <span class="sep">wsctl 0.2.0</span>
+      <span class="sep">wsctl {{ version }}</span>
     </div>
   </footer>
 </template>

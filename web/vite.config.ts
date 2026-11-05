@@ -55,7 +55,9 @@ export default defineConfig({
   build: {
     outDir: process.env.WSCTL_WEB_OUTDIR || "../src/wsctl/static",
     emptyOutDir: true,
-    sourcemap: true,
+    // Source maps expose the whole frontend and added ~7.6 MiB to the wheel.
+    // Keep them for an explicit debugging build, not for release artifacts.
+    sourcemap: process.env.WSCTL_WEB_SOURCEMAP === "1",
     target: "es2022",
     rollupOptions: {
       output: {

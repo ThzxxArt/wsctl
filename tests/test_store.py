@@ -29,6 +29,30 @@ def test_user_lifecycle(tmp_path: Path) -> None:
         store.close()
 
 
+def test_external_account_change_invalidates_the_auth_cache(tmp_path: Path) -> None:
+    """A CLI password/disable write must land inside the 30s cache TTL.
+
+    ``PRAGMA data_version`` changes when another connection commits; the cache
+    uses it as a cheap cross-process invalidation signal.
+    """
+    from wsctl.core.authcache import AuthCache
+
+    first = make_store(tmp_path)
+    second = make_store(tmp_path)
+    try:
+        user = first.user_create("carol", "oldpass123")
+        token = first.create_auth_session(user.id, ttl=3600)
+        first._auth_cache = AuthCache(ttl=30.0)
+        assert first.resolve_auth_session(token) is not None
+
+        second.user_set_password("carol", "newpass123")
+        second.delete_user_sessions(user.id)
+        assert first.resolve_auth_session(token) is None
+    finally:
+        first.close()
+        second.close()
+
+
 def test_authenticate(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     try:

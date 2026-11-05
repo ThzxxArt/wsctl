@@ -29,7 +29,13 @@ from sse_starlette.sse import EventSourceResponse
 from wsctl.core import config_v2
 from wsctl.core.database import Database
 from wsctl.core.store import User, hash_token
-from wsctl.server.deps import current_user, owned_session, require_admin
+from wsctl.server.deps import (
+    current_user,
+    owned_session,
+    require_admin,
+    resolve_token_user,
+    token_source,
+)
 from wsctl.server.security import client_ip
 from wsctl.server.services.events import format_sse
 from wsctl.server.services.shares import SCOPES, ShareService
@@ -184,6 +190,16 @@ async def revoke_share(
     if user.role != "admin" and owner_id != user.id:
         raise HTTPException(status_code=403, detail="无权访问该分享")
     revoked = await asyncio.to_thread(service.revoke, share_id)
+    # A 0.1.x token was also copied into the legacy column/table by migration.
+    # Revoking the v2 row must not leave that older authority alive.
+    session = request.app.state.manager.get(record.term_session_id)
+    if session is not None:
+        session.revoke_share()
+    await asyncio.to_thread(
+        request.app.state.store.term_session_set_share,
+        record.term_session_id,
+        token=None,
+    )
     request.app.state.audit.enqueue(
         "share_revoke",
         user_id=user.id,
@@ -376,11 +392,31 @@ async def events_endpoint(
 ) -> EventSourceResponse:
     broker = request.app.state.events
     queue = await broker.subscribe()
+    settings = request.app.state.settings
+    token, source = token_source(request)
+    current = user
+    last_check = time.monotonic()
 
     async def generator() -> AsyncIterator[str]:
+        nonlocal current, last_check
         try:
             async for message in broker.stream(queue):
-                if _event_visible(message, user):
+                # An SSE subscription is long-lived; the role/disabled state at
+                # connect time is not a permission for the next hour. Re-resolve
+                # periodically and stop as soon as the session is gone.
+                now = time.monotonic()
+                if settings.auth_required and now - last_check >= 5.0:
+                    last_check = now
+                    fresh = await asyncio.to_thread(
+                        resolve_token_user,
+                        request,
+                        token,
+                        allow_api_key=(source == "bearer"),
+                    )
+                    if fresh is None:
+                        return
+                    current = fresh
+                if _event_visible(message, current):
                     yield format_sse(message)
         finally:
             await broker.unsubscribe(queue)

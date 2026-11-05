@@ -14,7 +14,7 @@ import type { IDisposable, ITerminalAddon } from "@xterm/xterm";
 import { useWorkspaceStore, leavesOf, type LeafNode } from "@/stores/workspace";
 import { useSessionsStore } from "@/stores/sessions";
 import { useTerminalStore } from "@/stores/terminal";
-import { usePrefsStore } from "@/stores/prefs";
+import { terminalFontFamily, usePrefsStore } from "@/stores/prefs";
 import { useUiStore } from "@/stores/ui";
 import { usePresenceStore } from "@/stores/presence";
 import PaneContextMenu from "./PaneContextMenu.vue";
@@ -24,7 +24,15 @@ import { sessions as sessionsApi } from "@/api";
 import type { CommandBlock } from "@/api/types";
 import { useI18n } from "vue-i18n";
 
-const props = defineProps<{ pane: LeafNode; tabId: string; focused: boolean }>();
+const props = defineProps<{
+  pane: LeafNode;
+  tabId: string;
+  focused: boolean;
+  shareOnly?: boolean;
+}>();
+const writable = ref(true);
+const shareMode = computed(() => Boolean(props.shareOnly || props.pane.share));
+let connectEpoch = 0;
 const workspace = useWorkspaceStore();
 const sessions = useSessionsStore();
 const terminalStore = useTerminalStore();
@@ -36,6 +44,7 @@ const { t } = useI18n();
 const termHost = ref<HTMLDivElement | null>(null);
 const searchOpen = ref(false);
 const searchText = ref("");
+const searchInput = ref<HTMLInputElement | null>(null);
 const commandsOpen = ref(false);
 const pickerOpen = ref(false);
 const showMobileKeys = ref(false);
@@ -130,7 +139,7 @@ function createTerminal(): Terminal {
     cursorBlink: prefs.prefs.cursorBlink,
     fontSize: prefs.prefs.fontSize,
     lineHeight: 1.2,
-    fontFamily: prefs.prefs.fontFamily || undefined,
+    fontFamily: terminalFontFamily(prefs.prefs.fontFamily),
     scrollback: prefs.prefs.scrollback,
     allowProposedApi: true,
     theme: prefs.terminalTheme,
@@ -255,7 +264,12 @@ function scheduleCache(): void {
   cacheTimer = window.setTimeout(() => {
     if (!serializeAddon || !sessionId.value || !socket?.generation) return;
     if (desyncFrom.value !== null || socket.awaitingSnapshot) return;
-    const serialized = serializeAddon.serialize({ scrollback: 2000 });
+    // Keep the user's configured scrollback in the persisted screen. A hard
+    // 2000-line cap silently discarded history every time a tab was switched
+    // (inactive tabs unmount).
+    const serialized = serializeAddon.serialize({
+      scrollback: Math.max(2000, prefs.prefs.scrollback),
+    });
     void writeScreen({
       session: sessionId.value,
       generation: socket.generation,
@@ -284,7 +298,14 @@ function refreshSize(): void {
 }
 
 async function connect(): Promise<void> {
+  // A second connect (double retry, quick pane rebind) must invalidate the
+  // first one's pending cache read; otherwise the slower one can repaint its
+  // old screen and install a socket pointing at the wrong session.
+  const epoch = ++connectEpoch;
   disconnect();
+  // A new socket must not inherit the previous session's gap/repair state.
+  desyncFrom.value = null;
+  desyncTo.value = null;
   if (writeFrame !== null) cancelAnimationFrame(writeFrame);
   if (writeTimer !== null) window.clearTimeout(writeTimer);
   writeFrame = null;
@@ -297,6 +318,7 @@ async function connect(): Promise<void> {
     return;
   }
   const cached = await readScreen(sid);
+  if (epoch !== connectEpoch || sid !== sessionId.value || !term) return;
   let lastSeq: number | null = null;
   let generation: string | null = null;
   if (cached) {
@@ -320,11 +342,12 @@ async function connect(): Promise<void> {
     lastSeq,
     generation,
     onAck: (seq) => {
-      if (sessionId.value === sid) scheduleCache();
+      if (socket === ws && sessionId.value === sid) scheduleCache();
       void seq;
     },
     handlers: {
       onData: (payload, _seq, _flags, ack) => {
+        if (socket !== ws) return;
         if (zmodemSentry) {
           try {
             zmodemSentry.consume(payload);
@@ -339,6 +362,7 @@ async function connect(): Promise<void> {
         scheduleCache();
       },
       onState: (state, detail) => {
+        if (socket !== ws) return;
         connectionState.value = state;
         connectionDetail.value = detail ?? "";
         terminalStore.setState(sid, state, detail);
@@ -350,6 +374,10 @@ async function connect(): Promise<void> {
         }
       },
       onControl: (message) => {
+        if (socket !== ws) return;
+        if (message.type === "attached") {
+          writable.value = message.writable !== false;
+        }
         if (message.type === "gap") {
           desyncFrom.value = typeof message.from === "number" ? message.from : 0;
           desyncTo.value = typeof message.to === "number" ? message.to : 0;
@@ -419,6 +447,7 @@ async function connect(): Promise<void> {
         }
       },
       onNotice: (message, level) => {
+        if (socket !== ws) return;
         ui.notify(message, level === "error" ? "error" : level === "warn" ? "warning" : "info");
       },
     },
@@ -446,11 +475,12 @@ async function setup(): Promise<void> {
   attachRenderer();
   disposables = [
     term.onData((data) => {
+      if (!writable.value) return; // a read-only share must not echo locally
       if (zmodemActive.value) return; // protocol bytes own the input stream
       socket?.sendInput(data);
     }),
     term.onBinary((data) => {
-      if (zmodemActive.value) return;
+      if (!writable.value || zmodemActive.value) return;
       socket?.sendInput(Uint8Array.from(data, (char) => char.charCodeAt(0)));
     }),
     term.onBell(() => {
@@ -468,7 +498,7 @@ async function setup(): Promise<void> {
     }),
     term.onSelectionChange(() => {
       if (prefs.prefs.copyOnSelect && term?.hasSelection()) {
-        void navigator.clipboard?.writeText(term.getSelection()).catch(() => undefined);
+        void writeClipboard(term.getSelection());
       }
     }),
   ];
@@ -502,9 +532,8 @@ function toggleSearch(): void {
   searchOpen.value = !searchOpen.value;
   if (searchOpen.value) {
     nextTick(() => {
-      const input = document.querySelector<HTMLInputElement>(".pane-search-input");
-      input?.focus();
-      input?.select();
+      searchInput.value?.focus();
+      searchInput.value?.select();
     });
   }
 }
@@ -520,17 +549,51 @@ function findPrevious(): void {
   searchAddon?.findPrevious(searchText.value);
 }
 
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through to the legacy path */
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 async function copySelection(): Promise<void> {
   const text = term?.getSelection() ?? "";
   if (!text) return;
-  await navigator.clipboard.writeText(text);
-  ui.notify(t("app.copied"), "success", 1200);
+  if (await writeClipboard(text)) {
+    ui.notify(t("app.copied"), "success", 1200);
+  } else {
+    ui.notify("复制失败：浏览器不允许访问剪贴板", "warning");
+  }
 }
 
 async function paste(): Promise<void> {
+  if (!writable.value) {
+    ui.notify("该分享为只读", "warning");
+    return;
+  }
   try {
     const text = await navigator.clipboard.readText();
-    socket?.sendInput(text);
+    // ``term.paste`` wraps the text in bracketed-paste markers when the shell
+    // enabled them; sending raw bytes made a multi-line paste execute every
+    // line immediately.
+    term?.paste(text);
   } catch {
     ui.notify("浏览器拒绝了剪贴板读取", "warning");
   }
@@ -582,8 +645,12 @@ function moveToTab(event: Event): void {
   const tabId = target.value;
   target.value = "";
   if (!tabId) return;
-  if (workspace.movePaneToTab(props.pane.id, tabId)) {
-    ui.notify("已移动分屏", "success", 1200);
+  try {
+    if (workspace.movePaneToTab(props.pane.id, tabId)) {
+      ui.notify("已移动分屏", "success", 1200);
+    }
+  } catch (error) {
+    ui.notify((error as Error).message, "warning");
   }
 }
 
@@ -600,12 +667,20 @@ function paneEventMatches(event: Event): boolean {
 function onSearchEvent(event: Event): void {
   if (paneEventMatches(event)) {
     searchOpen.value = true;
-    nextTick(() => document.querySelector<HTMLInputElement>(".pane-search-input")?.focus());
+    nextTick(() => searchInput.value?.focus());
   }
 }
 
 function onClearEvent(event: Event): void {
   if (paneEventMatches(event)) clearTerminal();
+}
+
+function onCopyEvent(event: Event): void {
+  if (paneEventMatches(event)) void copySelection();
+}
+
+function onPasteEvent(event: Event): void {
+  if (paneEventMatches(event)) void paste();
 }
 
 function runCommand(command: string): void {
@@ -615,7 +690,10 @@ function runCommand(command: string): void {
 }
 
 async function copyCommand(command: string): Promise<void> {
-  await navigator.clipboard.writeText(command);
+  if (!(await writeClipboard(command))) {
+    ui.notify("复制失败：浏览器不允许访问剪贴板", "warning");
+    return;
+  }
   ui.notify(t("app.copied"), "success", 1200);
 }
 
@@ -661,7 +739,10 @@ async function copyOutput(block: CommandBlock): Promise<void> {
     ui.notify("该命令块没有输出", "info", 1500);
     return;
   }
-  await navigator.clipboard.writeText(text);
+  if (!(await writeClipboard(text))) {
+    ui.notify("复制失败：浏览器不允许访问剪贴板", "warning");
+    return;
+  }
   ui.notify(`已复制 ${lines.length} 行输出`, "success", 1500);
 }
 
@@ -705,6 +786,14 @@ function releaseZmodem(): void {
   zmodemOn.value = zmodemSentry !== null;
 }
 
+function resetZmodem(): void {
+  zmodemSentry = null;
+  if (zmodemTimer !== null) window.clearTimeout(zmodemTimer);
+  zmodemTimer = null;
+  zmodemActive.value = false;
+  zmodemOn.value = false;
+}
+
 function armZmodemWatchdog(): void {
   if (zmodemTimer !== null) window.clearTimeout(zmodemTimer);
   zmodemTimer = window.setTimeout(() => {
@@ -726,9 +815,14 @@ async function toggleZmodem(): Promise<void> {
   try {
     const module = await import("zmodem.js");
     const Zmodem = (module as unknown as { default?: any }).default ?? module;
+    const owner = socket;
     zmodemSentry = new Zmodem.Sentry({
+      // Tie the protocol bytes to the socket that was current when the
+      // transfer armed; a pane rebind must never inject them into a new PTY.
       to_terminal: (octets: number[]) => term?.write(new Uint8Array(octets)),
-      sender: (octets: number[]) => socket?.sendInput(new Uint8Array(octets)),
+      sender: (octets: number[]) => {
+        if (socket === owner) owner?.sendInput(new Uint8Array(octets));
+      },
       on_detect: (detection: any) => handleZmodem(detection),
       on_retract: () => {
         zmodemActive.value = false;
@@ -847,6 +941,7 @@ watch(
     pickerOpen.value = false;
     markerByBlock.clear();
     pendingMarker = null;
+    resetZmodem();
     // A pane can be rebound to a different session. Keeping the old screen
     // would paint the new session's output on top of it; the cache marker must
     // also be reset so the new session's persisted screen can hydrate.
@@ -862,7 +957,7 @@ watch(
   () => {
     if (!term) return;
     term.options.fontSize = prefs.prefs.fontSize;
-    term.options.fontFamily = prefs.prefs.fontFamily || undefined;
+    term.options.fontFamily = terminalFontFamily(prefs.prefs.fontFamily);
     nextTick(refreshSize);
   },
 );
@@ -924,11 +1019,15 @@ onMounted(async () => {
   showMobileKeys.value = window.matchMedia("(max-width: 760px)").matches;
   window.addEventListener("wsctl-search", onSearchEvent);
   window.addEventListener("wsctl-clear", onClearEvent);
+  window.addEventListener("wsctl-copy", onCopyEvent);
+  window.addEventListener("wsctl-paste", onPasteEvent);
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("wsctl-search", onSearchEvent);
   window.removeEventListener("wsctl-clear", onClearEvent);
+  window.removeEventListener("wsctl-copy", onCopyEvent);
+  window.removeEventListener("wsctl-paste", onPasteEvent);
   if (cacheTimer !== null) window.clearTimeout(cacheTimer);
   if (writeFrame !== null) cancelAnimationFrame(writeFrame);
   if (writeTimer !== null) window.clearTimeout(writeTimer);
@@ -966,9 +1065,10 @@ onBeforeUnmount(() => {
       <span class="pane-title" :title="paneTitle">{{ paneTitle }}</span>
       <span class="pane-state">{{ statusText }}</span>
       <span v-if="meta && meta.cols" class="pane-size">{{ meta.cols }}×{{ meta.rows }}</span>
+      <span v-if="!writable" class="readonly-badge">只读</span>
       <div class="pane-actions">
         <select
-          v-if="otherTabs.length"
+          v-if="!shareMode && otherTabs.length"
           class="move-tab"
           title="移动到其他标签"
           aria-label="移动到其他标签"
@@ -1019,6 +1119,7 @@ onBeforeUnmount(() => {
           ⌫
         </button>
         <button
+          v-if="!shareMode"
           class="ws-icon-btn"
           title="向右分屏"
           aria-label="向右分屏"
@@ -1027,6 +1128,7 @@ onBeforeUnmount(() => {
           ◫
         </button>
         <button
+          v-if="!shareMode"
           class="ws-icon-btn"
           title="向下分屏"
           aria-label="向下分屏"
@@ -1035,6 +1137,7 @@ onBeforeUnmount(() => {
           ⬓
         </button>
         <button
+          v-if="!shareMode"
           class="ws-icon-btn"
           title="与下一个分屏交换"
           aria-label="与下一个分屏交换"
@@ -1043,6 +1146,7 @@ onBeforeUnmount(() => {
           ⇄
         </button>
         <button
+          v-if="!shareMode"
           class="ws-icon-btn"
           :title="$t('app.maximize')"
           :aria-label="$t('app.maximize')"
@@ -1051,6 +1155,7 @@ onBeforeUnmount(() => {
           ⤢
         </button>
         <button
+          v-if="!shareMode"
           class="ws-icon-btn"
           :title="$t('app.closePane')"
           :aria-label="$t('app.closePane')"
@@ -1064,7 +1169,7 @@ onBeforeUnmount(() => {
     <div class="ws-pane-body" @contextmenu="onContextMenu">
       <div v-show="sessionId" ref="termHost" class="ws-term" />
 
-      <div v-if="!sessionId" class="pane-picker">
+      <div v-if="!sessionId && !shareMode" class="pane-picker">
         <p>这个分屏还没有绑定会话。</p>
         <button class="primary" @click="createHere">{{ $t("app.newSession") }}</button>
         <div class="picker-list ws-scroll">
@@ -1096,6 +1201,7 @@ onBeforeUnmount(() => {
 
       <div v-if="searchOpen" class="pane-search">
         <input
+          ref="searchInput"
           v-model="searchText"
           class="pane-search-input"
           placeholder="搜索终端内容"
@@ -1193,10 +1299,47 @@ onBeforeUnmount(() => {
 .pane-size {
   font-size: 10px;
 }
+.readonly-badge {
+  padding: 1px 6px;
+  border: 1px solid var(--warning);
+  border-radius: 999px;
+  color: var(--warning);
+  font-size: 10px;
+  white-space: nowrap;
+}
 .pane-actions {
   display: flex;
   gap: 1px;
   margin-left: auto;
+}
+@media (max-width: 760px) {
+  .ws-pane-header {
+    gap: 4px;
+    padding: 0 4px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .ws-pane-header::-webkit-scrollbar {
+    display: none;
+  }
+  .pane-state,
+  .pane-size,
+  .move-tab {
+    display: none;
+  }
+  .pane-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pane-actions {
+    flex: 0 0 auto;
+  }
+  .pane-actions .ws-icon-btn {
+    min-width: 24px;
+    padding: 0 3px;
+  }
 }
 .move-tab {
   max-width: 92px;

@@ -156,3 +156,10 @@ def test_clearing_a_section_alias_removes_that_line() -> None:
     edited = apply_key(original, "files.root", None)
     assert "root" not in edited
 
+
+
+def test_retention_days_are_converted_as_days_not_seconds() -> None:
+    """``30d`` means thirty days; the sweep multiplies by 86400 itself."""
+    assert config_v2.coerce_value("audit_retention_days", "30d") == 30
+    assert config_v2.coerce_value("term_session_retention_days", "2w") == 14
+    assert config_v2.coerce_value("recordings_retention_days", "48h") == 2

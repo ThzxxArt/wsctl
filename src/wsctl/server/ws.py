@@ -45,6 +45,7 @@ from wsctl.core.ratelimit import TokenBucket
 from wsctl.core.recording import has_room as recordings_have_room
 from wsctl.core.session import (
     ClientGone,
+    SessionFull,
     SessionManager,
     SessionSpec,
     TermSession,
@@ -181,10 +182,19 @@ class ConnectionCaps:
 
 
 def _auth_token(websocket: WebSocket) -> str | None:
-    auth = websocket.headers.get("authorization")
+    values = websocket.headers.getlist("authorization")
+    if len(values) > 1:
+        return None
+    auth = values[0] if values else None
     if auth and auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return websocket.cookies.get(COOKIE_NAME)
+        token = auth[7:].strip()
+        if token:
+            return token
+    cookie_token = websocket.cookies.get(COOKIE_NAME)
+    # An API key in a cookie would bypass the Authorization-only scope checks.
+    if cookie_token and cookie_token.startswith("wsctl_"):
+        return None
+    return cookie_token
 
 
 async def api_key_scopes(websocket: WebSocket) -> set[str] | None:
@@ -653,6 +663,12 @@ async def _handshake(
     filter_share = None if owner_connection else share
     try:
         await session.attach(client, writable=writable, share=filter_share)
+    except SessionFull as exc:
+        # A full session is a transient capacity problem: 4413 lets the client
+        # retry, while 4409 is fatal and turned a reconnect race into a dead tab.
+        if created:
+            await manager.remove(session.id)
+        raise _Denied(str(exc), CLOSE_OVERLOAD) from exc
     except ClientGone as exc:
         # A session we just created has no other owner and must not be leaked.
         if created:

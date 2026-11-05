@@ -1968,6 +1968,8 @@ export interface components {
         ContentBody: {
             /** Content */
             content: string;
+            /** Expected Mtime */
+            expected_mtime?: number | null;
             /** Path */
             path: string;
         };

@@ -5,9 +5,16 @@ import { useUiStore } from "@/stores/ui";
 
 const workspace = useWorkspaceStore();
 const ui = useUiStore();
+
+function duplicate(tabId: string): void {
+  try {
+    workspace.duplicateTab(tabId);
+  } catch (error) {
+    ui.notify((error as Error).message, "warning");
+  }
+}
 const editing = ref<string | null>(null);
 const draft = ref("");
-const inputRef = ref<HTMLInputElement | null>(null);
 const dragIndex = ref<number | null>(null);
 
 function paneCount(tabId: string): number {
@@ -18,7 +25,13 @@ function paneCount(tabId: string): number {
 function beginRename(tabId: string, name: string): void {
   editing.value = tabId;
   draft.value = name;
-  void nextTick(() => inputRef.value?.select());
+  void nextTick(() => {
+    // A ref inside v-for is an array (and ``select`` is not a function on it).
+    // Only one tab is in edit mode, so a scoped query is unambiguous.
+    const input = document.querySelector<HTMLInputElement>(".tab .rename");
+    input?.focus();
+    input?.select();
+  });
 }
 
 function commitRename(): void {
@@ -46,15 +59,16 @@ function newTab(): void {
 
 <template>
   <div class="tabbar">
-    <div class="tab-scroll" role="tablist" :aria-label="$t('app.sessions')">
+    <div class="tab-scroll" role="toolbar" :aria-label="$t('app.sessions')">
       <div
         v-for="(tab, index) in workspace.tabs"
         :key="tab.id"
         class="tab"
         :class="{ active: tab.id === workspace.activeTabId }"
         draggable="true"
-        role="tab"
-        :aria-selected="tab.id === workspace.activeTabId"
+        role="group"
+        :aria-current="tab.id === workspace.activeTabId ? 'page' : undefined"
+        :aria-label="tab.name"
         tabindex="0"
         @dragstart="onDragStart(index)"
         @dragover.prevent
@@ -65,7 +79,6 @@ function newTab(): void {
       >
         <input
           v-if="editing === tab.id"
-          ref="inputRef"
           v-model="draft"
           class="rename"
           @click.stop
@@ -81,7 +94,7 @@ function newTab(): void {
           class="dup"
           :title="$t('app.duplicateTab')"
           :aria-label="$t('app.duplicateTab')"
-          @click.stop="workspace.duplicateTab(tab.id)"
+          @click.stop="duplicate(tab.id)"
         >
           ⧉
         </button>

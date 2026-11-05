@@ -4279,7 +4279,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.12" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "watchfiles", specifier = ">=0.22" },
-    { name = "websockets", specifier = ">=13" },
+    { name = "websockets", specifier = ">=14" },
 ]
 provides-extras = ["win", "docs", "dev"]
 

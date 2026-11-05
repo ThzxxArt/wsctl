@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from wsctl.core.config import load_settings
@@ -496,6 +498,35 @@ def test_exit_code_is_persisted_and_returned_in_history(tmp_path: Path) -> None:
         assert detail.status_code == 200, detail.text
         assert detail.json()["exit_code"] == 7
         assert detail.json()["state"] == "finished"
+
+
+def test_no_auth_mode_keeps_its_v2_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v2 recheck must honour auth_required=False for anonymous sessions."""
+    from wsctl.core.config import load_settings
+    from wsctl.core.session import SessionManager
+    from wsctl.core.store import Store
+    from wsctl.server import ws_v2
+    from wsctl.server.app import create_app
+
+    monkeypatch.setattr(ws_v2, "ACCESS_RECHECK", 0.02)
+    settings = load_settings(
+        data_dir=tmp_path,
+        auth_required=False,
+        default_shell="/bin/sh",
+        cookie_secure=False,
+    )
+    app = create_app(settings, store=Store(tmp_path / "noauth.db"), manager=SessionManager())
+    with (
+        TestClient(app) as client,
+        client.websocket_connect("/ws/v2", subprotocols=[SUBPROTOCOL]) as ws,
+    ):
+        ws.send_text(encode_control({"type": "attach", "cols": 80, "rows": 24}))
+        recv_control(ws, "attached")
+        time.sleep(0.1)  # let the 5s recheck interval (patched) fire
+        ws.send_bytes(encode_input(b"printf 'STILL-HERE\\n'\r"))
+        recv_output(ws, b"STILL-HERE")
 
 
 def test_unbalanced_quotes_in_command_are_a_400(tmp_path: Path) -> None:

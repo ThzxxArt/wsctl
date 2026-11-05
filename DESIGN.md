@@ -516,5 +516,5 @@ symlink 守卫因 `resolve()` 抹掉链接身份而成死代码，改为词法�
 - 包名 / PyPI：`wsctl`（已验证可用）
 - GitHub：`ThzxxArt/wsctl`
 - 版本：语义化；初始 `0.1.0`
-- CI：ruff + mypy + pytest（py3.11 / 3.12 / 3.13）
+- CI：ruff + mypy + pytest（py3.12 / 3.13 / 3.14）
 - 发布：tag 触发 PyPI Trusted Publishing（OIDC，无需存 token）

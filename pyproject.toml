@@ -39,7 +39,9 @@ dependencies = [
     "python-multipart>=0.0.9",
     "pyotp>=2.9",
     "segno>=1.6",
-    "websockets>=13",
+    # ``additional_headers`` was added in websockets 14; the CLI always passes
+    # it, so a 13.x resolution would fail only on a user's machine.
+    "websockets>=14",
     # ``wsctl serve --tls-self-signed`` is advertised as one command, so it
     # cannot depend on something a plain install does not have.
     "cryptography>=42",
@@ -92,6 +94,10 @@ wsctl = "wsctl.cli.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wsctl"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"THIRD_PARTY_NOTICES.md" = "wsctl/THIRD_PARTY_NOTICES.md"
+"LICENSE" = "wsctl/LICENSE"
 
 [tool.hatch.build.targets.sdist]
 include = [

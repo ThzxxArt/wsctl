@@ -20,10 +20,13 @@ services:
     ports:
       - "127.0.0.1:7681:7681"
     volumes:
+      # First run: mkdir -p data workspace && sudo chown -R 10001:10001 data workspace
       - ./data:/data
+      - ./workspace:/workspace
     environment:
       WSCTL_DATA_DIR: /data
-      WSCTL_FILE_ROOT: /data
+      WSCTL_CONFIG: /data/config.toml
+      WSCTL_FILE_ROOT: /workspace
       WSCTL_HOST: 0.0.0.0
       WSCTL_PORT: "7681"
       WSCTL_ADMIN_PASSWORD: ${WSCTL_ADMIN_PASSWORD:?请设置环境变量 WSCTL_ADMIN_PASSWORD}

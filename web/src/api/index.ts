@@ -99,7 +99,7 @@ export const sessions = {
 };
 
 export const files = {
-  list: (path: string) =>
+  list: (path: string, limit = 2000, offset = 0) =>
     unwrap<{
       entries: FileEntry[];
       path: string;
@@ -108,8 +108,8 @@ export const files = {
       offset: number;
       limit: number;
       truncated: boolean;
-    }>(http.GET("/api/v2/files", { params: { query: { path } } })),
-  read: async (path: string): Promise<string> => {
+    }>(http.GET("/api/v2/files", { params: { query: { path, limit, offset } } })),
+  read: async (path: string): Promise<{ content: string; mtime: number | null }> => {
     const response = await fetch(`/api/v2/files/preview?path=${encodeURIComponent(path)}`, {
       credentials: "same-origin",
     });
@@ -123,12 +123,14 @@ export const files = {
       }
       throw new ApiError(response.status, detail);
     }
-    return response.text();
+    const rawMtime = response.headers.get("x-wsctl-mtime");
+    const parsed = rawMtime === null ? Number.NaN : Number(rawMtime);
+    return { content: await response.text(), mtime: Number.isFinite(parsed) ? parsed : null };
   },
-  write: (path: string, content: string) =>
+  write: (path: string, content: string, expectedMtime?: number | null) =>
     unwrap<{ size: number }>(
       http.PUT("/api/v2/files/content", {
-        body: { path, content },
+        body: { path, content, expected_mtime: expectedMtime ?? null },
       }),
     ),
   mkdir: (path: string, name: string) =>

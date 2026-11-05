@@ -132,6 +132,17 @@
             "title": "Content",
             "type": "string"
           },
+          "expected_mtime": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Mtime"
+          },
           "path": {
             "maxLength": 4096,
             "title": "Path",

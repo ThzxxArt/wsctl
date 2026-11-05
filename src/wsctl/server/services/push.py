@@ -87,6 +87,12 @@ class PushService:
         if not isinstance(p256dh, str) or not p256dh or not isinstance(auth, str) or not auth:
             raise ValueError("push keys 缺少 p256dh/auth")
         existing = self._db.push_list(user_id)
+        # Endpoint is globally unique. Reassigning another user's row from a
+        # guessable endpoint let one account silently steal/mute another's
+        # notifications; require the owner to unsubscribe first.
+        record = self._db.push_find(endpoint)
+        if record is not None and int(record["user_id"]) != user_id:
+            raise ValueError("该推送 endpoint 已被其他用户订阅")
         if len(existing) >= MAX_SUBSCRIPTIONS and not any(
             item["endpoint"] == endpoint for item in existing
         ):

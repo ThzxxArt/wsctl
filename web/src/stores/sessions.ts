@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import { sessions as api } from "@/api";
 import type { HistoryRow, SessionInfo } from "@/api/types";
 import { usePresenceStore } from "@/stores/presence";
+import { clearScreen } from "@/protocol/cache";
 
 export interface SessionEvent {
   v: number;
@@ -58,7 +59,11 @@ export const useSessionsStore = defineStore("sessions", () => {
     if (source) return;
     source = new EventSource("/api/v2/events");
     source.onopen = () => {
+      const reconnected = !sseConnected.value;
       sseConnected.value = true;
+      // Events missed while the stream was down are gone; reconcile the list
+      // instead of leaving the sidebar stale until an unrelated action.
+      if (reconnected) scheduleRefresh();
     };
     source.onerror = () => {
       sseConnected.value = false;
@@ -93,6 +98,12 @@ export const useSessionsStore = defineStore("sessions", () => {
     source.addEventListener("session_created", handle as EventListener);
     source.addEventListener("session_ended", handle as EventListener);
     source.addEventListener("presence", handle as EventListener);
+    source.addEventListener("overflow", (() => {
+      // The broker told us events were dropped and closed the stream. Force a
+      // full list refresh; EventSource will reconnect on its own.
+      sseConnected.value = false;
+      scheduleRefresh();
+    }) as EventListener);
   }
 
   function stopEvents(): void {
@@ -123,6 +134,7 @@ export const useSessionsStore = defineStore("sessions", () => {
   async function remove(sid: string): Promise<void> {
     await api.remove(sid);
     live.value = live.value.filter((session) => session.id !== sid);
+    await clearScreen(sid);
     await refresh();
   }
 

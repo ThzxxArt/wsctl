@@ -16,6 +16,8 @@ a file that is not being written.
 
 from __future__ import annotations
 
+import codecs
+import contextlib
 import json
 import logging
 import os
@@ -29,6 +31,9 @@ log = logging.getLogger("wsctl.recording")
 
 FLUSH_INTERVAL = 1.0
 MAX_QUEUE = 10000
+#: A count bound alone allowed 10,000 × 64 KiB reads (~640 MiB) to sit in
+#: memory when the disk stalled. The byte bound is the real memory contract.
+MAX_QUEUE_BYTES = 8 * 1024 * 1024
 
 # Process-wide count of recorders stopped by a write failure. Exposed as the
 # ``wsctl_recording_failures_total`` gauge; it is monotonic so a scrape shows
@@ -95,6 +100,10 @@ class Recorder:
         self._dropped = 0
         self._stop = threading.Event()
         self._queue: queue.Queue[str] = queue.Queue(maxsize=MAX_QUEUE)
+        self._queued_bytes = 0
+        self._queue_lock = threading.Lock()
+        self._out_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._in_decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._thread = threading.Thread(target=self._run, name="wsctl-recorder", daemon=True)
         self._thread.start()
 
@@ -125,17 +134,23 @@ class Recorder:
             return
         elapsed = round(time.monotonic() - self._start, 6)
         line = json.dumps([elapsed, kind, text]) + "\n"
-        try:
-            self._queue.put_nowait(line)
-        except queue.Full:
-            # Disk cannot keep up: drop rather than block the terminal.
-            self._dropped += 1
+        with self._queue_lock:
+            if self._queued_bytes + len(line) > MAX_QUEUE_BYTES:
+                self._dropped += 1
+                return
+            try:
+                self._queue.put_nowait(line)
+            except queue.Full:
+                # Disk cannot keep up: drop rather than block the terminal.
+                self._dropped += 1
+                return
+            self._queued_bytes += len(line)
 
     def output(self, data: bytes) -> None:
-        self._event("o", data.decode("utf-8", "replace"))
+        self._event("o", self._out_decoder.decode(data))
 
     def input(self, data: bytes) -> None:
-        self._event("i", data.decode("utf-8", "replace"))
+        self._event("i", self._in_decoder.decode(data))
 
     def _run(self) -> None:
         while True:
@@ -145,6 +160,8 @@ class Recorder:
                 if self._stop.is_set():
                     break
                 continue
+            with self._queue_lock:
+                self._queued_bytes = max(0, self._queued_bytes - len(line))
             with self._io_lock:
                 if self._fh is None:
                     return
@@ -166,6 +183,16 @@ class Recorder:
     def close(self) -> None:
         if self._closed and self._fh is None:
             return
+        # Flush a trailing partial UTF-8 character before closing; otherwise a
+        # character split across the final two PTY reads is lost entirely.
+        with contextlib.suppress(Exception):
+            tail = self._out_decoder.decode(b"", final=True)
+            if tail:
+                self._event("o", tail)
+        with contextlib.suppress(Exception):
+            tail = self._in_decoder.decode(b"", final=True)
+            if tail:
+                self._event("i", tail)
         self._closed = True
         self._stop.set()
         self._thread.join(timeout=5)

@@ -239,6 +239,10 @@ def audit_digest(
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+class LastAdminError(Exception):
+    """A guarded mutation would leave the instance without an enabled admin."""
+
+
 class Store:
     """Thin, thread-safe wrapper around a SQLite database."""
 
@@ -248,6 +252,11 @@ class Store:
         self._lock = threading.Lock()
         self._sink: Any = None
         self._auth_cache: Any = None
+        #: SQLite ``data_version`` observed when the auth cache was last
+        #: trusted. It changes when *another* connection commits, which is how
+        #: a CLI ``user passwd/disable/role`` invalidates this process's cache
+        #: immediately instead of after the 30s TTL.
+        self._auth_data_version: int | None = None
         # When true, an active session's expiry slides forward on each use.
         self.sliding_ttl = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
@@ -475,6 +484,71 @@ class Store:
         self._invalidate_user(int(row["id"]) if row else None)
         return cur.rowcount > 0
 
+    def _guarded_admin_mutation(
+        self,
+        username: str,
+        *,
+        role: str | None = None,
+        disabled: bool | None = None,
+        delete: bool = False,
+    ) -> bool:
+        """Apply one mutation and its last-admin check in one write transaction."""
+        user_id: int | None = None
+        changed = False
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT id, role, disabled FROM users WHERE username = ?",
+                    (username,),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                else:
+                    user_id = int(row["id"])
+                    removing_admin = (
+                        str(row["role"]) == "admin"
+                        and int(row["disabled"]) == 0
+                        and ((role == "user") or bool(disabled) or delete)
+                    )
+                    if removing_admin:
+                        count = self._conn.execute(
+                            "SELECT COUNT(*) FROM users"
+                            " WHERE role = 'admin' AND disabled = 0"
+                        ).fetchone()[0]
+                        if int(count) <= 1:
+                            raise LastAdminError("至少保留一个管理员")
+                    if delete:
+                        cur = self._conn.execute(
+                            "DELETE FROM users WHERE username = ?", (username,)
+                        )
+                    elif role is not None:
+                        cur = self._conn.execute(
+                            "UPDATE users SET role = ? WHERE username = ?",
+                            (role, username),
+                        )
+                    else:
+                        cur = self._conn.execute(
+                            "UPDATE users SET disabled = ? WHERE username = ?",
+                            (1 if disabled else 0, username),
+                        )
+                    changed = cur.rowcount > 0
+                    self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        self._invalidate_user(user_id)
+        return changed
+
+    def user_set_role_guarded(self, username: str, role: str) -> bool:
+        return self._guarded_admin_mutation(username, role=role)
+
+    def user_set_disabled_guarded(self, username: str, disabled: bool) -> bool:
+        return self._guarded_admin_mutation(username, disabled=disabled)
+
+    def user_delete_guarded(self, username: str) -> bool:
+        return self._guarded_admin_mutation(username, delete=True)
+
     def user_set_role(self, username: str, role: str) -> bool:
         if role not in ("admin", "user"):
             raise ValueError(f"invalid role: {role}")
@@ -581,6 +655,16 @@ class Store:
         token_hash = hash_token(token)
         cache = self._auth_cache
         if cache is not None:
+            with self._lock:
+                row = self._conn.execute("PRAGMA data_version").fetchone()
+            version = int(row[0]) if row is not None else 0
+            if self._auth_data_version is None:
+                self._auth_data_version = version
+            elif version != self._auth_data_version:
+                # A different process committed (CLI password/role/disable).
+                # Drop every cached identity before trusting a hit.
+                self._auth_data_version = version
+                cache.clear()
             hit = cache.get(token_hash)
             if hit is not _CACHE_MISS:
                 return cast("User | None", hit)

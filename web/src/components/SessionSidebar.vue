@@ -4,6 +4,7 @@ import { useSessionsStore } from "@/stores/sessions";
 import { useWorkspaceStore } from "@/stores/workspace";
 import { useUiStore } from "@/stores/ui";
 import { usePresenceStore } from "@/stores/presence";
+import { useAuthStore } from "@/stores/auth";
 import { recordings, sessions as api } from "@/api";
 import type { SessionInfo } from "@/api/types";
 
@@ -11,6 +12,7 @@ const sessions = useSessionsStore();
 const workspace = useWorkspaceStore();
 const ui = useUiStore();
 const presence = usePresenceStore();
+const auth = useAuthStore();
 const filter = ref("");
 const tab = ref<"live" | "history">("live");
 const backendFilter = ref("");
@@ -51,6 +53,10 @@ const filtered = computed(() => {
   });
 });
 
+function closeSidebarOnMobile(): void {
+  if (window.innerWidth <= 760) ui.sidebarOpen = false;
+}
+
 function open(session: SessionInfo): void {
   const active = workspace.activeTab;
   if (active) {
@@ -58,17 +64,19 @@ function open(session: SessionInfo): void {
     const rows = workspace.allLeaves.find((leaf) => leaf.id === focused);
     if (rows && rows.sessionId === null) {
       workspace.setPaneSession(rows.id, session.id, session.name);
+      closeSidebarOnMobile();
       return;
     }
     if (workspace.allLeaves.some((leaf) => leaf.sessionId === session.id)) {
       const existing = workspace.allLeaves.find((leaf) => leaf.sessionId === session.id);
       if (existing) workspace.focusPane(existing.id);
+      closeSidebarOnMobile();
       return;
     }
   }
   try {
     workspace.createTab(session.id, session.name);
-    if (window.innerWidth <= 760) ui.sidebarOpen = false;
+    closeSidebarOnMobile();
   } catch (error) {
     ui.notify((error as Error).message, "warning");
   }
@@ -185,7 +193,14 @@ function formatBytes(value: number): string {
       </select>
     </div>
     <div class="list ws-scroll">
-      <p v-if="filtered.length === 0" class="empty ws-muted">{{ $t("app.noSessions") }}</p>
+      <p v-if="sessions.loading && sessions.live.length === 0" class="empty ws-muted">
+        正在加载会话…
+      </p>
+      <div v-else-if="sessions.error" class="empty ws-muted">
+        <p>{{ sessions.error }}</p>
+        <button @click="sessions.refresh()">重试</button>
+      </div>
+      <p v-else-if="filtered.length === 0" class="empty ws-muted">{{ $t("app.noSessions") }}</p>
       <article
         v-for="session in filtered"
         :key="session.id"
@@ -214,7 +229,7 @@ function formatBytes(value: number): string {
         <div v-if="presence.viewers[session.id]?.length" class="viewers">
           观众：{{ presence.viewers[session.id].join("、") }}
         </div>
-        <div class="actions">
+        <div class="actions" @keydown.enter.stop>
           <button v-if="tab === 'live'" @click.stop="rename(session)">
             {{ $t("app.rename") }}
           </button>
@@ -225,7 +240,7 @@ function formatBytes(value: number): string {
             {{ session.recording ? "停止录制" : "录制" }}
           </button>
           <button
-            v-if="tab === 'live' && session.recording"
+            v-if="tab === 'live' && session.recording && auth.isAdmin"
             @click.stop="ui.openReplay(session.id)"
           >
             {{ $t("app.replay") }}

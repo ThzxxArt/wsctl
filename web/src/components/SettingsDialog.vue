@@ -264,10 +264,7 @@ async function saveServerLayout(): Promise<void> {
   const name = window.prompt("布局名称", "default");
   if (!name) return;
   try {
-    await layoutsApi.put(name, {
-      tabs: workspace.tabs,
-      activeTabId: workspace.activeTabId,
-    });
+    await layoutsApi.put(name, workspace.snapshot());
     ui.notify(`布局「${name}」已保存到服务器`, "success");
   } catch (error) {
     ui.notify((error as Error).message, "error");

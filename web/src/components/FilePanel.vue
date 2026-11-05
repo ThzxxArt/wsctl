@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { NButton, NEmpty, NInput, NModal, NProgress, NSpace } from "naive-ui";
 import { files } from "@/api";
 import type { FileEntry } from "@/api/types";
@@ -17,11 +17,12 @@ const root = ref("");
 const entries = ref<FileEntry[]>([]);
 const loading = ref(false);
 const uploadRatio = ref<number | null>(null);
-const editor = ref<{ path: string; content: string } | null>(null);
+const editor = ref<{ path: string; content: string; mtime: number | null } | null>(null);
 const image = ref<string | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
 const listing = ref<HTMLElement | null>(null);
 const filter = ref("");
+const pageInfo = ref({ total: 0, offset: 0, limit: 0, truncated: false });
 
 interface UploadJob {
   name: string;
@@ -72,20 +73,32 @@ function join(base: string, name: string): string {
   return base ? `${base}/${name}` : name;
 }
 
-async function load(target = path.value): Promise<void> {
+async function load(target = path.value, append = false): Promise<void> {
   loading.value = true;
   try {
-    const page = await files.list(target);
+    const page = await files.list(target, 2000, append ? entries.value.length : 0);
     path.value = page.path;
     root.value = page.root;
-    entries.value = page.entries;
-    scrollTop.value = 0;
-    if (listing.value) listing.value.scrollTop = 0;
+    entries.value = append ? [...entries.value, ...page.entries] : page.entries;
+    pageInfo.value = {
+      total: page.total,
+      offset: page.offset,
+      limit: page.limit,
+      truncated: page.truncated,
+    };
+    if (!append) {
+      scrollTop.value = 0;
+      if (listing.value) listing.value.scrollTop = 0;
+    }
   } catch (error) {
     ui.notify((error as Error).message, "error");
   } finally {
     loading.value = false;
   }
+}
+
+function loadMore(): void {
+  void load(path.value, true);
 }
 
 function enter(entry: FileEntry): void {
@@ -96,8 +109,12 @@ function enter(entry: FileEntry): void {
 
 async function openText(entry: FileEntry): Promise<void> {
   try {
-    const content = await files.read(join(path.value, entry.name));
-    editor.value = { path: join(path.value, entry.name), content };
+    const result = await files.read(join(path.value, entry.name));
+    editor.value = {
+      path: join(path.value, entry.name),
+      content: result.content,
+      mtime: result.mtime,
+    };
   } catch (error) {
     ui.notify((error as Error).message, "error");
   }
@@ -106,11 +123,13 @@ async function openText(entry: FileEntry): Promise<void> {
 async function save(content: string): Promise<void> {
   if (!editor.value) return;
   try {
-    await files.write(editor.value.path, content);
+    await files.write(editor.value.path, content, editor.value.mtime);
     ui.notify("已保存", "success");
     editor.value = null;
     await load();
   } catch (error) {
+    // 409 means another tab/process changed the file; keep the editor open and
+    // let the author decide instead of silently overwriting.
     ui.notify((error as Error).message, "error");
   }
 }
@@ -148,7 +167,14 @@ async function remove(entry: FileEntry): Promise<void> {
 }
 
 function download(entry: FileEntry): void {
-  void files.download(join(path.value, entry.name));
+  // A direct same-origin link streams the file and lets the browser show its
+  // own progress; fetch+blob buffered a multi-GB file in the tab first.
+  const anchor = document.createElement("a");
+  anchor.href = files.url(join(path.value, entry.name));
+  anchor.download = entry.name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
 }
 
 function previewImage(entry: FileEntry): void {
@@ -249,6 +275,12 @@ function isImage(name: string): boolean {
 
 onMounted(() => load(""));
 
+onBeforeUnmount(() => {
+  // Closing the panel (or logging out) must not leave uploads writing files
+  // behind it.
+  for (const job of queue.value) job.controller?.abort();
+});
+
 watch(filter, () => {
   // Filtering shortens the virtual list; keeping the old scroll offset made
   // the window start past the last match and rendered an empty panel.
@@ -326,6 +358,10 @@ watch(filter, () => {
         @dragover.prevent
         @drop.prevent="onDropFiles($event)"
       >
+        <div v-if="pageInfo.truncated" class="page-more">
+          <span class="ws-muted">已显示 {{ entries.length }} / {{ pageInfo.total }}</span>
+          <button :disabled="loading" @click="loadMore">加载更多</button>
+        </div>
         <NEmpty v-if="filtered.length === 0 && !loading" :description="t('files.empty')" />
         <template v-else>
           <div class="thead">
@@ -414,6 +450,13 @@ watch(filter, () => {
 .root {
   margin: 0 0 8px;
   font-size: 11px;
+}
+.page-more {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  font-size: 12px;
 }
 .listing {
   flex: 1;

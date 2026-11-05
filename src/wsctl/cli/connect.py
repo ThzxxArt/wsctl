@@ -29,6 +29,8 @@ from wsctl.cli.client import ApiClient, ApiError, ca_bundle_for, load_credential
 # places and 4401 was fatal here but not in the browser.
 from wsctl.core.closecodes import FATAL_CLOSE_CODES as FATAL_CODES
 from wsctl.core.protocol import (
+    FLAG_DISPLAY,
+    FLAG_LAST,
     FLAG_SNAPSHOT,
     SUBPROTOCOL,
     DataFrame,
@@ -132,6 +134,8 @@ async def _run(base: str, session: str | None, token: str | None, *, reconnect: 
     def on_stdin() -> None:
         try:
             data = os.read(fd, READ_SIZE)
+        except BlockingIOError:
+            return  # no data right now; not EOF
         except OSError:
             data = b""
         if not data:
@@ -140,7 +144,12 @@ async def _run(base: str, session: str | None, token: str | None, *, reconnect: 
 
     def on_resize() -> None:
         width, height = _winsize()
-        outbound.put_nowait(json.dumps({"type": "resize", "cols": width, "rows": height}))
+        # This was a raw ``json.dumps`` without the protocol version. The
+        # server's decoder defaulted it to v1 and closed the whole connection
+        # with a fatal 4400 on every window resize.
+        outbound.put_nowait(
+            encode_control({"type": "resize", "cols": width, "rows": height})
+        )
 
     def restore() -> None:
         """Whatever happens to the bridge, the user's terminal must come back.
@@ -177,12 +186,31 @@ async def _run(base: str, session: str | None, token: str | None, *, reconnect: 
 
 
 def _drain(queue: asyncio.Queue[bytes | str | None]) -> None:
-    """Drop items queued for a connection that no longer exists."""
+    """Drop items queued for a connection that no longer exists.
+
+    The stdin-EOF sentinel must survive: dropping it left the new connection's
+    sender waiting on an empty queue forever after a reconnect.
+    """
+    saw_eof = False
     while True:
         try:
-            queue.get_nowait()
+            item = queue.get_nowait()
         except asyncio.QueueEmpty:
-            return
+            break
+        if item is None:
+            saw_eof = True
+    if saw_eof:
+        queue.put_nowait(None)
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    """Write every byte; a single ``os.write`` may be short on a pipe."""
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("stdout closed")
+        view = view[written:]
 
 
 async def _recv_loop(
@@ -231,18 +259,32 @@ async def _recv_loop(
                     _notice(f"协议错误：{exc}")
                     continue
                 try:
-                    os.write(sys.stdout.fileno(), frame.payload)
+                    _write_all(sys.stdout.fileno(), frame.payload)
+                except BlockingIOError:
+                    # stdout is momentarily non-blocking, not gone.
+                    await asyncio.sleep(0.01)
+                    with contextlib.suppress(OSError):
+                        _write_all(sys.stdout.fileno(), frame.payload)
                 except OSError:
                     return notice, None, True, 0
+                if frame.flags & FLAG_DISPLAY:
+                    # Clear prefixes and repaint nudge output are display-only;
+                    # they must never move the resume cursor.
+                    await send_ack()
+                    continue
                 if frame.flags & FLAG_SNAPSHOT:
                     # A snapshot is a rendered screen anchored at ``seq``; its
-                    # byte length is not stream offset. Adding it claimed bytes
-                    # that were never sent and made the next resume skip data.
-                    current = state.get("last_seq")
-                    state["last_seq"] = (
-                        frame.seq if not isinstance(current, int) else max(current, frame.seq)
-                    )
-                    state["awaiting_snapshot"] = False
+                    # byte length is not stream offset. Only the final chunk is
+                    # allowed to adopt the anchor; earlier chunks are still
+                    # being painted.
+                    if frame.flags & FLAG_LAST:
+                        current = state.get("last_seq")
+                        state["last_seq"] = (
+                            frame.seq
+                            if not isinstance(current, int)
+                            else max(current, frame.seq)
+                        )
+                        state["awaiting_snapshot"] = False
                 elif not state.get("awaiting_snapshot"):
                     current = state.get("last_seq")
                     end = frame.seq + len(frame.payload)
@@ -275,7 +317,12 @@ async def _recv_loop(
                         resync_requested = True
                         with contextlib.suppress(Exception):
                             await ws.send(  # type: ignore[attr-defined]
-                                encode_control({"type": "snapshot-request"})
+                                encode_control(
+                                    {
+                                        "type": "snapshot-request",
+                                        "last_seq": state.get("last_seq"),
+                                    }
+                                )
                             )
                 elif isinstance(data.get("seq"), int):
                     # Replay is complete and was queued before ``attached``.
@@ -303,7 +350,12 @@ async def _recv_loop(
                     resync_requested = True
                     with contextlib.suppress(Exception):
                         await ws.send(  # type: ignore[attr-defined]
-                            encode_control({"type": "snapshot-request"})
+                            encode_control(
+                                {
+                                    "type": "snapshot-request",
+                                    "last_seq": state.get("last_seq"),
+                                }
+                            )
                         )
             elif kind == "snapshot":
                 source = data.get("source") or data.get("format") or "unknown"
@@ -320,6 +372,23 @@ async def _recv_loop(
                     state["last_seq"] = seq if not isinstance(current, int) else max(current, seq)
                     state["awaiting_snapshot"] = False
                 resync_requested = False
+            elif kind == "resync-rejected":
+                # Without this branch the CLI stayed in awaiting_snapshot with
+                # no retry: live frames painted but the resume offset froze
+                # until the user reconnected manually.
+                _notice(str(data.get("msg") or "重新同步过于频繁，稍后重试"))
+                resync_requested = False
+                await asyncio.sleep(2.0)
+                with contextlib.suppress(Exception):
+                    await ws.send(  # type: ignore[attr-defined]
+                        encode_control(
+                            {
+                                "type": "snapshot-request",
+                                "last_seq": state.get("last_seq"),
+                            }
+                        )
+                    )
+                    resync_requested = True
             elif kind == "evicted":
                 _notice(str(data.get("msg") or "连接已被释放（会话仍在运行）"))
     except ConnectionClosed as exc:
@@ -431,7 +500,10 @@ async def _session_loop(
         if notice:
             _notice(notice)
         if exited:
-            return exit_code
+            # POSIX reports a signal death as -N; a process exit status is
+            # 128+N. Passing -15 to typer.Exit produced 241 (or a negative
+            # status in the UI) for a session killed by SIGHUP.
+            return exit_code if exit_code >= 0 else 128 + abs(exit_code)
         if state["stdin_closed"]:
             return 0
         if code in FATAL_CODES:

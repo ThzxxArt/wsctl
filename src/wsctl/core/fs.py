@@ -24,6 +24,8 @@ class FsError(Exception):
 
     #: Nothing of that name here.
     NOT_FOUND = "not_found"
+    #: The caller's expected version is stale (concurrent edit).
+    CONFLICT = "conflict"
 
     def __init__(self, message: str, *, code: str = "invalid") -> None:
         super().__init__(message)
@@ -315,8 +317,15 @@ def read_image_file(
     return raw, mime
 
 
-def write_text_file(root: Path, rel: str, content: str) -> int:
-    """Replace a small text file atomically (sidecar + ``os.replace``)."""
+def write_text_file(
+    root: Path, rel: str, content: str, *, expected_mtime: float | None = None
+) -> int:
+    """Replace a small text file atomically (sidecar + ``os.replace``).
+
+    ``expected_mtime`` is the last write time the editor loaded. If another
+    process or tab changed the file meanwhile, refuse with a conflict instead
+    of silently winning the race.
+    """
     target = safe_resolve(root, rel)
     if target.is_symlink():
         # Checked first and on the *lexical* path: writing through a symlink
@@ -327,6 +336,13 @@ def write_text_file(root: Path, rel: str, content: str) -> int:
     data = content.encode("utf-8")
     if len(data) > EDIT_MAX_BYTES:
         raise FsError(f"内容过大（上限 {EDIT_MAX_BYTES // 1024} KB）")
+    if expected_mtime is not None:
+        try:
+            actual_mtime = target.stat().st_mtime
+        except OSError as exc:
+            raise FsError("文件已不存在") from exc
+        if abs(actual_mtime - expected_mtime) > 1e-6:
+            raise FsError("文件已在磁盘上修改", code=FsError.CONFLICT)
     # Preserve the file's permission bits: replacing it with a 0600 staging
     # file silently removed group read and, worse, the executable bit from a
     # script the user just edited.

@@ -56,6 +56,8 @@ class ContentBody(BaseModel):
     # ``write_text_file`` runs on the *encoded* bytes, and a multi-megabyte
     # request body is already in memory by then.
     content: str = Field(max_length=2 * 1024 * 1024)
+    #: The preview's mtime; a mismatch means another editor won the race.
+    expected_mtime: float | None = None
 
 
 class _UploadTooLarge(Exception):
@@ -134,11 +136,12 @@ def _quote_filename(name: str) -> str:
 
 
 def _fs_error(exc: fs_mod.FsError) -> HTTPException:
-    code = (
-        status.HTTP_404_NOT_FOUND
-        if exc.code == fs_mod.FsError.NOT_FOUND
-        else status.HTTP_400_BAD_REQUEST
-    )
+    if exc.code == fs_mod.FsError.NOT_FOUND:
+        code = status.HTTP_404_NOT_FOUND
+    elif exc.code == fs_mod.FsError.CONFLICT:
+        code = status.HTTP_409_CONFLICT
+    else:
+        code = status.HTTP_400_BAD_REQUEST
     return HTTPException(status_code=code, detail=str(exc))
 
 
@@ -200,10 +203,20 @@ async def preview_file(
     """A small text file's contents, so the panel is not download-or-nothing."""
     root = request.app.state.settings.files_root
     try:
+        target = fs_mod.safe_resolve(root, path)
+        stat_result = await asyncio.to_thread(target.stat)
         text, encoding = await asyncio.to_thread(fs_mod.read_text_file, root, path)
     except fs_mod.FsError as exc:
         raise _fs_error(exc) from exc
-    return PlainTextResponse(text, headers={"X-Wsctl-Encoding": encoding})
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    return PlainTextResponse(
+        text,
+        headers={
+            "X-Wsctl-Encoding": encoding,
+            "X-Wsctl-Mtime": f"{stat_result.st_mtime:.6f}",
+        },
+    )
 
 
 @router.get("/files/image")
@@ -252,7 +265,13 @@ async def write_file(
     """Replace a small text file (atomic: sidecar + ``os.replace``)."""
     root = request.app.state.settings.files_root
     try:
-        size = await asyncio.to_thread(fs_mod.write_text_file, root, body.path, body.content)
+        size = await asyncio.to_thread(
+            fs_mod.write_text_file,
+            root,
+            body.path,
+            body.content,
+            expected_mtime=body.expected_mtime,
+        )
     except fs_mod.FsError as exc:
         raise _fs_error(exc) from exc
     request.app.state.metrics.inc("wsctl_file_edits_total")

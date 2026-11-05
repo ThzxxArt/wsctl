@@ -14,7 +14,7 @@ from wsctl.core.store import Store, User
 
 from ..deps import current_user, require_admin, token_from_request
 from ..models import LoginRequest
-from ..security import COOKIE_NAME, client_ip
+from ..security import COOKIE_NAME, client_ip, forwarded_scheme
 
 router = APIRouter(tags=["auth"])
 
@@ -126,7 +126,15 @@ async def login(body: LoginRequest, request: Request, response: Response) -> dic
         token,
         max_age=settings.session_ttl,
         httponly=True,
-        secure=settings.cookie_secure,
+        # A cookie served over HTTPS must not be allowed to travel over plain
+        # HTTP just because an old config left cookie_secure at its false
+        # default. Trust the request's actual scheme (including a trusted
+        # X-Forwarded-Proto) as well as the explicit setting.
+        secure=(
+            settings.cookie_secure
+            or request.url.scheme == "https"
+            or forwarded_scheme(request, settings) == "https"
+        ),
         samesite="lax",
         path="/",
     )

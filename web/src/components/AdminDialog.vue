@@ -32,6 +32,7 @@ const tab = ref("overview");
 const verifyResult = ref<string>("");
 const newToken = ref("");
 const totpSetup = ref<{ username: string; secret: string; qr: string } | null>(null);
+const totpCode = ref("");
 const newUsername = ref("");
 const newPassword = ref("");
 const newRole = ref("user");
@@ -148,13 +149,28 @@ async function setupTotp(user: User): Promise<void> {
     }
     const result = await users.enableTotp(user.username);
     totpSetup.value = { username: user.username, secret: result.secret, qr: result.qr_svg };
-    const code = window.prompt("用验证器扫描二维码，输入 6 位验证码完成绑定");
-    if (!code) return;
-    await users.confirmTotp(user.username, code);
+    totpCode.value = "";
+  } catch (err) {
+    ui.notify((err as Error).message, "error");
+  }
+}
+
+async function confirmTotp(): Promise<void> {
+  if (!totpSetup.value) return;
+  const code = totpCode.value.trim();
+  if (!/^\d{6}$/.test(code)) {
+    ui.notify("请输入 6 位验证码", "warning");
+    return;
+  }
+  try {
+    await users.confirmTotp(totpSetup.value.username, code);
     totpSetup.value = null;
+    totpCode.value = "";
     await loadUsers();
     ui.notify("两步验证已启用", "success");
   } catch (err) {
+    // Keep the same secret/QR visible so a typo can be retried; regenerating
+    // it would silently invalidate what the user just scanned.
     ui.notify((err as Error).message, "error");
   }
 }
@@ -255,6 +271,17 @@ function formatTime(value: number | null | undefined): string {
           <p>为 {{ totpSetup.username }} 绑定两步验证：</p>
           <div class="qr" v-html="totpSetup.qr" />
           <code class="mono">{{ totpSetup.secret }}</code>
+          <NSpace style="margin-top: 8px" align="center">
+            <NInput
+              v-model:value="totpCode"
+              placeholder="6 位验证码"
+              maxlength="6"
+              style="width: 150px"
+              @keyup.enter="confirmTotp"
+            />
+            <NButton type="primary" @click="confirmTotp">完成绑定</NButton>
+            <NButton quaternary @click="totpSetup = null">取消</NButton>
+          </NSpace>
         </NAlert>
         <table class="table">
           <thead>

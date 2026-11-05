@@ -1,4 +1,6 @@
 import {
+  FLAG_DISPLAY,
+  FLAG_LAST,
   FLAG_SNAPSHOT,
   MAX_INPUT_FRAME,
   ProtocolError,
@@ -50,7 +52,9 @@ export class TerminalSocket {
   private reconnectTimer: number | null = null;
   private pingTimer: number | null = null;
   private ackTimer: number | null = null;
+  private snapshotTimer: number | null = null;
   private closed = false;
+  private snapshotPending = false;
   private pendingAck: number | null = null;
   private lastAckSent = 0;
   //: Highest stream offset *received*, used only for flow-control ACKs. It may
@@ -65,7 +69,18 @@ export class TerminalSocket {
   lastSeq: number | null;
   generation: string | null;
 
+  private readonly onOnline = (): void => {
+    if (this.closed) return;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.delay = INITIAL_DELAY;
+      this.connect();
+    }
+  };
+
   constructor(options: TerminalOptions) {
+    window.addEventListener("online", this.onOnline);
     this.session = options.session;
     this.share = options.share ?? null;
     this.cols = options.cols;
@@ -93,7 +108,10 @@ export class TerminalSocket {
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     ws.onopen = () => {
-      this.delay = INITIAL_DELAY;
+      // Do not reset the backoff here: the server accepts the socket before
+      // it rejects an overloaded/unauthorized session, so a reset on open made
+      // every such rejection retry at 500ms forever. ``attached`` is the first
+      // proof that a session actually exists.
       this.setState("connected");
       this.sendAttach();
       this.startHeartbeat();
@@ -155,24 +173,38 @@ export class TerminalSocket {
       this.handlers.onNotice((error as Error).message, "error");
       return;
     }
-    if (frame.flags & FLAG_SNAPSHOT) {
-      // Snapshot bytes replace the screen; a resync state ends once written.
+    const isSnapshot = (frame.flags & FLAG_SNAPSHOT) !== 0;
+    const isDisplay = (frame.flags & FLAG_DISPLAY) !== 0;
+    if (isSnapshot && !isDisplay) {
+      // A snapshot may be split into several frames with the same anchor.
+      // Keep the resume cursor still until the frame carrying FLAG_LAST has
+      // actually been painted; the first chunk must not acknowledge the whole
+      // screen.
+      this.snapshotPending = true;
       this.setState("resyncing");
     }
-    const isSnapshot = (frame.flags & FLAG_SNAPSHOT) !== 0;
     const ack = () => {
       const end = frame.seq + frame.payload.byteLength;
       this.ackSeq = Math.max(this.ackSeq, isSnapshot ? frame.seq : end);
       this.queueAck(this.ackSeq);
+      if (isDisplay) {
+        // Repaint output and the clear-screen prefix are display-only: they
+        // never move the resume cursor and never clear a gap.
+        return;
+      }
       if (isSnapshot) {
-        // A snapshot is a rendered screen anchored at ``seq``. It restores
-        // contiguity -- and, when the generation changed, it replaces the old
-        // stream offset instead of being max()'d against it.
+        if ((frame.flags & FLAG_LAST) === 0) return;
+        // A complete snapshot is a rendered screen anchored at ``seq``. It
+        // restores contiguity -- and, when the generation changed, it replaces
+        // the old stream offset instead of being max()'d against it.
         this.lastSeq = frame.seq;
         this.ackSeq = frame.seq;
         this.awaitingSnapshot = false;
+        this.snapshotPending = false;
         this.setState("connected");
-      } else if (!this.awaitingSnapshot) {
+        return;
+      }
+      if (!this.awaitingSnapshot) {
         this.lastSeq = advanceSeq(
           this.lastSeq ?? 0,
           frame.seq,
@@ -211,18 +243,26 @@ export class TerminalSocket {
         // Adopting the server's end offset first would let a tab that closes
         // early persist a "caught up" marker over a screen that never got the
         // bytes.
+        if (this.snapshotPending) {
+          // Snapshot chunks queued before ``attached`` are still being
+          // painted. The final chunk's ACK owns the cursor.
+          break;
+        }
         this.awaitingSnapshot = false;
+        this.delay = INITIAL_DELAY; // an attached session is genuinely stable
         this.setState("connected");
         break;
       }
       case "gap":
+        if (!this.awaitingSnapshot) {
+          this.handlers.onNotice(
+            `输出丢失 ${String(message.from)}..${String(message.to)}，正在请求快照`,
+            "warn",
+          );
+          this.setState("resyncing");
+          this.requestSnapshot();
+        }
         this.awaitingSnapshot = true;
-        this.handlers.onNotice(
-          `输出丢失 ${String(message.from)}..${String(message.to)}，正在请求快照`,
-          "warn",
-        );
-        this.setState("resyncing");
-        this.requestSnapshot();
         break;
       case "snapshot":
         this.setState("resyncing");
@@ -239,16 +279,20 @@ export class TerminalSocket {
           this.handlers.onNotice("重新同步未完整，请稍后重试", "warn");
           break;
         }
-        if (typeof message.seq === "number") {
-          this.lastSeq = Math.max(this.lastSeq ?? 0, message.seq);
-          this.ackSeq = Math.max(this.ackSeq, message.seq);
+        if (this.snapshotPending) {
+          // The final snapshot chunk's write callback advances the cursor.
+          break;
         }
+        // Do not adopt ``message.seq`` here: raw replay frames queued before
+        // this control may still be unpainted, and ACKing an offset the user
+        // never saw is exactly how a reconnect skips bytes.
         this.awaitingSnapshot = false;
         this.setState("connected");
         break;
       case "resync-rejected":
         this.handlers.onNotice("重新同步过于频繁，请稍候", "warn");
         this.setState(this.awaitingSnapshot ? "resyncing" : "connected");
+        if (this.awaitingSnapshot) this.scheduleSnapshotRetry();
         break;
       case "notice":
         this.handlers.onNotice(String(message.msg ?? "提示"), "warn");
@@ -278,12 +322,22 @@ export class TerminalSocket {
 
   private scheduleReconnect(): void {
     if (this.closed || this.reconnectTimer !== null) return;
-    const wait = this.delay;
+    // Full jitter prevents a fleet of panes from reconnecting in lockstep
+    // after a server restart; the lower half keeps recovery prompt.
+    const wait = Math.round(this.delay * (0.5 + Math.random() * 0.5));
     this.delay = Math.min(this.delay * 2, MAX_DELAY);
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
     }, wait);
+  }
+
+  private scheduleSnapshotRetry(): void {
+    if (this.closed || this.snapshotTimer !== null) return;
+    this.snapshotTimer = window.setTimeout(() => {
+      this.snapshotTimer = null;
+      if (this.awaitingSnapshot) this.requestSnapshot();
+    }, 2_000);
   }
 
   private startHeartbeat(): void {
@@ -343,14 +397,19 @@ export class TerminalSocket {
   }
 
   requestSnapshot(): void {
-    this.sendText(encodeControl({ type: "snapshot-request" }));
+    const payload: Record<string, unknown> = { type: "snapshot-request" };
+    if (this.lastSeq !== null) payload.last_seq = this.lastSeq;
+    this.sendText(encodeControl(payload));
   }
 
   close(): void {
     this.closed = true;
+    window.removeEventListener("online", this.onOnline);
     this.stopHeartbeat();
     if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
+    if (this.snapshotTimer !== null) window.clearTimeout(this.snapshotTimer);
     this.reconnectTimer = null;
+    this.snapshotTimer = null;
     this.ws?.close(1000, "client closed");
     this.ws = null;
     this.setState("idle");

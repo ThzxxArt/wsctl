@@ -203,5 +203,15 @@ jobs:
       - name: Smoke the image
         run: |
           docker run --rm wsctl:ci version
-          docker run --rm -e WSCTL_ADMIN_PASSWORD=ci-password-123 \
-            -v "$PWD/ci-data:/data" wsctl:ci doctor
+          mkdir -p ci-data ci-workspace
+          sudo chown -R 10001:10001 ci-data ci-workspace
+          docker run -d --name wsctl-ci -p 17881:7681 \
+            -e WSCTL_ADMIN_PASSWORD=ci-password-123 \
+            -v "$PWD/ci-data:/data" -v "$PWD/ci-workspace:/workspace" wsctl:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:17881/healthz && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:17881/healthz
+          docker exec wsctl-ci wsctl doctor --json
+          docker rm -f wsctl-ci

@@ -3,7 +3,9 @@
 `wsctl` 0.2.0 bundles a pre-built frontend in `src/wsctl/static/`. The source
 and exact versions are pinned in `web/package.json` and `web/pnpm-lock.yaml`.
 License texts for the bundled packages are available from their npm packages
-and are included in the published sdist via `web/pnpm-lock.yaml`.
+and are shipped in the wheel as `wsctl/THIRD_PARTY_NOTICES.md`; the exact
+package versions are pinned in `web/pnpm-lock.yaml` (which records integrity
+hashes, not license text). Apache-2.0 components are listed explicitly above.
 
 | Component | Version | License |
 |---|---|---|

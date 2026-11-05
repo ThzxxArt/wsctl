@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from typing import Any
 
 
@@ -29,6 +30,18 @@ def decode_cursor(cursor: str) -> dict[str, Any]:
     except (ValueError, UnicodeDecodeError) as exc:
         raise ValueError("游标无效") from exc
     if not isinstance(value, dict):
+        raise ValueError("游标无效")
+
+    def finite(item: Any) -> bool:
+        if isinstance(item, float):
+            return math.isfinite(item)
+        if isinstance(item, dict):
+            return all(finite(v) for v in item.values())
+        if isinstance(item, list):
+            return all(finite(v) for v in item)
+        return True
+
+    if not finite(value):
         raise ValueError("游标无效")
     return value
 

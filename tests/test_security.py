@@ -166,15 +166,21 @@ def test_malformed_hops_are_skipped_rather_than_returned() -> None:
 # -- 0.1.30 review: same-origin must survive a reverse proxy ------------------
 
 
-def test_a_proxied_origin_with_a_port_matches_a_host_without_one() -> None:
-    """nginx's documented ``proxy_set_header Host $host`` drops the port.
+def test_a_port_less_host_does_not_match_a_non_default_origin_port() -> None:
+    """``Host`` without a port means the scheme's default port, not any port.
 
-    Comparing ``Origin``'s whole netloc with ``Host`` rejected every write
-    (login included) on ``https://term.example.com:8443``, and the UI showed
-    the 403 as "wrong password".
+    Treating it as a wildcard let a page on ``http://host:8080`` drive an
+    authenticated panel on ``http://host`` (same-site, so the Lax cookie was
+    sent). A proxy must preserve the external port (``Host $http_host``) or
+    the operator must list the origin explicitly.
     """
-    assert is_origin_allowed(
+    assert not is_origin_allowed(
         "https://term.example.com:8443", "term.example.com", []
+    )
+    assert is_origin_allowed(
+        "https://term.example.com:8443",
+        "term.example.com",
+        ["https://term.example.com:8443"],
     )
     # A direct connection carries the port in Host; it must still match.
     assert is_origin_allowed(

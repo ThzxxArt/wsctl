@@ -22,18 +22,22 @@ from wsctl.core.store import Store, User, hash_token
 from .security import COOKIE_NAME
 
 
-def resolve_token_user(request: Request | WebSocket, token: str | None) -> User | None:
+def resolve_token_user(
+    request: Request | WebSocket, token: str | None, *, allow_api_key: bool = True
+) -> User | None:
     """Resolve a login token or an API key to a user.
 
     API keys are checked *before* auth sessions only when they carry the
     ``wsctl_`` prefix; both are hashed, so a stolen database row cannot be
-    replayed as a credential.
+    replayed as a credential. ``allow_api_key`` is false for a token that came
+    from a cookie: an API key is a bearer credential and must never be accepted
+    from a path where its scopes are not visible to the request middleware.
     """
     if not token:
         return None
     store: Store = request.app.state.store
     db = getattr(request.app.state, "db", None)
-    if db is not None and token.startswith("wsctl_"):
+    if allow_api_key and db is not None and token.startswith("wsctl_"):
         record = db.api_key_resolve(hash_token(token))
         if record is not None:
             user = store.user_get_by_id(int(record["user_id"]))
@@ -42,21 +46,52 @@ def resolve_token_user(request: Request | WebSocket, token: str | None) -> User 
     return store.resolve_auth_session(token)
 
 
-def token_from_request(request: Request | WebSocket) -> str | None:
-    auth = request.headers.get("authorization")
+def token_source(request: Request | WebSocket) -> tuple[str | None, str | None]:
+    """Return ``(token, source)`` where source is ``bearer`` or ``cookie``.
+
+    Duplicate ``Authorization`` headers are ambiguous: the scope middleware and
+    Starlette used to read different values (last vs first), which let a
+    read-only key ride alongside a bogus second header. Treat more than one as
+    no bearer credential at all.
+    """
+    values = request.headers.getlist("authorization")
+    if len(values) > 1:
+        return None, "ambiguous"
+    auth = values[0] if values else None
     if auth and auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return request.cookies.get(COOKIE_NAME)
+        token = auth[7:].strip()
+        if token:
+            return token, "bearer"
+    cookie = request.cookies.get(COOKIE_NAME)
+    return (cookie, "cookie") if cookie else (None, None)
+
+
+def token_from_request(request: Request | WebSocket) -> str | None:
+    return token_source(request)[0]
 
 
 def current_user(request: Request) -> User:
+    cached = getattr(request.state, "user", None)
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
     settings: Settings = request.app.state.settings
     if not settings.auth_required:
         user = User(id=0, username="anonymous", role="admin", disabled=False, created_at=0.0)
         request.state.user = user
         return user
-    token = token_from_request(request)
-    resolved: User | None = resolve_token_user(request, token)
+    token, source = token_source(request)
+    if source == "ambiguous":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization 头重复"
+        )
+    if source == "cookie" and token is not None and token.startswith("wsctl_"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API Key 只能通过 Authorization 头使用",
+        )
+    resolved: User | None = resolve_token_user(
+        request, token, allow_api_key=(source == "bearer")
+    )
     if resolved is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="需要登录"
@@ -65,6 +100,8 @@ def current_user(request: Request) -> User:
     # avoids a second token lookup and keeps a key from replaying another
     # account's response.
     request.state.user = resolved
+    request.state.token = token
+    request.state.token_source = source
     return resolved
 
 

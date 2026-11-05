@@ -73,7 +73,7 @@ class ShareService:
             label=label[:80],
             created_by=created_by,
             expires_at=time.time() + ttl if ttl else None,
-            token_hint=token[:8],
+            token_hint="",
         )
         self._cache[token] = _CacheEntry(record, time.time() + CACHE_TTL)
         return token, record

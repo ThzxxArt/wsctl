@@ -37,6 +37,7 @@ class SessionActor:
         self._worker: asyncio.Task[None] | None = None
         self._closed = False
         self._stopping = False
+        self._stop_task: asyncio.Task[None] | None = None
         # Route the read loop's output through this actor. ``_emit`` is the
         # single hook every byte passes through, so an attach queued in the
         # mailbox cannot observe a half-delivered chunk.
@@ -57,7 +58,14 @@ class SessionActor:
         real session kept using the old value -- the patch would appear to
         work and change nothing. Forwarding keeps the object contract.
         """
-        if name in {"session", "_mailbox", "_worker", "_closed", "_stopping"}:
+        if name in {
+            "session",
+            "_mailbox",
+            "_worker",
+            "_closed",
+            "_stopping",
+            "_stop_task",
+        }:
             object.__setattr__(self, name, value)
         else:
             setattr(self.session, name, value)
@@ -165,13 +173,23 @@ class SessionActor:
         await self._call("detach", client)
 
     async def stop(self, **kwargs: Any) -> None:
-        if self._closed or self._stopping:
+        if self._closed:
+            return
+        if self._stop_task is not None:
+            # A second caller (shutdown racing an admin action) must wait for
+            # the first stop to finish, not return while the child is alive.
+            await asyncio.shield(self._stop_task)
             return
         self._stopping = True
-        try:
-            await self._call("stop", **kwargs)
-        finally:
-            self._closed = True
+
+        async def run_stop() -> None:
+            try:
+                await self._call("stop", **kwargs)
+            finally:
+                self._closed = True
+
+        self._stop_task = asyncio.get_running_loop().create_task(run_stop())
+        await asyncio.shield(self._stop_task)
 
     async def resync(self, client: Any, *, requested: bool = True) -> dict[str, Any]:
         return dict(await self._call("resync", client, requested=requested))

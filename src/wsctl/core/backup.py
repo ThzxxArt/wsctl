@@ -50,6 +50,11 @@ def _snapshot_db(src: Path, dst: Path) -> bool:
         raise BackupError(f"数据库快照失败：{exc}") from exc
     finally:
         source.close()
+    # The snapshot contains password hashes, TOTP secrets and API-key hashes.
+    # sqlite3 creates it with the process umask (usually 0644); close that gap
+    # for every caller, including restore's ``.bak``.
+    with contextlib.suppress(OSError):
+        os.chmod(dst, 0o600)
     return True
 
 
@@ -173,14 +178,17 @@ def _live_instances(db_path: Path, ttl: float) -> list[str]:
 
     try:
         conn = sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as exc:
+        # Fail closed: "could not open" is not proof that no server is using
+        # the file. Only a genuinely old schema (no table) is a valid no-op.
+        raise BackupError(f"无法确认数据库是否正在使用：{exc}") from exc
     try:
         rows = conn.execute(
             "SELECT id FROM instances WHERE heartbeat >= ?", (time.time() - ttl,)
         ).fetchall()
-    except sqlite3.Error:
-        # Older schema without the table: nothing to go on, not a blocker.
+    except sqlite3.Error as exc:
+        if "no such table" not in str(exc).lower():
+            raise BackupError(f"无法确认数据库是否正在使用：{exc}") from exc
         return []
     finally:
         conn.close()
@@ -351,6 +359,8 @@ def restore_backup(
                 # A corrupt old database is exactly why someone restores; keep
                 # the bytes anyway rather than refusing the restore.
                 shutil.copy2(db_path, backup_path)
+                with contextlib.suppress(OSError):
+                    os.chmod(backup_path, 0o600)
 
         if source_db.is_file():
             _install_database(source_db, db_path)

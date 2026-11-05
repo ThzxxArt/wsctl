@@ -27,4 +27,18 @@ describe("keybindings", () => {
   it("formats a chord for display", () => {
     expect(formatBinding("Ctrl+Shift+P")).toBe("Ctrl+Shift+P");
   });
+
+  it("matches a shifted symbol against its unshifted key", () => {
+    expect(matchesBinding(event({ key: "_", shiftKey: true, altKey: true }), "Alt+Shift+-")).toBe(
+      true,
+    );
+  });
+
+  it("matches Alt+C when macOS reports a composed character", () => {
+    expect(matchesBinding(event({ key: "ç", code: "KeyC", altKey: true }), "Alt+C")).toBe(true);
+  });
+
+  it("accepts Right as an alias for ArrowRight", () => {
+    expect(matchesBinding(event({ key: "ArrowRight", altKey: true }), "Alt+Right")).toBe(true);
+  });
 });

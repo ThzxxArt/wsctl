@@ -58,6 +58,12 @@ KIND_INPUT = 2
 FLAG_SNAPSHOT = 0b0000_0001
 FLAG_REPLAY = 0b0000_0010
 FLAG_LAST = 0b0000_0100
+#: Display-only bytes: clear-screen prefixes and the output of a repaint nudge.
+#: They must be rendered but are not part of the resumable stream, so a client
+#: must not advance its resume cursor or clear a gap on them.
+FLAG_DISPLAY = 0b0000_1000
+
+_FLAG_MASK = FLAG_SNAPSHOT | FLAG_REPLAY | FLAG_LAST | FLAG_DISPLAY
 
 _HEADER = struct.Struct("!BQB")
 _INPUT_HEADER = struct.Struct("!BB")
@@ -83,6 +89,8 @@ CONTROL_TYPES = frozenset(
         "exit",
         "notice",
         "error",
+        "desync",
+        "close",
         "evicted",
         "command",
         "presence",
@@ -117,7 +125,7 @@ def encode_data(seq: int, payload: bytes, flags: int = 0) -> bytes:
         raise ProtocolError("seq 超出 u64 范围")
     if len(payload) > MAX_DATA_FRAME:
         raise ProtocolError(f"数据帧超过上限（{len(payload)} > {MAX_DATA_FRAME}）")
-    if flags & ~0x07:
+    if flags & ~_FLAG_MASK:
         raise ProtocolError("未知的数据帧标志位")
     return _HEADER.pack(KIND_DATA, int(seq), int(flags)) + bytes(payload)
 
@@ -129,7 +137,7 @@ def decode_data(frame: bytes) -> DataFrame:
     kind, seq, flags = _HEADER.unpack_from(frame)
     if kind != KIND_DATA:
         raise ProtocolError(f"不是数据帧（kind={kind}）")
-    if flags & ~0x07:
+    if flags & ~_FLAG_MASK:
         raise ProtocolError("未知的数据帧标志位")
     payload = bytes(frame[_HEADER.size:])
     if len(payload) > MAX_DATA_FRAME:
@@ -141,7 +149,7 @@ def encode_input(payload: bytes, flags: int = 0) -> bytes:
     """Encode a client→server terminal input frame."""
     if len(payload) > 256 * 1024:
         raise ProtocolError("输入帧超过上限")
-    if flags & ~0x07:
+    if flags & ~_FLAG_MASK:
         raise ProtocolError("未知的输入帧标志位")
     return _INPUT_HEADER.pack(KIND_INPUT, int(flags)) + bytes(payload)
 
@@ -153,7 +161,7 @@ def decode_input(frame: bytes) -> InputFrame:
     kind, flags = _INPUT_HEADER.unpack_from(frame)
     if kind != KIND_INPUT:
         raise ProtocolError(f"不是输入帧（kind={kind}）")
-    if flags & ~0x07:
+    if flags & ~_FLAG_MASK:
         raise ProtocolError("未知的输入帧标志位")
     payload = bytes(frame[_INPUT_HEADER.size:])
     if len(payload) > 256 * 1024:
@@ -205,6 +213,7 @@ def decode_control(raw: str | bytes) -> dict[str, Any]:
 
 __all__ = [
     "CONTROL_TYPES",
+    "FLAG_DISPLAY",
     "FLAG_LAST",
     "FLAG_REPLAY",
     "FLAG_SNAPSHOT",

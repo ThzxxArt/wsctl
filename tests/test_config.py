@@ -232,3 +232,16 @@ def test_negative_connection_limits_are_refused() -> None:
     # 0 still means "unlimited/off"; that is a documented choice.
     assert Settings(ws_max_connections=0).ws_max_connections == 0
     assert Settings(login_rate_limit=0).login_rate_limit == 0
+
+
+def test_reload_preserves_explicit_cli_overrides(tmp_path: Path, monkeypatch: object) -> None:
+    """``--no-auth`` must survive a config reload from a file that omits it."""
+    config = tmp_path / "config.toml"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("WSCTL_CONFIG", str(config))  # type: ignore[attr-defined]
+    settings = load_settings(auth_required=False)
+    assert settings.auth_required is False
+    changed, errors = reload_settings_file(settings)
+    assert errors == []
+    assert "auth_required" not in changed
+    assert settings.auth_required is False

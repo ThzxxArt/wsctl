@@ -114,6 +114,29 @@ async def test_raw_snapshot_is_honest_about_being_a_replay() -> None:
     assert snap.data == b"output"
 
 
+@pytest.mark.asyncio
+async def test_pyte_snapshot_keeps_split_utf8_and_wide_characters() -> None:
+    snapshotter = PyteSnapshot(20, 3, mode="always")
+    encoded = "中文测试ABC".encode()
+    # Split inside the first multi-byte character, as a PTY read can.
+    snapshotter.feed(encoded[:1])
+    snapshotter.feed(encoded[1:])
+    snap = await snapshotter.capture(0)
+    assert snap is not None and snap.capable
+    assert "中文测试ABC" in snap.data.decode("utf-8")
+    # A wide glyph must not be followed by an extra space stub.
+    assert "中 文" not in snap.data.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_pyte_snapshot_preserves_truecolor() -> None:
+    snapshotter = PyteSnapshot(20, 2, mode="always")
+    snapshotter.feed(b"\x1b[38;2;255;0;0mred\x1b[0m")
+    snap = await snapshotter.capture(0)
+    assert snap is not None
+    assert b"38;2;255;0;0" in snap.data
+
+
 def test_command_block_parser_handles_split_osc_and_exit_code() -> None:
     events: list[dict] = []
     parser = CommandBlockParser("s1", on_event=events.append, clock=lambda: 10.0)

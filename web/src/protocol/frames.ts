@@ -7,6 +7,7 @@ export const KIND_INPUT = 2;
 export const FLAG_SNAPSHOT = 0b0000_0001;
 export const FLAG_REPLAY = 0b0000_0010;
 export const FLAG_LAST = 0b0000_0100;
+export const FLAG_DISPLAY = 0b0000_1000;
 
 const HEADER_SIZE = 10;
 const INPUT_HEADER_SIZE = 2;
@@ -34,7 +35,7 @@ export class ProtocolError extends Error {}
  * would claim bytes that were never sent and make the next resume skip data.
  */
 export function advanceSeq(lastSeq: number, seq: number, length: number, flags: number): number {
-  if (flags & FLAG_SNAPSHOT) return seq;
+  if (flags & (FLAG_SNAPSHOT | FLAG_DISPLAY)) return seq;
   return Math.max(lastSeq, seq + length);
 }
 

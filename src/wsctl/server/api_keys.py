@@ -66,8 +66,29 @@ class ApiKeyScopeMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        headers = {key.lower(): value for key, value in scope.get("headers", [])}
-        raw = headers.get(b"authorization", b"").decode("latin-1").strip()
+        values = [
+            value.decode("latin-1").strip()
+            for key, value in scope.get("headers", [])
+            if key.lower() == b"authorization"
+        ]
+        if len(values) > 1:
+            # Ambiguous credentials must fail closed: Starlette's Headers.get
+            # takes the first value while this middleware used to take the
+            # last, so a read key plus a bogus second header bypassed scopes.
+            response = JSONResponse(
+                {
+                    "type": "about:blank",
+                    "title": "认证请求不明确",
+                    "status": 401,
+                    "detail": "Authorization 头重复",
+                    "instance": scope.get("path", ""),
+                },
+                status_code=401,
+                media_type="application/problem+json",
+            )
+            await response(scope, receive, send)
+            return
+        raw = values[0] if values else ""
         if not raw.lower().startswith("bearer "):
             await self.app(scope, receive, send)
             return

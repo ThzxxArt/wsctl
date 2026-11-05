@@ -51,6 +51,7 @@ from wsctl.core.webhook import WebhookDispatcher
 
 from . import routes
 from .api_keys import ApiKeyScopeMiddleware
+from .deps import resolve_token_user, token_source
 from .maintenance import (
     active_recording_paths,
     dead_instance_ids,
@@ -93,6 +94,24 @@ MAX_LOGIN_BODY = 8 * 1024
 MAX_JSON_BODY = 16 * 1024 * 1024
 
 log = logging.getLogger("wsctl.app")
+
+
+#: API paths that must work before a session exists. Everything else is
+#: authenticated in middleware *before* Starlette reads the body: otherwise an
+#: unauthenticated upload/JSON body is parsed (and spooled to disk/memory)
+#: before the route dependency gets a chance to return 401.
+_PUBLIC_API_SUFFIXES = (
+    "/login",
+    "/logout",
+    "/shares/resolve",
+    "/push/vapid",
+)
+
+
+def _needs_api_auth(path: str) -> bool:
+    if not path.startswith("/api/"):
+        return False
+    return not any(path.rstrip("/").endswith(suffix) for suffix in _PUBLIC_API_SUFFIXES)
 
 
 def _config_mtime(settings: Settings) -> float:
@@ -253,6 +272,11 @@ def create_app(
         if cutoffs["term_sessions"] is not None:
             await asyncio.to_thread(
                 store_.purge_term_sessions, cutoffs["term_sessions"]
+            )
+            # Command blocks were never purged; a busy account could grow the
+            # database forever even after its session rows were deleted.
+            await asyncio.to_thread(
+                app.state.db.command_blocks_purge, cutoffs["term_sessions"]
             )
         if cutoffs["recordings"] is not None:
             active = active_recording_paths(app.state.manager)
@@ -817,6 +841,27 @@ def create_app(
                     payload=f"{request.method} {request.url.path}",
                 )
                 return problem_response(request, status=403, detail=rejection)
+        if settings.auth_required and _needs_api_auth(request.url.path):
+            token, source = token_source(request)
+            if source == "ambiguous" or (
+                source == "cookie" and token is not None and token.startswith("wsctl_")
+            ):
+                return problem_response(
+                    request, status=401, detail="Authorization 头重复或凭证来源无效"
+                )
+            user = await asyncio.to_thread(
+                resolve_token_user,
+                request,
+                token,
+                allow_api_key=source == "bearer",
+            )
+            if user is None:
+                return problem_response(request, status=401, detail="需要登录")
+            # The route dependency can reuse this resolution instead of doing
+            # a second token lookup after the body was parsed.
+            request.state.user = user
+            request.state.token = token
+            request.state.token_source = source
         if request.method == "POST" and request.url.path.rstrip("/") in {
             "/api/login",
             "/api/v2/login",
@@ -827,21 +872,30 @@ def create_app(
             if issue is not None:
                 code, detail = issue
                 return problem_response(request, status=code, detail=detail)
-        elif (
-            request.method in {"POST", "PUT", "PATCH", "DELETE"}
-            and request.url.path.startswith("/api/")
-            and not request.url.path.rstrip("/").endswith("/files/upload")
+        elif request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith(
+            "/api/"
         ):
+            is_upload = request.url.path.rstrip("/").endswith("/files/upload")
+            if is_upload:
+                # The multipart envelope is a little larger than the file; the
+                # route still enforces the exact file limit while streaming.
+                configured = int(getattr(settings, "file_max_upload", 0) or 0)
+                limit = configured + 1024 * 1024 if configured > 0 else 1024**3
+            else:
+                limit = MAX_JSON_BODY
             raw_length = request.headers.get("content-length")
             if raw_length is None:
+                # A chunked body has no length to check before Starlette starts
+                # spooling it; both the UI and CLI always send a length. A
+                # request with neither framing header has no body at all
+                # (POST /share, DELETE without payload) and is safe.
                 if "chunked" in request.headers.get("transfer-encoding", "").lower():
-                    # ``Content-Length`` is what the cap above reads; a chunked
-                    # body would stream past it and only be bounded by memory.
                     return problem_response(
                         request,
                         status=411,
                         detail="该接口需要 Content-Length，不接受分块请求体",
                     )
+                length = 0
             else:
                 try:
                     length = int(raw_length)
@@ -849,12 +903,12 @@ def create_app(
                     return problem_response(
                         request, status=400, detail="Content-Length 无效"
                     )
-                if length > MAX_JSON_BODY:
-                    return problem_response(
-                        request,
-                        status=413,
-                        detail=f"请求体过大（上限 {MAX_JSON_BODY} 字节）",
-                    )
+            if length > limit:
+                return problem_response(
+                    request,
+                    status=413,
+                    detail=f"请求体过大（上限 {limit} 字节）",
+                )
         response = await call_next(request)
         # Authenticated API responses are per-user and must not sit in a shared
         # proxy or the browser's back/forward cache. Endpoints with an explicit

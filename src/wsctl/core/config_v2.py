@@ -136,7 +136,6 @@ APPLY_IMMEDIATE = frozenset(
         "allowed_origins",
         "audit_retention_days",
         "cookie_secure",
-        "database_echo",
         "file_max_upload",
         "file_root",
         "instance_ttl",
@@ -305,11 +304,38 @@ def parse_human_int(key: str, value: Any, *, kind: str = "auto") -> Any:
         return value
     number = float(match.group(1))
     unit = match.group(2).lower()
+    if key in _DAYS_KEYS:
+        day_factors = {
+            "d": 1.0,
+            "day": 1.0,
+            "days": 1.0,
+            "w": 7.0,
+            "week": 7.0,
+            "weeks": 7.0,
+            "h": 1 / 24,
+            "hour": 1 / 24,
+            "hours": 1 / 24,
+        }
+        if unit in day_factors:
+            # These fields are consumed as *days* and multiplied by 86400 by
+            # the retention sweep. Converting "30d" to seconds here made the
+            # product keep audit rows for roughly 7,000 years.
+            return max(1, int(number * day_factors[unit]))
+        return value
     if kind in ("auto", "bytes") and unit in _BYTE_UNITS:
         return int(number * _BYTE_UNITS[unit])
     if kind in ("auto", "time") and unit in _TIME_UNITS:
         return int(number * _TIME_UNITS[unit])
     return value
+
+
+_DAYS_KEYS = frozenset(
+    {
+        "audit_retention_days",
+        "term_session_retention_days",
+        "recordings_retention_days",
+    }
+)
 
 
 _TIME_KEYS = frozenset(

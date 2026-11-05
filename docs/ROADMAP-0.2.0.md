@@ -26,7 +26,7 @@
   `Idempotency-Key`、`ETag`/`If-None-Match`、`GET/PUT /api/v2/config`。
 - 前端：生成式 OpenAPI 客户端、TanStack Query、ESLint/Prettier、Vitest +
   Vue Test Utils、Playwright 跨浏览器/移动端/视觉回归/断网恢复。
-- 测试：pytest 全量（718 passed / 8 skipped）、Vitest 34 passed、Playwright
+- 测试：pytest 全量（728 passed / 8 skipped）、Vitest 40 passed、Playwright
   Chromium/WebKit/Firefox/移动端、`scripts/e2e` 全场景。
 - 审查修复：精确续传不再先清屏；退出码持久化到 `term_sessions.exit_code`；
   SSE 事件按会话属主过滤；旧 `/ws` 也执行 API Key scope；并发

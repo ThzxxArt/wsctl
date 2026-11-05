@@ -60,6 +60,7 @@ from wsctl.core.pty import PtyError
 from wsctl.core.recording import has_room as recordings_have_room
 from wsctl.core.session import (
     ClientGone,
+    SessionFull,
     SessionManager,
     within_user_quota,
 )
@@ -228,8 +229,9 @@ async def terminal_endpoint_v2(websocket: WebSocket) -> None:
                 close_code = int(code)
     except _Denied as exc:
         close_code = exc.code
-        with contextlib.suppress(ClientGone):
-            client.put({"type": "error", "msg": exc.message})
+        if not getattr(exc, "notified", False):
+            with contextlib.suppress(ClientGone):
+                client.put({"type": "error", "msg": exc.message})
     except ProtocolError as exc:
         close_code = CLOSE_BAD_REQUEST
         with contextlib.suppress(ClientGone):
@@ -445,6 +447,10 @@ async def _handshake_v2(
                 last_seq=last_seq,
                 generation=generation,
             )
+    except SessionFull as exc:
+        if created:
+            await manager.remove(session.id)
+        raise _Denied(str(exc), CLOSE_OVERLOAD) from exc
     except ClientGone as exc:
         if created:
             await manager.remove(session.id)
@@ -457,6 +463,11 @@ async def _handshake_v2(
         _snapshot_metric("ok", "session")
     elif meta.get("snapshot_required"):
         _snapshot_metric("missing", "raw")
+        if session.has_scrollback:
+            # No screen provider (mode=off or an incapable shadow): a raw
+            # replay cannot reconstruct a TUI. Ask the application to repaint,
+            # exactly as the v1 endpoint already does after a replay.
+            session.request_repaint()
     return session, writable, can_resize, filter_share
 
 
@@ -545,9 +556,20 @@ async def _pump_v2(
     async def deny(message: str, code: int = CLOSE_UNAUTHORIZED) -> None:
         with contextlib.suppress(ClientGone):
             client.put({"type": "error", "msg": message})
-        raise _Denied(message, code)
+        exc = _Denied(message, code)
+        exc.notified = True  # type: ignore[attr-defined]
+        raise exc
 
-    async def send_snapshot(*, requested: bool) -> bool:
+    def share_revoked_now() -> bool:
+        """The synchronous half of revocation, checked before every input.
+
+        ``revalidate_access`` runs every five seconds; letting input rely on
+        it alone meant a revoked writable share could still type for that
+        window. A cache miss is ``None`` (not yet known), not ``False``.
+        """
+        return share is not None and session.share_state(share) is False
+
+    async def send_snapshot(*, requested: bool, last_seq: int | None = None) -> bool:
         """Send a screen snapshot (or a sequenced full replay) and mark it."""
         if not resync_bucket.allow(1.0):
             with contextlib.suppress(ClientGone):
@@ -572,7 +594,9 @@ async def _pump_v2(
                 # Capture *and* queue under the session lock. Doing only the
                 # capture there still let live output jump ahead of the
                 # snapshot frame, which paints over bytes the client just got.
-                result = await session.resync(client, requested=requested)
+                result = await session.resync(
+                    client, requested=requested, last_seq=last_seq
+                )
         except ClientGone:
             return False
         with contextlib.suppress(ClientGone):
@@ -628,6 +652,13 @@ async def _pump_v2(
         a disabled account kept a writable terminal until it closed the tab.
         """
         nonlocal writable, can_resize
+        if not settings.auth_required:
+            # In no-auth mode the handshake deliberately creates an anonymous
+            # admin (id=0) and there is no token to re-resolve. Treating that
+            # as "no owner and no share" denied every v2 session after five
+            # seconds, making --no-auth unusable.
+            writable, can_resize = True, True
+            return
         fresh = None
         if auth_token and user_id is not None:
             fresh = await asyncio.to_thread(resolve_token_user, websocket, auth_token)
@@ -689,6 +720,8 @@ async def _pump_v2(
                 frame = decode_input(data_bytes)
             except ProtocolError as exc:
                 await deny(str(exc), CLOSE_BAD_REQUEST)
+            if share_revoked_now():
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
             if not writable:
                 notice("readonly", "会话为只读")
                 continue
@@ -723,6 +756,8 @@ async def _pump_v2(
                 with contextlib.suppress(Exception):
                     WS_ACK_LAG_BYTES.set(float(lag))
         elif kind == "resize":
+            if share_revoked_now():
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
             if not can_resize:
                 notice("control-only", "当前分享没有控制权限")
                 continue
@@ -731,6 +766,8 @@ async def _pump_v2(
             except (TypeError, ValueError, OverflowError):
                 continue
         elif kind == "input":
+            if share_revoked_now():
+                await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
             if not writable:
                 notice("readonly", "会话为只读")
                 continue
@@ -760,10 +797,18 @@ async def _pump_v2(
                     }
                 )
         elif kind in ("resync", "snapshot-request"):
-            if share is not None and not await refresh_share():
+            if share_revoked_now() or (
+                share is not None and not await refresh_share()
+            ):
                 await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
+            raw_last = data.get("last_seq")
+            last_seq = (
+                int(raw_last)
+                if isinstance(raw_last, int) and not isinstance(raw_last, bool) and raw_last >= 0
+                else None
+            )
             metrics.inc("wsctl_shed_resync_requests_total")
-            await send_snapshot(requested=True)
+            await send_snapshot(requested=True, last_seq=last_seq)
         elif kind == "claim-control":
             # ``claim-control`` is not a privilege escalation: a write share
             # still may not resize the owner's terminal. Only a connection

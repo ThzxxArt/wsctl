@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - 2026-11-04
+## [0.2.0] - 2026-11-05
 
 **「从能连上的终端，到可以长期工作的终端工作台。」**
 
@@ -110,8 +110,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   顶部；文件编辑器保留原权限位；右键菜单由组件承载（不再 `window.prompt`）。
   WebKit 下打开设置不再主动调用 `navigator.serviceWorker.ready`（Worker 激活期间
   会让 WebKit 页面直接退出），推送状态改为进入通知页时按需检测。
-- **测试**：pytest 718 passed / 8 skipped、slow 7 passed、Vitest 34 passed；
-  Chromium 8、Firefox 7+1、WebKit 7+1、移动端 5+3；`scripts/e2e` 全场景通过。
+- **测试**：pytest 728 passed / 8 skipped、slow 7 passed、Vitest 40 passed；
+  Playwright 27 passed / 5 skipped（Chromium/Firefox/WebKit/移动端）；
+  `scripts/e2e` 全场景通过。
+
+### 发布前终审（2026-11-05）
+
+- **认证**：API Key 只接受 `Authorization`，拒绝 Cookie 中的 `wsctl_` 凭据；
+  重复 `Authorization` 头按歧义拒绝。认证在读取请求体之前完成，上传按
+  `file_max_upload` 预检 `Content-Length`。
+- **跨进程吊销**：`PRAGMA data_version` 检测到另一连接提交时清空 auth cache，
+  CLI 改密/停用不再有 30 秒窗口。
+- **Origin**：`Host` 无端口时只接受 scheme 默认端口；nginx 示例改用
+  `$http_host` 保留外部端口。
+- **分享**：匿名浏览器带 `/s/<token>` 直接进入只读/可写工作台，不再先跳登录；
+  legacy 与 v2 分享撤销同时清理两个权威；读分享在 UI 上禁用输入并显示“只读”。
+- **协议**：新增 `FLAG_DISPLAY`，清屏/重绘不再冒充可续传快照；快照分块只在
+  `FLAG_LAST` 渲染完成后推进恢复游标；每次丢帧 burst 只发一条 `gap`；
+  `resync` 会报告已被淘汰、无法恢复的头部区间。
+- **稳定性**：finalizer 单任务化，`stop` 等待在途 finalize；PTY `close` 移出
+  事件循环；tmux 控制命令捕获 `OSError`；客户端重连退避在 `attached` 后才重置。
+- **视觉**：修复空 `fontFamily` 传给 xterm 导致的比例字体回退（字符间出现空格）；
+  重新生成 0.2.0 截图；生产构建不再发布 sourcemap。
+- **CLI**：窗口 resize 使用协议 v2 控制帧；短写循环写满；stdin EOF sentinel
+  跨重连保留；`resync-rejected` 自动重试；信号退出码规范化为 `128+N`。
 
 ### 变更
 

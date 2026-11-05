@@ -6,7 +6,7 @@ import TerminalPane from "./TerminalPane.vue";
 
 defineOptions({ name: "SplitPane" });
 
-const props = defineProps<{ node: PaneNode; tabId: string }>();
+const props = defineProps<{ node: PaneNode; tabId: string; shareOnly?: boolean }>();
 const workspace = useWorkspaceStore();
 const isNarrow = ref(typeof window !== "undefined" && window.innerWidth < 760);
 
@@ -51,6 +51,7 @@ function onDoubleClick(event: MouseEvent): void {
     v-if="node.type === 'leaf'"
     :pane="node"
     :tab-id="tabId"
+    :share-only="shareOnly"
     :focused="workspace.activeTab?.focus === node.id"
   />
   <Splitpanes
@@ -63,10 +64,10 @@ function onDoubleClick(event: MouseEvent): void {
     @dblclick="onDoubleClick"
   >
     <Pane :size="node.ratio" :min-size="12">
-      <SplitPane :node="node.a" :tab-id="tabId" />
+      <SplitPane :node="node.a" :tab-id="tabId" :share-only="shareOnly" />
     </Pane>
     <Pane :size="100 - node.ratio" :min-size="12">
-      <SplitPane :node="node.b" :tab-id="tabId" />
+      <SplitPane :node="node.b" :tab-id="tabId" :share-only="shareOnly" />
     </Pane>
   </Splitpanes>
 </template>

@@ -15,7 +15,7 @@ an instance out while the web UI correctly refuses the same operation.
 from __future__ import annotations
 
 from .passwords import PasswordPolicyError, validate_password
-from .store import Store, User
+from .store import LastAdminError, Store, User
 
 VALID_ROLES = ("admin", "user")
 
@@ -71,7 +71,10 @@ def set_role(store: Store, username: str, role: str, *, actor: User | None = Non
     target = _target(store, username)
     if role == "user" and target.role == "admin":
         _guard_last_admin(target, store)
-    store.user_set_role(username, role)
+    try:
+        store.user_set_role_guarded(username, role)
+    except LastAdminError as exc:
+        raise UserAdminError(str(exc)) from exc
 
 
 def set_disabled(store: Store, username: str, disabled: bool, *, actor: User | None = None) -> None:
@@ -80,7 +83,10 @@ def set_disabled(store: Store, username: str, disabled: bool, *, actor: User | N
         if actor is not None and actor.username == username:
             raise UserAdminError("不能禁用自己")
         _guard_last_admin(target, store)
-    store.user_set_disabled(username, disabled)
+    try:
+        store.user_set_disabled_guarded(username, disabled)
+    except LastAdminError as exc:
+        raise UserAdminError(str(exc)) from exc
     if disabled:
         # A disabled account must lose its live logins immediately.
         store.delete_user_sessions(target.id)
@@ -102,4 +108,7 @@ def delete(store: Store, username: str, *, actor: User | None = None) -> None:
     if actor is not None and actor.username == username:
         raise UserAdminError("不能删除自己")
     _guard_last_admin(target, store)
-    store.user_delete(username)
+    try:
+        store.user_delete_guarded(username)
+    except LastAdminError as exc:
+        raise UserAdminError(str(exc)) from exc

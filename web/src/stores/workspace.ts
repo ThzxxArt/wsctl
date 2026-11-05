@@ -172,15 +172,25 @@ export const useWorkspaceStore = defineStore("workspace", () => {
   );
   const allLeaves = computed(() => tabs.value.flatMap((tab) => leavesOf(tab.root)));
 
-  function persist(): void {
-    if (!hydrated.value) return;
-    const payload: PersistedLayout = {
+  function withoutShare(node: PaneNode): PaneNode {
+    if (node.type === "leaf") return { ...node, share: null };
+    return { ...node, a: withoutShare(node.a), b: withoutShare(node.b) };
+  }
+
+  function snapshot(): PersistedLayout {
+    return {
       version: 2,
       activeTabId: activeTabId.value,
-      tabs: tabs.value,
+      // A share token is a bearer credential; persisting it in localStorage
+      // (or uploading it with a server layout) would outlive the tab.
+      tabs: tabs.value.map((tab) => ({ ...tab, root: withoutShare(tab.root) })),
     };
+  }
+
+  function persist(): void {
+    if (!hydrated.value) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot()));
     } catch {
       /* ignore quota errors */
     }
@@ -278,6 +288,7 @@ export const useWorkspaceStore = defineStore("workspace", () => {
     const tab = tabForPane(paneId);
     if (tab) {
       tab.focus = paneId;
+      if (activeTabId.value !== tab.id) maximizedPaneId.value = null;
       activeTabId.value = tab.id;
     }
   }
@@ -314,6 +325,9 @@ export const useWorkspaceStore = defineStore("workspace", () => {
   function duplicateTab(tabId: string): Tab | null {
     const source = tabs.value.find((tab) => tab.id === tabId);
     if (!source) return null;
+    if (tabs.value.length >= MAX_TABS) {
+      throw new Error(`最多同时打开 ${MAX_TABS} 个标签`);
+    }
     const clone = (node: PaneNode): PaneNode =>
       node.type === "leaf"
         ? { ...node, id: uid("pane") }
@@ -327,6 +341,7 @@ export const useWorkspaceStore = defineStore("workspace", () => {
     };
     tabs.value.push(tab);
     activeTabId.value = tab.id;
+    maximizedPaneId.value = null;
     return tab;
   }
 
@@ -384,6 +399,9 @@ export const useWorkspaceStore = defineStore("workspace", () => {
     if (!source || !target || source.id === target.id) return false;
     const leaf = findLeaf(source.root, paneId);
     if (!leaf) return false;
+    if (leavesOf(target.root).length >= MAX_LEAVES) {
+      throw new Error(`单个标签最多 ${MAX_LEAVES} 个分屏`);
+    }
     const copy: LeafNode = { ...leaf, id: uid("pane") };
     target.root = {
       type: "split",
@@ -507,7 +525,11 @@ export const useWorkspaceStore = defineStore("workspace", () => {
     maximizedPaneId.value = null;
     hydrated.value = false;
     try {
+      // The legacy key must go too: hydrate() migrates it on every login, so
+      // leaving it behind resurrected the previous account's workspace on the
+      // next sign-in after an upgrade.
       localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem("wsctl-layout");
     } catch {
       /* storage disabled */
     }
@@ -535,6 +557,7 @@ export const useWorkspaceStore = defineStore("workspace", () => {
     setPaneSession,
     moveTab,
     movePaneToTab,
+    snapshot,
     toggleMaximize,
     applyPreset,
     hydrate,

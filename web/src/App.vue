@@ -12,29 +12,62 @@ import {
   enUS,
   zhCN,
 } from "naive-ui";
+import { useQueryClient } from "@tanstack/vue-query";
 import { useAuthStore } from "@/stores/auth";
 import { usePrefsStore } from "@/stores/prefs";
 import { useUiStore } from "@/stores/ui";
 import { useSessionsStore } from "@/stores/sessions";
 import { useWorkspaceStore } from "@/stores/workspace";
-import { clearScreen } from "@/protocol/cache";
+import { useTerminalStore } from "@/stores/terminal";
+import { usePresenceStore } from "@/stores/presence";
+import { clearAllScreens } from "@/protocol/cache";
 import LoginView from "@/components/LoginView.vue";
 import WorkspaceView from "@/components/WorkspaceView.vue";
 import ToastHost from "@/components/ToastHost.vue";
 import CommandPalette from "@/components/CommandPalette.vue";
 
-const SettingsDialog = defineAsyncComponent(() => import("@/components/SettingsDialog.vue"));
-const AdminDialog = defineAsyncComponent(() => import("@/components/AdminDialog.vue"));
-const FilePanel = defineAsyncComponent(() => import("@/components/FilePanel.vue"));
-const ShareDialog = defineAsyncComponent(() => import("@/components/ShareDialog.vue"));
-const ReplayDialog = defineAsyncComponent(() => import("@/components/ReplayDialog.vue"));
+function asyncDialog(loader: () => Promise<unknown>) {
+  return defineAsyncComponent({
+    loader: loader as never,
+    onError: (error, retry, fail, attempts) => {
+      // A deploy removes the old hashed chunk; a tab left open across it then
+      // imports a 404. Retry once, then ask for a reload instead of silently
+      // rendering nothing when the user clicks the dialog.
+      if (attempts < 2) retry();
+      else {
+        console.warn("dialog chunk failed to load", error);
+        fail();
+        if (window.confirm("页面资源已更新，需要刷新后继续。现在刷新？")) {
+          location.reload();
+        }
+      }
+    },
+  });
+}
+
+const SettingsDialog = asyncDialog(() => import("@/components/SettingsDialog.vue"));
+const AdminDialog = asyncDialog(() => import("@/components/AdminDialog.vue"));
+const FilePanel = asyncDialog(() => import("@/components/FilePanel.vue"));
+const ShareDialog = asyncDialog(() => import("@/components/ShareDialog.vue"));
+const ReplayDialog = asyncDialog(() => import("@/components/ReplayDialog.vue"));
 
 const auth = useAuthStore();
 const prefs = usePrefsStore();
 const ui = useUiStore();
 const sessions = useSessionsStore();
 const workspace = useWorkspaceStore();
+const terminalStore = useTerminalStore();
+const presence = usePresenceStore();
+const queryClient = useQueryClient();
 const { locale: i18nLocale } = useI18n();
+
+const shareToken = computed(() => {
+  const match = location.pathname.match(/^\/s\/([^/]+)/);
+  return match?.[1] ?? new URLSearchParams(location.search).get("share");
+});
+// An anonymous visitor with a share link must not be sent to LoginView: the
+// whole point of a share is that its bearer token is the credential.
+const shareOnly = computed(() => !auth.isAuthenticated && Boolean(shareToken.value));
 
 const naiveTheme = computed(() => (prefs.effectivePageTheme === "dark" ? darkTheme : null));
 const themeOverrides = computed(() => ({
@@ -49,6 +82,14 @@ const locale = computed(() => (prefs.prefs.language === "en" ? enUS : zhCN));
 const dateLocale = computed(() => (prefs.prefs.language === "en" ? dateEnUS : dateZhCN));
 
 onMounted(async () => {
+  if (typeof window !== "undefined" && !window.isSecureContext && !prefs.prefs.seenInsecureNotice) {
+    prefs.prefs.seenInsecureNotice = true;
+    ui.notify(
+      "当前不是 HTTPS：浏览器可能拒绝剪贴板读写，请使用 HTTPS 或 localhost",
+      "warning",
+      8000,
+    );
+  }
   await auth.restore();
   if (auth.isAuthenticated) {
     workspace.hydrate();
@@ -66,14 +107,20 @@ watch(
       void sessions.refresh();
     } else {
       sessions.reset();
-      // Session ids, pane titles and the per-user layout are not safe to keep
-      // across a logout: the next account would see the previous one's
-      // workspace (and send attach attempts for its sessions). The persisted
-      // screen cache is part of the same data and is dropped with it.
-      for (const leaf of workspace.allLeaves) {
-        if (leaf.sessionId) void clearScreen(leaf.sessionId);
-      }
+      // Session ids, pane titles, command history and the per-user layout are
+      // not safe to keep across a logout: the next account would see the
+      // previous one's workspace. Clear *all* cached screens, not only the
+      // currently open leaves -- closed tabs and ended sessions retained full
+      // terminal transcripts.
+      void clearAllScreens();
       workspace.reset();
+      terminalStore.meta = {};
+      terminalStore.commands = {};
+      presence.online = {};
+      presence.viewers = {};
+      ui.toasts = [];
+      ui.filesOpen = false;
+      queryClient.clear();
       closeTransient();
       ui.shareSession = null;
       ui.replaySession = null;
@@ -88,12 +135,14 @@ watch(
     document.documentElement.lang = language;
     i18nLocale.value = language;
   },
+  { immediate: true },
 );
 
 function closeTransient(): void {
   ui.settingsOpen = false;
   ui.adminOpen = false;
-  ui.filesOpen = false;
+  // Do not unmount the file panel here: it owns the editor's dirty-state
+  // guard. Closing Settings used to discard an unsaved draft behind the modal.
   ui.commandPaletteOpen = false;
   ui.quickSwitchOpen = false;
 }
@@ -109,27 +158,27 @@ function closeTransient(): void {
     <NGlobalStyle />
     <NDialogProvider>
       <NMessageProvider>
-        <LoginView v-if="auth.initialized && !auth.isAuthenticated" />
+        <LoginView v-if="auth.initialized && !auth.isAuthenticated && !shareOnly" />
         <div v-else-if="!auth.initialized" class="ws-login-shell" aria-busy="true">
           <span class="ws-muted">{{ $t("app.loading") }}</span>
         </div>
-        <WorkspaceView v-else />
+        <WorkspaceView v-else :share-only="shareOnly" />
         <ToastHost />
-        <SettingsDialog v-if="ui.settingsOpen" @close="closeTransient" />
-        <AdminDialog v-if="ui.adminOpen" @close="closeTransient" />
-        <FilePanel v-if="ui.filesOpen" @close="closeTransient" />
+        <SettingsDialog v-if="!shareOnly && ui.settingsOpen" @close="closeTransient" />
+        <AdminDialog v-if="!shareOnly && ui.adminOpen" @close="closeTransient" />
+        <FilePanel v-if="!shareOnly && ui.filesOpen" @close="ui.filesOpen = false" />
         <ShareDialog
-          v-if="ui.shareSession"
+          v-if="!shareOnly && ui.shareSession"
           :session="ui.shareSession"
           @close="ui.shareSession = null"
         />
         <ReplayDialog
-          v-if="ui.replaySession"
+          v-if="!shareOnly && ui.replaySession"
           :session="ui.replaySession"
           @close="ui.replaySession = null"
         />
         <CommandPalette
-          v-if="ui.commandPaletteOpen || ui.quickSwitchOpen"
+          v-if="!shareOnly && (ui.commandPaletteOpen || ui.quickSwitchOpen)"
           @close="
             ui.commandPaletteOpen = false;
             ui.quickSwitchOpen = false;

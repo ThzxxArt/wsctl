@@ -24,6 +24,19 @@ export interface Prefs {
   mobileGestures: boolean;
 }
 
+/**
+ * xterm measures a cell from the font it renders with. Passing ``undefined``
+ * made it fall back to the page's proportional ``v-sans``: cells were as wide
+ * as ``W`` (13.8px at 14px) while ``i`` was 3.9px, leaving a visible gap after
+ * every character. Always hand xterm a concrete stack.
+ */
+export const DEFAULT_TERM_FONT =
+  '"JetBrains Mono", "Cascadia Code", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace';
+
+export function terminalFontFamily(custom: string): string {
+  return custom.trim() || DEFAULT_TERM_FONT;
+}
+
 export interface TerminalTheme {
   background: string;
   foreground: string;
@@ -239,16 +252,21 @@ export const THEMES: Record<string, TerminalTheme> = {
 };
 
 export const DEFAULT_KEYBINDINGS: Record<string, string> = {
-  "tab.new": "Ctrl+Shift+T",
-  "tab.close": "Ctrl+Shift+W",
-  "tab.duplicate": "Ctrl+Shift+D",
-  "pane.splitRight": "Alt+Shift+Right",
-  "pane.splitDown": "Alt+Shift+Down",
+  // Ctrl+Shift+T/W are the browser's own reopen/close-window shortcuts; a
+  // page cannot reliably intercept them, and the terminal loses a tab or the
+  // whole window. Chorded Alt+Shift avoids that.
+  "tab.new": "Alt+Shift+T",
+  "tab.close": "Alt+Shift+W",
+  "tab.duplicate": "Alt+Shift+D",
+  "pane.splitRight": "Alt+Shift+ArrowRight",
+  "pane.splitDown": "Alt+Shift+ArrowDown",
   "pane.maximize": "Alt+Enter",
-  "pane.focusNext": "Alt+ArrowRight",
-  "pane.focusPrev": "Alt+ArrowLeft",
+  "pane.focusNext": "Alt+Shift+L",
+  "pane.focusPrev": "Alt+Shift+H",
   "pane.grow": "Alt+Shift+=",
   "pane.shrink": "Alt+Shift+-",
+  "terminal.copy": "Alt+C",
+  "terminal.paste": "Alt+Shift+V",
   "terminal.search": "Ctrl+Shift+F",
   "terminal.clear": "Ctrl+Shift+K",
   "palette.open": "Ctrl+Shift+P",

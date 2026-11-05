@@ -31,8 +31,9 @@ jobs:
           import os, tomllib, pathlib, re
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
           init = re.search(r'__version__ = "([^"]+)"', pathlib.Path("src/wsctl/__init__.py").read_text()).group(1)
+          web = __import__("json").loads(pathlib.Path("web/package.json").read_text())["version"]
           tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
-          assert version == init, f"pyproject {version} != __init__ {init}"
+          assert version == init == web, f"version drift: pyproject={version} init={init} web={web}"
           assert tag == version, f"tag {tag} != version {version}"
           PY
       - name: Frontend build
@@ -41,17 +42,31 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm lint
           pnpm format:check
+          pnpm typecheck
           pnpm test
           pnpm build
+          git diff --exit-code -- ../src/wsctl/static
+          test -z "$(git status --porcelain -- ../src/wsctl/static)"
       - name: Install Python
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+          sudo apt-get update && sudo apt-get install -y tmux lrzsz
       - name: Verify
         run: |
           ruff check .
           mypy src
           pytest
+          pytest -m slow -q --timeout=240
+          python scripts/e2e/run_all.py
+      - name: Browser tests
+        working-directory: web
+        env:
+          CI: "true"
+          WSCTL_PYTHON: python
+        run: |
+          pnpm exec playwright install --with-deps chromium firefox webkit
+          pnpm exec playwright test
       - name: Build
         run: python -m build
       - name: Check metadata

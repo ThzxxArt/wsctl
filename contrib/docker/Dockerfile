@@ -45,15 +45,19 @@ WORKDIR /
 RUN rm -rf /build
 
 ENV WSCTL_DATA_DIR=/data \
-    WSCTL_FILE_ROOT=/data \
+    WSCTL_CONFIG=/data/config.toml \
+    WSCTL_FILE_ROOT=/workspace \
     WSCTL_HOST=0.0.0.0 \
     WSCTL_PORT=7681
 
-VOLUME ["/data"]
+VOLUME ["/data", "/workspace"]
 EXPOSE 7681
 
-# 以非 root 运行（/data 需可写）
-RUN useradd --create-home --uid 10001 wsctl && mkdir -p /data && chown wsctl:wsctl /data
+# 以非 root 运行。The file panel root must not be the data directory: the
+# SQLite database, recordings and VAPID config all live there.
+RUN useradd --create-home --uid 10001 wsctl \
+    && mkdir -p /data /workspace \
+    && chown wsctl:wsctl /data /workspace
 
 # 入口脚本负责首启建号：密码来自 WSCTL_ADMIN_PASSWORD，缺失则生成随机密码。
 COPY --chown=wsctl:wsctl contrib/docker/entrypoint.sh /entrypoint.sh

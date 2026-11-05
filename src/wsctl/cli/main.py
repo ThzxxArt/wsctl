@@ -400,7 +400,7 @@ def doctor(
     add(
         "Python",
         f"{py.major}.{py.minor}.{py.micro}",
-        ok if py >= (3, 11) else bad,
+        ok if py >= (3, 12) else bad,
     )
 
     # Loaded once, with the target the user named (if any): loading it again
@@ -594,6 +594,7 @@ def doctor(
         "[dim]-[/]",
     )
 
+    has_failures = any("[red]" in value for _label, value in rows)
     if json_output:
         import re
 
@@ -603,12 +604,18 @@ def doctor(
         ]
         # ``sys.stdout`` so it composes with pipes.
         sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        if has_failures:
+            raise typer.Exit(1)
         return
 
     table = Table("检查项", "结果")
     for label, value in rows:
         table.add_row(label, value)
     console.print(table)
+    if has_failures:
+        # A diagnostic command used by CI and by "why is this broken?" must
+        # report failure through its exit status, not just red text.
+        raise typer.Exit(1)
 
 
 @app.command()

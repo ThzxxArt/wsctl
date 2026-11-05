@@ -93,6 +93,22 @@ def test_write_failure_stops_the_recorder(tmp_path: Path) -> None:
     assert failure_count() >= 1
 
 
+def test_recording_keeps_utf8_split_between_reads(tmp_path: Path) -> None:
+    path = tmp_path / "utf8.cast"
+    recorder = Recorder(path)
+    encoded = "中文".encode()
+    recorder.output(encoded[:1])
+    recorder.output(encoded[1:])
+    recorder.close()
+    events = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()[1:]
+    ]
+    text = "".join(event[2] for event in events if event[1] == "o")
+    assert text == "中文"
+    assert "\ufffd" not in text
+
+
 def test_close_is_safe_after_a_failure(tmp_path: Path) -> None:
     path = tmp_path / "fail2.cast"
     recorder = Recorder(path)

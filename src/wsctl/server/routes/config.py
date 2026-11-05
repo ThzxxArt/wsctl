@@ -76,7 +76,11 @@ async def get_config(request: Request, _: User = Depends(require_admin)) -> Resp
     etag = 'W/"' + hashlib.sha256(payload).hexdigest()[:32] + '"'
     return JSONResponse(
         body,
-        headers={"ETag": etag, "Cache-Control": "no-cache"},
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, no-store",
+            "Vary": "Cookie, Authorization",
+        },
     )
 
 

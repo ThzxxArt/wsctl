@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { useWorkspaceStore } from "@/stores/workspace";
 import { useSessionsStore } from "@/stores/sessions";
 import { useUiStore } from "@/stores/ui";
@@ -24,6 +24,11 @@ const auth = useAuthStore();
 const query = ref("");
 const index = ref(0);
 const input = ref<HTMLInputElement | null>(null);
+// Filtering can shrink the result list below the old selection; without this
+// Enter could select nothing or an item that is no longer on screen.
+watch(query, () => {
+  index.value = 0;
+});
 
 function close(): void {
   emit("close");

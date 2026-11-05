@@ -66,6 +66,12 @@ async def revoke_share(
     session = owned_session(request, sid, user)
     session.revoke_share()
     await asyncio.to_thread(request.app.state.store.term_session_set_share, sid, token=None)
+    # The migration copied the legacy token into the v2 ``shares`` table, so
+    # clearing only the old column left a second authority that kept working
+    # (and came back after a restart). Revoke both here.
+    shares = getattr(request.app.state, "shares", None)
+    if shares is not None:
+        await asyncio.to_thread(shares.revoke_session, sid)
     request.app.state.audit.enqueue("session_unshare", user_id=user.id, term_session_id=sid)
     return {"ok": True}
 

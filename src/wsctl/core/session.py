@@ -25,7 +25,7 @@ from typing import Any, Protocol, runtime_checkable
 from . import tmux
 from .command_block import CommandBlockParser
 from .observability import span
-from .protocol import FLAG_REPLAY, FLAG_SNAPSHOT
+from .protocol import FLAG_DISPLAY, FLAG_REPLAY, FLAG_SNAPSHOT
 from .pty import DEFAULT_TERM_SIGNAL, Pty, create_pty
 from .recording import Recorder
 from .scrollback import DEFAULT_MAX_BYTES, Scrollback
@@ -92,12 +92,18 @@ def _bump_evicted() -> None:
 
 #: How long ``_finalize`` waits for the child before escalating to ``kill``.
 FINALIZE_WAIT_TIMEOUT = 3.0
+#: Upper bound for a second stop caller waiting on an in-flight finalizer.
+FINALIZE_DRAIN_TIMEOUT = 6.0
 #: How long it waits after ``kill`` before giving up and reporting exit code -1.
 FINALIZE_KILL_TIMEOUT = 2.0
 
 
 class ClientGone(Exception):
     """Raised by a client sink that can no longer receive data."""
+
+
+class SessionFull(ClientGone):
+    """The session's per-client limit is full; a reconnect may succeed."""
 
 
 @runtime_checkable
@@ -176,7 +182,15 @@ LIFECYCLE_ENV_KEYS = ("WSCTL_DAEMON", "WSCTL_ROLLING_FROM_PID", "WSCTL_LOG_FILE"
 #: Only names that *are* the secret are removed, including future
 #: ``WSCTL_*_PASSWORD``/``_TOKEN``/``_SECRET`` spellings, which is why the
 #: suffix rule exists on top of the explicit list.
-SECRET_ENV_KEYS = frozenset({"WSCTL_ADMIN_PASSWORD", "WSCTL_TOKEN", "WSCTL_TOTP"})
+SECRET_ENV_KEYS = frozenset(
+    {
+        "WSCTL_ADMIN_PASSWORD",
+        "WSCTL_TOKEN",
+        "WSCTL_TOTP",
+        "WSCTL_WEB_PUSH_VAPID_PRIVATE",
+        "WSCTL_WEBHOOK_URL",
+    }
+)
 SECRET_ENV_SUFFIXES = ("_PASSWORD", "_TOKEN", "_SECRET")
 
 
@@ -242,6 +256,11 @@ class TermSession:
         #: in that window -- the browser then never saw the exit code and
         #: reconnected into a 4404.
         self._finalized = asyncio.Event()
+        #: One owner for finalization. Concurrent callers (the read loop and a
+        #: stop timeout) used to race: the second saw ``closed`` and set the
+        #: event while the first was still persisting the row and queueing the
+        #: exit notice.
+        self._finalize_task: asyncio.Task[None] | None = None
         #: How the session ended, decided by :meth:`stop` (or by the child
         #: exiting on its own). Consumed by the manager's ``on_session_end``
         #: hook so the database row says *why*, not just ``stopped``.
@@ -642,7 +661,7 @@ class TermSession:
             if self.closed:
                 raise ClientGone("会话已关闭")
             if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
-                raise ClientGone("会话连接数已达上限")
+                raise SessionFull("会话连接数已达上限")
             replay = self._scrollback.replay_frames(replay_target_for(client))
             key = id(client)
             self._clients[key] = _ClientEntry(client, writable=writable, share=share)
@@ -693,7 +712,7 @@ class TermSession:
             if self.closed:
                 raise ClientGone("会话已关闭")
             if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
-                raise ClientGone("会话连接数已达上限")
+                raise SessionFull("会话连接数已达上限")
 
             resume_ok = (
                 last_seq is not None
@@ -745,7 +764,7 @@ class TermSession:
                             client,
                             self._scrollback.end_seq,
                             b"\x1b[0m\x1b[2J\x1b[H",
-                            FLAG_SNAPSHOT,
+                            FLAG_DISPLAY,
                         )
                     for seq, chunk in replay:
                         _put_data(client, seq, chunk, FLAG_REPLAY)
@@ -779,7 +798,13 @@ class TermSession:
                 "writable": writable,
             }
 
-    async def resync(self, client: Client, *, requested: bool = True) -> dict[str, Any]:
+    async def resync(
+        self,
+        client: Client,
+        *,
+        requested: bool = True,
+        last_seq: int | None = None,
+    ) -> dict[str, Any]:
         """Repair one viewer's screen **atomically** with the live stream.
 
         A manual resync used to capture the snapshot and queue it outside the
@@ -818,20 +843,35 @@ class TermSession:
             if self.closed:
                 raise ClientGone("会话已关闭")
             end = self._scrollback.end_seq
-            _put_data(client, end, b"\x1b[0m\x1b[2J\x1b[H", FLAG_SNAPSHOT)
+            _put_data(client, end, b"\x1b[0m\x1b[2J\x1b[H", FLAG_DISPLAY)
             frames = self._scrollback.replay_frames_with_seq(replay_target_for(client))
             before = int(getattr(client, "dropped_events", 0))
             for seq, chunk in frames:
                 _put_data(client, seq, chunk, FLAG_REPLAY)
+            # A raw replay starts at ``base_seq``. If the viewer's last
+            # contiguous offset was already evicted, the head of its screen is
+            # unrecoverable even when this replay itself was not shed.
+            missing_head = (
+                last_seq is not None and last_seq < self._scrollback.base_seq
+            )
+            incomplete = (
+                missing_head or int(getattr(client, "dropped_events", 0)) > before
+            )
             return {
                 "format": "raw",
                 "seq": end,
                 "source": "ring",
-                "incomplete": int(getattr(client, "dropped_events", 0)) > before,
+                "incomplete": incomplete,
+                "missing_from": self._scrollback.base_seq if missing_head else None,
+                "missing_to": end if missing_head else None,
             }
 
     async def _capture_for_attach(self) -> Snapshot | None:
         """Capture while the session lock is held, so ``seq`` is exact."""
+        if not getattr(self._snapshotter, "capable", True):
+            # ``raw``/``off`` providers have no screen to capture; a full-ring
+            # copy here was pure waste and was discarded by the caller.
+            return None
         try:
             return await self._snapshotter.capture(self._scrollback.end_seq)
         except Exception:
@@ -1057,15 +1097,15 @@ class TermSession:
     async def _broadcast(self, data: bytes) -> int:
         """Append ``data`` and deliver it; returns its first sequence number.
 
-        The sequence advances even when the scrollback is muted for a repaint
-        nudge: clients that received the repaint bytes must not see a later
-        frame re-use the same offset. Muted frames are flagged ``SNAPSHOT`` so
-        a client knows they are display-only and not part of resumable state.
+        A muted repaint is display-only: it is not appended to the ring and its
+        bytes are not part of the resumable stream. It is flagged ``DISPLAY``
+        (not ``SNAPSHOT``) so a client can render it without moving its resume
+        cursor or clearing a gap.
         """
         async with self._lock:
             if self._mute_scrollback:
                 start_seq = self._scrollback.end_seq
-                flags = FLAG_SNAPSHOT
+                flags = FLAG_DISPLAY
             else:
                 start_seq = self._scrollback.append(data)
                 flags = 0
@@ -1082,10 +1122,7 @@ class TermSession:
                 dead.append(key)
                 continue
             try:
-                if flags & FLAG_SNAPSHOT:
-                    _put_data(entry.client, start_seq, data, flags)
-                else:
-                    _put_data(entry.client, start_seq, data, 0)
+                _put_data(entry.client, start_seq, data, flags)
             except ClientGone as exc:
                 dead.append(key)
                 self._report_slow_consumer(entry, exc)
@@ -1146,11 +1183,18 @@ class TermSession:
                 seq = await self._emit(data)
                 if self.spec.shell_integration:
                     for event in self._command_parser.feed(data, seq=seq):
-                        if self._on_command is not None:
-                            done = self._on_command(event)
-                            if inspect.isawaitable(done):
-                                await done
-                        await self._notify(event)
+                        # A bookkeeping hook (DB write, audit queue) must never
+                        # take down a live shell. Previously one exception here
+                        # was reported as "session read failed" and finalized
+                        # the whole terminal.
+                        try:
+                            if self._on_command is not None:
+                                done = self._on_command(event)
+                                if inspect.isawaitable(done):
+                                    await done
+                            await self._notify(event)
+                        except Exception:
+                            log.exception("command hook failed for %s", self.id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1163,13 +1207,14 @@ class TermSession:
         return await self._broadcast(data)
 
     async def _finalize(self) -> None:
-        if self.closed:
-            self._finalized.set()
-            return
-        try:
-            await self._finalize_impl()
-        finally:
-            self._finalized.set()
+        task = self._finalize_task
+        if task is None:
+            task = self._loop.create_task(self._finalize_impl())
+            self._finalize_task = task
+            task.add_done_callback(lambda _done: self._finalized.set())
+        # Shield: a cancelled WebSocket/read-loop caller must not cancel the
+        # only persistence path and leave the history row half-written.
+        await asyncio.shield(task)
 
     async def _finalize_impl(self) -> None:
         self.closed = True
@@ -1205,18 +1250,18 @@ class TermSession:
         else:
             self.end_status = "stopped"
             self.end_reason = f"进程退出（退出码 {self.exit_code}）"
-        self._pty.close()
+        # ``close`` may wait up to four seconds for a stuck child. Doing that
+        # on the event loop froze every other session; the finalizer already
+        # runs as a task, so move the blocking reap to a worker thread.
+        await asyncio.to_thread(self._pty.close)
         if self._on_close is not None:
-            done = self._on_close(self)
-            # The hook may be sync (tests, simple consumers) or async (the
-            # server persists the row on a worker thread). Await whatever it
-            # gives back so the row is written before this coroutine ends.
+            # The hook may be sync or async; a failure (including a synchronous
+            # one) must not swallow the ``exit`` notice.
             try:
+                done = self._on_close(self)
                 if inspect.isawaitable(done):
                     await done
             except Exception:
-                # A failed persistence must not swallow the ``exit`` notice:
-                # the viewer still needs to know the process ended.
                 log.exception("session end hook failed for %s", self.id)
         # The ``exit`` notice is queued *after* persistence: a client that
         # receives it and immediately asks for the history row must not race a
@@ -1260,6 +1305,9 @@ class TermSession:
         ``status`` is the enum half (``killed`` / ``expired`` / ``stopped``).
         """
         if self.closed:
+            # A request that arrives during finalization must wait for the exit
+            # notice/persistence, not return as if teardown were complete.
+            await self.wait_finalized(timeout=FINALIZE_DRAIN_TIMEOUT)
             return
         if reason and not preserve:
             self._stop_reason = reason
@@ -1267,7 +1315,14 @@ class TermSession:
             with contextlib.suppress(Exception):
                 await self._notify({"type": "notice", "level": "warn", "msg": reason})
         if self._tmux_name is not None and not preserve:
-            await tmux.kill_session_async(self._tmux_name)
+            try:
+                await tmux.kill_session_async(self._tmux_name)
+            except OSError:
+                # The tmux binary vanished or could not be executed. That is
+                # not a reason to skip stopping the local attach client: doing
+                # so left a live child behind an actor that had already marked
+                # itself closed.
+                log.warning("tmux kill failed for %s", self.id, exc_info=True)
         if sig is None:
             sig = DEFAULT_TERM_SIGNAL
         if self._tmux_name is not None and preserve:

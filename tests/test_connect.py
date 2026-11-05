@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from wsctl.cli.connect import ConnectError, _recv_loop, _ws_url, run_connect
-from wsctl.core.protocol import FLAG_SNAPSHOT, encode_data
+from wsctl.core.protocol import FLAG_LAST, FLAG_SNAPSHOT, encode_data
 
 
 def test_ws_url_http() -> None:
@@ -69,7 +69,7 @@ def test_recv_loop_decodes_data_frames_and_acks(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(connect_mod, "_notice", lambda _message: None)
     ws = _FakeWS(
         [
-            encode_data(7, b"hello", FLAG_SNAPSHOT),
+            encode_data(7, b"hello", FLAG_SNAPSHOT | FLAG_LAST),
             encode_data(7, b" world", 0),
             json.dumps({"type": "exit", "code": 0}),
         ]

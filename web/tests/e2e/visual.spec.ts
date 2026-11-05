@@ -17,6 +17,9 @@ test.describe("visual and network resilience", () => {
     await expect(page).toHaveScreenshot("settings.png", {
       maxDiffPixelRatio: 0.02,
       animations: "disabled",
+      // Other tests leave sessions/tabs behind; the modal is the subject, so
+      // mask the workspace chrome instead of depending on suite order.
+      mask: [page.locator(".ws-shell")],
     });
   });
 

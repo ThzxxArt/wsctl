@@ -42,7 +42,13 @@ from typing import Any
 from fastapi import WebSocket
 
 from wsctl.core.ansi import AnsiTracker
-from wsctl.core.protocol import FLAG_SNAPSHOT, MAX_DATA_FRAME, encode_data
+from wsctl.core.protocol import (
+    FLAG_DISPLAY,
+    FLAG_LAST,
+    FLAG_SNAPSHOT,
+    MAX_DATA_FRAME,
+    encode_data,
+)
 from wsctl.core.session import ClientGone, note_shed_frames
 
 MAX_PENDING = 512
@@ -113,6 +119,7 @@ class WsClient:
         self.dropped_bytes = 0
         self.dropped_events = 0
         self._shed_notice_open = False
+        self._gap_open = False
         #: Exact range evicted since the last reported gap. ``None`` means no
         #: sequenced frame was lost (legacy endpoint or a control-only queue).
         self._lost_from: int | None = None
@@ -174,10 +181,10 @@ class WsClient:
         Returns ``False`` when nothing terminal-shaped is left to give up.
         """
         while self._binary:
-            _order, item, ends_inside, data_seq, _flags = self._binary.popleft()
+            _order, item, ends_inside, data_seq, frame_flags = self._binary.popleft()
             self._pending_bytes = max(0, self._pending_bytes - len(item))
             self.dropped_bytes += len(item)
-            if data_seq is not None:
+            if data_seq is not None and not frame_flags & (FLAG_DISPLAY | FLAG_SNAPSHOT):
                 if self._lost_from is None:
                     self._lost_from = data_seq
                 self._lost_to = data_seq + len(item)
@@ -237,7 +244,12 @@ class WsClient:
         was omitted" is not. The range is only sent once per burst, mirroring
         the notice.
         """
-        if self._protocol_version >= 2 and self._lost_from is not None:
+        # One gap per burst. This used to run before the notice gate below,
+        # so a shed storm produced one gap per dropped frame; every gap made
+        # the browser request a snapshot and the rate limiter rejected most of
+        # them, turning backpressure into a request storm.
+        if self._protocol_version >= 2 and self._lost_from is not None and not self._gap_open:
+            self._gap_open = True
             lost_from = self._lost_from
             lost_to = self._lost_to if self._lost_to is not None else lost_from
             self._lost_from = None
@@ -301,7 +313,9 @@ class WsClient:
         if seq > self.last_acked_seq:
             self.last_acked_seq = int(seq)
 
-    def put_data(self, seq: int, payload: bytes, flags: int = 0) -> None:
+    def put_data(
+        self, seq: int, payload: bytes, flags: int = 0, *, _chunk: bool = False
+    ) -> None:
         """Queue one sequenced terminal frame (protocol v2)."""
         if self._closed:
             raise ClientGone("连接已关闭")
@@ -312,29 +326,46 @@ class WsClient:
             # before every PTY read and rendered it as garbage.
             self.put(payload)
             return
-        if flags & FLAG_SNAPSHOT and len(payload) > MAX_DATA_FRAME:
+        if flags & FLAG_SNAPSHOT and not _chunk and len(payload) > MAX_DATA_FRAME:
             # A large screen (up to 1000×1000) can serialize to more than one
             # protocol frame. The writer would otherwise raise inside
             # ``encode_data`` and drop the connection. Chunks keep the same
-            # snapshot anchor: the client paints them in order and acknowledges
-            # the screen sequence, not the byte count.
-            for offset in range(0, len(payload), MAX_DATA_FRAME):
-                self.put_data(seq, payload[offset : offset + MAX_DATA_FRAME], flags)
+            # snapshot anchor; only the final one is marked LAST so the client
+            # does not adopt the anchor while earlier chunks are still queued.
+            chunks = [
+                payload[offset : offset + MAX_DATA_FRAME]
+                for offset in range(0, len(payload), MAX_DATA_FRAME)
+            ]
+            for index, chunk in enumerate(chunks):
+                chunk_flags = flags
+                if index == len(chunks) - 1:
+                    chunk_flags |= FLAG_LAST
+                self.put_data(seq, chunk, chunk_flags, _chunk=True)
             return
+        if flags & FLAG_SNAPSHOT and not _chunk:
+            # This is the only (or final) chunk; it completes the screen.
+            flags |= FLAG_LAST
         ends_inside = self._tracker.feed(payload)
         if self._max_bytes > 0 and len(payload) > self._max_bytes:
             self.dropped_bytes += len(payload)
             self.dropped_events += 1
             note_shed_frames()
-            if self._lost_from is None:
-                self._lost_from = seq
-            self._lost_to = seq + len(payload)
+            # Display-only and snapshot bytes are not resumable stream content:
+            # dropping them must not manufacture a "lost range" in the stream.
+            if not flags & (FLAG_DISPLAY | FLAG_SNAPSHOT):
+                if self._lost_from is None:
+                    self._lost_from = seq
+                self._lost_to = seq + len(payload)
             self._announce_shed()
             return
         self._shed_for(len(payload))
         self._pending_bytes += len(payload)
         self._seq += 1
-        self._binary.append((self._seq, payload, ends_inside, int(seq), int(flags)))
+        # v2 frames always carry a header, even when they are display-only.
+        # ``data_seq`` stays the wire anchor; ``_drop_oldest_binary`` decides
+        # whether a drop is a resumable-stream loss from the flags.
+        data_seq = int(seq)
+        self._binary.append((self._seq, payload, ends_inside, data_seq, int(flags)))
         self._wakeup.set()
 
     def put(self, item: bytes | dict[str, Any]) -> None:
@@ -424,8 +455,9 @@ class WsClient:
                 else:
                     _seq, message = self._control.popleft()
                     await self._ws.send_json(message)
-                if not self._binary and not self._control and self._shed_notice_open:
+                if not self._binary and not self._control:
                     self._shed_notice_open = False
+                    self._gap_open = False
                 if self._closed and not self._binary and not self._control:
                     return
         except asyncio.CancelledError:

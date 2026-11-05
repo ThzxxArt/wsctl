@@ -26,8 +26,10 @@ back to raw replay plus the application repaint nudge instead of pretending.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -136,38 +138,46 @@ class PyteSnapshot:
         self._active = mode == "always"
         self.capable = True
         self._scan_tail = b""
+        # A PTY read can split a UTF-8 character. Decoding each chunk with
+        # "replace" turned the halves into two U+FFFD cells, which a snapshot
+        # then painted as permanent replacement glyphs.
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        # ``serialize`` runs in a worker thread while a resize may arrive on
+        # the event loop; both mutate the same pyte screen.
+        self._lock = threading.Lock()
 
     # -- feeding -------------------------------------------------------
 
     def feed(self, data: bytes) -> None:
         if not data:
             return
+        window = self._scan_tail + data
         if self._mode == "auto":
-            window = self._scan_tail + data
             if ALT_SCREEN_ON.search(window):
                 self._active = True
             elif ALT_SCREEN_OFF.search(window):
                 # Leave the shadow active: after alt-screen exit the normal
                 # screen model is still useful, and re-entering must not lose
-                # the parser state. ``feed`` below is idempotent either way.
+                # the parser state. A fresh normal screen also means a previous
+                # one-off graphic is gone, so snapshots may be trusted again.
                 self._active = True
-            self._scan_tail = window[-32:]
+                self.capable = True
+        self._scan_tail = window[-32:]
         if not self._active:
             return
+        # Scan the joined window, not just this chunk: a DCS/Kitty introducer
+        # split across two PTY reads used to slip through.
         for pattern in UNSUPPORTED:
-            if pattern.search(data):
+            if pattern.search(window):
                 # Graphics cannot be represented in pyte. Mark the snapshot
                 # non-authoritative so the caller never promises a screen it
                 # cannot paint; keep feeding the text parts for cursor state.
                 self.capable = False
                 break
-        if self.capable is False and self._mode == "auto":
-            # Still feed: if the graphics sequence is one-off, a later text
-            # screen may become authoritative again. ``capable`` stays false
-            # for this snapshot; the session may retry after a repaint.
-            pass
         try:
-            self._stream.feed(data.decode("utf-8", "replace"))
+            text = self._decoder.decode(data)
+            with self._lock:
+                self._stream.feed(text)
         except Exception:  # pragma: no cover - pyte is defensive itself
             log.debug("pyte feed failed", exc_info=True)
             self.capable = False
@@ -179,8 +189,9 @@ class PyteSnapshot:
         rows = max(1, min(int(rows), 1000))
         if cols == self._cols and rows == self._rows:
             return
-        self._cols, self._rows = cols, rows
-        self._screen.resize(rows, cols)
+        with self._lock:
+            self._cols, self._rows = cols, rows
+            self._screen.resize(rows, cols)
 
     async def capture(self, seq: int) -> Snapshot | None:
         if not self._active:
@@ -204,12 +215,16 @@ class PyteSnapshot:
             # is worse than letting the caller fall back to raw replay.
             return b""
         out: list[str] = ["\x1b[0m\x1b[2J"]
-        buffer = self._screen.buffer
-        for y in range(self._rows):
+        with self._lock:
+            buffer = self._screen.buffer
+            rows, cols = self._rows, self._cols
+            cursor = self._screen.cursor
+            snapshot = [[buffer[y][x] for x in range(cols)] for y in range(rows)]
+        for y in range(rows):
             out.append(f"\x1b[{y + 1};1H")
             current: tuple[Any, ...] | None = None
-            row = buffer[y]
-            for x in range(self._cols):
+            row = snapshot[y]
+            for x in range(cols):
                 char = row[x]
                 attrs = (
                     char.fg,
@@ -223,9 +238,12 @@ class PyteSnapshot:
                 if attrs != current:
                     out.append(_sgr(attrs))
                     current = attrs
-                out.append(char.data or " ")
+                # pyte stores a full-width glyph in one cell and an empty stub
+                # in the next; emitting the stub as a space shifted every CJK
+                # line by one column.
+                if char.data:
+                    out.append(char.data)
             out.append("\x1b[0m")
-        cursor = self._screen.cursor
         out.append(f"\x1b[{cursor.y + 1};{cursor.x + 1}H")
         return "".join(out).encode("utf-8")
 
@@ -258,6 +276,12 @@ def _color_code(value: Any, *, background: bool) -> str | None:
     if isinstance(value, int):
         # pyte uses ints for 256-colour cells.
         return f"{48 if background else 38};5;{value}"
+    text = str(value)
+    # pyte represents 24-bit colours as ``rrggbb`` (or ``#rrggbb``).
+    hex_value = text[1:] if text.startswith("#") else text
+    if len(hex_value) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in hex_value):
+        red, green, blue = (int(hex_value[i : i + 2], 16) for i in (0, 2, 4))
+        return f"{48 if background else 38};2;{red};{green};{blue}"
     table = (_DEFAULT_BG if background else _DEFAULT_FG)
     bright = (_BRIGHT_BG if background else _BRIGHT_FG)
     name = str(value)
@@ -325,10 +349,12 @@ def provider_for(
     pyte, ``off`` uses raw. A tmux-backed session always prefers tmux because
     it survives our process and can be captured even before we see any output.
     """
+    if mode == "off":
+        # An explicit ``off`` must win over tmux too; the config promises it
+        # disables screen capture.
+        return RawSnapshot(scrollback)
     if tmux_target:
         return TmuxSnapshot(tmux_target)
-    if mode == "off":
-        return RawSnapshot(scrollback)
     try:
         import pyte  # noqa: F401
     except ImportError:  # pragma: no cover - dependency is declared

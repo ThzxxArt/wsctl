@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, PrivateAttr, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -46,6 +46,11 @@ def default_data_dir() -> Path:
 
 
 class Settings(BaseSettings):
+    #: Field names supplied by ``load_settings(**overrides)`` (CLI flags).
+    #: A reload must preserve these even when the file omits them; every other
+    #: absent key returns to its model default.
+    _init_keys: frozenset[str] = PrivateAttr(default_factory=frozenset)
+
     model_config = SettingsConfigDict(
         env_prefix="WSCTL_",
         extra="ignore",
@@ -288,7 +293,9 @@ class _SectionEnvSource(PydanticBaseSettingsSource):
 def load_settings(**overrides: Any) -> Settings:
     """Load settings, allowing CLI overrides on top of the normal precedence."""
     filtered: dict[str, Any] = {k: v for k, v in overrides.items() if v is not None}
-    return Settings(**filtered)
+    settings = Settings(**filtered)
+    settings._init_keys = frozenset(filtered)
+    return settings
 
 
 # How a reload reaches each setting. Three tiers, because "hot reloadable" was
@@ -314,7 +321,6 @@ HOT_IMMEDIATE = frozenset(
         "allowed_origins",
         "audit_retention_days",
         "cookie_secure",
-        "database_echo",
         "file_max_upload",
         "file_root",
         "instance_ttl",
@@ -369,6 +375,8 @@ RESTART_FIELDS = frozenset(
         "config_path",
         "data_dir",
         "database_url",
+        # The engine is created once; ``echo`` cannot be changed on a live one.
+        "database_echo",
         "host",
         "log_backup_count",
         "log_file",
@@ -420,7 +428,22 @@ def reload_settings_file(settings: Settings) -> tuple[list[str], list[str]]:
     except config_v2.ConfigV2Error as exc:
         return [], [str(exc)]
     try:
-        candidate = Settings(**data)
+        # Build from the *current* effective values plus the file, not from a
+        # fresh ``Settings(**data)``. A fresh settings object re-runs the
+        # sources (environment and the default config path), which silently
+        # replaced CLI init overrides such as ``--no-auth`` and could let a
+        # stale ``~/.config/wsctl/config.toml`` turn authentication off.
+        merged: dict[str, Any] = dict(data)
+        for key in Settings.model_fields:
+            if key in merged:
+                continue
+            if key in settings._init_keys:
+                # An explicit CLI flag outranks the file and survives a reload.
+                merged[key] = getattr(settings, key)
+            # Every other absent key is intentionally omitted, so model_validate
+            # restores its default (deleting a security switch must not be a
+            # silent no-op).
+        candidate = Settings.model_validate(merged)
     except Exception as exc:
         return [], [f"配置项无效，已保持原值：{exc}"]
     changed: list[str] = []

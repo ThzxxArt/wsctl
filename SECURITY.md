@@ -22,8 +22,9 @@ session can run commands as the server's user. Treat it like SSH:
   `GET /api/v2/audit/verify` recomputes the chain. Retention may trim the head,
   which is reported as `truncated=true` rather than a false tamper alarm.
 - **Share links v2**: multiple links per session, `read`/`write`/`control`
-  scopes, expiry, immediate revocation. Only the token hash is persisted; the
-  plaintext is returned once at creation.
+  scopes, expiry, immediate revocation. Only the token hash is persisted (an
+  imported 0.1.x link may retain a non-authoritative 8-character display hint);
+  the plaintext is returned once at creation.
 - **Static assets**: content-hashed files are `immutable`; the entry document
   and service worker are `no-cache`; CSP has no `script-src 'unsafe-inline'`;
   the build injects `integrity="sha384-..."` into every entry asset tag (SRI),
@@ -139,8 +140,8 @@ session can run commands as the server's user. Treat it like SSH:
   directory that is already empty, can be removed. Emptying a tree is several
   deliberate acts rather than one misplaced click
 - Share links are unguessable, optionally time-limited, revocable, and refused
-  input when read-only. They are persisted alongside the session (schema v4;
-  current is v5), so a link keeps working across a server restart — the same
+  input when read-only. They are persisted in the `shares` table (schema v6,
+  head `0004_session_exit_code`), so a link keeps working across a server restart — the same
   promise the session itself makes. A rename never invalidates a distributed
   link.
 - Inline image preview decides the media type from the file's **leading bytes**,

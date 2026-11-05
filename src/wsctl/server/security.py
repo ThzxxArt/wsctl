@@ -17,6 +17,8 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
+    # Ignored over plain HTTP; effective once the panel is served via TLS.
+    "Strict-Transport-Security": "max-age=31536000",
     "Content-Security-Policy": (
         # ``img-src`` carries ``blob:`` because the file panel previews a
         # bitmap from an object URL (``URL.createObjectURL``) rather than
@@ -101,7 +103,14 @@ def client_ip(conn: Request | WebSocket, settings: Settings) -> str | None:
         return peer
     if not _trusted_proxy_peer(peer, settings):
         return peer
-    forwarded = conn.headers.get("x-forwarded-for")
+    # A proxy may append a separate header line instead of one comma-joined
+    # value. ``Headers.get`` returns only the first line, so a client-supplied
+    # leftmost hop could become the trusted one.
+    getlist = getattr(conn.headers, "getlist", None)
+    if callable(getlist):
+        forwarded = ",".join(getlist("x-forwarded-for"))
+    else:  # lightweight request stand-ins used by tests
+        forwarded = str(conn.headers.get("x-forwarded-for") or "")
     if not forwarded:
         return peer
     hops = [part.strip() for part in forwarded.split(",") if part.strip()]
@@ -211,12 +220,23 @@ def is_origin_allowed(
     host_name, host_port = _split_host(host)
     if not host_name or origin_host != host_name:
         return False
-    if host_port is None:
-        return True
     try:
         origin_port = parsed.port or _DEFAULT_PORTS.get(origin_scheme)
     except ValueError:
         return False
+    if host_port is None:
+        # ``Host`` without a port means the default port for the request's
+        # scheme -- not "any port on this host". Ignoring the port let a page
+        # on ``http://host:8080`` drive an authenticated panel on
+        # ``http://host`` (same-site, so the Lax cookie was sent), which is a
+        # CSRF/WebSocket-hijack path. A reverse proxy that terminates TLS must
+        # preserve the external port (``Host $http_host``) or list the origin
+        # explicitly in ``allowed_origins``.
+        expected_scheme = {"ws": "http", "wss": "https"}.get(
+            str(scheme or origin_scheme).lower(),
+            str(scheme or origin_scheme).lower(),
+        )
+        return origin_port == _DEFAULT_PORTS.get(expected_scheme)
     return origin_port == host_port
 
 

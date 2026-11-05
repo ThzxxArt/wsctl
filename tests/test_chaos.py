@@ -34,9 +34,12 @@ async def test_a_slow_viewer_gets_a_gap_not_a_disconnect() -> None:
         for _index in range(50):
             await session._broadcast(b"Z" * 64)
         controls = client.queued_controls()
-        gap = next((item for item in controls if item.get("type") == "gap"), None)
-        assert gap is not None, "a shed burst must produce an exact gap"
-        assert gap["from"] < gap["to"]
+        gaps = [item for item in controls if item.get("type") == "gap"]
+        assert gaps, "a shed burst must produce an exact gap"
+        # One per burst, not one per dropped frame: the latter made the browser
+        # request a snapshot for every frame and the rate limiter rejected most.
+        assert len(gaps) == 1
+        assert gaps[0]["from"] < gaps[0]["to"]
         assert session.closed is False
         assert session.client_count == 1
     finally:

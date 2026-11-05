@@ -165,7 +165,7 @@ wsctl status
 | 配置 | 分节 TOML，支持 `"8MiB"` / `"12h"`；`wsctl config migrate` 保留注释并备份；热更新 / 仅新对象 / 需重启三档如实标注 |
 | 安全 | Argon2、TOTP、API Key scope、分享 token 哈希、Origin + scheme 校验、CSP/SRI、请求体上限、IP/登录限速、数据库与录制文件 `0600` |
 | 观测 | structlog、prometheus-client、OpenTelemetry（可选）、请求 ID、`/readyz`、审计哈希链、Webhook |
-| 质量 | pytest **718**、Vitest **34**、Playwright Chromium / Firefox / WebKit / 移动端、视觉回归、后端 e2e 全场景 |
+| 质量 | pytest **728**、Vitest **40**、Playwright Chromium / Firefox / WebKit / 移动端、视觉回归、后端 e2e 全场景 |
 
 > 从 0.1.x 升级前请先备份并按 [迁移指南](https://github.com/ThzxxArt/wsctl/blob/main/docs/MIGRATION-0.2.0.md)
 > 执行 `config migrate` → `migrate --apply` → 启动演练。0.2.0 数据库不能直接回退到 0.1.x。
@@ -331,7 +331,7 @@ location / {
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
+    proxy_set_header Host $http_host;   # 保留外部端口，Origin 校验需要
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 3600s;
@@ -350,8 +350,15 @@ WSCTL_ADMIN_PASSWORD='换成你的强密码' \
   docker compose -f contrib/docker/docker-compose.yml up -d
 ```
 
-镜像包含 `tmux`、`openssh-client`、`lrzsz`；数据卷挂到 `/data`。也可以直接
-`docker build -t wsctl -f contrib/docker/Dockerfile .`，构建上下文必须是仓库根目录。
+镜像包含 `tmux`、`openssh-client`、`lrzsz`；`/data` 存数据库/录制/配置，
+`/workspace` 是文件面板根目录，两个卷分开。首次运行前请让 UID 10001 可写：
+
+```bash
+mkdir -p data workspace
+sudo chown -R 10001:10001 data workspace
+```
+
+也可以直接 `docker build -t wsctl -f contrib/docker/Dockerfile .`，构建上下文必须是仓库根目录。
 
 ### HTTPS
 
@@ -369,8 +376,8 @@ Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对�
 - 默认开启认证；密码用 Argon2 哈希，登录 token 与会话 token 只存哈希。
 - 支持 TOTP 双因子、登录失败限速、`allowed_ips` CIDR 白名单。
 - WebSocket 与 HTTP 写请求都校验 `Origin`（含 scheme）；认证 API 响应默认
-  `Cache-Control: no-store`（配置端点带 ETag，显式使用 `no-cache`）；CSP 禁止内联
-  脚本，静态入口资源带 SRI。
+  `Cache-Control: no-store`（配置端点带 ETag，显式使用 `private, no-store` 与
+  `Vary`）；CSP 禁止内联脚本，静态入口资源带 SRI。
 - API Key 只存哈希；分享链接支持 scope / 有效期 / 撤销；只读链接拒绝输入。
 - 文件面板对路径做解析后校验，拒绝越界与符号链接写入；上传默认不覆盖，覆盖需显式确认。
 - SQLite、WAL/SHM、配置、录制与备份文件统一 `0600`；迁移前自动备份。

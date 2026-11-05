@@ -452,6 +452,23 @@ class Database:
                 )
             )
 
+    def command_blocks_purge(self, before: float) -> int:
+        """Drop command history older than the session retention cutoff."""
+        from sqlalchemy import delete, func
+
+        with self.session() as s:
+            result = s.execute(
+                delete(CommandBlockRow).where(
+                    func.coalesce(
+                        CommandBlockRow.ended_at,
+                        CommandBlockRow.started_at,
+                        0.0,
+                    )
+                    < before
+                )
+            )
+            return int(getattr(result, "rowcount", 0) or 0)
+
     def command_blocks(self, sid: str, limit: int = 100) -> list[dict[str, Any]]:
         with self.session() as s:
             rows = s.scalars(
@@ -476,6 +493,15 @@ class Database:
             ][::-1]
 
     # -- push ----------------------------------------------------------
+
+    def push_find(self, endpoint: str) -> dict[str, Any] | None:
+        with self.session() as s:
+            row = s.scalar(
+                select(PushSubscription).where(PushSubscription.endpoint == endpoint)
+            )
+            if row is None:
+                return None
+            return {"id": row.id, "user_id": row.user_id, "endpoint": row.endpoint}
 
     def push_subscribe(
         self, user_id: int, endpoint: str, keys: dict[str, Any]

@@ -15,6 +15,7 @@ import StatusBar from "./StatusBar.vue";
 
 const auth = useAuthStore();
 const sessions = useSessionsStore();
+const props = defineProps<{ shareOnly?: boolean }>();
 const workspace = useWorkspaceStore();
 const ui = useUiStore();
 const prefs = usePrefsStore();
@@ -102,6 +103,10 @@ function dispatchPaneEvent(name: string): void {
 }
 
 function onKeydown(event: KeyboardEvent): void {
+  // Do not steal shortcuts from an open modal or the file editor. Ctrl+, over
+  // a dirty editor used to open Settings, whose close path then discarded the
+  // draft.
+  if (document.querySelector(".n-modal")) return;
   const target = event.target as HTMLElement | null;
   const typing =
     target?.tagName === "INPUT" ||
@@ -112,6 +117,22 @@ function onKeydown(event: KeyboardEvent): void {
   const bindings = prefs.prefs.keybindings;
   const action = Object.keys(bindings).find((name) => matchesBinding(event, bindings[name]));
   if (!action) return;
+  if (
+    props.shareOnly &&
+    ![
+      "terminal.copy",
+      "terminal.paste",
+      "terminal.search",
+      "terminal.clear",
+      "font.increase",
+      "font.decrease",
+      "font.reset",
+    ].includes(action)
+  ) {
+    // A share-only visitor has no session list, settings, admin, tabs or
+    // split panes; letting those shortcuts through would only produce 401s.
+    return;
+  }
   // A focused xterm is a <textarea>; treating that as "the user is typing in a
   // form" disabled every global shortcut except the palette. Chorded bindings
   // (Ctrl/Alt/Meta) cannot be mistaken for terminal input -- xterm never
@@ -136,7 +157,13 @@ function onKeydown(event: KeyboardEvent): void {
       break;
     case "tab.duplicate":
       handled();
-      if (workspace.activeTab) workspace.duplicateTab(workspace.activeTab.id);
+      if (workspace.activeTab) {
+        try {
+          workspace.duplicateTab(workspace.activeTab.id);
+        } catch (error) {
+          ui.notify((error as Error).message, "warning");
+        }
+      }
       break;
     case "pane.splitRight":
       handled();
@@ -165,6 +192,14 @@ function onKeydown(event: KeyboardEvent): void {
     case "pane.shrink":
       handled();
       if (activeLeaf.value) workspace.nudgeRatio(activeLeaf.value.id, -5);
+      break;
+    case "terminal.copy":
+      handled();
+      dispatchPaneEvent("wsctl-copy");
+      break;
+    case "terminal.paste":
+      handled();
+      dispatchPaneEvent("wsctl-paste");
       break;
     case "terminal.search":
       handled();
@@ -287,7 +322,7 @@ async function openShareFromUrl(): Promise<void> {
   if (workspace.allLeaves.some((leaf) => leaf.share === token)) return;
   try {
     const info = await shares.resolve(token);
-    workspace.createTab(info.session, sessions.nameOf(info.session), true, token);
+    workspace.createTab(info.session, "分享会话", true, token);
     ui.notify(info.scope === "read" ? "已通过只读分享连接" : "已通过分享连接", "success");
     // A 0.1.x link used ``?session=&share=``. Keep it working, but move the
     // address bar to the canonical ``/s/<token>`` so the next refresh and any
@@ -342,6 +377,7 @@ onBeforeUnmount(() => {
     <div v-if="offline" class="offline-bar" role="status">网络已断开，恢复后会自动重连</div>
     <header class="topbar">
       <button
+        v-if="!shareOnly"
         class="ws-icon-btn"
         :title="$t('app.sessions')"
         :aria-label="$t('app.sessions')"
@@ -350,8 +386,9 @@ onBeforeUnmount(() => {
         ☰
       </button>
       <span class="brand">wsctl</span>
-      <TabBar />
-      <div class="top-actions">
+      <span v-if="shareOnly" class="share-only-label">分享会话</span>
+      <TabBar v-if="!shareOnly" />
+      <div v-if="!shareOnly" class="top-actions">
         <button
           class="ws-icon-btn"
           :title="$t('app.newSession')"
@@ -380,6 +417,7 @@ onBeforeUnmount(() => {
           ⇗
         </button>
         <button
+          v-if="auth.isAdmin"
           class="ws-icon-btn"
           :title="$t('app.replay')"
           :aria-label="$t('app.replay')"
@@ -433,7 +471,7 @@ onBeforeUnmount(() => {
     </header>
 
     <div class="ws-main">
-      <SessionSidebar v-if="ui.sidebarOpen" />
+      <SessionSidebar v-if="!shareOnly && ui.sidebarOpen" />
       <main
         class="ws-workspace"
         @touchstart.passive="onTouchStart"
@@ -445,15 +483,17 @@ onBeforeUnmount(() => {
           :pane="maximizedLeaf"
           :tab-id="workspace.activeTab?.id ?? ''"
           :focused="true"
+          :share-only="shareOnly"
         />
         <SplitPane
           v-else-if="workspace.activeTab"
           :node="workspace.activeTab.root"
           :tab-id="workspace.activeTab.id"
+          :share-only="shareOnly"
         />
         <div v-else class="empty-workspace">
-          <p>{{ $t("app.noSessions") }}</p>
-          <button @click="newSession">{{ $t("app.newSession") }}</button>
+          <p>{{ shareOnly ? "正在打开分享会话…" : $t("app.noSessions") }}</p>
+          <button v-if="!shareOnly" @click="newSession">{{ $t("app.newSession") }}</button>
         </div>
       </main>
     </div>
@@ -489,6 +529,15 @@ onBeforeUnmount(() => {
   font-weight: 700;
   letter-spacing: 0.04em;
 }
+.share-only-label {
+  align-self: center;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .top-actions {
   display: flex;
   align-items: center;

@@ -16,7 +16,7 @@ const rows = ref<ShareRecord[]>([]);
 const scope = ref<"read" | "write" | "control">("read");
 const label = ref("");
 const ttl = ref<number | null>(24);
-const created = ref<{ url: string; absolute_url: string; qr_svg: string } | null>(null);
+const created = ref<{ id: number; url: string; absolute_url: string; qr_svg: string } | null>(null);
 const loading = ref(false);
 const creating = ref(false);
 
@@ -48,6 +48,7 @@ async function create(): Promise<void> {
       ttl.value ? ttl.value * 3600 : null,
     );
     created.value = {
+      id: result.id,
       url: result.url,
       absolute_url: result.absolute_url || `${location.origin}${result.url}`,
       qr_svg: result.qr_svg,
@@ -65,7 +66,9 @@ async function revoke(row: ShareRecord): Promise<void> {
   if (!window.confirm(`撤销分享链接 #${row.id}？已打开的观众会立即失去访问。`)) return;
   try {
     await shares.revoke(row.id);
-    if (created.value) created.value = null;
+    // Keep the one-time link visible when a *different* link was revoked;
+    // clearing it here destroyed the only copy of a credential.
+    if (created.value?.id === row.id) created.value = null;
     await load();
     ui.notify("分享已撤销", "success");
   } catch (error) {
@@ -121,7 +124,14 @@ onMounted(load);
             <code>{{ created.absolute_url }}</code>
             <NSpace style="margin-top: 8px">
               <NButton size="small" @click="copy">{{ t("app.copy") }}</NButton>
-              <NButton size="small" tag="a" :href="created.url" target="_blank">打开</NButton>
+              <NButton
+                size="small"
+                tag="a"
+                :href="created.url"
+                target="_blank"
+                rel="noopener noreferrer"
+                >打开</NButton
+              >
             </NSpace>
           </div>
           <div v-if="created.qr_svg" class="qr" v-html="created.qr_svg" />
