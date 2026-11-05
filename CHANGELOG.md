@@ -18,14 +18,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   透传 `last_seq`，并新增 v2 重同步与 actor 透传回归测试。
 - **4500 改为可恢复**：服务端内部错误不再被浏览器/CLI 当成永久失败，而是按指数
   退避自动重连，不再让标签永久停在“连接失败”。
+- **快照整组原子化**：服务端不再允许背压只丢掉快照的一部分。快照要么整组入队，
+  要么整组丢弃并让客户端重新请求；客户端永远不会收到“半张屏幕 + FLAG_LAST”。
+- **前端连接看门狗**：旧 socket 的迟到 close 不再清空新连接；90 秒无任何消息
+  自动重连；快照 10 秒无进展自动重试，连续失败后换新连接；手动“强制重绘”会
+  暂停屏幕缓存并请求完整快照。
+- **渲染稳定性**：WebGL 上下文丢失立即回退 Canvas 并强制重绘；xterm 写入按
+  256 KiB 分批，避免一次解析数 MiB 造成卡顿；屏幕缓存只在 5 秒静默后序列化。
+- **缓存版本升级**：IndexedDB 屏幕缓存升到 v2，升级时清空 0.2.0 可能写坏的
+  缓存，首次连接强制拿完整快照。
+- **ANSI 跟踪性能**：纯文本用 `bytes.find` 跳转，8 MiB 追加从 1.10s 降到
+  0.6ms，macOS CI 的 perf 门槛恢复稳定。
 - **应用内弹窗**：17 处 `window.confirm` / `window.prompt` 统一为 Naive UI
   `AppDialog`（Promise 队列、危险操作红色按钮、键盘焦点）；管理员重置密码改为
   掩码输入 + 二次确认。
 
 ### 测试
 
-- pytest **730 passed / 8 skipped**；slow **7 passed**。
-- Vitest **48 passed**。
+- pytest **733 passed / 8 skipped**；slow **7 passed**。
+- Vitest **51 passed**。
 - Playwright **34 passed / 6 skipped**（Chromium / Firefox / WebKit / 移动端）。
 
 ## [0.2.0] - 2026-11-05
