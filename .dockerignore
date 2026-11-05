@@ -3,6 +3,7 @@
 .git
 .github
 .venv
+.venv*
 venv
 __pycache__
 *.pyc
@@ -10,6 +11,10 @@ __pycache__
 .mypy_cache
 .pytest_cache
 .ruff_cache
+web/node_modules
+web/test-results
+web/playwright-report
+web/dist
 dist
 build
 *.egg-info

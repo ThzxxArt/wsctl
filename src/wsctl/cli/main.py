@@ -59,9 +59,13 @@ backup_mod = _LazyModule("wsctl.core.backup")
 totp = _LazyModule("wsctl.core.totp")
 user_admin = _LazyModule("wsctl.core.user_admin")
 config_mod = _LazyModule("wsctl.core.config")
+config_v2_mod = _LazyModule("wsctl.core.config_v2")
 config_edit_mod = _LazyModule("wsctl.core.config_edit")
 logging_mod = _LazyModule("wsctl.core.logging")
 store_mod = _LazyModule("wsctl.core.store")
+migrations_mod = _LazyModule("wsctl.core.migrations")
+shell_integration_mod = _LazyModule("wsctl.core.shell_integration")
+webpush_keys_mod = _LazyModule("wsctl.core.webpush_keys")
 client_mod = _LazyModule("wsctl.cli.client")
 connect_mod = _LazyModule("wsctl.cli.connect")
 
@@ -88,10 +92,16 @@ session_app = typer.Typer(name="session", help="管理终端会话。", no_args_
 completion_app = typer.Typer(
     name="completion", help="安装或查看 shell 补全脚本。", no_args_is_help=True
 )
+shell_app = typer.Typer(
+    name="shell-integration", help="安装 Shell Integration（命令块）。", no_args_is_help=True
+)
+push_app = typer.Typer(name="push", help="Web Push（VAPID）配置。", no_args_is_help=True)
 app.add_typer(user_app)
 app.add_typer(config_app)
 app.add_typer(session_app)
 app.add_typer(completion_app)
+app.add_typer(shell_app)
+app.add_typer(push_app)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -662,6 +672,89 @@ def restore(
         else "未知时间"
     )
     console.print(f"[green]已从备份恢复[/] {archive}（备份于 {when}）")
+
+
+@app.command()
+def migrate(
+    config: Annotated[Path | None, typer.Option("--config", "-c", help="配置文件路径。")] = None,
+    check: Annotated[
+        bool, typer.Option("--check", help="只检查当前数据库版本，不修改。")
+    ] = False,
+    apply: Annotated[
+        bool, typer.Option("--apply", help="执行迁移到最新版本。")
+    ] = False,
+) -> None:
+    """查看或执行数据库 schema 迁移（Alembic）。"""
+    settings = _settings_from(config)
+    url = settings.database_url or f"sqlite:///{settings.db_path}"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    current = migrations_mod.current_revision(url)
+    head = migrations_mod.head_revision(url)
+    if check or not apply:
+        console.print(f"数据库：{url}")
+        console.print(f"当前版本：{current or '[yellow]未初始化[/]'}；最新版本：{head}")
+        if current != head:
+            console.print("[dim]运行 wsctl migrate --apply 升级（升级前请先 wsctl backup）[/]")
+        return
+    before = current
+    try:
+        after = migrations_mod.upgrade_database(url)
+    except Exception as exc:
+        _fail(f"数据库迁移失败：{exc}")
+    console.print(f"[green]已迁移[/] {before or '未初始化'} → {after}")
+
+
+@shell_app.command("show")
+def shell_show(
+    shell: Annotated[str | None, typer.Argument(help="bash / zsh / fish / powershell")] = None,
+) -> None:
+    """打印 Shell Integration 脚本。"""
+    name = shell or shell_integration_mod.detect_shell()
+    try:
+        console.print(shell_integration_mod.snippet(name), markup=False, highlight=False)
+    except ValueError as exc:
+        _fail(str(exc))
+
+
+@shell_app.command("install")
+def shell_install(
+    shell: Annotated[str | None, typer.Argument(help="bash / zsh / fish / powershell")] = None,
+    write_rc: Annotated[
+        bool,
+        typer.Option(
+            "--write-rc",
+            help="同时把 source 行写入 shell 的启动文件（会修改 ~/.bashrc 等）。",
+        ),
+    ] = False,
+) -> None:
+    """安装 Shell Integration（默认只写文件，不修改 rc）。"""
+    name = shell or shell_integration_mod.detect_shell()
+    try:
+        target, rc = shell_integration_mod.install(name, write_rc=write_rc)
+    except (ValueError, OSError) as exc:
+        _fail(str(exc))
+    console.print(f"[green]已写入[/] {target}")
+    if rc is not None:
+        console.print(f"[green]已更新[/] {rc}")
+    else:
+        console.print(f"[dim]在 {name} 启动文件中加入：source \"{target}\"[/]")
+
+
+@push_app.command("keys")
+def push_keys() -> None:
+    """生成一对 VAPID 密钥，用于 Web Push。"""
+    public, private = webpush_keys_mod.generate_vapid_keys()
+    console.print("[green]已生成 VAPID 密钥[/]（写入配置文件后重启生效）")
+    # Raw stdout, not Rich: a private key is one long token that must be
+    # copy-pasteable, and Rich's wrapping inserted newlines into the middle of
+    # it. This block is TOML, not decorated output.
+    sys.stdout.write(
+        "[push]\n"
+        "web_push_enabled = true\n"
+        f'web_push_vapid_public = "{public}"\n'
+        f'web_push_vapid_private = "{private}"\n'
+        'web_push_subject = "mailto:admin@example.com"\n'
+    )
 
 
 # Rules shared by ``serve`` and ``start``: they describe which options cannot be
@@ -1878,17 +1971,21 @@ def config_show(
     """显示生效中的配置。"""
     settings = _settings_from(config)
     values = settings.model_dump()
+    secret = config_v2_mod.SECRET_KEYS
     if json_output:
         _print_json(
             {
                 "config_path": str(settings.config_path),
-                "values": {k: str(v) if isinstance(v, Path) else v for k, v in values.items()},
+                "values": {
+                    k: "***" if k in secret else (str(v) if isinstance(v, Path) else v)
+                    for k, v in values.items()
+                },
             }
         )
         return
     table = Table("配置项", "值")
     for key, value in values.items():
-        table.add_row(key, str(value))
+        table.add_row(key, "***" if key in secret else str(value))
     console.print(table)
     console.print(f"[dim]配置文件：{settings.config_path}[/]")
 
@@ -1909,6 +2006,7 @@ def config_get(
     """打印某个配置项的生效值（默认裸值便于 $( ) 捕获）。"""
     settings = _settings_from(config)
     try:
+        key = config_v2_mod.normalise_key(key)
         config_edit_mod.check_key(key)
     except config_edit_mod.ConfigEditError as exc:
         _fail(str(exc))
@@ -1924,15 +2022,15 @@ def config_get(
 def config_validate(
     config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
 ) -> None:
-    """校验配置文件是否合法。"""
+    """校验配置文件是否合法（v1 扁平与 v2 分节均可）。"""
     path = _settings_from(config).config_path
     if not path.is_file():
         console.print(f"[yellow]配置文件不存在[/]（将使用默认值）：{path}")
         return
     try:
-        data = tomllib.loads(path.read_text("utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        _fail(f"配置文件 TOML 语法错误：{exc}")
+        data = config_v2_mod.read_flat(path)
+    except config_v2_mod.ConfigV2Error as exc:
+        _fail(str(exc))
     try:
         config_mod.Settings(**data)
     except Exception as exc:
@@ -1940,71 +2038,117 @@ def config_validate(
     console.print(f"[green]配置有效[/]：{path}")
 
 
-CONFIG_TEMPLATE = """# wsctl 配置文件
+@config_app.command("migrate")
+def config_migrate(
+    config: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    no_backup: Annotated[
+        bool, typer.Option("--no-backup", help="不保留 config.toml.v1.bak。")
+    ] = False,
+) -> None:
+    """把 0.1.x 的扁平 TOML 迁移为 0.2.0 的分节格式。
+
+    只移动键与注释，不改变值；原文件默认备份为 ``*.v1.bak``。已经是分节格式
+    时不做任何事，也不会重排用户的文件。
+    """
+    settings = _settings_from(config)
+    try:
+        changed, backup = config_v2_mod.migrate_file(
+            settings.config_path, backup=not no_backup
+        )
+    except config_v2_mod.ConfigV2Error as exc:
+        _fail(str(exc))
+    if not changed:
+        console.print(f"[dim]无需迁移[/]（已是分节格式）：{settings.config_path}")
+        return
+    console.print(f"[green]已迁移[/] {settings.config_path}")
+    if backup is not None:
+        console.print(f"[dim]原文件备份：{backup}[/]")
+
+
+CONFIG_TEMPLATE = '''# wsctl 0.2.0 配置文件（分节格式）
+# 所有项均可省略；省略即使用默认值。大小/时长可写 "8MiB" / "12h"。
+
+[server]
 host = "127.0.0.1"
 port = 7681
+# reuse_port = false
+# ssl_cert = "/etc/wsctl/cert.pem"
+# ssl_key = "/etc/wsctl/key.pem"
 
-# --- 认证与安全 ---
+[auth]
 # auth_required = true
-# session_ttl = 43200
+# session_ttl = "12h"
 # session_sliding_ttl = false
 # cookie_secure = false
+# totp_issuer = "wsctl"
+
+[security]
 # trust_proxy = false
 # trusted_proxies = ["127.0.0.1"]   # 允许携带 X-Forwarded-For 的代理 CIDR（空 = 仅回环）
 # allowed_origins = []
 # allowed_ips = ["10.0.0.0/8"]
 # security_headers = true
 # login_rate_limit = 10
-# login_rate_window = 300
-# audit_input = false
-# totp_issuer = "wsctl"
+# login_rate_window = "5m"
 
-# --- 会话默认值 ---
+[terminal]
 # default_shell = "/bin/bash"
 # default_cwd = "/home/me"
 # default_backend = "local"
 # tmux_preserve_on_shutdown = true
-# idle_timeout = 3600
-# max_life = 86400
+# idle_timeout = "1h"
+# max_life = "24h"
 # max_sessions = 64
 # max_sessions_per_user = 0
 # session_max_clients = 0
-# session_memory_limit = 67108864
-# client_max_bytes = 8388608
+# session_memory_limit = "64MiB"
+# client_max_bytes = "8MiB"
 # ws_max_connections = 512
 # ws_max_connections_per_ip = 64
 # input_rate_limit = 0
 # input_rate_burst = 0
-# scrollback_bytes = 4194304
+# scrollback_bytes = "4MiB"
+# snapshot_mode = "auto"            # auto | always | off
+# shell_integration = true
 
-# --- 文件面板 ---
+[files]
 # file_root = "/home/me"
-# file_max_upload = 104857600
+# file_max_upload = "100MiB"
 
-# --- 录制 ---
+[recording]
 # auto_record = false
 # record_input = false
+# recordings_retention_days = 0
+# recordings_max_bytes = 0
 
-# --- 可观测 / 日志 ---
+[observability]
 # metrics_enabled = true
 # metrics_require_auth = false
 # log_level = "info"
 # log_json = false
+# log_file = "/var/log/wsctl/wsctl.log"
 # webhook_url = ""
-
-# --- 多实例与保留策略 ---
-# instance_ttl = 30
+# audit_input = false
 # audit_retention_days = 30
-# term_session_retention_days = 30
-# recordings_retention_days = 0
-# recordings_max_bytes = 0
+# otel_enabled = false
+# otel_endpoint = "http://127.0.0.1:4318/v1/traces"
+# otel_sample_ratio = 0.1
 
-# --- 数据与 TLS ---
+[data]
 # data_dir = "/var/lib/wsctl"
-# ssl_cert = "/etc/wsctl/cert.pem"
-# ssl_key = "/etc/wsctl/key.pem"
-# reuse_port = false
-"""
+# instance_ttl = 30
+# term_session_retention_days = 30
+
+[database]
+# database_url = ""                 # 空 = SQLite（data_dir/wsctl.db）
+# database_echo = false
+
+[push]
+# web_push_enabled = false
+# web_push_vapid_public = ""
+# web_push_vapid_private = ""
+# web_push_subject = "mailto:admin@localhost"
+'''
 
 
 @config_app.command("edit")

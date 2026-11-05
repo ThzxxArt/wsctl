@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -58,7 +59,14 @@ class Recorder:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._io_lock = threading.Lock()
-        self._fh: TextIO | None = self.path.open("w", encoding="utf-8")
+        # Recordings are a complete transcript, optionally including typed
+        # input. Create them 0600 instead of the process default (usually 0644).
+        fd = os.open(
+            self.path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        self._fh: TextIO | None = os.fdopen(fd, "w", encoding="utf-8")
         header: dict[str, object] = {
             "version": 2,
             "width": width,

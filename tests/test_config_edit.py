@@ -102,7 +102,7 @@ def test_the_write_is_atomic(tmp_path: Path) -> None:
 def test_a_file_that_does_not_exist_yet_is_created() -> None:
     out = apply_key("", "port", 8080)
     data = out.strip().splitlines()
-    assert data == ["port = 8080"]
+    assert data == ["[server]", "port = 8080"]
 
 
 @pytest.mark.parametrize(
@@ -161,13 +161,20 @@ def test_every_key_the_model_knows_can_be_written(tmp_path: Path) -> None:
         "log_level": "info", "log_json": True, "log_file": "/tmp/l",
         "log_max_bytes": 1, "log_backup_count": 1, "auto_record": True,
         "record_input": True, "webhook_url": "http://example.invalid/hook",
+        "snapshot_mode": "auto", "shell_integration": True,
+        "database_url": "", "database_echo": False,
+        "otel_enabled": False, "otel_endpoint": None, "otel_sample_ratio": 0.1,
+        "web_push_enabled": False, "web_push_vapid_public": "",
+        "web_push_vapid_private": "", "web_push_subject": "mailto:admin@localhost",
     }
     missing = known_keys() - set(sample)
     assert not missing, f"the sample does not cover {sorted(missing)}"
     text = ""
     for key in sorted(sample):
         text = apply_key(text, key, sample[key])
-    parsed = Settings(**__import__("tomllib").loads(text))
+    from wsctl.core.config_v2 import flatten_document
+
+    parsed = Settings(**flatten_document(__import__("tomllib").loads(text)))
     assert parsed.port == 1
 
 

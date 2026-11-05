@@ -34,6 +34,10 @@ CLOSE_RATE_LIMITED = 4429
 #: browser think everything was normal, auto-reconnect, clear the terminal and
 #: then race a replay it could lose again.
 CLOSE_SLOW_CONSUMER = 4410
+#: The client speaks a protocol version this server does not implement.
+CLOSE_PROTOCOL_VERSION = 4426
+#: A snapshot was requested but the session's provider cannot produce one.
+CLOSE_SNAPSHOT_UNAVAILABLE = 4427
 #: The server failed while serving this connection.
 CLOSE_SERVER_ERROR = 4500
 
@@ -48,6 +52,8 @@ ALL_CLOSE_CODES: tuple[int, ...] = (
     CLOSE_RATE_LIMITED,
     CLOSE_SERVER_ERROR,
     CLOSE_SLOW_CONSUMER,
+    CLOSE_PROTOCOL_VERSION,
+    CLOSE_SNAPSHOT_UNAVAILABLE,
 )
 
 #: Codes after which retrying cannot help: the failure is permanent and the
@@ -62,6 +68,7 @@ FATAL_CLOSE_CODES = frozenset(
         CLOSE_NOT_FOUND,
         CLOSE_LIMIT,
         CLOSE_RATE_LIMITED,
+        CLOSE_PROTOCOL_VERSION,
         CLOSE_SERVER_ERROR,
     }
 )

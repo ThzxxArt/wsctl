@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wsctl"
-version = "0.1.30"
-description = "单机部署的 Web 在线终端：多会话、多用户 RBAC、审计、分享、录制与可观测，ttyd 的现代 Python 超集。"
+version = "0.2.0"
+description = "单机部署的 Web 终端工作台：可恢复协议、多会话、多用户 RBAC、审计、分享、录制与可观测。"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "ThzxxArt" }]
-keywords = ["terminal", "web", "ttyd", "pty", "websocket", "xterm", "shell"]
+keywords = ["terminal", "web", "pty", "websocket", "xterm", "shell", "workspace"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
@@ -21,9 +21,9 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Shells",
     "Topic :: System :: Systems Administration",
 ]
@@ -41,32 +41,50 @@ dependencies = [
     "segno>=1.6",
     "websockets>=13",
     # ``wsctl serve --tls-self-signed`` is advertised as one command, so it
-    # cannot depend on something a plain install does not have. It *did*: this
-    # was in the ``dev`` extra only (for CI type checking), and Windows ships no
-    # ``openssl`` on PATH either, so on a default install both backends were
-    # missing and HTTPS simply refused to start. Wheels exist for every platform
-    # wsctl supports, and the openssl fallback is kept for the rest.
+    # cannot depend on something a plain install does not have.
     "cryptography>=42",
+    # -- 0.2.0 platform ---------------------------------------------------
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "limits>=3.13",
+    "orjson>=3.10",
+    "structlog>=24.1",
+    "prometheus-client>=0.20",
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-instrumentation-fastapi>=0.46b0",
+    "opentelemetry-exporter-otlp-proto-http>=1.25",
+    "watchfiles>=0.22",
+    "psutil>=6.0",
+    "pyte>=0.8",
+    "sse-starlette>=2.1",
+    "pywebpush>=2.0",
 ]
 
 [project.optional-dependencies]
 win = ["pywinpty>=2.0"]
-e2e = ["playwright>=1.44"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5"]
 dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-timeout>=2.3",
+    "pytest-xdist>=3.6",
+    "pytest-benchmark>=4.0",
+    "hypothesis>=6.100",
+    "schemathesis>=3.30",
     "httpx>=0.27",
     "build>=1.2",
     "twine>=5.1",
+    "pip-audit>=2.7",
+    "cyclonedx-bom>=4.1",
 ]
 
 [project.urls]
 Homepage = "https://github.com/ThzxxArt/wsctl"
 Repository = "https://github.com/ThzxxArt/wsctl"
-Issues = "https://github.com/ThzxxArt/wsctl/issues"
+Issues = "https://github.com/ThzxxArt/wsctl"
 Changelog = "https://github.com/ThzxxArt/wsctl/blob/main/CHANGELOG.md"
 
 [project.scripts]
@@ -78,6 +96,7 @@ packages = ["src/wsctl"]
 [tool.hatch.build.targets.sdist]
 include = [
     "src/wsctl",
+    "web",
     "tests",
     "scripts",
     "contrib",
@@ -89,11 +108,21 @@ include = [
     "THIRD_PARTY_NOTICES.md",
     "LICENSE",
     "CHANGELOG.md",
+    "uv.lock",
+]
+exclude = [
+    "web/node_modules",
+    "web/test-results",
+    "web/playwright-report",
+    "web/dist",
+    "web/.e2e-data",
+    "**/__pycache__",
+    "**/*.pyc",
 ]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -107,7 +136,7 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 "src/wsctl/server/**.py" = ["B008"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 files = ["src/wsctl"]
 
@@ -122,6 +151,10 @@ files = ["src/wsctl"]
 module = ["cryptography", "cryptography.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["pyte", "pyte.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
@@ -130,4 +163,7 @@ timeout = 120
 markers = [
     "slow: heavier tests, run with -m slow (skipped by default)",
     "browser: Playwright browser tests, run with -m browser (skipped by default)",
+    "protocol: protocol v2 codec and state-machine tests",
+    "migration: database/config migration tests",
+    "perf: performance budget tests",
 ]

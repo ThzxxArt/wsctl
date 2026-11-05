@@ -104,6 +104,10 @@ def create_backup(
                 tar.add(config_path, arcname="config.toml")
             if recordings_dir.is_dir():
                 tar.add(recordings_dir, arcname="recordings", filter=_skip_links)
+    # The archive holds the database, the config (VAPID private key, webhook
+    # credential) and possibly input recording. tarfile creates it 0644.
+    with contextlib.suppress(OSError):
+        os.chmod(output, 0o600)
     return output
 
 
@@ -238,6 +242,8 @@ def _install_database(source: Path, db_path: Path) -> None:
             with contextlib.suppress(FileNotFoundError):
                 db_path.with_name(db_path.name + suffix).unlink()
         os.replace(staging, db_path)
+        with contextlib.suppress(OSError):
+            os.chmod(db_path, 0o600)
         _fsync_dir(db_path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
@@ -313,6 +319,8 @@ def restore_backup(
             if restore_config and source_cfg.is_file() and config_path is not None:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_cfg, config_path)
+                with contextlib.suppress(OSError):
+                    os.chmod(config_path, 0o600)
         except OSError as exc:
             raise BackupError(f"恢复录制/配置失败（数据库未改动）：{exc}") from exc
 

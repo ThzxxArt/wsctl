@@ -10,8 +10,12 @@ keeping every path through :func:`~wsctl.core.fs.safe_resolve` and refusing to
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
+import hashlib
 import os
 import secrets
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +36,9 @@ from wsctl.core import fs as fs_mod
 from wsctl.core.store import User
 
 from ..deps import current_user
+from ..idempotency import abort, claim, remember, replay
 
-router = APIRouter(prefix="/api", tags=["files"])
+router = APIRouter(tags=["files"])
 
 
 class NameBody(BaseModel):
@@ -55,6 +60,39 @@ class ContentBody(BaseModel):
 
 class _UploadTooLarge(Exception):
     """Raised when an upload exceeds ``file_max_upload``."""
+
+
+class _UploadExists(Exception):
+    """Raised when a no-overwrite upload loses the race to another writer."""
+
+
+def _publish_upload(staging: Path, dest: Path, overwrite: bool) -> None:
+    """Move ``staging`` to ``dest`` without ever clobbering by accident.
+
+    ``os.replace`` always overwrites. The "is it there?" check before the
+    upload is only a fast path: another request can create ``dest`` while this
+    one is streaming. ``os.link`` gives us the missing atomic primitive --
+    it fails with ``EEXIST`` instead of replacing -- and the staging name is
+    unlinked afterwards. Filesystems without hard links (some network shares)
+    fall back to a final check followed by ``replace``; that is a smaller race
+    than the original one, and the explicit ``overwrite`` flag remains the
+    only way to destroy a file on every filesystem we support.
+    """
+    if overwrite:
+        os.replace(staging, dest)
+        return
+    try:
+        os.link(staging, dest)
+    except FileExistsError as exc:
+        raise _UploadExists from exc
+    except (AttributeError, OSError) as exc:
+        if getattr(exc, "errno", None) == errno.EEXIST:
+            raise _UploadExists from exc
+        if dest.exists():
+            raise _UploadExists from exc
+        os.replace(staging, dest)
+    else:
+        staging.unlink(missing_ok=True)
 
 
 def _copy_upload(src: Any, fd: int, limit: int, chunk_size: int = 1 << 20) -> int:
@@ -96,7 +134,12 @@ def _quote_filename(name: str) -> str:
 
 
 def _fs_error(exc: fs_mod.FsError) -> HTTPException:
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    code = (
+        status.HTTP_404_NOT_FOUND
+        if exc.code == fs_mod.FsError.NOT_FOUND
+        else status.HTTP_400_BAD_REQUEST
+    )
+    return HTTPException(status_code=code, detail=str(exc))
 
 
 @router.get("/files")
@@ -286,6 +329,27 @@ async def delete_entry(
     return {"ok": True}
 
 
+def _upload_size_hint(file: UploadFile) -> int | None:
+    """Size of the spooled upload without reading it.
+
+    ``UploadFile`` in the pinned Starlette has no ``size`` attribute, so the
+    idempotency hash used to contain ``None`` for every upload: retrying with
+    the same key, name, path and overwrite flag replayed the first response
+    even when the new file had a different size.
+    """
+    handle = getattr(file, "file", None)
+    if handle is None:
+        return None
+    try:
+        position = handle.tell()
+        handle.seek(0, os.SEEK_END)
+        size = int(handle.tell())
+        handle.seek(position)
+        return size
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 @router.post("/files/upload", status_code=status.HTTP_201_CREATED)
 async def upload_file(
     request: Request,
@@ -293,10 +357,22 @@ async def upload_file(
     file: UploadFile = File(...),
     path: str = Form(""),
     overwrite: bool = Form(False),
-) -> dict[str, Any]:
+) -> Any:
     settings = request.app.state.settings
     root = settings.files_root
     name = Path(file.filename or "").name
+    size_hint = _upload_size_hint(file)
+    request_hash = hashlib.sha256(
+        f"{name}\x00{path}\x00{int(bool(overwrite))}\x00{size_hint}".encode()
+    ).hexdigest()
+    try:
+        cached = await replay(request, request_hash=request_hash)
+    except BaseException:
+        await file.close()
+        raise
+    if cached is not None:
+        await file.close()
+        return cached
     if not name or name in (".", "..") or "\x00" in name or name.startswith(".wsctl-"):
         await file.close()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件名无效")
@@ -306,6 +382,7 @@ async def upload_file(
         await file.close()
         raise _fs_error(exc) from exc
     if not directory.is_dir():
+        await file.close()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="不是目录")
 
     dest = directory / name
@@ -336,7 +413,21 @@ async def upload_file(
     # the exact half-written state the sidecar exists to prevent -- and one
     # request's failure path would unlink the sidecar the other was still
     # writing to.
+    try:
+        claimed = await claim(request, request_hash=request_hash)
+    except BaseException:
+        await file.close()
+        raise
+    if claimed is not None:
+        await file.close()
+        return claimed
     staging = directory / f".{name}.wsctl-{secrets.token_hex(8)}.upload"
+    dest_mode: int | None = None
+    if overwrite and dest.is_file() and not dest.is_symlink():
+        try:
+            dest_mode = stat.S_IMODE(dest.stat().st_mode) & 0o777
+        except OSError:
+            dest_mode = None
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -347,6 +438,7 @@ async def upload_file(
         fd = os.open(staging, flags, 0o600)
     except OSError as exc:
         await file.close()
+        await abort(request)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="拒绝覆盖符号链接或非法路径",
@@ -359,13 +451,36 @@ async def upload_file(
         )
         if dest.is_dir():
             raise OSError("目标是目录")
-        os.replace(staging, dest)
+        _publish_upload(staging, dest, overwrite)
+        if dest_mode is not None:
+            with contextlib.suppress(OSError):
+                os.chmod(dest, dest_mode)
     except _UploadTooLarge as exc:
         staging.unlink(missing_ok=True)
+        await abort(request)
         raise HTTPException(status_code=413, detail="文件过大") from exc
+    except _UploadExists as exc:
+        staging.unlink(missing_ok=True)
+        await abort(request)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"文件已存在：{name}（确认后可覆盖）",
+        ) from exc
+    except asyncio.CancelledError:
+        # The client went away mid-stream. The claim must not block the same
+        # key for the next two minutes.
+        staging.unlink(missing_ok=True)
+        await abort(request)
+        raise
     except Exception as exc:
         # Do not leave a half-written sidecar behind on any other failure.
         staging.unlink(missing_ok=True)
+        await abort(request)
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            raise HTTPException(
+                status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+                detail="磁盘空间不足，上传已取消",
+            ) from exc
         if isinstance(exc, OSError) and "目录" in str(exc):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="目标是目录，无法覆盖"
@@ -380,4 +495,6 @@ async def upload_file(
         user_id=user.id,
         payload=fs_mod.relative_to(root, dest)[:256],
     )
-    return {"name": name, "size": size}
+    payload = {"name": name, "size": size}
+    await remember(request, payload, status_code=201, request_hash=request_hash)
+    return payload

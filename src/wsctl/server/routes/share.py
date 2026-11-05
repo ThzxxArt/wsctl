@@ -13,7 +13,7 @@ from ..deps import current_user, owned_session, qr_svg
 from ..models import SessionShare
 from ..security import forwarded_scheme, is_origin_allowed
 
-router = APIRouter(prefix="/api", tags=["share"])
+router = APIRouter(tags=["share"])
 
 
 @router.get("/sessions/{sid}/share")
@@ -79,7 +79,12 @@ async def share_qr(
     if token is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该会话未分享")
     settings = request.app.state.settings
-    allowed = is_origin_allowed(origin, request.headers.get("host"), settings.allowed_origins)
+    allowed = is_origin_allowed(
+        origin,
+        request.headers.get("host"),
+        settings.allowed_origins,
+        scheme=forwarded_scheme(request, settings) or request.url.scheme,
+    )
     if origin and allowed:
         base = origin
     else:

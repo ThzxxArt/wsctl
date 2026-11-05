@@ -15,9 +15,23 @@ import logging
 import time
 from typing import Any
 
+from .observability import span
 from .store import Store
 
 log = logging.getLogger("wsctl.audit")
+
+def _request_id() -> str | None:
+    """Current request id, without importing observability at module import.
+
+    Keeping this lazy preserves the CLI's fast paths (``wsctl version`` must not
+    pull in prometheus_client and structlog).
+    """
+    try:
+        from .observability import request_id_var
+
+        return request_id_var.get() or None
+    except Exception:  # pragma: no cover - optional import
+        return None
 
 BATCH = 256
 MAX_QUEUE = 20000
@@ -31,6 +45,10 @@ class AuditWriter:
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
+        #: Wakeup for the writer. The queue alone cannot be used as the wakeup:
+        #: ``get()`` outside the write lock let ``flush`` drain later events
+        #: first, so the audit chain could be persisted out of order.
+        self._wakeup = asyncio.Event()
         self.dropped = 0
         self.errors = 0
 
@@ -63,10 +81,12 @@ class AuditWriter:
             "term_session_id": term_session_id,
             "payload": payload,
             "ip": ip,
+            "request_id": _request_id(),
             "ts": time.time(),
         }
         try:
             self._queue.put_nowait(record)
+            self._wakeup.set()
         except asyncio.QueueFull:
             self.dropped += 1
             if self.dropped == 1 or self.dropped % 1000 == 0:
@@ -83,12 +103,15 @@ class AuditWriter:
 
     async def _run(self) -> None:
         while True:
-            first = await self._queue.get()
+            await self._wakeup.wait()
+            # Clear before draining: an event enqueued between the clear and
+            # the drain is still picked up by the drain, and one enqueued after
+            # it sets the flag for the next iteration.
+            self._wakeup.clear()
             # Drain and write under the same lock as ``flush`` so events keep
             # their order and a concurrent flush never strands a batch.
             async with self._write_lock:
-                batch = [first]
-                batch.extend(self._drain_batch())
+                batch = self._drain_batch()
                 await self._write_locked(batch)
 
     async def _write_locked(self, batch: list[dict[str, Any]]) -> None:
@@ -99,20 +122,21 @@ class AuditWriter:
         """
         if not batch:
             return
-        try:
-            # DB write on a worker thread; webhook dispatch back on the loop.
-            await asyncio.to_thread(self._store.write_events, batch)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.errors += 1
-            log.exception("audit write failed; %d event(s) dropped", len(batch))
-        try:
-            self._store.dispatch_events(batch)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("audit sink dispatch failed")
+        with span("audit.flush", count=len(batch)):
+            try:
+                # DB write on a worker thread; webhook dispatch back on the loop.
+                await asyncio.to_thread(self._store.write_events, batch)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.errors += 1
+                log.exception("audit write failed; %d event(s) dropped", len(batch))
+            try:
+                self._store.dispatch_events(batch)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("audit sink dispatch failed")
 
     async def flush(self) -> None:
         """Write everything currently queued (used before shutdown and by the

@@ -11,6 +11,47 @@ session can run commands as the server's user. Treat it like SSH:
 - prefer a reverse proxy for TLS (`trust_proxy = true`,
   `trusted_proxies = ["<proxy CIDR>"]`, `cookie_secure = true`)
 
+## 0.2.0 additions
+
+- **API Keys**: `wsctl_...` bearer tokens, stored as SHA-256 hashes only, with
+  scopes, expiry and last-used tracking. Deleting a key invalidates it at once.
+  Scopes are enforced on HTTP **and** both WebSocket endpoints; a `read` key
+  cannot write, resize, create sessions, or fetch a legacy share token to
+  escalate through the share path.
+- **Audit hash chain**: every row carries `prev_hash` and `hash`;
+  `GET /api/v2/audit/verify` recomputes the chain. Retention may trim the head,
+  which is reported as `truncated=true` rather than a false tamper alarm.
+- **Share links v2**: multiple links per session, `read`/`write`/`control`
+  scopes, expiry, immediate revocation. Only the token hash is persisted; the
+  plaintext is returned once at creation.
+- **Static assets**: content-hashed files are `immutable`; the entry document
+  and service worker are `no-cache`; CSP has no `script-src 'unsafe-inline'`;
+  the build injects `integrity="sha384-..."` into every entry asset tag (SRI),
+  so a swapped bundle is refused even on the same origin.
+- **Idempotency**: `Idempotency-Key` is bound to the authenticated principal,
+  method, path and a content hash; reusing it for a different request is a 409
+  rather than replaying the wrong object. Keys expire after one day.
+- **Secret handling**: the config API and `wsctl config show` never echo
+  `web_push_vapid_private` or `webhook_url` (an explicit
+  `wsctl config get <key>` still returns the value for automation). SQLite
+  (including WAL/SHM), written configs and backups, recording casts, and
+  migration snapshots are created or tightened to `0600`.
+- **Origin and caching**: `Origin` must match the request scheme as well as the
+  host (a same-hostname HTTP page cannot drive an HTTPS panel). Authenticated
+  `/api/` responses default to `Cache-Control: no-store`; chunked JSON bodies
+  are refused where a `Content-Length` cap is what bounds memory.
+- **Web Push**: subscriptions require a public HTTPS endpoint (cleartext,
+  loopback, private literals, `localhost` and `.local` are refused), carry
+  `p256dh`/`auth`, and are capped per user. A stored endpoint is an outbound
+  request target, so this is an SSRF boundary, not just validation.
+- **File editing**: the web editor preserves the file's ordinary permission
+  bits (without setuid/setgid) instead of replacing a script with a `0600`
+  regular file.
+- **Conditional GET**: config and static responses carry an ETag and honour
+  `If-None-Match`, so a stale browser cache is detected instead of reused.
+- **Release**: CycloneDX SBOM, Sigstore signatures, SLSA build provenance,
+  PyPI Trusted Publishing, and a manual TestPyPI install gate.
+
 ## Built-in protections
 
 - Argon2 password hashing and server-side session tokens (HttpOnly cookies)

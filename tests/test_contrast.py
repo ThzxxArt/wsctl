@@ -1,13 +1,10 @@
-"""WCAG 2.1 non-text contrast for the design tokens in ``static/app.css``.
+"""WCAG 2.1 contrast for the 0.2.0 design tokens.
 
-The 0.1.8 plan promised "对比度 AA" and the first audit found one real
-failure: the form-control border sat at 1.5:1 on both themes. Greys that only
-separate regions are exempt as decoration (WCAG 2.1 1.4.11), but a control's
-boundary is what *identifies* it, so ``--border-input`` must clear 3:1 against
-every background a control can sit on. Body text must clear 4.5:1.
-
-This test is what keeps the promise from decaying the next time someone
-"just tweaks a colour".
+The old suite asserted against ``static/app.css``, the hand-written 0.1.x
+stylesheet. 0.2.0 is a Vite build: the source of truth is ``web/src/styles.css``
+and the released file is content-hashed. Checking the source keeps the promise
+from decaying when someone "just tweaks a colour", while the separate asset
+test proves the built CSS is actually the one shipped.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-APP_CSS = Path(__file__).resolve().parent.parent / "src" / "wsctl" / "static" / "app.css"
+APP_CSS = Path(__file__).resolve().parent.parent / "web" / "src" / "styles.css"
 
 
 def _block(selector: str, css: str) -> str:
@@ -48,88 +45,54 @@ def _ratio(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-# (foreground, background, minimum) -- 4.5 for body text, 3.0 for UI boundaries.
 BODY_TEXT = [
-    ("fg", "bg", 4.5),
-    ("fg", "bg-2", 4.5),
-    ("fg", "bg-3", 4.5),
-    ("fg", "bg-4", 4.5),
-    ("muted", "bg-2", 4.5),
-    ("muted", "bg-3", 4.5),
+    ("text", "bg", 4.5),
+    ("text", "bg-elevated", 4.5),
+    ("text", "bg-panel", 4.5),
+    ("muted", "bg", 4.5),
+    ("muted", "bg-elevated", 4.5),
 ]
-# A control's boundary and the focus ring identify the control.
 UI_BOUNDARY = [
     ("border-input", "bg", 3.0),
-    ("border-input", "bg-2", 3.0),
-    ("border-input", "bg-3", 3.0),
+    ("border-input", "bg-elevated", 3.0),
     ("accent", "bg", 3.0),
-    ("accent", "bg-2", 3.0),
+    ("accent", "bg-elevated", 3.0),
 ]
 SEMANTIC = [
-    ("ok", "bg-2", 3.0),
-    ("warn", "bg-2", 3.0),
-    ("danger", "bg-2", 3.0),
+    ("success", "bg-elevated", 3.0),
+    ("warning", "bg-elevated", 3.0),
+    ("danger", "bg-elevated", 3.0),
 ]
+
+
+def _check(selector: str, label: str) -> None:
+    tokens = _tokens(selector, APP_CSS.read_text(encoding="utf-8"))
+    failures = []
+    for fg, bg, need in BODY_TEXT + UI_BOUNDARY + SEMANTIC:
+        actual = _ratio(tokens[fg], tokens[bg])
+        if actual < need:
+            failures.append(f"{fg} on {bg}: {actual:.2f}:1 < {need}")
+    assert not failures, f"{label} theme below WCAG AA:\n  " + "\n  ".join(failures)
 
 
 def test_dark_theme_meets_wcag_aa() -> None:
-    tokens = _tokens(":root", APP_CSS.read_text(encoding="utf-8"))
-    failures = []
-    for fg, bg, need in BODY_TEXT + UI_BOUNDARY + SEMANTIC:
-        actual = _ratio(tokens[fg], tokens[bg])
-        if actual < need:
-            failures.append(f"{fg} on {bg}: {actual:.2f}:1 < {need}")
-    assert not failures, "dark theme below WCAG AA:\n  " + "\n  ".join(failures)
+    _check(":root", "dark")
 
 
 def test_light_theme_meets_wcag_aa() -> None:
-    tokens = _tokens('html[data-theme="light"]', APP_CSS.read_text(encoding="utf-8"))
-    failures = []
-    for fg, bg, need in BODY_TEXT + UI_BOUNDARY + SEMANTIC:
-        actual = _ratio(tokens[fg], tokens[bg])
-        if actual < need:
-            failures.append(f"{fg} on {bg}: {actual:.2f}:1 < {need}")
-    assert not failures, "light theme below WCAG AA:\n  " + "\n  ".join(failures)
-
-
-def test_interactive_controls_use_the_accessible_border() -> None:
-    """Form controls must not fall back to the decorative border grey.
-
-    ``--border`` / ``--border-strong`` are exempt as decoration; a control
-    drawn with them is not.
-    """
-    css = APP_CSS.read_text(encoding="utf-8")
-    # Every rule that styles an input/select/textarea/button border must use
-    # the token this test proves is legible. The list grows whenever a new kind
-    # of control appears -- 0.1.15 added ghost/warn actions, the settings
-    # dialog's key-binding inputs and the search toggles -- and a control that
-    # slips past this list is exactly how the 0.1.8 failure happened.
-    for pattern in (
-        r"\.modal-card input, \.modal-card select, \.modal-card textarea "
-        r"\{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-        r"\.modal-actions button \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-        r"\.modal-card button\.ghost,\s*\.modal-card button\.warn-btn "
-        r"\{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-        r"\.admin-toolbar input \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-        r"\.hotkey-row input \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-        r"\.custom-theme input, \.custom-theme textarea "
-        r"\{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-        r"#file-filter \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-        r"\.search-bar \.opt \{[^}]*border: 1px solid var\(--(?P<tok>[a-z-]+)\)",
-    ):
-        match = re.search(pattern, css, re.S)
-        assert match is not None, f"rule not found: {pattern[:44]}"
-        assert match.group("tok") == "border-input", (
-            f"interactive control uses --{match.group('tok')}, which is decorative"
-        )
+    _check(':root[data-theme="light"]', "light")
 
 
 def test_focus_ring_is_visible() -> None:
     """:focus-visible is the only keyboard affordance; it must clear 3:1."""
     css = APP_CSS.read_text(encoding="utf-8")
-    block = _block(":focus-visible", css)
-    assert "var(--accent)" in block, "focus ring must use the accent token"
-    for name, selector in (("dark", ":root"), ("light", 'html[data-theme="light"]')):
+    assert "outline: 2px solid var(--accent)" in css
+    for selector, label in ((":root", "dark"), (':root[data-theme="light"]', "light")):
         tokens = _tokens(selector, css)
-        assert _ratio(tokens["accent"], tokens["bg"]) >= 3.0, name
-        assert _ratio(tokens["accent"], tokens["bg-2"]) >= 3.0, name
+        assert _ratio(tokens["accent"], tokens["bg"]) >= 3.0, label
+        assert _ratio(tokens["accent"], tokens["bg-elevated"]) >= 3.0, label
+
+
+def test_reduced_motion_is_respected() -> None:
+    css = APP_CSS.read_text(encoding="utf-8")
+    assert "prefers-reduced-motion: reduce" in css

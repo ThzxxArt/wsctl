@@ -13,15 +13,16 @@ import json
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from wsctl import __version__
 from wsctl.core import session as session_mod
 from wsctl.core.store import User
 
 from ..deps import current_user, require_admin, serialize_session
+from ..pagination import decode_cursor, encode_cursor
 
-router = APIRouter(prefix="/api", tags=["status"])
+router = APIRouter(tags=["status"])
 
 
 #: Fallback sentences for rows written before ``end_reason`` existed.
@@ -73,6 +74,7 @@ def _history_row(row: dict[str, Any]) -> dict[str, Any]:
         # ``status`` is the enum, ``ended_reason`` is the sentence: "killed"
         # versus "被管理员终止". A bare enum left the user guessing.
         "ended_reason": row.get("end_reason") or _REASONS.get(str(row.get("status")), ""),
+        "exit_code": row.get("exit_code"),
         "created_at": created,
         "last_active": last,
         # Round it once here rather than making every client guess at the
@@ -93,8 +95,10 @@ def _history_row(row: dict[str, Any]) -> dict[str, Any]:
 @router.get("/sessions/history")
 async def session_history(
     request: Request,
+    response: Response,
     user: User = Depends(current_user),
     limit: int = 100,
+    cursor: str | None = None,
 ) -> list[dict[str, Any]]:
     """Finished sessions: stopped, expired or killed.
 
@@ -103,10 +107,42 @@ async def session_history(
     -- retained and cleaned up, but never shown.
     """
     owner = None if user.role == "admin" else user.id
+    page_size = min(max(limit, 1), 1000)
+    before_ts: float | None = None
+    before_id: str | None = None
+    if cursor:
+        try:
+            payload = decode_cursor(cursor)
+            before_ts = float(payload["ts"])
+            before_id = str(payload["id"])
+        except (ValueError, KeyError, TypeError):
+            raise HTTPException(status_code=400, detail="游标无效") from None
     rows = await asyncio.to_thread(
-        request.app.state.store.term_session_history, owner_id=owner, limit=limit
+        request.app.state.store.term_session_history,
+        owner_id=owner,
+        limit=page_size,
+        before_ts=before_ts,
+        before_id=before_id,
     )
-    return [_history_row(row) for row in rows]
+    owner_ids = {
+        int(row["owner_id"]) for row in rows if row.get("owner_id") is not None
+    }
+    owners = (
+        await asyncio.to_thread(request.app.state.store.users_by_ids, owner_ids)
+        if owner_ids
+        else {}
+    )
+    if len(rows) == page_size and rows:
+        response.headers["X-Next-Cursor"] = encode_cursor(
+            {"ts": float(rows[-1]["last_active"]), "id": str(rows[-1]["id"])}
+        )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = _history_row(row)
+        owner_row = owners.get(int(row["owner_id"])) if row.get("owner_id") is not None else None
+        item["owner"] = owner_row.username if owner_row is not None else None
+        out.append(item)
+    return out
 
 
 @router.get("/sessions/{sid}/detail")
@@ -137,7 +173,7 @@ async def session_detail(
     else:
         payload = _history_row(row or {})
         payload["state"] = "finished"
-        payload["exit_code"] = None
+        payload["exit_code"] = (row or {}).get("exit_code")
 
     if owner_id is not None:
         owner = await asyncio.to_thread(store.user_get_by_id, int(owner_id))
@@ -146,13 +182,18 @@ async def session_detail(
     clients: list[dict[str, Any]] = []
     if live is not None:
         for entry in live.clients():
-            clients.append({"writable": entry["writable"], "shared": entry["share"] is not None})
+            clients.append(
+                {
+                    "viewer": entry["viewer"],
+                    "writable": entry["writable"],
+                    "shared": entry["share"] is not None,
+                }
+            )
     payload["attached"] = clients
     payload["share_active"] = live.peek_share() is not None if live is not None else False
     payload["recording_path"] = (
         str(live.recording_path) if live is not None and live.recording_path else None
     )
-    payload["exit_code"] = live.exit_code if live is not None else None
     payload["instance_id"] = (row or {}).get("instance_id")
     # The session's story: create / attach / detach / kill …, oldest first.
     payload["timeline"] = await asyncio.to_thread(store.term_session_timeline, sid)
@@ -173,12 +214,6 @@ async def overview(request: Request, _: User = Depends(require_admin)) -> dict[s
     metrics = request.app.state.metrics
 
     live = manager.list_sessions()
-    owners = {s.owner_id: None for s in live if s.owner_id is not None}
-    if owners:
-        resolved = await asyncio.to_thread(store.users_by_ids, set(owners))
-        for key in owners:
-            owners[key] = resolved.get(key)
-
     instances = await asyncio.to_thread(store.instance_all)
     recent = await asyncio.to_thread(store.recent_audit, 20)
     history = await asyncio.to_thread(store.term_session_history, owner_id=None, limit=5)
@@ -186,6 +221,7 @@ async def overview(request: Request, _: User = Depends(require_admin)) -> dict[s
     return {
         "version": __version__,
         "sessions": len(live),
+        "users": await asyncio.to_thread(store.user_count),
         "clients": sum(s.client_count for s in live),
         "bytes": sum(s.memory_usage() for s in live),
         "evicted_clients": session_mod.evicted_clients_total(),

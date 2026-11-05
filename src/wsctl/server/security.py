@@ -26,7 +26,8 @@ SECURITY_HEADERS = {
         # nothing that a script could not reach another way.
         "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
         "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
-        "connect-src 'self' blob:; worker-src 'self' blob:"
+        "connect-src 'self' blob:; worker-src 'self' blob:; "
+        "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     ),
 }
 
@@ -158,7 +159,13 @@ def _split_host(value: str) -> tuple[str, int | None]:
         return "", None
 
 
-def is_origin_allowed(origin: str | None, host: str | None, allowed: list[str]) -> bool:
+def is_origin_allowed(
+    origin: str | None,
+    host: str | None,
+    allowed: list[str],
+    *,
+    scheme: str | None = None,
+) -> bool:
     """Validate an ``Origin`` against the request's own host or an allowlist.
 
     A missing ``Origin`` means a non-browser client (e.g. the CLI); such
@@ -170,6 +177,13 @@ def is_origin_allowed(origin: str | None, host: str | None, allowed: list[str]) 
     against ``Host: term.example.com`` and every write -- including login --
     was rejected as cross-site. An explicit port in ``Host`` still has to
     match, which is the case a direct (non-proxied) browser hits.
+
+    ``scheme`` closes the remaining hole in that port rule: with no port in
+    ``Host``, ``Origin: http://term.example.com`` matched an HTTPS panel on
+    port 443. Any service (or network attacker) able to serve that hostname
+    over plain HTTP could then drive authenticated writes. Callers pass the
+    scheme the request was actually served with -- including a trusted
+    ``X-Forwarded-Proto`` -- and the origin must agree.
 
     ``allowed_origins`` is *additional*, not exclusive: it used to replace the
     same-origin check entirely, so configuring the WebSocket whitelist broke
@@ -187,6 +201,11 @@ def is_origin_allowed(origin: str | None, host: str | None, allowed: list[str]) 
     if not origin_host:
         # ``Origin: null`` (sandboxed iframe, file://) has no host to compare.
         return False
+    origin_scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme.lower(), parsed.scheme.lower())
+    if scheme is not None:
+        expected = {"ws": "http", "wss": "https"}.get(scheme.lower(), scheme.lower())
+        if origin_scheme != expected:
+            return False
     if not host:
         return False
     host_name, host_port = _split_host(host)
@@ -195,7 +214,7 @@ def is_origin_allowed(origin: str | None, host: str | None, allowed: list[str]) 
     if host_port is None:
         return True
     try:
-        origin_port = parsed.port or _DEFAULT_PORTS.get(parsed.scheme.lower())
+        origin_port = parsed.port or _DEFAULT_PORTS.get(origin_scheme)
     except ValueError:
         return False
     return origin_port == host_port

@@ -15,9 +15,16 @@ DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 
 
 class Scrollback:
-    """A bounded FIFO of byte chunks, capped at ``max_bytes``."""
+    """A bounded FIFO of byte chunks, capped at ``max_bytes``.
 
-    __slots__ = ("_chunks", "_inside", "_max_bytes", "_size", "_tracker")
+    Every byte carries a global sequence number (its offset in the session's
+    output stream). ``base_seq`` is the offset of the oldest byte still held
+    and ``end_seq`` the offset just past the newest. A client that reconnects
+    with ``last_seq`` can therefore be told exactly what is still available and
+    exactly what was lost -- the difference between "restore" and "guess".
+    """
+
+    __slots__ = ("_chunks", "_end_seq", "_inside", "_max_bytes", "_size", "_tracker")
 
     def __init__(self, max_bytes: int = DEFAULT_MAX_BYTES) -> None:
         if max_bytes <= 0:
@@ -31,6 +38,7 @@ class Scrollback:
         self._inside: deque[str | None] = deque()
         self._tracker = AnsiTracker()
         self._size = 0
+        self._end_seq = 0
 
     @property
     def size(self) -> int:
@@ -41,15 +49,88 @@ class Scrollback:
     def max_bytes(self) -> int:
         return self._max_bytes
 
-    def append(self, data: bytes) -> None:
-        """Append ``data``, evicting the oldest bytes beyond the cap."""
+    @property
+    def end_seq(self) -> int:
+        """Offset just past the newest byte ever appended."""
+        return self._end_seq
+
+    @property
+    def base_seq(self) -> int:
+        """Offset of the oldest byte still in the buffer."""
+        return self._end_seq - self._size
+
+    def append(self, data: bytes) -> int:
+        """Append ``data``, evicting the oldest bytes beyond the cap.
+
+        Returns the sequence number of the first byte in ``data``.
+        """
         if not data:
-            return
+            return self._end_seq
+        start = self._end_seq
+        self._end_seq += len(data)
         self._chunks.append(data)
         self._tracker.feed(data)
         self._inside.append(self._tracker.state)
         self._size += len(data)
         self._trim()
+        return start
+
+    def chunks_with_seq(self) -> tuple[tuple[int, bytes], ...]:
+        """Buffered chunks paired with the sequence number of their first byte."""
+        out: list[tuple[int, bytes]] = []
+        seq = self.base_seq
+        for chunk in self._chunks:
+            out.append((seq, chunk))
+            seq += len(chunk)
+        return tuple(out)
+
+    def since(self, last_seq: int) -> tuple[tuple[int, bytes], ...] | None:
+        """Return every byte at or after ``last_seq``.
+
+        ``None`` means the requested offset has been evicted (the client must
+        take a snapshot or a full replay). A value equal to ``end_seq`` is a
+        valid, empty resume -- the client is already current.
+        """
+        if last_seq < 0:
+            return None
+        if last_seq > self._end_seq:
+            # A client claiming to be ahead of us is not something we can
+            # reconcile by replay; report it as gone.
+            return None
+        if last_seq < self.base_seq:
+            return None
+        out: list[tuple[int, bytes]] = []
+        for seq, chunk in self.chunks_with_seq():
+            end = seq + len(chunk)
+            if end <= last_seq:
+                continue
+            if seq < last_seq:
+                cut = last_seq - seq
+                chunk = chunk[cut:]
+                seq = last_seq
+            out.append((seq, chunk))
+        return tuple(out)
+
+    def replay_frames_with_seq(self, target: int = 65536) -> tuple[tuple[int, bytes], ...]:
+        """The buffer as coalesced wire frames, each with its start sequence."""
+        if target <= 0:
+            target = 1
+        out: list[tuple[int, bytes]] = []
+        buf = bytearray()
+        seq = self.base_seq
+        chunk_start = seq
+        for chunk_seq, chunk in self.chunks_with_seq():
+            if not buf:
+                chunk_start = chunk_seq
+            buf += chunk
+            while len(buf) >= target:
+                out.append((chunk_start, bytes(buf[:target])))
+                chunk_start += target
+                del buf[:target]
+        if buf:
+            out.append((chunk_start, bytes(buf)))
+        return tuple(out)
+
 
     def snapshot(self) -> bytes:
         """Return all buffered bytes, oldest first."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Any
 
@@ -17,21 +18,7 @@ from ..maintenance import active_recording_paths
 from ..models import RecordingStart
 from ..security import can_access
 
-router = APIRouter(prefix="/api", tags=["recordings"])
-
-
-def _scan_recordings(directory: Path) -> list[dict[str, Any]]:
-    """List ``*.cast`` files (blocking; call via ``asyncio.to_thread``)."""
-    if not directory.is_dir():
-        return []
-    items: list[dict[str, Any]] = []
-    for entry in sorted(directory.glob("*.cast")):
-        try:
-            stat = entry.stat()
-        except OSError:
-            continue
-        items.append({"name": entry.name, "size": stat.st_size, "mtime": stat.st_mtime})
-    return items
+router = APIRouter(tags=["recordings"])
 
 
 def _recording_path(request: Request, name: str) -> Path:
@@ -60,9 +47,22 @@ async def start_recording(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="录制目录已达容量上限"
         )
-    path = await session.start_recording(
-        settings.recordings_dir / f"{sid}.cast", record_input=body.record_input
-    )
+    try:
+        path = await session.start_recording(
+            settings.recordings_dir / f"{sid}.cast", record_input=body.record_input
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"无法创建录制文件：{exc}",
+        ) from exc
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(
+            request.app.state.db.recording_start,
+            sid,
+            str(path),
+            owner_id=user.id if user.id > 0 else None,
+        )
     request.app.state.audit.enqueue("recording_start", user_id=user.id, term_session_id=sid)
     return {"path": str(path)}
 
@@ -76,7 +76,17 @@ async def stop_recording(
         # ``{"ok": True}`` for "there was nothing to stop" is a claim of work
         # that never happened.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该会话未在录制")
+    settings = request.app.state.settings
     await session.stop_recording()
+    path = settings.recordings_dir / f"{sid}.cast"
+    try:
+        size = path.stat().st_size if path.is_file() else 0
+    except OSError:
+        size = 0
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(
+            request.app.state.db.recording_finish, str(path), size=size
+        )
     request.app.state.audit.enqueue("recording_stop", user_id=user.id, term_session_id=sid)
     return {"ok": True}
 
@@ -102,6 +112,8 @@ async def download_recording(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
         if user.role != "admin" and row.get("owner_id") != user.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该会话")
+        if not sid or Path(sid).name != sid:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
         candidate = request.app.state.settings.recordings_dir / f"{sid}.cast"
         if not candidate.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有录制")
@@ -115,9 +127,23 @@ async def download_recording(
 async def list_recordings(
     request: Request, _: User = Depends(require_admin)
 ) -> list[dict[str, Any]]:
-    return await asyncio.to_thread(
-        _scan_recordings, request.app.state.settings.recordings_dir
+    settings = request.app.state.settings
+    active = active_recording_paths(request.app.state.manager)
+    rows = await asyncio.to_thread(
+        request.app.state.db.recording_reconcile,
+        settings.recordings_dir,
+        live_paths=set(active),
     )
+    return [
+        {
+            "name": row["name"],
+            "size": row["size"],
+            "mtime": row["ended_at"] or row["started_at"] or 0.0,
+            "session": row["session"],
+            "status": row["status"],
+        }
+        for row in rows
+    ]
 
 
 @router.get("/recordings/{name}")
@@ -148,5 +174,9 @@ async def delete_recording_by_name(
             status_code=status.HTTP_409_CONFLICT, detail="录制进行中，请先停止录制"
         )
     await asyncio.to_thread(path.unlink, missing_ok=True)
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(
+            request.app.state.db.recording_delete, str(path)
+        )
     request.app.state.audit.enqueue("recording_delete", user_id=actor.id, payload=name)
     return {"ok": True}

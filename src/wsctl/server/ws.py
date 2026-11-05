@@ -16,6 +16,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
@@ -38,6 +39,7 @@ from wsctl.core.closecodes import (
 )
 from wsctl.core.config import Settings
 from wsctl.core.metrics import Metrics
+from wsctl.core.protocol import MAX_CONTROL_FRAME
 from wsctl.core.pty import PtyError
 from wsctl.core.ratelimit import TokenBucket
 from wsctl.core.recording import has_room as recordings_have_room
@@ -49,10 +51,17 @@ from wsctl.core.session import (
     replay_target_for,
     within_user_quota,
 )
-from wsctl.core.store import Store, User
+from wsctl.core.store import Store, User, hash_token
 
 from .client import WsClient
-from .security import COOKIE_NAME, client_ip, ip_allowed, is_origin_allowed
+from .deps import resolve_token_user
+from .security import (
+    COOKIE_NAME,
+    client_ip,
+    forwarded_scheme,
+    ip_allowed,
+    is_origin_allowed,
+)
 
 log = logging.getLogger("wsctl.ws")
 
@@ -173,6 +182,29 @@ def _auth_token(websocket: WebSocket) -> str | None:
     return websocket.cookies.get(COOKIE_NAME)
 
 
+async def api_key_scopes(websocket: WebSocket) -> set[str] | None:
+    """Scopes of a ``wsctl_`` bearer token, or ``None`` for cookie auth.
+
+    ``None`` means "not an API key": the caller should use the user's normal
+    permissions. An empty set means the key exists but carries no scopes, which
+    the HTTP middleware documents as "inherit the user's permissions" -- so it
+    is normalised to ``None`` here as well.
+    """
+    auth = websocket.headers.get("authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        return None
+    token = auth[7:].strip()
+    if not token.startswith("wsctl_"):
+        return None
+    db = getattr(websocket.app.state, "db", None)
+    if db is None:
+        return set()
+    record = await asyncio.to_thread(db.api_key_resolve, hash_token(token))
+    if record is None:
+        return set()
+    return set(record.get("scopes") or []) or None
+
+
 def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
     shell = settings.shell
     backend = settings.default_backend
@@ -190,6 +222,8 @@ def _default_spec(settings: Settings, cols: int, rows: int) -> SessionSpec:
         max_clients=settings.session_max_clients,
         memory_limit=settings.session_memory_limit,
         scrollback_bytes=settings.scrollback_bytes,
+        snapshot_mode=settings.snapshot_mode,
+        shell_integration=settings.shell_integration,
     )
 
 
@@ -202,6 +236,19 @@ async def _resolve_user(
     token = _auth_token(websocket)
     if not token:
         return None
+    db = getattr(websocket.app.state, "db", None)
+    if db is not None and token.startswith("wsctl_"):
+
+        def resolve_key() -> User | None:
+            record = db.api_key_resolve(hash_token(token))
+            if record is None:
+                return None
+            user = store.user_get_by_id(int(record["user_id"]))
+            return user if user is not None and not user.disabled else None
+
+        user = await asyncio.to_thread(resolve_key)
+        if user is not None:
+            return user
     return await asyncio.to_thread(store.resolve_auth_session, token)
 
 
@@ -225,6 +272,8 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     ip = client_ip(websocket, settings)
     user = await _resolve_user(websocket, store, settings.auth_required)
     auth_token = _auth_token(websocket)
+    key_scopes = await api_key_scopes(websocket)
+    shares = getattr(app.state, "shares", None)
     share_param = websocket.query_params.get("share")
 
     # Accept first so the client receives a WebSocket close *code* (a close
@@ -241,6 +290,7 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         websocket.headers.get("origin"),
         websocket.headers.get("host"),
         settings.allowed_origins,
+        scheme=forwarded_scheme(websocket, settings) or websocket.url.scheme,
     ):
         await websocket.close(code=CLOSE_FORBIDDEN)
         return
@@ -293,11 +343,22 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     close_code = 1000
     try:
         result = await _handshake(
-            websocket, client, settings, manager, user, share_param
+            websocket,
+            client,
+            settings,
+            manager,
+            user,
+            share_param,
+            key_scopes=key_scopes,
+            shares=shares,
         )
         if result is None:
             return
         session, writable, share = result
+        if shares is not None:
+            session.set_external_share_resolver(
+                shares.resolver(session.id), shares.known(session.id)
+            )
         # Shedding is how a slow viewer is kept alive, but the frames it lost
         # are gone from *its* screen. A full-screen application redraws only
         # what it believes changed, so the regions it last painted are the ones
@@ -339,16 +400,30 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
         # revoked, login expired, idle timeout, rate limit) shared the defect.
         pending_close: list[int | None] = [None]
         recheck: Callable[[], Awaitable[User | None]] | None = None
+        share_recheck: Callable[[], Awaitable[bool]] | None = None
         if user is not None and auth_token is not None:
             token = auth_token
 
             async def recheck() -> User | None:
                 # Off the event loop: this runs every few seconds per connection
                 # and the store consults a short-lived cache on the hot path.
-                # Returning the *user* (not a bool) is what lets the pump
-                # re-derive access: a demoted admin must not keep a writable
-                # handle on a session ``can_access()`` now refuses.
-                return await asyncio.to_thread(store.resolve_auth_session, token)
+                # ``resolve_token_user`` (not ``resolve_auth_session``) is what
+                # keeps an API key working past the first re-check: the latter
+                # only knows browser sessions, so a ``wsctl_`` token was denied
+                # five seconds after it connected.
+                return await asyncio.to_thread(resolve_token_user, websocket, token)
+
+        if share is not None and shares is not None:
+            held_share = share
+
+            async def share_recheck() -> bool:
+                # Legacy token first: it lives on the session, not in the v2
+                # table, so asking the database alone would revoke a valid old
+                # link five seconds after it attached.
+                if await asyncio.to_thread(session.share_valid, held_share):
+                    return True
+                record = await asyncio.to_thread(shares.resolve, held_share)
+                return record is not None and record.term_session_id == session.id
 
         await _pump(
             websocket,
@@ -359,6 +434,8 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             writable=writable,
             share=share,
             recheck=recheck,
+            share_recheck=share_recheck,
+            key_scopes=key_scopes,
             metrics=metrics,
             close_code_out=pending_close,
             control_bucket=control_bucket,
@@ -417,6 +494,9 @@ async def _handshake(
     manager: SessionManager,
     user: User | None,
     share_param: str | None = None,
+    *,
+    key_scopes: set[str] | None = None,
+    shares: Any = None,
 ) -> tuple[TermSession, bool, str | None] | None:
     try:
         # Only the *first frame* is on a clock. Wrapping the whole handshake in
@@ -425,6 +505,8 @@ async def _handshake(
         raw = await asyncio.wait_for(
             websocket.receive_text(), timeout=HANDSHAKE_TIMEOUT
         )
+        if len(raw.encode("utf-8")) > MAX_CONTROL_FRAME:
+            raise _Denied("attach 消息超过上限", CLOSE_BAD_REQUEST)
         msg = json.loads(raw)
     except TimeoutError:
         raise _Denied("握手超时：连接后 5 秒内没有发送 attach", CLOSE_TIMEOUT) from None
@@ -467,23 +549,50 @@ async def _handshake(
         session = manager.get(str(sid))
         if session is None:
             raise _Denied(f"会话不存在：{sid}", CLOSE_NOT_FOUND)
-        access = _access(user, session, share)
+        # Resolve a database-backed share before ``_access`` so the cached
+        # resolver the broadcast filter uses is warm, and so a v1 client can
+        # open a v2 share link at all (the resolver is installed per session,
+        # not globally).
+        access = None
+        if share and shares is not None:
+            record = await asyncio.to_thread(shares.resolve, share)
+            if record is not None and record.term_session_id == session.id:
+                access = record.scope
+                session.set_external_share_resolver(
+                    shares.resolver(session.id), shares.known(session.id)
+                )
+        if access is None and user is not None and (
+            user.role == "admin" or session.owner_id == user.id
+        ):
+            access = "write"
+        if access is None:
+            # Legacy token only. A database token that failed the explicit
+            # resolve above must not be resurrected from the live cache.
+            access = session.legacy_share_scope(share) if share else None
         if access is None:
             raise _Denied("无权访问该会话", CLOSE_FORBIDDEN)
         writable = access == "write"
+        if key_scopes is not None and "admin" not in key_scopes:
+            # A scoped API key is never more powerful than its scopes, even
+            # when the underlying user owns the session. Before this check the
+            # legacy endpoint ignored scopes entirely: a read-only key could
+            # type into the owner's shell.
+            writable = writable and "write" in key_scopes
         owner_connection = user is not None and (
             user.role == "admin" or session.owner_id == user.id
         )
     else:
         if user is None:
             raise _Denied("创建会话需要登录", CLOSE_UNAUTHORIZED)
+        if key_scopes is not None and "admin" not in key_scopes and "write" not in key_scopes:
+            raise _Denied("该 API Key 没有创建会话的权限", CLOSE_FORBIDDEN)
         if len(manager.list_sessions()) >= settings.max_sessions:
             raise _Denied("会话数量已达上限", CLOSE_LIMIT)
         if not within_user_quota(manager, settings.max_sessions_per_user, user.id):
             raise _Denied("该用户的会话数量已达上限", CLOSE_LIMIT)
         spec = _default_spec(settings, cols, rows)
         try:
-            session = await manager.create(spec, owner_id=user.id)
+            session = await manager.create(spec, owner_id=user.id if user.id > 0 else None)
         except (OSError, PtyError) as exc:
             raise _Denied(f"无法启动命令：{exc}", CLOSE_BAD_REQUEST) from exc
         created = True
@@ -503,7 +612,7 @@ async def _handshake(
                 store.term_session_upsert,
                 session.id,
                 name=spec.name,
-                owner_id=user.id,
+                owner_id=user.id if user.id > 0 else None,
                 backend=spec.backend,
                 command=None,
                 argv=spec.argv,
@@ -512,6 +621,9 @@ async def _handshake(
                 idle_timeout=spec.idle_timeout,
                 max_life=spec.max_life,
                 instance_id=getattr(websocket.app.state, "instance_id", None),
+                generation=session.generation,
+                snapshot_mode=spec.snapshot_mode,
+                shell_integration=spec.shell_integration,
             )
             websocket.app.state.audit.enqueue(
                 "session_create",
@@ -541,6 +653,10 @@ async def _handshake(
         if created:
             await manager.remove(session.id)
         raise _Denied(str(exc), CLOSE_LIMIT) from exc
+    except Exception:
+        if created:
+            await manager.remove(session.id)
+        raise
     return session, writable, filter_share
 
 
@@ -579,6 +695,8 @@ async def _pump(
     writable: bool = True,
     share: str | None = None,
     recheck: Callable[[], Awaitable[User | None]] | None = None,
+    share_recheck: Callable[[], Awaitable[bool]] | None = None,
+    key_scopes: set[str] | None = None,
     metrics: Metrics | None = None,
     close_code_out: list[int | None] | None = None,
     control_bucket: TokenBucket | None = None,
@@ -599,7 +717,10 @@ async def _pump(
     last_recheck = time.monotonic()
 
     def share_revoked() -> bool:
-        return share is not None and not session.share_valid(share)
+        # ``False`` only: a database-backed token that is merely absent from
+        # the local cache is not revoked. The periodic async re-check resolves
+        # it and closes the connection if the row is really gone.
+        return share is not None and session.share_state(share) is False
 
     async def enforce_access() -> bool:
         """Run the periodic re-validation. ``True`` = a denial was issued, stop.
@@ -611,6 +732,9 @@ async def _pump(
         """
         nonlocal writable, last_recheck
         if client.closed:
+            return True
+        if share_recheck is not None and not await share_recheck():
+            await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
             return True
         if share_revoked():
             await deny("分享已撤销或过期", CLOSE_FORBIDDEN)
@@ -628,6 +752,8 @@ async def _pump(
                 await deny("无权访问该会话", CLOSE_FORBIDDEN)
                 return True
             writable = access == "write"
+            if key_scopes is not None and "admin" not in key_scopes:
+                writable = writable and "write" in key_scopes
         last_recheck = time.monotonic()
         return False
 

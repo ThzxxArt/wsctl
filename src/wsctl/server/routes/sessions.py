@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shlex
 from pathlib import Path
@@ -23,10 +24,11 @@ from ..deps import (
     resolve_owners,
     serialize_session,
 )
+from ..idempotency import abort, claim, remember, replay
 from ..models import SessionCreate, SessionRename, SessionReopen
 from ..security import can_access
 
-router = APIRouter(prefix="/api", tags=["sessions"])
+router = APIRouter(tags=["sessions"])
 
 
 @router.get("/sessions")
@@ -43,11 +45,17 @@ async def list_sessions(
 @router.post("/sessions", status_code=status.HTTP_201_CREATED)
 async def create_session(
     body: SessionCreate, request: Request, user: User = Depends(current_user)
-) -> dict[str, Any]:
+) -> Any:
     settings: Settings = request.app.state.settings
     manager: SessionManager = request.app.state.manager
     store = request.app.state.store
     instance_id = request.app.state.instance_id
+    request_hash = hashlib.sha256(
+        json.dumps(body.model_dump(), sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    cached = await replay(request, request_hash=request_hash)
+    if cached is not None:
+        return cached
     if len(manager.list_sessions()) >= settings.max_sessions:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="会话数量已达上限"
@@ -92,7 +100,13 @@ async def create_session(
         name = body.name or f"ssh:{target.destination()}"
     else:
         if body.command is not None:
-            argv = shlex.split(body.command)
+            try:
+                argv = shlex.split(body.command)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"命令无法解析：{exc}",
+                ) from exc
             if not argv:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail="命令为空"
@@ -117,14 +131,26 @@ async def create_session(
         max_clients=settings.session_max_clients,
         memory_limit=settings.session_memory_limit,
         scrollback_bytes=settings.scrollback_bytes,
+        snapshot_mode=settings.snapshot_mode,
+        shell_integration=settings.shell_integration,
     )
+    claimed = await claim(request, request_hash=request_hash)
+    if claimed is not None:
+        return claimed
     try:
-        session = await manager.create(spec, owner_id=user.id)
+        session = await manager.create(spec, owner_id=user.id if user.id > 0 else None)
     except (OSError, PtyError) as exc:
+        await abort(request)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"无法启动命令：{exc}",
         ) from exc
+    except asyncio.CancelledError:
+        await abort(request)
+        raise
+    except Exception:
+        await abort(request)
+        raise
     try:
         if settings.auto_record and await asyncio.to_thread(
             recording_mod.has_room,
@@ -139,7 +165,7 @@ async def create_session(
             store.term_session_upsert,
             session.id,
             name=name,
-            owner_id=user.id,
+            owner_id=user.id if user.id > 0 else None,
             backend=backend,
             command=body.command,
             argv=spec.argv,
@@ -148,18 +174,35 @@ async def create_session(
             idle_timeout=spec.idle_timeout,
             max_life=spec.max_life,
             instance_id=instance_id,
+            generation=session.generation,
+            snapshot_mode=spec.snapshot_mode,
+            shell_integration=spec.shell_integration,
         )
         request.app.state.audit.enqueue(
             "session_create", user_id=user.id, term_session_id=session.id, payload=name
         )
     except Exception as exc:
         await manager.remove(session.id)
+        await abort(request)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="创建会话失败",
         ) from exc
+    except asyncio.CancelledError:
+        await manager.remove(session.id)
+        await abort(request)
+        raise
     request.app.state.metrics.inc("wsctl_sessions_created_total")
-    return serialize_session(session, {user.id: user})
+    request.app.state.events.publish(
+        "session_created",
+        owner_id=user.id if user.id > 0 else None,
+        session=session.id,
+        name=name,
+        owner=user.username,
+    )
+    payload = serialize_session(session, {user.id: user})
+    await remember(request, payload, status_code=201, request_hash=request_hash)
+    return payload
 
 
 @router.post("/sessions/{sid}/reopen", status_code=status.HTTP_201_CREATED)
@@ -228,9 +271,11 @@ async def reopen_session(
         max_clients=settings.session_max_clients,
         memory_limit=settings.session_memory_limit,
         scrollback_bytes=settings.scrollback_bytes,
+        snapshot_mode=settings.snapshot_mode,
+        shell_integration=settings.shell_integration,
     )
     try:
-        session = await manager.create(spec, owner_id=user.id)
+        session = await manager.create(spec, owner_id=user.id if user.id > 0 else None)
     except (OSError, PtyError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"无法启动命令：{exc}"
@@ -239,7 +284,7 @@ async def reopen_session(
         request.app.state.store.term_session_upsert,
         session.id,
         name=name,
-        owner_id=user.id,
+        owner_id=user.id if user.id > 0 else None,
         backend=backend,
         command=spec.command,
         argv=spec.argv,
@@ -248,11 +293,21 @@ async def reopen_session(
         idle_timeout=spec.idle_timeout,
         max_life=spec.max_life,
         instance_id=request.app.state.instance_id,
+        generation=session.generation,
+        snapshot_mode=spec.snapshot_mode,
+        shell_integration=spec.shell_integration,
     )
     request.app.state.audit.enqueue(
         "session_create", user_id=user.id, term_session_id=session.id, payload=f"reopen {name}"
     )
     request.app.state.metrics.inc("wsctl_sessions_created_total")
+    request.app.state.events.publish(
+        "session_created",
+        owner_id=user.id if user.id > 0 else None,
+        session=session.id,
+        name=name,
+        owner=user.username,
+    )
     return serialize_session(session, {user.id: user})
 
 
@@ -277,12 +332,10 @@ async def rename_session(
     session = owned_session(request, sid, user)
     name = session.rename(body.name)
     await asyncio.to_thread(
-        request.app.state.store.term_session_upsert,
-        sid,
-        name=name,
-        owner_id=session.owner_id,
-        cwd=session.spec.cwd,
-        instance_id=request.app.state.instance_id,
+        request.app.state.store.term_session_set_name, sid, name
+    )
+    request.app.state.audit.enqueue(
+        "session_rename", user_id=user.id, term_session_id=sid, payload=name[:256]
     )
     # Tell every attached client so a rename is not invisible until the next
     # reconnect. Two tabs on one session used to keep showing different names.

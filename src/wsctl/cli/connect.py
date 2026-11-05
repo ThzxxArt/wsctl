@@ -16,6 +16,8 @@ import os
 import signal
 import ssl
 import sys
+import time
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import websockets
@@ -26,6 +28,15 @@ from wsctl.cli.client import ApiClient, ApiError, ca_bundle_for, load_credential
 # Imported, never re-listed: the fatal set used to be maintained in three
 # places and 4401 was fatal here but not in the browser.
 from wsctl.core.closecodes import FATAL_CLOSE_CODES as FATAL_CODES
+from wsctl.core.protocol import (
+    FLAG_SNAPSHOT,
+    SUBPROTOCOL,
+    DataFrame,
+    ProtocolError,
+    decode_data,
+    encode_control,
+    encode_input,
+)
 
 DEFAULT_SIZE = (80, 24)
 READ_SIZE = 4096
@@ -64,7 +75,7 @@ def run_connect(
 def _ws_url(base: str) -> str:
     parsed = urlsplit(base)
     scheme = "wss" if parsed.scheme == "https" else "ws"
-    path = parsed.path.rstrip("/") + "/ws"
+    path = parsed.path.rstrip("/") + "/ws/v2"
     return urlunsplit((scheme, parsed.netloc, path, "", ""))
 
 
@@ -108,7 +119,15 @@ async def _run(base: str, session: str | None, token: str | None, *, reconnect: 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     outbound: asyncio.Queue[bytes | str | None] = asyncio.Queue()
-    state = {"stdin_closed": False}
+    state: dict[str, Any] = {
+        "stdin_closed": False,
+        "last_seq": None,
+        "generation": None,
+        #: Set after a loss signal until a snapshot restores contiguity. Live
+        #: frames still paint, but must not advance the resume offset.
+        "awaiting_snapshot": False,
+        "attached": asyncio.Event(),
+    }
 
     def on_stdin() -> None:
         try:
@@ -167,24 +186,68 @@ def _drain(queue: asyncio.Queue[bytes | str | None]) -> None:
 
 
 async def _recv_loop(
-    ws: object, session_id: str, cols: int, rows: int
+    ws: object, session_id: str, cols: int, rows: int, state: dict[str, Any]
 ) -> tuple[str | None, int | None, bool, int]:
     """Attach and pump output. Returns ``(notice, close_code, exited, code)``."""
-    await ws.send(  # type: ignore[attr-defined]
-        json.dumps({"type": "attach", "session": session_id, "cols": cols, "rows": rows})
-    )
+    attach: dict[str, Any] = {
+        "v": 2,
+        "type": "attach",
+        "session": session_id,
+        "cols": cols,
+        "rows": rows,
+        "capabilities": ["snapshot", "osc133", "resume"],
+    }
+    if state.get("last_seq") is not None and not state.get("awaiting_snapshot"):
+        attach["last_seq"] = state["last_seq"]
+    if state.get("generation"):
+        attach["generation"] = state["generation"]
+    await ws.send(encode_control(attach))  # type: ignore[attr-defined]
+
     notice: str | None = None
     exit_code = 0
+    last_ack = 0.0
+    resync_requested = False
+
+    async def send_ack(force: bool = False) -> None:
+        nonlocal last_ack
+        now = time.monotonic()
+        if not force and now - last_ack < 0.1:
+            return
+        last_ack = now
+        seq = state.get("last_seq")
+        if isinstance(seq, int):
+            with contextlib.suppress(Exception):
+                await ws.send(  # type: ignore[attr-defined]
+                    encode_control({"type": "ack", "seq": seq})
+                )
+
     try:
         while True:
             message = await ws.recv()  # type: ignore[attr-defined]
             if isinstance(message, bytes):
                 try:
-                    os.write(sys.stdout.fileno(), message)
+                    frame: DataFrame = decode_data(message)
+                except ProtocolError as exc:
+                    _notice(f"协议错误：{exc}")
+                    continue
+                try:
+                    os.write(sys.stdout.fileno(), frame.payload)
                 except OSError:
-                    # The local stdout went away (``| head``): stop cleanly
-                    # instead of dying with a BrokenPipeError traceback.
                     return notice, None, True, 0
+                if frame.flags & FLAG_SNAPSHOT:
+                    # A snapshot is a rendered screen anchored at ``seq``; its
+                    # byte length is not stream offset. Adding it claimed bytes
+                    # that were never sent and made the next resume skip data.
+                    current = state.get("last_seq")
+                    state["last_seq"] = (
+                        frame.seq if not isinstance(current, int) else max(current, frame.seq)
+                    )
+                    state["awaiting_snapshot"] = False
+                elif not state.get("awaiting_snapshot"):
+                    current = state.get("last_seq")
+                    end = frame.seq + len(frame.payload)
+                    state["last_seq"] = end if not isinstance(current, int) else max(current, end)
+                await send_ack()
                 continue
             # A proxy or middlebox can inject non-JSON text frames; ignoring
             # them keeps the terminal alive instead of tearing the link down.
@@ -195,36 +258,70 @@ async def _recv_loop(
             if not isinstance(data, dict):
                 continue
             kind = data.get("type")
-            if kind == "exit":
+            if kind == "attached":
+                event = state.get("attached")
+                if event is not None:
+                    event.set()
+                if isinstance(data.get("generation"), str):
+                    state["generation"] = data["generation"]
+                if data.get("incomplete"):
+                    # The server's replay was itself shed. Do not adopt its
+                    # offset: that would skip exactly the missing bytes on the
+                    # next reconnect. Ask for a real screen snapshot.
+                    notice = "会话回放未完整，正在请求快照"
+                    _notice(notice)
+                    state["awaiting_snapshot"] = True
+                    if not resync_requested:
+                        resync_requested = True
+                        with contextlib.suppress(Exception):
+                            await ws.send(  # type: ignore[attr-defined]
+                                encode_control({"type": "snapshot-request"})
+                            )
+                elif isinstance(data.get("seq"), int):
+                    # Replay is complete and was queued before ``attached``.
+                    state["last_seq"] = data["seq"]
+                    state["awaiting_snapshot"] = False
+            elif kind == "exit":
                 raw = data.get("code")
                 exit_code = int(raw) if isinstance(raw, (int, float)) else 0
                 return f"会话已退出（退出码 {raw}）", 1000, True, exit_code
-            if kind == "error":
-                # The reason may be followed by a fatal close; keep reading to
-                # learn the close code before deciding whether to retry.
+            elif kind == "error":
                 notice = str(data.get("msg"))
             elif kind == "notice":
-                # Operational notices (read-only, rate limit, shutdown) must
-                # reach the operator here exactly as they reach the browser --
-                # silently swallowing them is the same defect as a browser
-                # toast that never appears.
                 _notice(str(data.get("msg") or "提示"))
             elif kind == "desync":
-                # Frames were shed to keep the link. The local terminal is a
-                # real emulator and holds whatever arrived; say so and say what
-                # cannot be undone. The server triggers the redraw itself (two
-                # real size changes) -- asking the user for Ctrl+L was wrong
-                # for a TUI, which eats the key.
                 _notice(
                     str(data.get("msg") or "输出过快，部分内容已省略")
                     + "。同步后全屏程序会自动重绘；仍不完整可再请求一次同步"
                 )
+            elif kind == "gap":
+                lost_from = data.get("from")
+                lost_to = data.get("to")
+                _notice(f"连接丢失了字节 {lost_from}..{lost_to}，正在请求快照")
+                state["awaiting_snapshot"] = True
+                if not resync_requested:
+                    resync_requested = True
+                    with contextlib.suppress(Exception):
+                        await ws.send(  # type: ignore[attr-defined]
+                            encode_control({"type": "snapshot-request"})
+                        )
+            elif kind == "snapshot":
+                source = data.get("source") or data.get("format") or "unknown"
+                _notice(f"已收到屏幕快照（{source}）")
+            elif kind == "snapshot-request":
+                continue
+            elif kind == "resynced":
+                seq = data.get("seq")
+                if data.get("incomplete"):
+                    notice = "重新同步未完整，部分内容仍缺失"
+                    state["awaiting_snapshot"] = True
+                elif isinstance(seq, int):
+                    current = state.get("last_seq")
+                    state["last_seq"] = seq if not isinstance(current, int) else max(current, seq)
+                    state["awaiting_snapshot"] = False
+                resync_requested = False
             elif kind == "evicted":
                 _notice(str(data.get("msg") or "连接已被释放（会话仍在运行）"))
-            elif kind == "attached" and data.get("incomplete"):
-                # The replay itself shed. Claiming a whole screen would repeat
-                # the exact lie the desync notice exists to correct.
-                _notice("会话回放未完整，部分内容已省略")
     except ConnectionClosed as exc:
         code: int | None = None
         if exc.rcvd is not None:
@@ -258,7 +355,14 @@ async def _session_loop(
     while True:
         try:
             ws = await websockets.connect(
-                ws_url, additional_headers=headers, max_size=None, ssl=tls_context
+                ws_url,
+                additional_headers=headers,
+                # Data frames are capped at 1 MiB by the protocol and control
+                # frames at 64 KiB. An unbounded read would let a broken (or
+                # hostile) server exhaust this process's memory instead.
+                max_size=2 * 1024 * 1024,
+                ssl=tls_context,
+                subprotocols=[SUBPROTOCOL],  # type: ignore[list-item]
             )
         except InvalidStatus as exc:
             status = exc.response.status_code
@@ -277,9 +381,15 @@ async def _session_loop(
         # every later reconnect waited 16-30s and looked like a dead server.
         delay = INITIAL_DELAY
         _drain(outbound)  # discard input meant for the previous connection
+        attached_event = state.get("attached")
+        if isinstance(attached_event, asyncio.Event):
+            attached_event.clear()
         cols, rows = _winsize()
         async with ws:
             async def sender(conn: object = ws) -> None:
+                event = state.get("attached")
+                if isinstance(event, asyncio.Event):
+                    await event.wait()
                 while True:
                     item = await outbound.get()
                     if item is None:
@@ -287,7 +397,10 @@ async def _session_loop(
                             await conn.close()  # type: ignore[attr-defined]
                         return
                     try:
-                        await conn.send(item)  # type: ignore[attr-defined]
+                        if isinstance(item, bytes):
+                            await conn.send(encode_input(item))  # type: ignore[attr-defined]
+                        else:
+                            await conn.send(item)  # type: ignore[attr-defined]
                     except ConnectionClosed:
                         return
 
@@ -296,14 +409,18 @@ async def _session_loop(
                 while True:
                     await asyncio.sleep(PING_INTERVAL)
                     try:
-                        await conn.send(json.dumps({"type": "ping"}))  # type: ignore[attr-defined]
+                        await conn.send(  # type: ignore[attr-defined]
+                            encode_control({"type": "ping", "nonce": int(time.time())})
+                        )
                     except ConnectionClosed:
                         return
 
             send_task = asyncio.create_task(sender())
             ping_task = asyncio.create_task(pinger())
             try:
-                notice, code, exited, exit_code = await _recv_loop(ws, session_id, cols, rows)
+                notice, code, exited, exit_code = await _recv_loop(
+                    ws, session_id, cols, rows, state
+                )
             finally:
                 send_task.cancel()
                 ping_task.cancel()

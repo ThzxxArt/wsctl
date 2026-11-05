@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 460" width="1600" height="460" role="img" aria-labelledby="wsctl-banner-title wsctl-banner-desc">
+  <title id="wsctl-banner-title">wsctl — 单机部署的 Web 终端工作台</title>
+  <desc id="wsctl-banner-desc">wsctl 0.2.0：可恢复协议、多会话分屏、多用户 RBAC、审计、分享、录制与可观测。</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a101c"/>
+      <stop offset="0.55" stop-color="#0d1729"/>
+      <stop offset="1" stop-color="#0a111f"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f9cf9"/>
+      <stop offset="1" stop-color="#7c5cff"/>
+    </linearGradient>
+    <linearGradient id="accent-soft" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4f9cf9" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#7c5cff" stop-opacity="0.06"/>
+    </linearGradient>
+    <radialGradient id="glow-blue" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#4f9cf9" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#4f9cf9" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-violet" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="blur" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="42"/>
+    </filter>
+    <filter id="card-shadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000000" flood-opacity="0.38"/>
+    </filter>
+    <pattern id="grid" width="44" height="44" patternUnits="userSpaceOnUse">
+      <path d="M 44 0 L 0 0 0 44" fill="none" stroke="#1d2c46" stroke-width="1" opacity="0.34"/>
+    </pattern>
+    <clipPath id="banner-clip">
+      <rect x="0" y="0" width="1600" height="460" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#banner-clip)">
+    <rect width="1600" height="460" fill="url(#bg)"/>
+    <rect width="1600" height="460" fill="url(#grid)"/>
+    <circle cx="210" cy="70" r="300" fill="url(#glow-blue)" filter="url(#blur)"/>
+    <circle cx="1390" cy="420" r="320" fill="url(#glow-violet)" filter="url(#blur)"/>
+    <path d="M0 388 C 280 300, 520 470, 820 360 S 1350 300, 1600 372" fill="none" stroke="url(#accent)" stroke-width="1.2" opacity="0.22"/>
+
+    <!-- brand mark -->
+    <g transform="translate(92 86)">
+      <rect width="94" height="94" rx="24" fill="#080e19" stroke="url(#accent)" stroke-width="2.4"/>
+      <rect x="8" y="8" width="78" height="78" rx="18" fill="#0b1322" opacity="0.9"/>
+      <path d="M27 31 L47 47 L27 63" fill="none" stroke="url(#accent)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M55 63 H71" fill="none" stroke="#e8edf6" stroke-width="7" stroke-linecap="round"/>
+    </g>
+
+    <text x="216" y="142" fill="#f5f8fd" font-family="'SF Pro Display','Segoe UI',system-ui,sans-serif" font-size="70" font-weight="800" letter-spacing="-2">wsctl</text>
+    <text x="218" y="184" fill="#9db2d0" font-family="'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif" font-size="25" font-weight="500">单机部署的 Web 终端工作台</text>
+    <text x="218" y="222" fill="#7086a6" font-family="'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif" font-size="17">可恢复协议 · 多会话分屏 · RBAC · 审计 · 分享 · 录制</text>
+
+    <!-- feature pills -->
+    <g transform="translate(218 258)" font-family="'SFMono-Regular',Consolas,'Liberation Mono',monospace" font-size="14">
+      <rect width="140" height="34" rx="17" fill="url(#accent-soft)" stroke="#27415f"/>
+      <text x="20" y="22" fill="#9fc3ef">0.2.0 stable</text>
+      <rect x="152" width="138" height="34" rx="17" fill="#0e1a2b" stroke="#223650"/>
+      <text x="172" y="22" fill="#8fa9c8">Python 3.12+</text>
+      <rect x="302" width="136" height="34" rx="17" fill="#0e1a2b" stroke="#223650"/>
+      <text x="322" y="22" fill="#8fa9c8">OpenAPI 3.1</text>
+      <rect x="450" width="118" height="34" rx="17" fill="#0e1a2b" stroke="#223650"/>
+      <text x="470" y="22" fill="#8fa9c8">schema v6</text>
+    </g>
+
+    <text x="96" y="394" fill="#435a7a" font-family="'SFMono-Regular',Consolas,'Liberation Mono',monospace" font-size="15" letter-spacing="4">SESSION ≠ CONNECTION</text>
+    <text x="96" y="421" fill="#314766" font-family="'SFMono-Regular',Consolas,'Liberation Mono',monospace" font-size="14">resume · snapshot · replay</text>
+
+    <!-- terminal card -->
+    <g transform="translate(930 88)" filter="url(#card-shadow)">
+      <rect width="574" height="286" rx="18" fill="#070c16" stroke="#22324b" stroke-width="1.2"/>
+      <rect width="574" height="48" rx="18" fill="#0b1423"/>
+      <rect y="30" width="574" height="18" fill="#0b1423"/>
+      <line x1="0" y1="48" x2="574" y2="48" stroke="#1a2940"/>
+      <circle cx="26" cy="24" r="6" fill="#ff5f57"/>
+      <circle cx="48" cy="24" r="6" fill="#febc2e"/>
+      <circle cx="70" cy="24" r="6" fill="#28c840"/>
+      <text x="96" y="29" fill="#7f95b3" font-family="'SFMono-Regular',Consolas,'Liberation Mono',monospace" font-size="13">wsctl — terminal workspace</text>
+
+      <g font-family="'SFMono-Regular',Consolas,'Liberation Mono',monospace" font-size="15">
+        <text x="28" y="92" fill="#dbe6f5">$ wsctl serve</text>
+        <text x="28" y="122" fill="#7ee787">wsctl 0.2.0 listening on 127.0.0.1:7681</text>
+        <text x="28" y="164" fill="#dbe6f5">$ wsctl connect</text>
+        <text x="28" y="194" fill="#8ea7c5">connected · session 8f3a… · resume ok</text>
+        <text x="28" y="234" fill="#b39cff">seq 12480 · ack 12480 · snapshot ready</text>
+      </g>
+      <rect x="28" y="252" width="10" height="18" rx="2" fill="#4f9cf9"/>
+      <text x="440" y="266" fill="#405776" font-family="'SFMono-Regular',Consolas,'Liberation Mono',monospace" font-size="12">/ws/v2</text>
+    </g>
+  </g>
+</svg>

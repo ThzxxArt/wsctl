@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
+from wsctl.core import config_v2
 from wsctl.core.config import HOT_FIELDS, kind_of
 from wsctl.core.config import RESTART_FIELDS as RESTART_FIELDS_ALL
 from wsctl.core.store import User
@@ -14,7 +18,7 @@ from wsctl.core.store import User
 from ..deps import render_setting, require_admin
 from ..models import ConfigSetRequest
 
-router = APIRouter(prefix="/api", tags=["config"])
+router = APIRouter(tags=["config"])
 
 
 @router.post("/config/reload")
@@ -31,7 +35,7 @@ async def reload_config(
 
 
 @router.get("/config")
-async def get_config(request: Request, _: User = Depends(require_admin)) -> dict[str, Any]:
+async def get_config(request: Request, _: User = Depends(require_admin)) -> Response:
     """Effective configuration, labelled by whether a reload can apply it."""
     settings = request.app.state.settings
     values = await asyncio.to_thread(lambda: settings.model_dump())
@@ -42,20 +46,38 @@ async def get_config(request: Request, _: User = Depends(require_admin)) -> dict
     fields = [
         {
             "key": key,
-            "value": render_setting(values.get(key)),
+            "value": (
+                config_v2.SECRET_PLACEHOLDER
+                if key in config_v2.SECRET_KEYS
+                else render_setting(values.get(key))
+            ),
             # The typed value, so the editor can pick the right control
             # (a checkbox for a bool, a number box for an int) instead of
             # handing every field a free-text box and re-parsing strings.
-            "raw": values.get(key),
+            "raw": (
+                config_v2.SECRET_PLACEHOLDER
+                if key in config_v2.SECRET_KEYS
+                else values.get(key)
+            ),
+            "secret": key in config_v2.SECRET_KEYS,
             "kind": kind_of(key),
         }
         for key in sorted(HOT_FIELDS | set(RESTART_FIELDS_ALL))
     ]
-    return {
+    body = {
         "config_path": str(settings.config_path),
         "data_dir": str(settings.data_dir),
         "fields": fields,
     }
+    body = jsonable_encoder(body)
+    import json
+
+    payload = json.dumps(body, ensure_ascii=False, sort_keys=True, default=str).encode()
+    etag = 'W/"' + hashlib.sha256(payload).hexdigest()[:32] + '"'
+    return JSONResponse(
+        body,
+        headers={"ETag": etag, "Cache-Control": "no-cache"},
+    )
 
 
 @router.put("/config")
@@ -74,32 +96,39 @@ async def put_config(
     nothing until someone remembers to restart.
     """
     config_edit = _config_edit()
+    from wsctl.core import config_v2
+
     settings = request.app.state.settings
     path = settings.config_path
 
-    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    text = (
+        await asyncio.to_thread(path.read_text, encoding="utf-8")
+        if path.is_file()
+        else ""
+    )
     written: list[str] = []
     for item in body.items:
-        kind = kind_of(item.key)
+        key = config_v2.normalise_key(item.key)
+        kind = kind_of(key)
         if kind == "restart":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    f"配置项 {item.key} 需要修改配置文件并重启服务后生效，"
+                    f"配置项 {key} 需要修改配置文件并重启服务后生效，"
                     "不支持在线写入"
                 ),
             )
         try:
-            text = config_edit.apply_key(text, item.key, item.value)
+            text = config_edit.apply_key(text, key, item.value)
         except config_edit.ConfigEditError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
             ) from exc
-        written.append(item.key)
+        written.append(key)
 
     # Publish once for the whole batch: a reader never sees a half-applied set.
     try:
-        config_edit.write_text_atomic(path, text)
+        await asyncio.to_thread(config_edit.write_text_atomic, path, text)
     except OSError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

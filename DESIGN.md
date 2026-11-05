@@ -1,41 +1,74 @@
 # wsctl 设计文档
 
-> 版本：0.1.30 · 状态：0.1.0–0.1.16、0.1.18–0.1.29 已发布（0.1.17 撤回，由 0.1.18 承载）
+> 版本：0.2.0 · 状态：0.1.x 已发布；0.2.0 平台换轨已实施
 > 作者：ThzxxArt · 许可：MIT
+
+## 0. 0.2.0 架构摘要
+
+```text
+Browser (Vue 3 + xterm 6)
+  ├─ REST /api/v2
+  ├─ SSE  /api/v2/events       状态事件，不承载终端字节
+  └─ WS   /ws/v2               seq / ack / resume / gap / snapshot
+
+FastAPI / Uvicorn
+  ├─ SessionActor（每会话 mailbox）
+  │    ├─ PTY / tmux / ssh
+  │    ├─ ScrollbackRing（带全局字节序号）
+  │    ├─ SnapshotProvider（tmux / pyte / raw）
+  │    ├─ CommandBlockParser（OSC 133/633）
+  │    └─ clients（有界队列 + gap 报告）
+  ├─ Store（SQLite 核心表）
+  ├─ Database（SQLAlchemy：shares/api_keys/layouts/command_blocks/push）
+  ├─ Alembic（schema v6，head 0004_session_exit_code）
+  ├─ ShareService / EventBroker / PushService
+  └─ observability（structlog / prometheus / OTel）
+```
+
+关键不变量：
+
+1. 会话独立于连接；关闭标签只 detach；
+2. 慢观众丢帧不断链，丢失必须报告精确区间（`gap`）；
+3. 重连要么精确续传，要么收到完整屏幕快照，不允许「猜」；
+4. 分享跨重启存活，撤销立即生效；
+5. 终端数据只走 WebSocket，SSE 只承载状态；
+6. HTTP 错误统一为 RFC 9457 Problem Details，创建/上传支持 `Idempotency-Key`；
+7. 迁移 schema 前自动生成 SQLite 一致性快照。
+
+设计决策见 `docs/ADR/`，升级步骤见 `docs/MIGRATION-0.2.0.md`。
 
 ## 1. 定位
 
-**wsctl 是 ttyd 的现代 Python 超集。**
+**wsctl 是单机部署的 Web 终端工作台。**
 
 单机部署的 Web 在线终端。一条命令起服务，浏览器或 CLI 得到完整 shell；终端
 **会话独立于连接**，断线重连即恢复。
 
 - 目标场景：个人 / 小团队的远程运维、跳板、演示、受限环境终端访问
 - 部署形态：单进程单机，`pip install wsctl` 零编译即用
-- 对照参照：`ttyd`（C + libuv/libwebsockets）
+- 设计取舍：可靠恢复、明确背压与可运维性优先于原始吞吐
 
 ### 1.1 明确边界（诚实声明）
 
-wsctl **不在原始吞吐上对标 ttyd**。纯 Python 无法在 `cat` 大文件、`yes` 刷屏
-这类高吞吐场景打赢 C+libuv。wsctl 的「稳定」来自**架构**——会话与连接解耦、
-输出背压、进程隔离——而非单连接速度。请勿用不公平 benchmark 比较两者。
+纯 Python 转发在 `cat` 大文件、`yes` 刷屏这类高吞吐场景不是强项。wsctl 的
+「稳定」来自**架构**——会话与连接解耦、输出背压、进程隔离——而非单连接速度。
 
-## 2. 相对 ttyd 的差异化
+## 2. 产品能力
 
-| 维度 | ttyd | wsctl |
-|---|---|---|
-| 会话模型 | 一进程 = 一会话 = 一端口 | 单服务托管 N 个会话 |
-| 多终端 | 起多进程 / 依赖 tmux | 原生多会话 + 多标签 UI |
-| 用户体系 | 单一 basic-auth 凭据 | 多用户 + RBAC（admin/user） |
-| 审计 | 无 | 结构化审计日志（可扩展录制） |
-| 连接语义 | 连接与会话耦合 | 解耦，断线重连回放屏幕 |
-| 配置 | 命令行参数 | 配置文件 + CLI + 热更新 |
-| 可观测 | 基础日志 | `/healthz` · `/metrics` · JSON 日志 |
-| 管理面 | 无 | REST API（可扩展 Webhook） |
-| 扩展 | C | Python |
-| 安装 | 各平台二进制 | `pip install` 零编译 |
+| 能力 | wsctl |
+|---|---|
+| 会话模型 | 单服务托管 N 个会话 |
+| 多终端 | 原生多会话 + 多标签 + 分屏 |
+| 用户体系 | 多用户 + RBAC（admin/user） |
+| 审计 | 结构化审计日志 + 哈希链 + Webhook |
+| 连接语义 | 会话与连接解耦，精确续传或屏幕快照 |
+| 配置 | 分节配置文件 + CLI + 热更新 |
+| 可观测 | `/healthz` · `/readyz` · `/metrics` · JSON 日志 · OTel |
+| 管理面 | REST API v2 + Web 管理台 |
+| 安装 | `pip install` 零编译 |
 
-**主动选择放弃的项**：不兼容 ttyd 的命令行参数，另起炉灶使用子命令式 CLI。
+**主动选择放弃的项**：CLI 采用子命令式设计，不复刻其他终端的参数拼盘；不追求
+命令行参数层面的兼容。
 
 ## 3. 核心架构：会话与连接解耦
 

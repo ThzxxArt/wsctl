@@ -16,15 +16,20 @@ import os
 import secrets
 import subprocess
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from . import tmux
+from .command_block import CommandBlockParser
+from .observability import span
+from .protocol import FLAG_REPLAY, FLAG_SNAPSHOT
 from .pty import DEFAULT_TERM_SIGNAL, Pty, create_pty
 from .recording import Recorder
 from .scrollback import DEFAULT_MAX_BYTES, Scrollback
+from .snapshot import RawSnapshot, Snapshot, provider_for
 
 log = logging.getLogger("wsctl.session")
 
@@ -137,6 +142,10 @@ class SessionSpec:
     max_clients: int = 0
     memory_limit: int = 0
     scrollback_bytes: int = DEFAULT_MAX_BYTES
+    #: ``auto`` keeps a shadow terminal only for alternate-screen apps,
+    #: ``always`` for every session, ``off`` never.
+    snapshot_mode: str = "auto"
+    shell_integration: bool = True
 
 
 @dataclass
@@ -214,6 +223,7 @@ class TermSession:
         loop: asyncio.AbstractEventLoop,
         owner_id: int | None = None,
         on_close: Callable[[TermSession], None] | None = None,
+        on_command: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self.id = sid
         self.spec = spec
@@ -222,6 +232,10 @@ class TermSession:
         self.last_active = self.created_at
         self.exit_code: int | None = None
         self.closed = False
+        #: Identity of this *stream*, not of the process. A reconnect that
+        #: presents an older generation is told to take a snapshot instead of
+        #: being fed bytes that belong to a different session lifetime.
+        self.generation = secrets.token_hex(16)
         #: Set once the finalizer has queued the ``exit`` notice. ``closed``
         #: alone is not enough: it flips *before* the notice is written, and a
         #: WebSocket pump that returned on ``closed`` could detach the client
@@ -254,7 +268,13 @@ class TermSession:
         #: and would feed the very backlog being shed.
         self._repaint_requested_at: float | None = None
         self._repaint_task: asyncio.Task[None] | None = None
+        #: Serialises ``nudge_repaint``. Two attaches (or a manual resync next
+        #: to an attach) used to run their shrink/restore windows concurrently;
+        #: one window then restored a size it read before the other's resize,
+        #: leaving the PTY smaller than ``spec`` until the next real resize.
+        self._repaint_lock = asyncio.Lock()
         self._on_close = on_close
+        self._on_command = on_command
         self._loop = loop
         self._scrollback = Scrollback(spec.scrollback_bytes)
         self._memory_limit = spec.memory_limit
@@ -263,6 +283,22 @@ class TermSession:
         self._share_token: str | None = None
         self._share_expires: float | None = None
         self._share_writable = False
+        #: Legacy tokens this session has rotated away from. Without it a
+        #: revoke is indistinguishable from "this connection is a database
+        #: share we have not resolved yet", and the immediate-revocation
+        #: contract for the legacy link would silently become a 5s one.
+        self._revoked_legacy: deque[str] = deque(maxlen=16)
+        #: Resolver for protocol-v2 share links stored in the ``shares`` table.
+        #: Called from the broadcast filter, so it must be cheap; the server's
+        #: ``ShareService`` keeps a short-lived in-memory cache and invalidates
+        #: it on revoke.
+        self._external_share: Callable[[str], str | None] | None = None
+        #: ``True``/``False`` when the resolver can tell a *known-invalid*
+        #: token from one it merely has not loaded into its cache yet. The
+        #: broadcast filter must never drop a viewer on a cache miss: that
+        #: turned an expired cache entry into a silently detached share viewer
+        #: for the rest of the connection's life.
+        self._external_share_known: Callable[[str], bool] | None = None
         self._tmux_name: str | None = None
         self._recorder: Recorder | None = None
         self._record_input = False
@@ -289,6 +325,18 @@ class TermSession:
             detach_only = getattr(self._pty, "set_detach_only", None)
             if callable(detach_only):
                 detach_only()
+        try:
+            self._snapshotter = provider_for(
+                mode=spec.snapshot_mode,
+                cols=spec.cols,
+                rows=spec.rows,
+                scrollback=self._scrollback,
+                tmux_target=self._tmux_name,
+            )
+        except Exception:  # pragma: no cover - a missing optional backend
+            log.debug("snapshot provider unavailable", exc_info=True)
+            self._snapshotter = RawSnapshot(self._scrollback)
+        self._command_parser = CommandBlockParser(sid)
         self._read_task = loop.create_task(self._read_loop())
 
     # -- introspection -------------------------------------------------
@@ -318,6 +366,7 @@ class TermSession:
         """
         return [
             {
+                "viewer": str(getattr(entry.client, "viewer_label", "") or "观众"),
                 "writable": entry.writable,
                 "share": entry.share,
                 "pending_bytes": int(getattr(entry.client, "pending_bytes", 0)),
@@ -329,6 +378,24 @@ class TermSession:
 
     def scrollback_snapshot(self) -> bytes:
         return self._scrollback.snapshot()
+
+    @property
+    def scrollback_size(self) -> int:
+        """Bytes currently held in the scrollback (no copy)."""
+        return self._scrollback.size
+
+    @property
+    def base_seq(self) -> int:
+        """Oldest output offset still available for exact resume."""
+        return self._scrollback.base_seq
+
+    @property
+    def end_seq(self) -> int:
+        """Offset just past the newest output byte."""
+        return self._scrollback.end_seq
+
+    def command_blocks(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self._command_parser.snapshot(limit)
 
     def scrollback_chunks(self, target: int = 65536) -> tuple[bytes, ...]:
         """Buffered output as **wire frames**, for a targeted replay.
@@ -385,28 +452,39 @@ class TermSession:
         """
         if self.closed:
             return
-        cols, rows = self.spec.cols, self.spec.rows
-        # The repaint's own output must not enter the scrollback (see
-        # ``_mute_scrollback``). Live viewers still get it -- that is the whole
-        # point of the nudge -- but a *recorded* redraw would make every later
-        # replay self-destructive.
-        self._mute_scrollback = True
-        try:
-            if rows > 1:
-                self._pty.resize(cols, rows - 1)
-            elif cols > 1:
-                self._pty.resize(cols - 1, rows)
-            else:
-                return
-            await asyncio.sleep(0.05)
+        async with self._repaint_lock:
             if self.closed:
                 return
-            self._pty.resize(self.spec.cols, self.spec.rows)
-            # Let the application's repaint actually arrive before unmuting;
-            # it is generated asynchronously off the SIGWINCH.
-            await asyncio.sleep(0.05)
-        finally:
-            self._mute_scrollback = False
+            cols, rows = self.spec.cols, self.spec.rows
+            # The repaint's own output must not enter the scrollback (see
+            # ``_mute_scrollback``). Live viewers still get it -- that is the
+            # whole point of the nudge -- but a *recorded* redraw would make
+            # every later replay self-destructive.
+            self._mute_scrollback = True
+            try:
+                if rows > 1:
+                    self._pty.resize(cols, rows - 1)
+                elif cols > 1:
+                    self._pty.resize(cols - 1, rows)
+                else:
+                    return
+                await asyncio.sleep(0.05)
+                if self.closed:
+                    return
+                # Restore the size that is current *now*, not the one read
+                # before the window. A real resize landing during these 50ms
+                # used to be undone by the stale restore, leaving ``spec`` and
+                # the PTY in disagreement until the next user resize.
+                self._pty.resize(self.spec.cols, self.spec.rows)
+                # Let the application's repaint actually arrive before
+                # unmuting; it is generated asynchronously off the SIGWINCH.
+                await asyncio.sleep(0.05)
+            except OSError:
+                # The PTY closed during the window (session ended, tmux
+                # vanished). A display refresh is best-effort.
+                log.debug("repaint nudge failed for session %s", self.id, exc_info=True)
+            finally:
+                self._mute_scrollback = False
 
     #: A shed burst asks for at most one repaint this often. The repaint is a
     #: full-screen redraw, so an unthrottled one per shed burst would *add* to
@@ -595,6 +673,171 @@ class TermSession:
                 self._clients.pop(key, None)
                 raise
 
+    async def attach_v2(
+        self,
+        client: Client,
+        *,
+        writable: bool = True,
+        share: str | None = None,
+        last_seq: int | None = None,
+        generation: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach a protocol-v2 client with exact resume or a screen snapshot.
+
+        Returns the metadata the endpoint announces in ``attached``. Ordering
+        is the same invariant as :meth:`attach`: every frame queued here is
+        enqueued while the broadcast lock is held, so live output cannot jump
+        ahead of the snapshot or the replay.
+        """
+        async with self._lock:
+            if self.closed:
+                raise ClientGone("会话已关闭")
+            if self.spec.max_clients > 0 and len(self._clients) >= self.spec.max_clients:
+                raise ClientGone("会话连接数已达上限")
+
+            resume_ok = (
+                last_seq is not None
+                and generation == self.generation
+                and last_seq <= self._scrollback.end_seq
+                and last_seq >= self._scrollback.base_seq
+            )
+            snapshot_required = not resume_ok
+            snapshot_used = False
+            replay: tuple[tuple[int, bytes], ...] = ()
+            if resume_ok:
+                assert last_seq is not None
+                with span("ws.replay", session=self.id, last_seq=last_seq):
+                    replay = self._scrollback.since(int(last_seq)) or ()
+            else:
+                with span("ws.snapshot.capture", session=self.id):
+                    snap = await self._capture_for_attach()
+                if snap is not None and snap.capable and snap.data:
+                    # A snapshot is a full-screen repaint. It is queued as a
+                    # data frame at the screen's sequence so the ordering with
+                    # the replay below is the binary queue's own order.
+                    before = int(getattr(client, "dropped_events", 0))
+                    _put_data(client, snap.seq, snap.data, FLAG_SNAPSHOT)
+                    snapshot_used = True
+                    replay = self._scrollback.since(snap.seq) or ()
+                    if int(getattr(client, "dropped_events", 0)) > before:
+                        snapshot_used = False
+                        replay = self._scrollback.replay_frames_with_seq(
+                            replay_target_for(client)
+                        )
+                else:
+                    replay = self._scrollback.replay_frames_with_seq(
+                        replay_target_for(client)
+                    )
+
+            key = id(client)
+            self._clients[key] = _ClientEntry(client, writable=writable, share=share)
+            self.last_active = time.time()
+            try:
+                before = int(getattr(client, "dropped_events", 0))
+                if not snapshot_used:
+                    # A snapshot is a full repaint and carries its own clear.
+                    # A **resume** must not clear: the client already holds the
+                    # screen before ``last_seq`` and replay only carries the
+                    # delta. Sending ED2 here used to blank a reconnected tab
+                    # and paint just the bytes written while it was away.
+                    if snapshot_required:
+                        _put_data(
+                            client,
+                            self._scrollback.end_seq,
+                            b"\x1b[0m\x1b[2J\x1b[H",
+                            FLAG_SNAPSHOT,
+                        )
+                    for seq, chunk in replay:
+                        _put_data(client, seq, chunk, FLAG_REPLAY)
+                incomplete = int(getattr(client, "dropped_events", 0)) > before
+                client.put(
+                    {
+                        "type": "attached",
+                        "session": self.id,
+                        "generation": self.generation,
+                        "name": self.spec.name,
+                        "cols": self.spec.cols,
+                        "rows": self.spec.rows,
+                        "writable": writable,
+                        "seq": self._scrollback.end_seq,
+                        "base_seq": self._scrollback.base_seq,
+                        "snapshot_required": snapshot_required,
+                        "snapshot_applied": snapshot_used,
+                        "incomplete": incomplete,
+                        "capabilities": ["snapshot", "osc133", "resume"],
+                    }
+                )
+            except ClientGone:
+                self._clients.pop(key, None)
+                raise
+            return {
+                "generation": self.generation,
+                "seq": self._scrollback.end_seq,
+                "base_seq": self._scrollback.base_seq,
+                "snapshot_required": snapshot_required,
+                "snapshot_applied": snapshot_used,
+                "writable": writable,
+            }
+
+    async def resync(self, client: Client, *, requested: bool = True) -> dict[str, Any]:
+        """Repair one viewer's screen **atomically** with the live stream.
+
+        A manual resync used to capture the snapshot and queue it outside the
+        broadcast lock. Output produced in that window could be queued *before*
+        the snapshot frame, so the repaint overwrote bytes the client had just
+        received; the inverse order left a gap. Both are invisible until a
+        later reconnect replays from the wrong offset. Holding ``_lock`` across
+        capture and queueing makes the snapshot a true cut point, exactly like
+        :meth:`attach_v2`.
+
+        Returns the metadata the endpoint announces in ``snapshot`` and
+        ``resynced`` controls.
+        """
+        async with self._lock:
+            if self.closed:
+                raise ClientGone("会话已关闭")
+            try:
+                snap = await self._snapshotter.capture(self._scrollback.end_seq)
+            except Exception:
+                log.debug("snapshot failed for session %s", self.id, exc_info=True)
+                snap = None
+            if snap is not None and snap.capable and snap.data:
+                before = int(getattr(client, "dropped_events", 0))
+                _put_data(client, snap.seq, snap.data, FLAG_SNAPSHOT)
+                if int(getattr(client, "dropped_events", 0)) == before:
+                    return {
+                        "format": "ansi",
+                        "seq": snap.seq,
+                        "source": snap.source,
+                        "incomplete": False,
+                    }
+                # The screen did not fit this client's byte budget. Fall back
+                # to a cleared replay, which is framed to fit by
+                # ``replay_target_for``; the partial snapshot stays queued but
+                # the ED2 below clears whatever of it arrived.
+            if self.closed:
+                raise ClientGone("会话已关闭")
+            end = self._scrollback.end_seq
+            _put_data(client, end, b"\x1b[0m\x1b[2J\x1b[H", FLAG_SNAPSHOT)
+            frames = self._scrollback.replay_frames_with_seq(replay_target_for(client))
+            before = int(getattr(client, "dropped_events", 0))
+            for seq, chunk in frames:
+                _put_data(client, seq, chunk, FLAG_REPLAY)
+            return {
+                "format": "raw",
+                "seq": end,
+                "source": "ring",
+                "incomplete": int(getattr(client, "dropped_events", 0)) > before,
+            }
+
+    async def _capture_for_attach(self) -> Snapshot | None:
+        """Capture while the session lock is held, so ``seq`` is exact."""
+        try:
+            return await self._snapshotter.capture(self._scrollback.end_seq)
+        except Exception:
+            log.debug("snapshot capture failed for %s", self.id, exc_info=True)
+            return None
+
     async def detach(self, client: Client) -> None:
         async with self._lock:
             self._clients.pop(id(client), None)
@@ -603,41 +846,120 @@ class TermSession:
 
     def create_share(self, ttl: float | None = None, *, writable: bool = False) -> str:
         """Create (or replace) a share token for this session."""
+        if self._share_token is not None:
+            self._revoked_legacy.append(self._share_token)
         self._share_token = secrets.token_urlsafe(24)
         self._share_expires = time.time() + ttl if ttl else None
         self._share_writable = writable
         return self._share_token
 
     def revoke_share(self) -> None:
+        if self._share_token is not None:
+            self._revoked_legacy.append(self._share_token)
         self._share_token = None
         self._share_expires = None
         self._share_writable = False
 
-    def share_access(self, token: str | None) -> str | None:
-        """Return ``"write"``, ``"read"`` or ``None`` for a share token."""
+    def set_external_share_resolver(
+        self,
+        resolver: Callable[[str], str | None] | None,
+        known: Callable[[str], bool] | None = None,
+    ) -> None:
+        """Install a resolver for database-backed share links (read/write/control).
+
+        ``known`` must answer "is this token present in the resolver's cache at
+        all?" so a cache miss is distinguishable from a revoked link. Without
+        it the broadcast filter has to guess, and guessing "revoked" detached
+        every share viewer when the cache entry expired.
+        """
+        self._external_share = resolver
+        self._external_share_known = known
+
+    def legacy_share_scope(self, token: str | None) -> str | None:
+        """Scope from the single 0.1.x token stored on this session.
+
+        Kept separate from :meth:`share_access` because authentication must be
+        authoritative: a database-backed token must be checked against the
+        database, not against a possibly stale cache entry.
+        """
         if not token or not isinstance(token, str) or self._share_token is None:
+            return None
+        if token in self._revoked_legacy:
             return None
         if self._share_expires is not None and time.time() >= self._share_expires:
             return None
-        # Compare *bytes*: ``secrets.compare_digest`` raises ``TypeError`` for
-        # a str containing non-ASCII, so a hand-typed share URL with Chinese in
-        # it used to escape as a 500 (and a 4500 close) instead of "not a valid
-        # token". Encoding first makes every token comparable.
-        #
-        # ``surrogatepass`` as well: ``json.loads('"\\ud800"')`` produces a lone
-        # surrogate, and its ``encode("utf-8")`` raises ``UnicodeEncodeError``
-        # -- another way to turn a bad token into a 4500.
+        # Compare *bytes*: ``secrets.compare_digest`` raises ``TypeError``
+        # for a str containing non-ASCII, so a hand-typed share URL with
+        # Chinese in it used to escape as a 500 (and a 4500 close) instead
+        # of "not a valid token". Encoding first makes every token
+        # comparable. ``surrogatepass`` covers a lone surrogate from JSON.
         try:
             candidate = token.encode("utf-8", "surrogatepass")
             expected = self._share_token.encode("utf-8")
         except (UnicodeEncodeError, AttributeError):
+            candidate = b""
+            expected = b"\x00"
+        if secrets.compare_digest(candidate, expected):
+            return "write" if self._share_writable else "read"
+        return None
+
+    def share_access(self, token: str | None) -> str | None:
+        """Return ``"read"``/``"write"``/``"control"`` or ``None``.
+
+        Legacy single-token links live on the session; protocol-v2 links are
+        rows in the ``shares`` table and are resolved by the installed
+        :meth:`set_external_share_resolver`. Keeping both here means the
+        broadcast filter and the input path share one authority check instead
+        of each growing its own copy.
+
+        This is the *cached* view used by live connections. A fresh handshake
+        must resolve a database token explicitly; a cache entry may be up to
+        one re-check interval stale.
+        """
+        if not token or not isinstance(token, str):
             return None
-        if not secrets.compare_digest(candidate, expected):
-            return None
-        return "write" if self._share_writable else "read"
+        scope = self.legacy_share_scope(token)
+        if scope is not None:
+            return scope
+        if self._external_share is not None:
+            try:
+                return self._external_share(token)
+            except Exception:
+                log.debug("external share resolver failed", exc_info=True)
+        return None
 
     def share_valid(self, token: str | None) -> bool:
         return self.share_access(token) is not None
+
+    def share_state(self, token: str | None) -> bool | None:
+        """Whether ``token`` is valid, or ``None`` when that is not knowable.
+
+        ``False`` means *definitely* invalid (no authority recognises it, a
+        legacy token expired, or the cache says the row is gone). ``None``
+        means the database-backed resolver has not loaded this token yet; the
+        connection pump resolves it off the event loop and closes the client
+        if it really was revoked. The broadcast path treats ``None`` as alive
+        so a cold cache cannot silently cut a working viewer off.
+        """
+        if not token or not isinstance(token, str):
+            return False
+        if token in self._revoked_legacy:
+            return False
+        if self.legacy_share_scope(token) is not None:
+            return True
+        if self._external_share is not None:
+            try:
+                if self._external_share(token) is not None:
+                    return True
+                if self._external_share_known is not None:
+                    return False if self._external_share_known(token) else None
+            except Exception:
+                log.debug("external share resolver failed", exc_info=True)
+            # The resolver cannot distinguish "revoked" from "not cached".
+            # Fail open for the broadcast filter only; the pump's explicit
+            # database check is what actually revokes the connection.
+            return None
+        return False
 
     @property
     def share_writable(self) -> bool:
@@ -720,33 +1042,50 @@ class TermSession:
         rows = min(max(1, rows), 1000)
         self.spec.cols = cols
         self.spec.rows = rows
-        self._pty.resize(cols, rows)
+        try:
+            self._pty.resize(cols, rows)
+        except OSError:
+            # The child closed between the check above and the ioctl.
+            return
+        resize_snapshot = getattr(self._snapshotter, "resize", None)
+        if callable(resize_snapshot):
+            try:
+                resize_snapshot(cols, rows)
+            except Exception:  # pragma: no cover - optional backend
+                log.debug("snapshot resize failed", exc_info=True)
 
-    async def _broadcast(self, data: bytes) -> None:
+    async def _broadcast(self, data: bytes) -> int:
+        """Append ``data`` and deliver it; returns its first sequence number.
+
+        The sequence advances even when the scrollback is muted for a repaint
+        nudge: clients that received the repaint bytes must not see a later
+        frame re-use the same offset. Muted frames are flagged ``SNAPSHOT`` so
+        a client knows they are display-only and not part of resumable state.
+        """
         async with self._lock:
-            if not self._mute_scrollback:
-                self._scrollback.append(data)
+            if self._mute_scrollback:
+                start_seq = self._scrollback.end_seq
+                flags = FLAG_SNAPSHOT
+            else:
+                start_seq = self._scrollback.append(data)
+                flags = 0
             if self._recorder is not None:
                 self._recorder.output(data)
+            try:
+                self._snapshotter.feed(data)
+            except Exception:  # pragma: no cover - optional backend
+                log.debug("snapshot feed failed", exc_info=True)
             targets = list(self._clients.items())
-        # Delivery is deliberately *outside* the session lock. ``put`` may shed
-        # frames, and shedding used to scan the whole outbound queue for the
-        # oldest terminal frame on every drop -- an O(n) pass per drop, running
-        # while the lock was held. Under a flood that stalled the read loop, the
-        # PTY backed up into the kernel, and the shell itself stopped writing:
-        # a server-side freeze, which is a different failure from the
-        # client-side one 0.1.12 fixed. The snapshot taken under the lock is
-        # what makes this safe: an attach that lands afterwards is not in
-        # ``targets``, so it cannot receive live bytes ahead of the replay it is
-        # queueing under that same lock -- and this chunk is already in the
-        # scrollback it will be replayed from.
         dead: list[int] = []
         for key, entry in targets:
-            if entry.share is not None and not self.share_valid(entry.share):
+            if entry.share is not None and self.share_state(entry.share) is False:
                 dead.append(key)
                 continue
             try:
-                entry.client.put(data)
+                if flags & FLAG_SNAPSHOT:
+                    _put_data(entry.client, start_seq, data, flags)
+                else:
+                    _put_data(entry.client, start_seq, data, 0)
             except ClientGone as exc:
                 dead.append(key)
                 self._report_slow_consumer(entry, exc)
@@ -754,6 +1093,7 @@ class TermSession:
             for key in dead:
                 self._clients.pop(key, None)
             self._enforce_memory_limit()
+        return start_seq
 
     def _report_slow_consumer(self, entry: _ClientEntry, exc: ClientGone) -> None:
         """Tell a client why it is being dropped, and leave a trace.
@@ -798,17 +1138,29 @@ class TermSession:
     async def _read_loop(self) -> None:
         try:
             while True:
-                data = await self._pty.read()
+                with span("pty.read", session=self.id):
+                    data = await self._pty.read()
                 if not data:
                     break
                 self.last_active = time.time()
-                await self._broadcast(data)
+                seq = await self._emit(data)
+                if self.spec.shell_integration:
+                    for event in self._command_parser.feed(data, seq=seq):
+                        if self._on_command is not None:
+                            done = self._on_command(event)
+                            if inspect.isawaitable(done):
+                                await done
+                        await self._notify(event)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self._notify({"type": "error", "msg": f"session read failed: {exc}"})
         finally:
             await self._finalize()
+
+    async def _emit(self, data: bytes) -> int:
+        """Deliver one output chunk. Overridden by :class:`SessionActor`."""
+        return await self._broadcast(data)
 
     async def _finalize(self) -> None:
         if self.closed:
@@ -853,15 +1205,23 @@ class TermSession:
         else:
             self.end_status = "stopped"
             self.end_reason = f"进程退出（退出码 {self.exit_code}）"
-        await self._notify({"type": "exit", "code": self.exit_code})
         self._pty.close()
         if self._on_close is not None:
             done = self._on_close(self)
             # The hook may be sync (tests, simple consumers) or async (the
             # server persists the row on a worker thread). Await whatever it
             # gives back so the row is written before this coroutine ends.
-            if inspect.isawaitable(done):
-                await done
+            try:
+                if inspect.isawaitable(done):
+                    await done
+            except Exception:
+                # A failed persistence must not swallow the ``exit`` notice:
+                # the viewer still needs to know the process ended.
+                log.exception("session end hook failed for %s", self.id)
+        # The ``exit`` notice is queued *after* persistence: a client that
+        # receives it and immediately asks for the history row must not race a
+        # write that has not happened yet.
+        await self._notify({"type": "exit", "code": self.exit_code})
 
     async def wait_finalized(self, timeout: float | None = None) -> bool:
         """Wait until the ``exit`` notice has been queued (``False`` on timeout).
@@ -940,19 +1300,21 @@ class SessionManager:
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         on_session_end: Callable[[TermSession], None] | None = None,
+        on_command: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         # The loop is resolved lazily: managers are often built while a server
         # factory runs, before the serving event loop exists.
         self._loop = loop
         self._on_session_end = on_session_end
-        self._sessions: dict[str, TermSession] = {}
+        self._on_command = on_command
+        self._sessions: dict[str, Any] = {}
         self._lock = asyncio.Lock()
 
-    def list_sessions(self) -> list[TermSession]:
+    def list_sessions(self) -> list[Any]:
         self._reap()
         return list(self._sessions.values())
 
-    def get(self, sid: str) -> TermSession | None:
+    def get(self, sid: str) -> Any:
         self._reap()
         return self._sessions.get(sid)
 
@@ -962,17 +1324,25 @@ class SessionManager:
         *,
         sid: str | None = None,
         owner_id: int | None = None,
-    ) -> TermSession:
+    ) -> Any:
         loop = self._loop or asyncio.get_running_loop()
         async with self._lock:
             sid = sid or self._new_id()
             if sid in self._sessions:
                 raise ValueError(f"session id already exists: {sid}")
             session = TermSession(
-                sid, spec, loop=loop, owner_id=owner_id, on_close=self._on_session_close
+                sid,
+                spec,
+                loop=loop,
+                owner_id=owner_id,
+                on_close=self._on_session_close,
+                on_command=self._on_command,
             )
-            self._sessions[sid] = session
-            return session
+            from .actor import SessionActor
+
+            actor: Any = SessionActor(session)
+            self._sessions[sid] = actor
+            return actor
 
     async def reap_expired(self, now: float | None = None) -> list[str]:
         """Stop and remove sessions past their idle/max lifetime."""
@@ -1094,3 +1464,18 @@ def replay_target_for(client: Client) -> int:
     if budget <= 0:
         return 65536
     return max(1, min(65536, budget))
+
+
+def _put_data(client: Client, seq: int, payload: bytes, flags: int) -> None:
+    """Deliver one terminal frame, with a sequence when the sink understands it.
+
+    Legacy clients (the v1 endpoint and its tests) only know raw bytes; v2
+    clients implement ``put_data`` and receive the header. Keeping this in one
+    helper means the broadcast path has no protocol branches scattered through
+    it.
+    """
+    put_data = getattr(client, "put_data", None)
+    if callable(put_data):
+        put_data(seq, payload, flags)
+    else:
+        client.put(payload)

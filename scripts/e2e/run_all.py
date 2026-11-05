@@ -226,6 +226,31 @@ def ws_recv_until(ws: object, marker: bytes, timeout: float = 10.0) -> bytes:
     return out
 
 
+def ws_wait_attached(ws: object, timeout: float = 10.0) -> None:
+    """Wait for the ``attached`` control before typing into a fresh session.
+
+    Sending input immediately after ``attach`` is normally safe (the text frame
+    is ordered first), but on a slow tmux start the shell may not be reading
+    yet and the line can land in a state the test then misreads as "the command
+    did not execute". Waiting for the server's confirmation removes that race
+    without weakening what the scenario checks.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            msg = ws.recv(timeout=2)  # type: ignore[attr-defined]
+        except TimeoutError:
+            continue
+        if isinstance(msg, str):
+            try:
+                data = json.loads(msg)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and data.get("type") == "attached":
+                return
+    raise AssertionError("server did not send attached")
+
+
 def _tmux_has(name: str) -> bool:
     return subprocess.run(
         ["tmux", "has-session", "-t", name], check=False,
@@ -288,6 +313,7 @@ def scenario_server() -> None:
             # one socket -- the marker fix alone did not make that true.
             with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
                 ws.send(json.dumps({"type": "attach", "cols": 100, "rows": 30}))
+                ws_wait_attached(ws)
                 ws.send(b"echo $((67*71))\r")
                 assert b"4757\r\n" in ws_recv_until(ws, b"4757\r\n")
             # Reconnect to the same session and demand the replay.
@@ -457,6 +483,7 @@ def scenario_tmux() -> None:
 
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
+            ws_wait_attached(ws)
             ws.send(b"echo $((83*89))\r")
             assert b"7387\r\n" in ws_recv_until(ws, b"7387\r\n")
 
@@ -533,6 +560,7 @@ def scenario_crash() -> None:
 
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 100, "rows": 30}))
+            ws_wait_attached(ws)
             ws.send(b"echo $((97*101))\r")
             assert b"9797\r\n" in ws_recv_until(ws, b"9797\r\n")
         assert _wait_tmux(tmux_mod.session_name(sid))
@@ -857,6 +885,7 @@ def scenario_selfrestart() -> None:
         # passing assertion is proof of execution rather than of terminal echo.
         with connect(ws_url, additional_headers=headers, open_timeout=10) as ws:
             ws.send(json.dumps({"type": "attach", "session": sid, "cols": 160, "rows": 40}))
+            ws_wait_attached(ws)
             ws.send(b"echo PROBE-$((6*7))" + CR)
             probe = ws_drain(ws, 3.0)
             assert b"PROBE-42" in probe, (

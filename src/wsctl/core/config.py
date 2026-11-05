@@ -18,12 +18,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from . import config_v2
 from .scrollback import DEFAULT_MAX_BYTES
-
-try:  # pragma: no cover - depends on pydantic-settings version
-    from pydantic_settings import TomlConfigSettingsSource
-except ImportError:  # pragma: no cover
-    TomlConfigSettingsSource = None  # type: ignore[assignment,misc]
 
 APP_NAME = "wsctl"
 DEFAULT_HOST = "127.0.0.1"
@@ -131,6 +127,12 @@ class Settings(BaseSettings):
     # raising ValueError from the session constructor took every attach down
     # with a bare 1000 close. Reject the value where it is read instead.
     scrollback_bytes: int = Field(DEFAULT_MAX_BYTES, ge=1)
+    #: Screen snapshot strategy for the v2 protocol. ``auto`` maintains a
+    #: shadow terminal only once an alternate screen is entered; ``always``
+    #: pays for every session; ``off`` disables the capability.
+    snapshot_mode: str = Field(default="auto", pattern="^(auto|always|off)$")
+    #: Parse OSC 133/633 and publish command blocks to the UI.
+    shell_integration: bool = True
 
     # How long another instance's lease may go unheard before its sessions are
     # considered abandoned (only relevant with SO_REUSEPORT / shared data_dir).
@@ -166,6 +168,43 @@ class Settings(BaseSettings):
     record_input: bool = False
     webhook_url: str | None = None
 
+    # -- 0.2.0 platform ---------------------------------------------------
+    #: Empty means "SQLite at ``data_dir/wsctl.db``". Kept so a future
+    #: milestone can accept a PostgreSQL URL without a config migration; 0.2.0
+    #: rejects every non-empty value because the auth/session kernel is still
+    #: SQLite-dialect.
+    database_url: str = ""
+    database_echo: bool = False
+
+    @field_validator("database_url")
+    @classmethod
+    def _check_database_url(cls, value: str) -> str:
+        """Only SQLite is a supported kernel in 0.2.0.
+
+        The v2 repository is SQLAlchemy, but the auth/session/audit kernel
+        still speaks SQLite's dialect. Accepting a PostgreSQL URL here would
+        split one deployment across two databases -- the worst of both. The
+        setting is therefore validated loudly instead of failing later with a
+        missing table. PostgreSQL is a 0.3 milestone.
+        """
+        url = (value or "").strip()
+        if url:
+            raise ValueError(
+                "0.2.0 仅使用 data_dir/wsctl.db；database_url 预留给 0.3 的 PostgreSQL 支持"
+            )
+        return url
+    #: OpenTelemetry is opt-in: an endpoint is required before spans leave
+    #: the process, and the default sampler is parent-based.
+    otel_enabled: bool = False
+    otel_endpoint: str | None = None
+    otel_sample_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    #: Web Push is opt-in and requires VAPID keys. Disabled by default: a
+    #: terminal server must not contact a push service unless asked.
+    web_push_enabled: bool = False
+    web_push_vapid_public: str = ""
+    web_push_vapid_private: str = ""
+    web_push_subject: str = "mailto:admin@localhost"
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "wsctl.db"
@@ -194,12 +233,56 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings, dotenv_settings]
+        sources: list[PydanticBaseSettingsSource] = [
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _SectionEnvSource(settings_cls),
+        ]
         path = default_config_path()
-        if TomlConfigSettingsSource is not None and path.is_file():
-            sources.append(TomlConfigSettingsSource(settings_cls, toml_file=path))
+        if path.is_file():
+            sources.append(_SectionedTomlSource(settings_cls, path))
         sources.append(file_secret_settings)
         return tuple(sources)
+
+
+class _SectionedTomlSource(PydanticBaseSettingsSource):
+    """Load a v1 flat or v2 sectioned TOML file as flat settings values."""
+
+    def __init__(self, settings_cls: type[BaseSettings], path: Path) -> None:
+        super().__init__(settings_cls)
+        self.path = path
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return config_v2.read_flat(self.path)
+
+
+class _SectionEnvSource(PydanticBaseSettingsSource):
+    """Support ``WSCTL_SERVER__PORT`` in addition to ``WSCTL_PORT``.
+
+    The double underscore is the standard section delimiter. The flat spelling
+    stays authoritative: an operator upgrading from 0.1.x must not have their
+    environment variables silently stop working.
+    """
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        prefix = "WSCTL_"
+        for name, raw in os.environ.items():
+            if not name.startswith(prefix) or "__" not in name:
+                continue
+            section, _, key = name[len(prefix):].partition("__")
+            if section.lower() not in config_v2.SECTIONS or not key:
+                continue
+            canonical = config_v2.canonical_key(section.lower(), key.lower())
+            values[canonical] = config_v2.coerce_value(canonical, raw)
+        return values
 
 
 def load_settings(**overrides: Any) -> Settings:
@@ -231,6 +314,7 @@ HOT_IMMEDIATE = frozenset(
         "allowed_origins",
         "audit_retention_days",
         "cookie_secure",
+        "database_echo",
         "file_max_upload",
         "file_root",
         "instance_ttl",
@@ -249,6 +333,10 @@ HOT_IMMEDIATE = frozenset(
         "tmux_preserve_on_shutdown",
         "trust_proxy",
         "trusted_proxies",
+        "web_push_enabled",
+        "web_push_subject",
+        "web_push_vapid_private",
+        "web_push_vapid_public",
         "ws_max_connections",
         "ws_max_connections_per_ip",
     }
@@ -270,6 +358,8 @@ HOT_NEW_OBJECTS = frozenset(
         "scrollback_bytes",
         "session_max_clients",
         "session_memory_limit",
+        "shell_integration",
+        "snapshot_mode",
         "totp_issuer",
     }
 )
@@ -278,12 +368,16 @@ RESTART_FIELDS = frozenset(
     {
         "config_path",
         "data_dir",
+        "database_url",
         "host",
         "log_backup_count",
         "log_file",
         "log_json",
         "log_level",
         "log_max_bytes",
+        "otel_enabled",
+        "otel_endpoint",
+        "otel_sample_ratio",
         "port",
         "reuse_port",
         "ssl_cert",
@@ -321,16 +415,10 @@ def reload_settings_file(settings: Settings) -> tuple[list[str], list[str]]:
     path = settings.config_path
     if not path.is_file():
         return [], []
-    import tomllib
-
     try:
-        data = tomllib.loads(path.read_text("utf-8"))
-    except OSError as exc:
-        return [], [f"无法读取配置文件 {path}：{exc}"]
-    except tomllib.TOMLDecodeError as exc:
-        return [], [f"配置文件 TOML 语法错误：{exc}"]
-    if not isinstance(data, dict):
-        return [], ["配置文件顶层必须是键值表"]
+        data = config_v2.read_flat(path)
+    except config_v2.ConfigV2Error as exc:
+        return [], [str(exc)]
     try:
         candidate = Settings(**data)
     except Exception as exc:

@@ -6,8 +6,10 @@ and ``sqlite3`` with WAL mode is plenty fast for a single-server deployment.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -24,7 +26,7 @@ from .passwords import (
     verify_password,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -72,9 +74,15 @@ CREATE TABLE IF NOT EXISTS term_sessions (
     max_life       REAL,
     status         TEXT NOT NULL DEFAULT 'running',
     instance_id    TEXT,
+    end_reason     TEXT,
+    exit_code      INTEGER,
     share_token    TEXT,
     share_expires  REAL,
     share_writable INTEGER NOT NULL DEFAULT 0,
+    generation     TEXT,
+    snapshot_mode  TEXT NOT NULL DEFAULT 'auto',
+    shell_integration INTEGER NOT NULL DEFAULT 1,
+    last_seq       INTEGER NOT NULL DEFAULT 0,
     created_at     REAL NOT NULL,
     last_active    REAL NOT NULL
 );
@@ -94,12 +102,71 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     event           TEXT NOT NULL,
     payload         TEXT,
     ip              TEXT,
-    ts              REAL NOT NULL
+    request_id      TEXT,
+    ts              REAL NOT NULL,
+    prev_hash       TEXT NOT NULL DEFAULT '',
+    hash            TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS shares (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    term_session_id TEXT NOT NULL,
+    token_hash      TEXT NOT NULL UNIQUE,
+    token_hint      TEXT NOT NULL DEFAULT '',
+    scope           TEXT NOT NULL DEFAULT 'read',
+    label           TEXT NOT NULL DEFAULT '',
+    created_by      INTEGER,
+    created_at      REAL NOT NULL,
+    expires_at      REAL,
+    last_used       REAL
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    name       TEXT NOT NULL DEFAULT '',
+    token_hash TEXT NOT NULL UNIQUE,
+    scopes     TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    expires_at REAL,
+    last_used  REAL
+);
+
+CREATE TABLE IF NOT EXISTS layouts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    layout_json TEXT NOT NULL DEFAULT '{}',
+    updated_at  REAL NOT NULL,
+    UNIQUE(user_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS command_blocks (
+    id              TEXT PRIMARY KEY,
+    term_session_id TEXT NOT NULL,
+    command         TEXT NOT NULL DEFAULT '',
+    cwd             TEXT,
+    started_at      REAL,
+    ended_at        REAL,
+    duration_ms     INTEGER,
+    exit_code       INTEGER,
+    status          TEXT NOT NULL DEFAULT 'running'
+);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    endpoint   TEXT NOT NULL UNIQUE,
+    keys_json  TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_ts ON audit_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_term_sessions_status ON term_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_shares_session ON shares(term_session_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_layouts_user ON layouts(user_id);
 """
 
 
@@ -131,6 +198,45 @@ def _is_lock_contention(exc: BaseException) -> bool:
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+GENESIS_HASH = "0" * 64
+
+
+def audit_digest(
+    *,
+    prev_hash: str,
+    ts: float,
+    user_id: int | None,
+    term_session_id: str | None,
+    event: str,
+    payload: str | None,
+    ip: str | None,
+    request_id: str | None,
+) -> str:
+    """Hash one audit row, chained to its predecessor.
+
+    The encoding is explicit and stable: a verification tool written in
+    another language must be able to reproduce it from the exported rows. JSON
+    is the obvious canonical form, and ``separators`` removes the whitespace
+    ambiguity.
+    """
+    body = json.dumps(
+        {
+            "prev": prev_hash,
+            "ts": f"{float(ts):.6f}",
+            "user_id": user_id,
+            "term_session_id": term_session_id,
+            "event": event,
+            "payload": payload,
+            "ip": ip,
+            "request_id": request_id,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 class Store:
@@ -173,6 +279,14 @@ class Store:
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
                 self._migrate()
+                # Password hashes, TOTP secrets, API-key digests and the audit
+                # trail live in this file. SQLite creates it 0644 under the
+                # usual umask, which makes every account's second factor
+                # readable by any local user. The WAL is equally sensitive:
+                # committed pages live there until the next checkpoint.
+                for suffix in ("", "-wal", "-shm"):
+                    with contextlib.suppress(OSError):
+                        os.chmod(self.path.with_name(self.path.name + suffix), 0o600)
                 return
             except sqlite3.OperationalError as exc:
                 if not _is_lock_contention(exc):
@@ -211,13 +325,23 @@ class Store:
                 "argv": "TEXT",
                 "env": "TEXT",
                 "end_reason": "TEXT",
+                "exit_code": "INTEGER",
                 "idle_timeout": "REAL",
                 "max_life": "REAL",
                 "instance_id": "TEXT",
                 "share_token": "TEXT",
                 "share_expires": "REAL",
                 "share_writable": "INTEGER NOT NULL DEFAULT 0",
-            }
+                "generation": "TEXT",
+                "snapshot_mode": "TEXT NOT NULL DEFAULT 'auto'",
+                "shell_integration": "INTEGER NOT NULL DEFAULT 1",
+                "last_seq": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "audit_logs": {
+                "request_id": "TEXT",
+                "prev_hash": "TEXT NOT NULL DEFAULT ''",
+                "hash": "TEXT NOT NULL DEFAULT ''",
+            },
         }
         with self._lock, self._conn:
             for table, columns in additions.items():
@@ -577,6 +701,9 @@ class Store:
         max_life: float | None = None,
         status: str = "running",
         instance_id: str | None = None,
+        generation: str | None = None,
+        snapshot_mode: str = "auto",
+        shell_integration: bool = True,
     ) -> None:
         now = time.time()
         argv_json = json.dumps(argv) if argv is not None else None
@@ -585,11 +712,14 @@ class Store:
             self._conn.execute(
                 "INSERT INTO term_sessions"
                 "(id, name, owner_id, backend, command, argv, env, cwd, idle_timeout,"
-                " max_life, status, instance_id, created_at, last_active)"
-                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " max_life, status, instance_id, created_at, last_active, generation,"
+                " snapshot_mode, shell_integration)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET"
                 " name=excluded.name, status=excluded.status,"
-                " instance_id=excluded.instance_id, last_active=excluded.last_active",
+                " instance_id=excluded.instance_id, last_active=excluded.last_active,"
+                " generation=excluded.generation, snapshot_mode=excluded.snapshot_mode,"
+                " shell_integration=excluded.shell_integration",
                 (
                     sid,
                     name,
@@ -605,23 +735,61 @@ class Store:
                     instance_id,
                     now,
                     now,
+                    generation,
+                    snapshot_mode,
+                    int(bool(shell_integration)),
                 ),
             )
 
+    def term_session_set_name(self, sid: str, name: str) -> None:
+        """Update only the display name.
+
+        A rename used to call :meth:`term_session_upsert` with defaults for
+        every other column; its ``ON CONFLICT`` clause then rewrote
+        ``generation``/``snapshot_mode``/``shell_integration`` with those
+        defaults. Renaming a tmux session could erase the generation a resume
+        depends on and silently reset its snapshot policy.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE term_sessions SET name = ?, last_active = ? WHERE id = ?",
+                (name, time.time(), sid),
+            )
+
+    def term_session_set_seq(self, sid: str, last_seq: int) -> None:
+        """Persist the last output offset this session has produced.
+
+        It is not used for resume across a restart -- ``generation`` changes
+        then, so a client must take a snapshot -- but it makes the row an
+        honest record of how much output a session generated and lets an
+        operator compare it with the scrollback cap.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE term_sessions SET last_seq = ? WHERE id = ?",
+                (max(0, int(last_seq)), sid),
+            )
+
     def term_session_set_status(
-        self, sid: str, status: str, reason: str | None = None
+        self,
+        sid: str,
+        status: str,
+        reason: str | None = None,
+        exit_code: int | None = None,
     ) -> None:
         """Record how a session ended.
 
         ``reason`` is the human half of ``status``: "killed" says *what*
         happened, "被管理员终止" says *why*. Without it the history list showed
-        a bare enum value and left the user to guess.
+        a bare enum value and left the user to guess. ``exit_code`` is the
+        process's own answer and cannot be recovered after the row is written,
+        so it is stored here rather than recomputed later.
         """
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE term_sessions SET status = ?, end_reason = ?, last_active = ?"
-                " WHERE id = ?",
-                (status, reason, time.time(), sid),
+                "UPDATE term_sessions SET status = ?, end_reason = ?, exit_code = ?,"
+                " last_active = ? WHERE id = ?",
+                (status, reason, exit_code, time.time(), sid),
             )
 
     def term_session_set_instance(self, sid: str, instance_id: str | None) -> None:
@@ -650,7 +818,9 @@ class Store:
             params.extend(sorted(alive_ids))
         with self._lock, self._conn:
             cur = self._conn.execute(
-                f"UPDATE term_sessions SET status = 'stopped' WHERE {' AND '.join(clauses)}",
+                f"UPDATE term_sessions SET status = 'stopped',"
+                f" end_reason = coalesce(end_reason, '服务退出或实例崩溃')"
+                f" WHERE {' AND '.join(clauses)}",
                 tuple(params),
             )
         return cur.rowcount
@@ -669,7 +839,12 @@ class Store:
         return [dict(row) for row in rows]
 
     def term_session_history(
-        self, *, owner_id: int | None = None, limit: int = 200
+        self,
+        *,
+        owner_id: int | None = None,
+        limit: int = 200,
+        before_ts: float | None = None,
+        before_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Finished session rows (newest first).
 
@@ -677,17 +852,24 @@ class Store:
         retention policy all exist -- but nothing ever read them, so a session
         that ended left no trace anywhere in the product. ``owner_id=None``
         means "everyone" (admin view).
+
+        ``before_ts``/``before_id`` are the cursor pair: rows are ordered by
+        ``last_active DESC, id DESC`` and the next page is strictly older than
+        the last row the caller saw.
         """
         clauses = ["status != 'running'"]
         params: list[Any] = []
         if owner_id is not None:
             clauses.append("owner_id = ?")
             params.append(owner_id)
+        if before_ts is not None and before_id is not None:
+            clauses.append("(last_active < ? OR (last_active = ? AND id < ?))")
+            params.extend([before_ts, before_ts, before_id])
         params.append(max(1, min(limit, 1000)))
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT * FROM term_sessions WHERE {' AND '.join(clauses)}"
-                " ORDER BY last_active DESC LIMIT ?",
+                " ORDER BY last_active DESC, id DESC LIMIT ?",
                 tuple(params),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -859,23 +1041,48 @@ class Store:
             return
         now = time.time()
         rows: list[tuple[Any, ...]] = []
-        for event in events:
-            ts = float(event.get("ts", now))
-            event["ts"] = ts
-            rows.append(
-                (
-                    event.get("user_id"),
-                    event.get("term_session_id"),
-                    event["event"],
-                    event.get("payload"),
-                    event.get("ip"),
-                    ts,
-                )
-            )
         with self._lock, self._conn:
+            # Take the write lock *before* reading the previous hash: two
+            # instances sharing a data directory (rolling restart) would
+            # otherwise read the same head and fork the chain.
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if "within a transaction" not in str(exc).lower():
+                    raise
+            last = self._conn.execute(
+                "SELECT hash FROM audit_logs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev = str(last["hash"]) if last is not None and last["hash"] else GENESIS_HASH
+            for event in events:
+                ts = float(event.get("ts", now))
+                event["ts"] = ts
+                user_id = event.get("user_id")
+                sid = event.get("term_session_id")
+                payload = event.get("payload")
+                ip = event.get("ip")
+                request_id = event.get("request_id")
+                event_name = str(event["event"])
+                digest = audit_digest(
+                    prev_hash=prev,
+                    ts=ts,
+                    user_id=user_id,
+                    term_session_id=sid,
+                    event=event_name,
+                    payload=payload,
+                    ip=ip,
+                    request_id=request_id,
+                )
+                rows.append(
+                    (user_id, sid, event_name, payload, ip, request_id, ts, prev, digest)
+                )
+                event["prev_hash"] = prev
+                event["hash"] = digest
+                prev = digest
             self._conn.executemany(
-                "INSERT INTO audit_logs(user_id, term_session_id, event, payload, ip, ts)"
-                " VALUES(?, ?, ?, ?, ?, ?)",
+                "INSERT INTO audit_logs"
+                "(user_id, term_session_id, event, payload, ip, request_id, ts, prev_hash, hash)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
 
@@ -919,6 +1126,7 @@ class Store:
         event: str | None = None,
         user_id: int | None = None,
         ip: str | None = None,
+        before_id: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -931,6 +1139,9 @@ class Store:
         if ip:
             clauses.append("ip = ?")
             params.append(ip)
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(int(before_id))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             rows = self._conn.execute(
@@ -938,3 +1149,69 @@ class Store:
                 (*params, limit, max(offset, 0)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def verify_audit(self) -> dict[str, Any]:
+        """Recompute the audit hash chain and report the first broken link.
+
+        Retention deletes old rows, so the chain may legitimately start at a
+        non-genesis ``prev_hash``. That first row is treated as an anchor and
+        reported as ``truncated``; every subsequent row must link exactly.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, user_id, term_session_id, event, payload, ip,"
+                " request_id, ts, prev_hash, hash FROM audit_logs ORDER BY id"
+            ).fetchall()
+        if not rows:
+            return {"ok": True, "checked": 0, "truncated": False, "broken_at": None}
+        hashed = [row for row in rows if str(row["hash"] or "")]
+        unhashed = len(rows) - len(hashed)
+        if not hashed:
+            # A database upgraded from 0.1.x may contain only legacy rows:
+            # there is nothing to verify yet, and saying "broken" would be a
+            # false accusation against a valid migration.
+            return {
+                "ok": True,
+                "checked": 0,
+                "truncated": True,
+                "unhashed": unhashed,
+                "broken_at": None,
+            }
+        truncated = unhashed > 0 or str(hashed[0]["prev_hash"] or "") != GENESIS_HASH
+        expected_prev = str(hashed[0]["prev_hash"] or GENESIS_HASH)
+        for index, row in enumerate(hashed):
+            actual_prev = str(row["prev_hash"] or "")
+            if index > 0 and actual_prev != expected_prev:
+                return {
+                    "ok": False,
+                    "checked": index,
+                    "truncated": truncated,
+                    "broken_at": int(row["id"]),
+                    "reason": "prev_hash 与上一行不连续",
+                }
+            digest = audit_digest(
+                prev_hash=actual_prev,
+                ts=float(row["ts"]),
+                user_id=row["user_id"],
+                term_session_id=row["term_session_id"],
+                event=str(row["event"]),
+                payload=row["payload"],
+                ip=row["ip"],
+                request_id=row["request_id"],
+            )
+            if digest != str(row["hash"] or ""):
+                return {
+                    "ok": False,
+                    "checked": index,
+                    "truncated": truncated,
+                    "broken_at": int(row["id"]),
+                    "reason": "hash 与记录内容不匹配",
+                }
+            expected_prev = digest
+        return {
+            "ok": True,
+            "checked": len(hashed),
+            "truncated": truncated,
+            "unhashed": unhashed,
+            "broken_at": None,
+        }

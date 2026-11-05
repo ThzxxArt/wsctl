@@ -16,7 +16,7 @@ from ..deps import current_user, require_admin, token_from_request
 from ..models import LoginRequest
 from ..security import COOKIE_NAME, client_ip
 
-router = APIRouter(prefix="/api", tags=["auth"])
+router = APIRouter(tags=["auth"])
 
 #: How long one login may wait for an Argon2 slot before the server says it is
 #: busy. Verification takes tens of milliseconds; a login that waited ten
@@ -41,6 +41,7 @@ def _blocked_retry_after(limiters: list[tuple[RateLimiter, str]]) -> int:
 
 
 @router.post("/login")
+@router.post("/auth/login")
 async def login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
     settings: Settings = request.app.state.settings
     store: Store = request.app.state.store
@@ -134,6 +135,7 @@ async def login(body: LoginRequest, request: Request, response: Response) -> dic
 
 
 @router.post("/logout")
+@router.post("/auth/logout")
 async def logout(request: Request, response: Response) -> dict[str, bool]:
     token = token_from_request(request)
     if token:
@@ -154,6 +156,7 @@ async def logout(request: Request, response: Response) -> dict[str, bool]:
 
 
 @router.get("/me")
+@router.get("/auth/me")
 async def me(user: User = Depends(current_user)) -> dict[str, Any]:
     return {"username": user.username, "role": user.role}
 

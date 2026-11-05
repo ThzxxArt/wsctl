@@ -13,16 +13,36 @@ import re
 from typing import Any
 
 import segno
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, WebSocket, status
 
 from wsctl.core.config import Settings
 from wsctl.core.session import SessionManager, TermSession
-from wsctl.core.store import Store, User
+from wsctl.core.store import Store, User, hash_token
 
 from .security import COOKIE_NAME
 
 
-def token_from_request(request: Request) -> str | None:
+def resolve_token_user(request: Request | WebSocket, token: str | None) -> User | None:
+    """Resolve a login token or an API key to a user.
+
+    API keys are checked *before* auth sessions only when they carry the
+    ``wsctl_`` prefix; both are hashed, so a stolen database row cannot be
+    replayed as a credential.
+    """
+    if not token:
+        return None
+    store: Store = request.app.state.store
+    db = getattr(request.app.state, "db", None)
+    if db is not None and token.startswith("wsctl_"):
+        record = db.api_key_resolve(hash_token(token))
+        if record is not None:
+            user = store.user_get_by_id(int(record["user_id"]))
+            if user is not None and not user.disabled:
+                return user
+    return store.resolve_auth_session(token)
+
+
+def token_from_request(request: Request | WebSocket) -> str | None:
     auth = request.headers.get("authorization")
     if auth and auth.lower().startswith("bearer "):
         return auth[7:].strip()
@@ -31,16 +51,21 @@ def token_from_request(request: Request) -> str | None:
 
 def current_user(request: Request) -> User:
     settings: Settings = request.app.state.settings
-    store: Store = request.app.state.store
     if not settings.auth_required:
-        return User(id=0, username="anonymous", role="admin", disabled=False, created_at=0.0)
+        user = User(id=0, username="anonymous", role="admin", disabled=False, created_at=0.0)
+        request.state.user = user
+        return user
     token = token_from_request(request)
-    user = store.resolve_auth_session(token) if token else None
-    if user is None:
+    resolved: User | None = resolve_token_user(request, token)
+    if resolved is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="需要登录"
         )
-    return user
+    # Idempotency keys are scoped by principal; storing the resolved user here
+    # avoids a second token lookup and keeps a key from replaying another
+    # account's response.
+    request.state.user = resolved
+    return resolved
 
 
 def require_admin(user: User = Depends(current_user)) -> User:
@@ -143,6 +168,8 @@ async def resolve_owners(request: Request, sessions: list[TermSession]) -> dict[
 
 def owned_session(request: Request, sid: str, user: User) -> TermSession:
     """Fetch a session the user may act on, or raise a 404/403."""
+    from typing import cast
+
     from .security import can_access
 
     manager: SessionManager = request.app.state.manager
@@ -151,4 +178,4 @@ def owned_session(request: Request, sid: str, user: User) -> TermSession:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
     if not can_access(user, session):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该会话")
-    return session
+    return cast(TermSession, session)

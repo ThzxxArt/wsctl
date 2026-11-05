@@ -1,0 +1,2 @@
+function e(e,t){if(!e)return`-`;try{return new Intl.DateTimeFormat(t,{dateStyle:`medium`,timeStyle:`medium`}).format(new Date(e*1e3))}catch{return new Date(e*1e3).toLocaleString()}}export{e as t};
+//# sourceMappingURL=format-CwnatI2v.js.map

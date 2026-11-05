@@ -14,7 +14,7 @@ from wsctl.core.store import User
 from ..deps import qr_svg, require_admin
 from ..models import TotpConfirm, UserCreate, UserUpdate
 
-router = APIRouter(prefix="/api", tags=["users"])
+router = APIRouter(tags=["users"])
 
 
 async def _terminate_owned(request: Request, user_id: int, username: str) -> None:
@@ -164,7 +164,7 @@ async def enable_totp(
 ) -> dict[str, str]:
     """Begin a TOTP enrolment. Nothing is active until :func:`confirm_totp`."""
     settings = request.app.state.settings
-    if request.app.state.store.user_get(username) is None:
+    if await asyncio.to_thread(request.app.state.store.user_get, username) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     secret = totp.generate_secret()
     _pending_totp[username] = secret
@@ -191,7 +191,9 @@ async def confirm_totp(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="验证码校验失败，未启用 TOTP",
         )
-    request.app.state.store.user_set_totp(username, secret)
+    await asyncio.to_thread(
+        request.app.state.store.user_set_totp, username, secret
+    )
     _pending_totp.pop(username, None)
     request.app.state.audit.enqueue("user_totp_on", user_id=actor.id, payload=username)
     return {"ok": True}
@@ -208,7 +210,10 @@ async def disable_totp(
     prevent.
     """
     _pending_totp.pop(username, None)
-    if not request.app.state.store.user_clear_totp(username):
+    cleared = await asyncio.to_thread(
+        request.app.state.store.user_clear_totp, username
+    )
+    if not cleared:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
     request.app.state.audit.enqueue("user_totp_off", user_id=actor.id, payload=username)
     return {"ok": True}

@@ -5,6 +5,135 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-04
+
+**「从能连上的终端，到可以长期工作的终端工作台。」**
+
+这是一次平台换轨，允许破坏性变更：前端重写、WebSocket v2、SQLAlchemy/Alembic、
+配置 v2、可观测性与安全组件升级。完整迁移步骤见 `docs/MIGRATION-0.2.0.md`。
+
+### 新增
+
+- **Vue 3 终端工作台**：TypeScript + Vite 8 + Pinia + Naive UI + Tailwind 4，
+  xterm.js 6；标签拖拽/重命名、分屏预设、命令面板（`Ctrl+Shift+P`）、快速切换
+  （`Ctrl+P`）、会话侧栏、状态栏、移动端工具栏、PWA。
+- **WebSocket v2**：`/ws/v2`，seq/ack/resume/gap/snapshot；断线精确续传；
+  generation 失配与 ring 淘汰自动快照；tmux `capture-pane`、pyte 影子屏幕与
+  raw replay 三层恢复；`nudge_repaint()` 降级为兜底。
+- **会话 actor**：每会话一个 mailbox，输出/attach/detach/stop 串行化。
+- **Shell Integration**：OSC 133/633 流式解析，命令块（命令、cwd、耗时、退出码、
+  重跑、复制）；`wsctl shell-integration install/show`，支持 bash/zsh/fish/PowerShell。
+- **多分享链接**：一个会话多条链接，`read`/`write`/`control`，标签、有效期、
+  最后使用时间；`/s/<token>` 干净 URL；创建时返回二维码。
+- **API Keys**：`wsctl_...` bearer token，哈希存储、scope、过期、最后使用。
+- **布局同步**：localStorage 默认；可选服务端 `layouts` 跨设备同步。
+- **文件编辑器**：CodeMirror 6，语法高亮、搜索、撤销、保存快捷键；图片预览。
+- **主题导入**：Windows Terminal JSON 与 iTerm2 `.itermcolors`。
+- **终端能力**：Sixel/Image addon、ZMODEM（sz/rz，按需动态加载）、终端搜索、
+  选中即复制、右键粘贴、字号快捷键。
+- **Web Push**：VAPID；`wsctl push keys` 生成密钥；会话结束通知；默认关闭。
+- **可观测性**：structlog JSON、prometheus-client（含直方图）、OpenTelemetry
+  （可选）、`request_id` 贯穿日志、`/readyz`、审计哈希链与 `/api/v2/audit/verify`。
+- **SQLAlchemy 2.1 + Alembic**：schema v6；`wsctl migrate --check/--apply`；
+  新表 repository；启动自动升级。
+- **配置 v2**：分节 TOML、`"8MiB"`/`"12h"`、`WSCTL_SECTION__KEY` 环境变量、
+  `wsctl config migrate`（保留注释、自动备份、幂等）。
+- **SSE**：`/api/v2/events` 推送会话创建/结束/在线观众等状态，不承载终端字节。
+- **安全**：审计哈希链、API Keys、静态资源 immutable 缓存、CSP 无 script
+  `unsafe-inline`、SBOM 与 Sigstore 发布签名。
+- **测试**：Vitest（协议/store/主题/快捷键）、Playwright（Chromium/Firefox/WebKit/
+  移动端 + axe）、Alembic 迁移测试、协议 fuzz、构建契约、bundle budget。
+- **API 契约补齐**：`/api/v2/auth/*` 别名、RFC 9457 Problem Details、游标分页
+  （`X-Next-Cursor`）、`Idempotency-Key`（创建会话/上传）、配置与静态资源
+  `ETag`/`If-None-Match` → 304。
+- **数据层补齐**：`recordings` 表（会话/状态/大小索引）、`idempotency_keys`、
+  `term_sessions.last_seq`、0.1.x 单分享 token 自动导入 `shares`、
+  `audit_events` 只读视图；迁移前用 SQLite 在线备份自动留档。
+- **前端工程补齐**：`openapi-typescript` + `openapi-fetch` 生成客户端、
+  TanStack Query（管理面板服务端状态）、ESLint 9 + Prettier、Vue Test Utils
+  组件测试、视觉回归基线、断网/恢复 Playwright 场景。
+- **工作台补齐**：复制标签、交换/移动分屏、键盘调整比例、双击分隔条复位、
+  `Ctrl/Cmd+K` 命令面板、侧栏按后端/状态/用户过滤、命令块选中/复制输出与
+  提示符跳转、在线观众列表、失步条、PWA 安装/离线提示、移动端手势与窄屏堆叠、
+  高对比主题、屏幕阅读器模式、GNOME Terminal 配色导入、上传队列/取消/409 覆盖确认。
+- **发布补齐**：Vite 构建后注入 SRI、SLSA provenance、TestPyPI 手动验证工作流。
+
+### 审查修复（2026-11-05）
+
+- **精确续传不再清屏**：`last_seq` 命中时只回放增量；只有快照/全量回退才发送
+  `ED2`。
+- **退出码持久化**：新增 `term_sessions.exit_code`（迁移
+  `0004_session_exit_code`），历史详情返回真实退出码，而不是 `None`。
+- **SSE 按属主过滤**：普通用户不再收到其他用户会话的 presence / created /
+  ended / share 事件。
+- **旧 `/ws` 执行 API Key scope**：只读 Key 不能通过兼容端点升级为可写；同时修复
+  API Key 在 5 秒重检后被误判为登录失效。
+- **Idempotency-Key 原子抢占**：并发重试只有一个请求创建会话/上传；未完成请求
+  返回 409 而不是创建第二份。
+- **上传不覆盖竞态**：`overwrite=false` 使用原子 hard-link 发布，检查与落盘之间
+  不再存在覆盖窗口。
+- **分享生命周期**：会话结束即撤销数据库分享；过期链接不再从列表/解析中复活；
+  每会话/每用户/每布局数量有上限。
+- **前端稳定性**：后台标签页用定时器写入并 ACK（不再因 rAF 暂停而被服务端判定
+  为慢消费者）；首次加载缓存不再在手动重连时重复叠加；pane 换绑会话先重置屏幕。
+- **死代码清理**：移除旧 `vendor/` 静态缓存分支、未使用的数据库/会话/前端导出，
+  删除 `postgres` extra 与相关假支持说明。
+
+### 第二轮全量 review（2026-11-05）
+
+- **续传游标与 ACK 游标分离**：快照是「屏幕锚点」而不是流字节，旧实现把快照长度
+  加到 `last_seq` 上；浏览器/CLI 重连会跳过从未发送的区间。ACK 仍可确认已收帧，
+  但只有连续渲染的流偏移进入恢复游标；`gap` 后必须等快照修复。
+- **手动重新同步原子化**：捕获与入队现在与直播 `_broadcast` 共用会话锁；旧实现
+  会让新输出插到快照前面，重连时再按错误偏移续传。
+- **分享缓存过期不再误踢观众**：广播过滤只丢弃「确定已撤销」的 token；缓存未命中
+  交给 5 秒异步重检。本地撤销使用 tombstone，仍是立即生效。新连接的数据库分享
+  一律显式解析，不复用可能过期的缓存。
+- **配置接口不回显密钥**：`GET /api/v2/config` 与 `/config/schema` 不再返回
+  `web_push_vapid_private` / `webhook_url`；VAPID 相关项改为可热更新。
+- **安全加固**：Origin 校验加入 scheme（防同主机 HTTP 页面驱动 HTTPS 面板）；
+  认证 API 响应默认 `Cache-Control: no-store`；拒绝 chunked JSON 请求体；
+  X-Request-ID 清洗；CSP 增加 `frame-ancestors/base-uri/form-action`。
+- **文件权限**：SQLite 主库、WAL/SHM、配置备份、录制 cast、完整备份统一 0600；
+  迁移/恢复后再收紧一次，避免 CLI 先创建文件时留下 0644。
+- **数据一致性**：重命名改用专用 UPDATE，不再用 upsert 默认值覆盖
+  `generation`/`snapshot_mode`/`shell_integration`；幂等键按用户隔离并改用内容
+  哈希，避免跨账号重放；审计队列并发 flush 不再打乱哈希链顺序。
+- **Web Push**：仅接受公网 HTTPS 端点（拒绝明文、loopback、私网字面量与 localhost）；
+  每用户最多 20 个订阅；`p256dh`/`auth` 必填；损坏的 keys JSON 不再让通知循环崩溃。
+- **稳定性**：会话重同步/重绘串行化，重绘恢复当前尺寸而非进入窗口时的旧尺寸；
+  大屏 pyte 序列化移出事件循环；录制目录保留清理改为每小时而非每 5 秒；
+  SSE 慢订阅者收到 overflow 后主动结束连接以便重连；会话崩溃后遗留在数据库里的
+  分享链接在实例回收时撤销。
+- **前端**：XTerm 聚焦时按修饰键的全局快捷键恢复；登出清空布局/屏幕缓存/弹窗；
+  移动端侧栏默认收起并在选会话后关闭；文件面板列表被裁剪在模态框内，过滤后回到
+  顶部；文件编辑器保留原权限位；右键菜单由组件承载（不再 `window.prompt`）。
+  WebKit 下打开设置不再主动调用 `navigator.serviceWorker.ready`（Worker 激活期间
+  会让 WebKit 页面直接退出），推送状态改为进入通知页时按需检测。
+- **测试**：pytest 718 passed / 8 skipped、slow 7 passed、Vitest 34 passed；
+  Chromium 8、Firefox 7+1、WebKit 7+1、移动端 5+3；`scripts/e2e` 全场景通过。
+
+### 变更
+
+- Python 基线提升到 **3.12+**（CI 覆盖 3.12/3.13/3.14）。
+- REST 规范路径为 `/api/v2`；旧 `/api` 保留一版兼容别名，响应带 `Deprecation`。
+- 前端构建从「零构建」改为「开发者 pnpm 构建、用户 wheel 内置」。
+- `tests/test_ui_contracts.py` 的 59 条源码字符串契约删除，改为行为测试。
+- 终端恢复主路径从「全量回放 + SIGWINCH」改为「增量/快照」。
+- 主题、字号、快捷键等偏好迁移到 v2 store；旧 `wsctl-layout` 自动迁移。
+
+### 移除
+
+- `src/wsctl/static/app.js`、`app.css`、`vendor/` 与 `asciinema` 旧内嵌资源。
+- `tests/test_ui_contracts.py` 与 `tests/test_browser.py`（被 Vitest/Playwright 取代）。
+- 对 Python 3.11 的支持。
+
+### 已知边界
+
+- PostgreSQL 推迟到 0.3；`database_url` 设为非 SQLite URL 会在启动时明确拒绝。
+- Web Push 需要 HTTPS 或 localhost，且需要操作者配置 VAPID 密钥。
+- 递归删除文件仍不提供；目录必须为空才能删除。
+
 ## [0.1.30] - 2026-10-25
 
 **「按了 Alt+C，什么都没发生」——按键、焦点，以及入口边界。**

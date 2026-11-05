@@ -2,8 +2,8 @@
 
 The server, the CLI and the browser each decide whether a close code is
 permanent. The first two import :mod:`wsctl.core.closecodes`; the browser
-cannot, so ``static/app.js`` mirrors the set as a literal. Before this test
-existed the CLI and the browser disagreed about ``4401`` and nothing
+cannot, so ``web/src/protocol/client.ts`` mirrors the set as a literal. Before
+this test existed the CLI and the browser disagreed about ``4401`` and nothing
 complained -- a mirror nobody checks is just a second place to forget.
 """
 
@@ -14,14 +14,20 @@ from pathlib import Path
 
 from wsctl.core import closecodes
 
-APP_JS = Path(__file__).resolve().parent.parent / "src" / "wsctl" / "static" / "app.js"
+PROTOCOL_TS = (
+    Path(__file__).resolve().parent.parent
+    / "web"
+    / "src"
+    / "protocol"
+    / "client.ts"
+)
 CONNECT_PY = Path(__file__).resolve().parent.parent / "src" / "wsctl" / "cli" / "connect.py"
 
 
 def _browser_fatal_codes() -> set[int]:
-    source = APP_JS.read_text(encoding="utf-8")
-    match = re.search(r"FATAL_CLOSE_CODES = new Set\(\[([^\]]+)\]\)", source)
-    assert match is not None, "FATAL_CLOSE_CODES literal missing from app.js"
+    source = PROTOCOL_TS.read_text(encoding="utf-8")
+    match = re.search(r"FATAL_CODES = new Set\(\[([^\]]+)\]\)", source)
+    assert match is not None, "FATAL_CODES literal missing from protocol/client.ts"
     return {int(part.strip()) for part in match.group(1).split(",") if part.strip()}
 
 
@@ -56,6 +62,8 @@ def test_every_code_is_classified() -> None:
         closecodes.CLOSE_SLOW_CONSUMER,
         # the server is full *right now*; reconnecting later is the whole point
         closecodes.CLOSE_OVERLOAD,
+        # no snapshot available: the client falls back to a raw replay
+        closecodes.CLOSE_SNAPSHOT_UNAVAILABLE,
     }
     assert set(closecodes.ALL_CLOSE_CODES) == (
         set(closecodes.FATAL_CLOSE_CODES) | recoverable

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -246,7 +248,7 @@ def read_text_file(root: Path, rel: str, *, limit: int = PREVIEW_MAX_BYTES) -> t
     """Return ``(text, encoding)`` for preview. Refuses binaries and big files."""
     target = safe_resolve(root, rel)
     if not target.is_file():
-        raise FsError("不是文件")
+        raise FsError("不是文件", code=FsError.NOT_FOUND)
     size = target.stat().st_size
     if size > limit:
         raise FsError(f"文件过大，无法预览（上限 {limit // (1024 * 1024)} MB）")
@@ -325,6 +327,15 @@ def write_text_file(root: Path, rel: str, content: str) -> int:
     data = content.encode("utf-8")
     if len(data) > EDIT_MAX_BYTES:
         raise FsError(f"内容过大（上限 {EDIT_MAX_BYTES // 1024} KB）")
+    # Preserve the file's permission bits: replacing it with a 0600 staging
+    # file silently removed group read and, worse, the executable bit from a
+    # script the user just edited.
+    try:
+        # Only the ordinary permission bits: a setuid/setgid bit must not be
+        # re-attached to content that was just replaced through the API.
+        original_mode = stat.S_IMODE(target.stat().st_mode) & 0o777
+    except OSError:
+        original_mode = 0o600
     # Unique + ``O_EXCL``: a fixed sidecar name let two concurrent edits of the
     # same file interleave their bytes into one staging file and publish the
     # mixture, and a hostile neighbour could pre-create the predictable name to
@@ -346,6 +357,8 @@ def write_text_file(root: Path, rel: str, content: str) -> int:
     except BaseException:
         staging.unlink(missing_ok=True)
         raise
+    with contextlib.suppress(OSError):
+        os.chmod(target, original_mode)
     return len(data)
 
 
@@ -376,13 +389,14 @@ def list_dir_paged(
     # million-entry directory for a single unbounded response.
     if limit is None or limit <= 0:
         limit = DEFAULT_LIST_LIMIT
+    offset = max(0, offset)
     entries = entries[offset : offset + limit]
     return {
         "entries": entries,
         "total": total,
-        "offset": max(0, offset),
+        "offset": offset,
         "limit": limit,
-        "truncated": total > max(0, offset) + len(entries),
+        "truncated": total > offset + len(entries),
     }
 
 

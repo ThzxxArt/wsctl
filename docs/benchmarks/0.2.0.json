@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "date": "2026-11-05T10:21:44+0800",
+  "commit": "working tree (0.2.0 implementation)",
+  "env": {
+    "cpu": "local development host",
+    "memory": "not recorded",
+    "python": "3.13.5",
+    "node": "24.19.0",
+    "transport": "FastAPI TestClient (in-process ASGI + real PTY)"
+  },
+  "first_load_gzip_kb": 393.2,
+  "t1_seq_200000_ms": 235.6,
+  "t2_8_sessions_ms": 1757.7,
+  "t2_p50_session_ms": 218.9,
+  "attach_ms": 90.7,
+  "reconnect_ms": 1.8,
+  "frames": 348,
+  "idle_100_rss_delta_mb": 0.3,
+  "idle_per_session_kib": 3.1,
+  "notes": [
+    "T1 = seq 1 200000 through a real /bin/sh PTY and /ws/v2 framing.",
+    "T2 = 8 sequential sessions in one app; each session runs its own seq 1 200000.",
+    "first_load_gzip_kb excludes lazy editor/replay/zmodem/admin chunks.",
+    "Numbers are a smoke baseline, not a CI hard gate; CI enforces the bundle budget and functional invariants."
+  ]
+}

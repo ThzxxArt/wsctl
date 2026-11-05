@@ -172,7 +172,7 @@ def test_a_dropped_frame_still_advances_the_sequence_tracker(tmp_path) -> None:
     client.put(b"PLAIN")           # must be judged as starting outside
     queued = list(client._binary)
     assert queued, "the surviving frames must still be there"
-    _seq, payload, ends_inside = queued[-1]
+    _seq, payload, ends_inside, _data_seq, _flags = queued[-1]
     assert payload == b"PLAIN"
     assert ends_inside is False, (
         "the tracker was not advanced by the discarded frame: the state after "
@@ -308,3 +308,16 @@ def test_a_non_json_success_response_is_an_error_not_a_traceback() -> None:
             api.request("GET", "/api/me")
     finally:
         client_mod.opener_for = original  # type: ignore[assignment]
+
+
+def test_legacy_client_queues_raw_bytes_not_v2_frames() -> None:
+    """``/ws`` clients must never see a v2 header.
+
+    ``_put_data`` calls ``put_data`` whenever the sink exposes it, and every
+    ``WsClient`` does. A v1 client therefore received the 10-byte sequence
+    header before every PTY read unless ``put_data`` checks the negotiated
+    protocol version.
+    """
+    client = WsClient(_StubWs(), protocol_version=1)  # type: ignore[arg-type]
+    client.put_data(1234, b"plain bytes", 0)
+    assert client.queued_binary() == b"plain bytes"

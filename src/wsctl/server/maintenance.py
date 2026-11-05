@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
@@ -12,6 +13,7 @@ from fastapi import FastAPI
 
 from wsctl.core import tmux
 from wsctl.core.config import Settings
+from wsctl.core.pty import PtyError
 from wsctl.core.session import SessionManager, SessionSpec
 from wsctl.core.store import Store
 
@@ -54,6 +56,16 @@ def prune_dead_local_leases(store: Store, me: str, host: str) -> None:
             store.instance_remove(str(inst["id"]))
 
 
+async def _retire_row(app: FastAPI, sid: str, status: str, reason: str) -> None:
+    """Mark a row finished and make every share link to it inert."""
+    store: Store = app.state.store
+    await asyncio.to_thread(store.term_session_set_status, sid, status, reason)
+    await asyncio.to_thread(store.term_session_set_share, sid, token=None)
+    service = getattr(app.state, "shares", None)
+    if service is not None:
+        await asyncio.to_thread(service.revoke_session, sid)
+
+
 async def reconcile_instances(app: FastAPI) -> None:
     """Adopt sessions abandoned by dead instances; leave live peers alone.
 
@@ -63,27 +75,34 @@ async def reconcile_instances(app: FastAPI) -> None:
     using a different data directory on the same host is never mistaken for an
     orphan.
     """
+    import asyncio
+
     settings: Settings = app.state.settings
     store: Store = app.state.store
     manager: SessionManager = app.state.manager
     me = app.state.instance_id
     host = socket.gethostname()
-    prune_dead_local_leases(store, me, host)
+    await asyncio.to_thread(prune_dead_local_leases, store, me, host)
 
-    rows = store.term_session_list()
+    rows = await asyncio.to_thread(store.term_session_list)
     tick = int(getattr(app.state, "_reconcile_tick", 0))
     app.state._reconcile_tick = tick + 1
     has_tmux_rows = any(row.get("backend") == "tmux" for row in rows)
     # Probing tmux spawns a subprocess; only scan for orphans when there are
     # tmux-backed rows, and otherwise just occasionally.
     if tmux.is_available() and (has_tmux_rows or tick % 12 == 0):
-        known = {str(row["id"]) for row in rows}
+        known = {
+            str(row["id"])
+            for row in rows
+            if row.get("status") in ("running", "interrupted")
+        }
         for name in await tmux.list_sessions_async():
             if tmux.owns(name) and tmux.sid_from_name(name) not in known:
                 await tmux.kill_session_async(name)
                 log.info("reaped orphan tmux session %s", name)
 
-    live = store.instance_alive_ids(settings.instance_ttl) - {me}
+    live = await asyncio.to_thread(store.instance_alive_ids, settings.instance_ttl)
+    live -= {me}
     for row in rows:
         if row.get("status") not in ("running", "interrupted"):
             continue
@@ -94,10 +113,10 @@ async def reconcile_instances(app: FastAPI) -> None:
             continue  # already held in this process
         if row.get("backend") != "tmux":
             # A local session died together with its instance.
-            store.term_session_set_status(sid, "stopped", "服务退出或实例崩溃")
+            await _retire_row(app, sid, "stopped", "服务退出或实例崩溃")
             continue
         if not await tmux.has_session_async(tmux.session_name(sid)):
-            store.term_session_set_status(sid, "stopped", "tmux 会话已不存在")
+            await _retire_row(app, sid, "stopped", "tmux 会话已不存在")
             continue
         spec = SessionSpec(
             name=str(row["name"]),
@@ -109,10 +128,12 @@ async def reconcile_instances(app: FastAPI) -> None:
             max_clients=settings.session_max_clients,
             memory_limit=settings.session_memory_limit,
             scrollback_bytes=settings.scrollback_bytes,
+            snapshot_mode=settings.snapshot_mode,
+            shell_integration=settings.shell_integration,
         )
         try:
             session = await manager.create(spec, sid=sid, owner_id=row.get("owner_id"))
-        except (ValueError, OSError, tmux.TmuxError):
+        except (ValueError, OSError, PtyError, tmux.TmuxError):
             continue
         # A share link outlives a restart too: the token is rehydrated verbatim
         # so a QR code already handed out keeps working.
@@ -121,8 +142,10 @@ async def reconcile_instances(app: FastAPI) -> None:
             row.get("share_expires"),
             bool(row.get("share_writable")),
         )
-        store.term_session_set_instance(sid, me)
-        store.term_session_set_status(sid, "running", "已接管")
+        await asyncio.to_thread(store.term_session_set_instance, sid, me)
+        await asyncio.to_thread(
+            store.term_session_set_status, sid, "running", "已接管"
+        )
         log.info("adopted tmux session %s", sid)
 
 

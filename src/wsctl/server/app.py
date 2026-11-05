@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request, Response, WebSocket
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import RequestResponseEndpoint
 
@@ -40,7 +39,10 @@ from wsctl.core.config import (
     Settings,
     reload_settings_file,
 )
+from wsctl.core.database import Database
 from wsctl.core.metrics import Metrics
+from wsctl.core.migrations import upgrade_database
+from wsctl.core.observability import RequestContextMiddleware, setup_tracing
 from wsctl.core.pty import PtyError
 from wsctl.core.ratelimit import RateLimiter
 from wsctl.core.session import SessionManager, SessionSpec
@@ -48,6 +50,7 @@ from wsctl.core.store import Store
 from wsctl.core.webhook import WebhookDispatcher
 
 from . import routes
+from .api_keys import ApiKeyScopeMiddleware
 from .maintenance import (
     active_recording_paths,
     dead_instance_ids,
@@ -55,14 +58,18 @@ from .maintenance import (
     reconcile_instances,
     retention_cutoffs,
 )
-from .routes.health import NO_CACHE, VENDOR_CACHE, VOLATILE_ASSETS
+from .problems import install_problem_handlers
+from .problems import problem as problem_response
+from .routes.health import NO_CACHE, VOLATILE_ASSETS
 from .security import (
     SECURITY_HEADERS,
     client_ip,
+    forwarded_scheme,
     ip_allowed,
     is_origin_allowed,
 )
 from .ws import ConnectionCaps, terminal_endpoint
+from .ws_v2 import terminal_endpoint_v2
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 MAINTENANCE_INTERVAL = 5.0
@@ -79,6 +86,11 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: request is refused outright because neither the browser UI nor the CLI
 #: streams a login.
 MAX_LOGIN_BODY = 8 * 1024
+
+#: JSON API bodies are small (a layout, a config batch, a rename). File upload
+#: has its own streaming cap; everything else that claims a huge body is
+#: refused before Starlette buffers it into memory.
+MAX_JSON_BODY = 16 * 1024 * 1024
 
 log = logging.getLogger("wsctl.app")
 
@@ -118,8 +130,12 @@ def _cross_site(request: Request, settings: Settings) -> str | None:
     """
     origin = request.headers.get("origin")
     if origin is not None:
+        scheme = forwarded_scheme(request, settings) or request.url.scheme
         if is_origin_allowed(
-            origin, request.headers.get("host"), settings.allowed_origins
+            origin,
+            request.headers.get("host"),
+            settings.allowed_origins,
+            scheme=scheme,
         ):
             return None
         return "跨站请求被拒绝"
@@ -174,6 +190,22 @@ def create_app(
 
     instance_id = uuid.uuid4().hex
     config_clock = {"mtime": _config_mtime(settings)}
+    background_tasks: set[asyncio.Task[Any]] = set()
+
+    def _spawn(coro: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+        background_tasks.add(task)
+
+        def _done(finished: asyncio.Task[Any]) -> None:
+            background_tasks.discard(finished)
+            if finished.cancelled():
+                return
+            error = finished.exception()
+            if error is not None:
+                log.warning("background task failed: %s", error)
+
+        task.add_done_callback(_done)
+        return task
 
     def _reload_config() -> tuple[list[str], list[str]]:
         changed, errors = reload_settings_file(settings)
@@ -204,9 +236,16 @@ def create_app(
         """Bound on-disk growth: audit log, finished session rows, old casts.
 
         The database purges and the directory scan are blocking, so they run on
-        a worker thread rather than stalling the event loop every 5 seconds.
+        a worker thread rather than stalling the event loop. They also run
+        hourly, not on every five-second tick: a DELETE plus a full recordings
+        directory stat every tick took the SQLite write lock and walked the
+        data directory for no benefit. Menu-level deletes and explicit stops
+        remain immediate; this is only the background sweep.
         """
         now = time.time()
+        if now - float(getattr(app.state, "_retention_purged_at", 0.0)) < 3600:
+            return
+        app.state._retention_purged_at = now
         store_ = app.state.store
         cutoffs = retention_cutoffs(now, settings)
         if cutoffs["audit"] is not None:
@@ -220,6 +259,9 @@ def create_app(
             await asyncio.to_thread(
                 prune_recordings, settings.recordings_dir, cutoffs["recordings"], active
             )
+        # Idempotency keys are useful for retries, not forever. A day is well
+        # beyond any client's retry window and keeps the table bounded.
+        await asyncio.to_thread(app.state.db.idempotency_purge, older_than=86400)
 
     def _maintenance_db_writes(instance_id_: str, ttl: float) -> None:
         """Maintenance database writes that depend on no live snapshot.
@@ -235,6 +277,10 @@ def create_app(
         )
         store_.purge_expired_sessions()
         store_.term_session_clear_expired_shares()
+        now = time.time()
+        if now - float(getattr(app.state, "_shares_purged_at", 0.0)) >= 3600:
+            app.state._shares_purged_at = now
+            app.state.shares.purge_expired()
         for dead in dead_instance_ids(store_, ttl, instance_id_):
             store_.instance_remove(dead)
 
@@ -345,6 +391,17 @@ def create_app(
                 # if a peer pruned our lease while we were paused, this restores it.
                 await _maintenance_db_tick()
                 await _reconcile_accounts()
+                with contextlib.suppress(Exception):
+                    from wsctl.core.observability import ACTOR_MAILBOX_DEPTH
+
+                    ACTOR_MAILBOX_DEPTH.set(
+                        float(
+                            sum(
+                                int(getattr(session, "mailbox_depth", 0))
+                                for session in app.state.manager.list_sessions()
+                            )
+                        )
+                    )
                 await reconcile_instances(app)
                 await _purge_retention()
                 if app.state.reload_requested:
@@ -363,6 +420,24 @@ def create_app(
             except Exception:
                 log.exception("maintenance task failed")
 
+    async def _watch_config() -> None:
+        """Mark a reload as soon as the config file changes.
+
+        The maintenance loop's mtime check remains as a fallback (network
+        filesystems, editors that preserve mtime); watchfiles is the fast path
+        and uses inotify/FSEvents instead of polling every five seconds.
+        """
+        try:
+            from watchfiles import awatch
+
+            async for changes in awatch(settings.config_path):
+                if any(Path(path) == settings.config_path for _change, path in changes):
+                    app.state.reload_requested = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("watchfiles unavailable; mtime polling remains", exc_info=True)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from wsctl.core import tmux
@@ -373,6 +448,7 @@ def create_app(
             instance_id, pid=os.getpid(), host=socket.gethostname()
         )
         maint = asyncio.create_task(_maintenance())
+        watcher = asyncio.create_task(_watch_config())
         # Start the event-loop lag watchdog now that a loop is actually running.
         app.state.loop_lag_starter()
         _install_sighup(app)
@@ -380,18 +456,32 @@ def create_app(
         if webhook is not None:
             webhook.start()
         await reconcile_instances(app)
-        if startup_command:
-            argv = shlex.split(startup_command)
+        command = startup_command
+        if command:
+            try:
+                argv = shlex.split(command)
+            except ValueError as exc:
+                log.error("启动会话命令无法解析，已跳过：%s", exc)
+                argv = []
+            if not argv:
+                command = None
+        if command:
+            backend = settings.default_backend
+            if backend == "tmux" and not tmux.is_available():
+                log.warning("default_backend=tmux but tmux is unavailable; using local")
+                backend = "local"
             spec = SessionSpec(
                 name=Path(argv[0]).name if argv else "终端",
                 argv=argv,
                 cwd=settings.default_cwd,
-                backend=settings.default_backend,
+                backend=backend,
                 idle_timeout=settings.idle_timeout,
                 max_life=settings.max_life,
                 max_clients=settings.session_max_clients,
                 memory_limit=settings.session_memory_limit,
                 scrollback_bytes=settings.scrollback_bytes,
+                snapshot_mode=settings.snapshot_mode,
+                shell_integration=settings.shell_integration,
             )
             try:
                 session = await app.state.manager.create(spec)
@@ -404,36 +494,112 @@ def create_app(
                     owner_id=None,
                     backend=spec.backend,
                     instance_id=instance_id,
+                    generation=session.generation,
+                    snapshot_mode=spec.snapshot_mode,
+                    shell_integration=spec.shell_integration,
                 )
-                log.info("startup session %s: %s", session.id, startup_command)
+                log.info("startup session %s: %s", session.id, command)
         try:
             yield
         finally:
             maint.cancel()
+            watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await maint
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
             await app.state.manager.shutdown(preserve=settings.tmux_preserve_on_shutdown)
             # Flush queued audit events (and deliver them to the webhook) before
             # tearing the webhook down.
             await audit.stop()
             if webhook is not None:
                 await webhook.stop()
+            # Drain short-lived background writes (command blocks, push
+            # notifications) before the database handles close. Without this a
+            # command that ended during shutdown could lose its row.
+            pending = list(background_tasks)
+            if pending:
+                _done, still_pending = await asyncio.wait(pending, timeout=5.0)
+                for task in still_pending:
+                    task.cancel()
+                await asyncio.gather(*still_pending, return_exceptions=True)
             with contextlib.suppress(Exception):
                 app.state.store.instance_remove(instance_id)
             app.state.store.close()
+            app.state.db.close()
 
     app = FastAPI(
         title="wsctl", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan
     )
+    install_problem_handlers(app)
     app.state.settings = settings
     app.state.instance_id = instance_id
     app.state.store = store or Store(settings.db_path)
+    # The legacy tables are owned by ``Store`` (which applies its idempotent
+    # v5→v6 migration on open). Alembic records the same schema as a versioned
+    # chain and owns every table added from 0.2.0 onward. Running it on an
+    # existing 0.1.30 database is a no-op apart from stamping the revision.
+    database_url = settings.database_url or f"sqlite:///{app.state.store.path}"
+    upgrade_database(database_url)
+    app.state.db = Database(database_url, echo=settings.database_echo)
+    from .services import EventBroker, PushService, ShareService
+
+    app.state.events = EventBroker()
+    app.state.shares = ShareService(app.state.db)
+    app.state.push = PushService(app.state.db, settings)
     app.state.store.sliding_ttl = settings.session_sliding_ttl
     # A short-lived resolution cache: WebSocket re-checks run every few seconds
     # per connection and must not become a database query on the event loop.
     app.state.auth_cache = AuthCache(ttl=30.0)
     app.state.store.set_auth_cache(app.state.auth_cache)
     app.state.manager = manager or SessionManager()
+    if getattr(app.state.manager, "_on_command", None) is None:
+
+        async def _persist_command(event: dict[str, Any]) -> None:
+            if event.get("phase") != "finished":
+                return
+            async def _write_block() -> None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(app.state.db.command_block_add, event)
+
+            # The reader loop awaits this hook. A synchronous SQLite commit on
+            # every command must not stall the PTY: schedule it and keep
+            # reading. ``session_commands`` falls back to the live parser until
+            # the row lands.
+            _spawn(_write_block())
+            if settings.audit_input:
+                app.state.audit.enqueue(
+                    "command",
+                    term_session_id=str(event.get("session") or ""),
+                    payload=str(event.get("command") or "")[:512],
+                )
+            duration = event.get("duration_ms")
+            if (
+                settings.web_push_enabled
+                and isinstance(duration, (int, float))
+                and duration >= 10_000
+            ):
+                session = app.state.manager.get(str(event.get("session") or ""))
+                owner_id = getattr(session, "owner_id", None) if session else None
+                if owner_id is not None:
+                    with contextlib.suppress(Exception):
+                        # Notification I/O must not hold the PTY read loop: a
+                        # push service timeout would freeze the shell's output.
+                        _spawn(
+                            app.state.push.notify(
+                                int(owner_id),
+                                {
+                                    "title": "wsctl 长命令完成",
+                                    "body": (
+                                        f"{str(event.get('command') or '命令')[:80]}"
+                                        f"（{int(duration)} ms）"
+                                    ),
+                                    "url": "/",
+                                },
+                            )
+                        )
+
+        app.state.manager._on_command = _persist_command
     # A session that ends writes its own row, with the real reason and exit
     # code, at the moment it ends. The maintenance sweep below only catches
     # rows orphaned by a crash -- for those, a bare ``stopped`` and the
@@ -446,11 +612,43 @@ def create_app(
                 # stay ``running`` so the next startup adopts it.
                 return
             await asyncio.to_thread(
+                app.state.store.term_session_set_seq, session.id, session.end_seq
+            )
+            await asyncio.to_thread(
                 app.state.store.term_session_set_status,
                 session.id,
                 session.end_status,
                 session.end_reason,
+                session.exit_code,
             )
+            # A link to a session that has ended must not stay resolvable.
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    app.state.store.term_session_set_share, session.id, token=None
+                )
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    app.state.shares.revoke_session, session.id
+                )
+            app.state.events.publish(
+                "session_ended",
+                owner_id=session.owner_id,
+                session=session.id,
+                status=session.end_status,
+                exit_code=session.exit_code,
+            )
+            if settings.web_push_enabled and session.owner_id is not None:
+                with contextlib.suppress(Exception):
+                    _spawn(
+                        app.state.push.notify(
+                            int(session.owner_id),
+                            {
+                                "title": "wsctl 会话已结束",
+                                "body": f"{session.spec.name}（退出码 {session.exit_code}）",
+                                "url": "/",
+                            },
+                        )
+                    )
 
         app.state.manager._on_session_end = _persist_session_end
 
@@ -609,7 +807,7 @@ def create_app(
         ip = client_ip(request, settings)
         if not ip_allowed(ip, settings.allowed_ips):
             app.state.audit.enqueue("ip_rejected", ip=ip, payload=request.url.path)
-            return JSONResponse({"detail": "forbidden"}, status_code=403)
+            return problem_response(request, status=403, detail="forbidden")
         if request.method not in SAFE_METHODS and request.url.path.startswith("/api/"):
             rejection = _cross_site(request, settings)
             if rejection is not None:
@@ -618,13 +816,74 @@ def create_app(
                     ip=ip,
                     payload=f"{request.method} {request.url.path}",
                 )
-                return JSONResponse({"detail": rejection}, status_code=403)
-        if request.method == "POST" and request.url.path.rstrip("/") == "/api/login":
-            problem = _login_body_problem(request)
-            if problem is not None:
-                code, detail = problem
-                return JSONResponse({"detail": detail}, status_code=code)
+                return problem_response(request, status=403, detail=rejection)
+        if request.method == "POST" and request.url.path.rstrip("/") in {
+            "/api/login",
+            "/api/v2/login",
+            "/api/auth/login",
+            "/api/v2/auth/login",
+        }:
+            issue = _login_body_problem(request)
+            if issue is not None:
+                code, detail = issue
+                return problem_response(request, status=code, detail=detail)
+        elif (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path.startswith("/api/")
+            and not request.url.path.rstrip("/").endswith("/files/upload")
+        ):
+            raw_length = request.headers.get("content-length")
+            if raw_length is None:
+                if "chunked" in request.headers.get("transfer-encoding", "").lower():
+                    # ``Content-Length`` is what the cap above reads; a chunked
+                    # body would stream past it and only be bounded by memory.
+                    return problem_response(
+                        request,
+                        status=411,
+                        detail="该接口需要 Content-Length，不接受分块请求体",
+                    )
+            else:
+                try:
+                    length = int(raw_length)
+                except ValueError:
+                    return problem_response(
+                        request, status=400, detail="Content-Length 无效"
+                    )
+                if length > MAX_JSON_BODY:
+                    return problem_response(
+                        request,
+                        status=413,
+                        detail=f"请求体过大（上限 {MAX_JSON_BODY} 字节）",
+                    )
         response = await call_next(request)
+        # Authenticated API responses are per-user and must not sit in a shared
+        # proxy or the browser's back/forward cache. Endpoints with an explicit
+        # policy (the config ETag) keep their own header.
+        if request.url.path.startswith("/api/") and "cache-control" not in {
+            key.lower() for key in response.headers
+        }:
+            response.headers["Cache-Control"] = "no-store"
+        # Conditional GET is what turns a reload of a 2 MB bundle into a 304
+        # with no body. Starlette's FileResponse *sets* an ETag but never
+        # checks If-None-Match, and our config endpoint sets its own. Handling
+        # it once here covers both without each route re-implementing it.
+        etag = response.headers.get("etag")
+        if etag and request.headers.get("if-none-match"):
+            candidates = {
+                value.strip() for value in request.headers["if-none-match"].split(",")
+            }
+            if etag in candidates or "*" in candidates:
+                headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() in {"etag", "cache-control", "last-modified"}
+                }
+                return Response(status_code=304, headers=headers)
+        if request.url.path.startswith("/api/") and not request.url.path.startswith(
+            "/api/v2/"
+        ):
+            response.headers.setdefault("Deprecation", "true")
+            response.headers.setdefault("Link", '</api/v2>; rel="successor-version"')
         if settings.security_headers:
             for key, value in SECURITY_HEADERS.items():
                 response.headers.setdefault(key, value)
@@ -634,10 +893,11 @@ def create_app(
         """Static files that cannot go stale on the user.
 
         ``StaticFiles`` sends no ``Cache-Control`` at all, so the browser
-        applies heuristic caching. For ``vendor/`` that is fine -- those files
-        are version-pinned and never change in place. For ``app.js`` and
-        ``app.css`` it is not: a stale bundle under a fresh ``index.html`` is
-        exactly how a new control appears on screen with nothing wired to it.
+        applies heuristic caching. Vite emits content-hashed names under
+        ``assets/``; those are safe to cache for a year. The entry document and
+        manifest must be revalidated, because they are what *point* at the new
+        hashes. A stale entry document under a fresh bundle is exactly how a
+        new control appears on screen with nothing wired to it.
         """
 
         def file_response(
@@ -649,17 +909,37 @@ def create_app(
         ) -> Response:
             response = super().file_response(full_path, stat_result, scope, status_code)
             name = str(full_path).replace("\\", "/").rsplit("/", 1)[-1]
-            in_vendor = "/vendor/" in str(full_path).replace("\\", "/")
-            if in_vendor:
-                response.headers.setdefault("Cache-Control", VENDOR_CACHE)
+            in_assets = "/assets/" in str(full_path).replace("\\", "/")
+            if in_assets:
+                # Vite emits content-hashed filenames. They cannot go stale in
+                # place; a year-long immutable cache is correct and removes a
+                # revalidation round trip from every page load.
+                response.headers["Cache-Control"] = (
+                    "public, max-age=31536000, immutable"
+                )
             elif name in VOLATILE_ASSETS or name.endswith((".js", ".css", ".html")):
                 response.headers["Cache-Control"] = NO_CACHE
             return response
 
     app.mount("/static", _CachingStatic(directory=STATIC_DIR), name="static")
 
+    app.add_middleware(ApiKeyScopeMiddleware)
+    app.add_middleware(RequestContextMiddleware)
+    setup_tracing(app, settings)
+
     for router, _prefix in routes.ROUTERS:
-        app.include_router(router)
+        if router is routes.health.router:
+            app.include_router(router)
+        else:
+            # 0.2.0's canonical surface is /api/v2. The unprefixed version is
+            # kept for one release so a 0.1.x script or an open tab does not
+            # break mid-upgrade; it is marked deprecated on every response.
+            app.include_router(router, prefix="/api/v2")
+            app.include_router(router, prefix="/api")
+
+    @app.websocket("/ws/v2")
+    async def ws_v2_endpoint(websocket: WebSocket) -> None:
+        await terminal_endpoint_v2(websocket)
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

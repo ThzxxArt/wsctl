@@ -2163,27 +2163,30 @@ def test_control_frames_survive_the_shed(tmp_path: Path) -> None:
 
 
 def test_release_assets_cannot_go_stale(tmp_path: Path) -> None:
-    """`app.js` must never be served from a stale browser cache.
+    """The entry document must never be served from a stale browser cache.
 
     The symptom this prevents: a user upgrades, reloads, and gets the new
-    `index.html` with the new dropdown while the cached `app.js` is still the
-    previous release's -- so the control is on screen with nothing wired to it
-    and right-click keeps doing whatever it did before. `StaticFiles` sends no
-    `Cache-Control` at all, leaving the browser to cache heuristically.
+    ``index.html`` while an old bundle is still cached -- so the control is on
+    screen with nothing wired to it. Vite's content-hashed assets are the
+    opposite case: they may be cached for a year because the name changes.
     """
+    import re
+
     with TestClient(build_app(tmp_path)) as client:
-        for path in ("/", "/static/app.js", "/static/app.css", "/static/index.html"):
+        for path in ("/", "/static/index.html", "/static/manifest.webmanifest", "/sw.js"):
             response = client.get(path)
             assert response.status_code == 200, path
             cache = response.headers.get("cache-control", "")
             assert "no-cache" in cache or "must-revalidate" in cache, (
                 f"{path} may go stale: cache-control={cache!r}"
             )
-        # Version-pinned vendor bundles are the opposite: they never change in
-        # place, so caching them hard is both safe and desirable.
-        vendor = client.get("/static/vendor/xterm.js")
-        assert vendor.status_code == 200
-        assert "max-age=31536000" in vendor.headers.get("cache-control", "")
+        index = client.get("/").text
+        match = re.search(r'/static/(assets/[^"]+\.js)', index)
+        assert match is not None, "built index has no hashed JS asset"
+        hashed = client.get(f"/static/{match.group(1)}")
+        assert hashed.status_code == 200
+        assert "max-age=31536000" in hashed.headers.get("cache-control", "")
+        assert "immutable" in hashed.headers.get("cache-control", "")
 
 
 # -- 0.1.22: checks must be driven by the clock, not by "the peer went quiet" --

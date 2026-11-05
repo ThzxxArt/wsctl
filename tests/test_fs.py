@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -127,9 +128,15 @@ def test_preview_refuses_binaries_and_oversized_files(tmp_path: Path) -> None:
 def test_write_text_file_is_atomic_and_bounded(tmp_path: Path) -> None:
     target = tmp_path / "edit.txt"
     target.write_text("before", encoding="utf-8")
+    if os.name != "nt":
+        # An executable script must not lose its mode just because it was
+        # edited through the panel.
+        os.chmod(target, 0o754)
     size = fs.write_text_file(tmp_path, "edit.txt", "after 内容")
     assert size == len("after 内容".encode())
     assert target.read_text(encoding="utf-8") == "after 内容"
+    if os.name != "nt":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o754
     assert list(tmp_path.glob(".*wsctl-edit")) == [], "staging sidecar left behind"
     with pytest.raises(fs.FsError, match="过大"):
         fs.write_text_file(tmp_path, "edit.txt", "x" * (fs.EDIT_MAX_BYTES + 1))

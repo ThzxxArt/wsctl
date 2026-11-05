@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from . import audit, auth, config, files, health, recordings, sessions, share, status, users
+from . import audit, auth, config, files, health, recordings, sessions, share, status, users, v2
 
 ROUTERS: list[tuple[APIRouter, str]] = [
     (health.router, ""),
@@ -23,6 +23,7 @@ ROUTERS: list[tuple[APIRouter, str]] = [
     (audit.router, ""),
     (config.router, ""),
     (files.router, ""),
+    (v2.router, ""),
 ]
 
 __all__ = ["ROUTERS"]

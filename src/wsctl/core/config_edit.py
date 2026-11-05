@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config as config_mod
+from . import config_v2
 
 
 class ConfigEditError(Exception):
@@ -28,6 +29,42 @@ class ConfigEditError(Exception):
 
 
 _KEY_LINE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=")
+_SECTION_LINE = re.compile(r"^\s*\[([A-Za-z_][A-Za-z0-9_]*)\]\s*$")
+
+
+def _find_section(lines: list[str], section: str) -> int | None:
+    for index, line in enumerate(lines):
+        match = _SECTION_LINE.match(line)
+        if match is not None and match.group(1) == section:
+            return index
+    return None
+
+
+def _find_key_line(lines: list[str], key: str) -> int | None:
+    """Index of the line that sets ``key`` in its canonical section.
+
+    Tracks ``[section]`` headers so ``[auth] required`` is found when the
+    canonical key is ``auth_required``, while a same-named key in a different
+    section is not touched.
+    """
+    section = config_v2.section_of(key)
+    aliases = set(config_v2.local_aliases(section, key))
+    current: str | None = None
+    for index, line in enumerate(lines):
+        header = _SECTION_LINE.match(line)
+        if header is not None:
+            current = header.group(1)
+            continue
+        match = _KEY_LINE.match(line)
+        if match is None:
+            continue
+        name = match.group(2)
+        if current is None:
+            if name == key:
+                return index
+        elif current == section and (name == key or name in aliases):
+            return index
+    return None
 
 
 def known_keys() -> set[str]:
@@ -60,6 +97,10 @@ def split_trailing_comment(text: str) -> tuple[str, str | None]:
 
 def format_toml_value(value: Any) -> str:
     """Render a Python value as a TOML literal on one line."""
+    from pathlib import Path
+
+    if isinstance(value, Path):
+        value = str(value)
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -100,9 +141,15 @@ def check_value(key: str, value: Any) -> None:
 
     ``port = "abc"`` is refused here rather than at the next start, where the
     failure would be a service that does not come up and a log nobody reads.
+    Human units (``"12h"`` / ``"8MiB"``) are normalised first so the editor can
+    accept the same spellings the config file does.
     """
+    from . import config_v2
+
+    key = config_v2.normalise_key(key)
+    normalised = config_v2.coerce_value(key, value)
     try:
-        config_mod.Settings(**{key: value})
+        config_mod.Settings(**{key: normalised})
     except Exception as exc:  # pydantic ValidationError and friends
         raise ConfigEditError(f"配置项 {key} 的值无效：{exc}") from exc
 
@@ -114,6 +161,7 @@ def apply_key(original: str, key: str, value: Any) -> str:
     before deciding to keep it. Raises :class:`ConfigEditError` rather than
     return a document that would not load.
     """
+    key = config_v2.normalise_key(key)
     check_key(key)
     check_value(key, value)
 
@@ -129,35 +177,42 @@ def apply_key(original: str, key: str, value: Any) -> str:
         # string: an optional field with nothing in it means "unset", and
         # `default_cwd = ""` is a different (and broken) thing from no cwd.
         # ``check_value`` above has already confirmed the model accepts None.
-        kept = []
-        removed = False
-        for line in lines:
-            match = _KEY_LINE.match(line)
-            if match is not None and match.group(2) == key and not removed:
-                removed = True
-                continue
-            kept.append(line)
-        new_text = ending.join(kept)
+        index = _find_key_line(lines, key)
+        if index is not None:
+            lines.pop(index)
+        new_text = ending.join(lines)
         if new_text:
             new_text = new_text.rstrip("\r\n") + ending
     else:
         rendered = format_toml_value(value)
-        replaced = False
-        for index, line in enumerate(lines):
+        index = _find_key_line(lines, key)
+        if index is not None:
+            line = lines[index]
             match = _KEY_LINE.match(line)
-            if match is None or match.group(2) != key:
-                continue
+            assert match is not None
             _, comment = split_trailing_comment(line[match.end():])
             suffix = f"  {comment}" if comment else ""
             lines[index] = f"{key} = {rendered}{suffix}"
-            replaced = True
-            break
-        if not replaced:
+        else:
             # Keep the file's trailing newline convention: a config that grew a
             # key should not also grow a diff on every unrelated line.
-            if lines and not lines[-1].strip():
-                lines.insert(len(lines) - 1, f"{key} = {rendered}")
+            section = config_v2.section_of(key)
+            header = f"[{section}]"
+            header_index = _find_section(lines, section)
+            if header_index is not None:
+                insert_at = header_index + 1
+                for index in range(header_index + 1, len(lines)):
+                    if _SECTION_LINE.match(lines[index]):
+                        break
+                    if lines[index].strip():
+                        insert_at = index + 1
+                lines.insert(insert_at, f"{key} = {rendered}")
+            elif lines and not lines[-1].strip():
+                lines.insert(len(lines) - 1, f"{header}\n{key} = {rendered}")
             else:
+                if lines:
+                    lines.append("")
+                lines.append(header)
                 lines.append(f"{key} = {rendered}")
         new_text = ending.join(lines).rstrip("\r\n") + ending
 
@@ -169,7 +224,8 @@ def apply_key(original: str, key: str, value: Any) -> str:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigEditError(f"写入后配置无效，已放弃修改：{exc}") from exc
     try:
-        config_mod.Settings(**data)
+        flat = config_v2.flatten_document(data)
+        config_mod.Settings(**flat)
     except Exception as exc:
         raise ConfigEditError(f"写入后配置无效，已放弃修改：{exc}") from exc
     return new_text

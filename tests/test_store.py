@@ -435,3 +435,58 @@ def test_schema_migration_is_safe_under_two_concurrent_instances(tmp_path) -> No
     finally:
         conn.close()
     assert names.count("end_reason") == 1
+
+
+def test_rename_only_touches_the_name(tmp_path: Path) -> None:
+    """A rename must not reset the resume/snapshot columns.
+
+    ``PATCH /sessions/{sid}`` used to call the full upsert with defaults for
+    every other field; its ON CONFLICT clause then wrote ``generation=NULL``,
+    ``snapshot_mode='auto'`` and ``shell_integration=1`` over the real values.
+    """
+    store = make_store(tmp_path)
+    try:
+        store.term_session_upsert(
+            "s1",
+            name="old",
+            owner_id=None,
+            backend="tmux",
+            command="htop",
+            argv=["htop"],
+            cwd="/tmp",
+            generation="gen-123",
+            snapshot_mode="off",
+            shell_integration=False,
+        )
+        store.term_session_set_name("s1", "new")
+        row = store.term_session_get("s1")
+        assert row is not None
+        assert row["name"] == "new"
+        assert row["backend"] == "tmux"
+        assert row["command"] == "htop"
+        assert row["cwd"] == "/tmp"
+        assert row["generation"] == "gen-123"
+        assert row["snapshot_mode"] == "off"
+        assert row["shell_integration"] == 0
+    finally:
+        store.close()
+
+
+def test_database_files_are_owner_only(tmp_path: Path) -> None:
+    """Password hashes, TOTP secrets and audit data must not be world-readable."""
+    import os
+    import stat
+
+    if os.name == "nt":
+        pytest.skip("POSIX mode bits are not meaningful on Windows")
+    store = make_store(tmp_path)
+    try:
+        store.user_create("alice", "s3cret12")
+        for suffix in ("", "-wal", "-shm"):
+            path = store.path.with_name(store.path.name + suffix)
+            if not path.exists():
+                continue
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == 0o600, f"{path.name} is {oct(mode)}"
+    finally:
+        store.close()

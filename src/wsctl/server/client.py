@@ -42,6 +42,7 @@ from typing import Any
 from fastapi import WebSocket
 
 from wsctl.core.ansi import AnsiTracker
+from wsctl.core.protocol import FLAG_SNAPSHOT, MAX_DATA_FRAME, encode_data
 from wsctl.core.session import ClientGone, note_shed_frames
 
 MAX_PENDING = 512
@@ -66,8 +67,15 @@ class WsClient:
         max_pending: int = MAX_PENDING,
         max_bytes: int = 0,
         on_shed: Callable[[], None] | None = None,
+        on_gap: Callable[[int, int], None] | None = None,
+        protocol_version: int = 1,
     ) -> None:
         self._ws = websocket
+        self._protocol_version = protocol_version
+        self.on_gap = on_gap
+        #: Human label shown in the online-viewer list. Set by the WebSocket
+        #: endpoint after authentication; never trusted for authorization.
+        self.viewer_label = ""
         #: Called once per shedding burst, right after the viewer is told its
         #: screen is incomplete. The notice is not the repair: a full-screen
         #: application draws on top of a base the dropped frames no longer
@@ -76,11 +84,14 @@ class WsClient:
         #: redraw (``TermSession.request_repaint``) rather than wait for a
         #: human to click 重新同步.
         self.on_shed = on_shed
-        #: ``(seq, payload, ends_inside_escape)`` -- the flag is the streaming
-        #: ANSI state *after* that frame. A drop may only land where the state
-        #: is outside a sequence, otherwise the surviving stream resumes
-        #: mid-escape and a full-screen program renders as garbage.
-        self._binary: deque[tuple[int, bytes, bool]] = deque()
+        #: ``(order, payload, ends_inside_escape, data_seq, flags)`` -- the
+        #: first flag is the streaming ANSI state *after* that frame. A drop
+        #: may only land where the state is outside a sequence, otherwise the
+        #: surviving stream resumes mid-escape and a full-screen program
+        #: renders as garbage. ``data_seq`` is ``None`` for the legacy
+        #: endpoint; protocol v2 stamps every terminal frame with its global
+        #: byte offset so a reconnect can resume exactly.
+        self._binary: deque[tuple[int, bytes, bool, int | None, int]] = deque()
         self._control: deque[tuple[int, dict[str, Any]]] = deque()
         # Streaming ANSI state fed once per terminal frame. A stateless scan of
         # a single frame cannot answer "does this end inside a sequence",
@@ -102,6 +113,14 @@ class WsClient:
         self.dropped_bytes = 0
         self.dropped_events = 0
         self._shed_notice_open = False
+        #: Exact range evicted since the last reported gap. ``None`` means no
+        #: sequenced frame was lost (legacy endpoint or a control-only queue).
+        self._lost_from: int | None = None
+        self._lost_to: int | None = None
+        #: Highest sequence the client has acknowledged writing to xterm.
+        #: Monotonic: a stale ACK (arriving out of order) must not move it
+        #: backwards and make the server re-send bytes.
+        self.last_acked_seq = 0
 
     # -- introspection (also the tests' view of the queue) ---------------
 
@@ -126,7 +145,7 @@ class WsClient:
 
     def queued_binary(self) -> bytes:
         """The terminal frames still queued, oldest first."""
-        return b"".join(payload for _seq, payload, _inside in self._binary)
+        return b"".join(payload for _o, payload, _i, _s, _f in self._binary)
 
     def queued_controls(self) -> list[dict[str, Any]]:
         """The control frames still queued, oldest first."""
@@ -155,9 +174,13 @@ class WsClient:
         Returns ``False`` when nothing terminal-shaped is left to give up.
         """
         while self._binary:
-            _seq, item, ends_inside = self._binary.popleft()
+            _order, item, ends_inside, data_seq, _flags = self._binary.popleft()
             self._pending_bytes = max(0, self._pending_bytes - len(item))
             self.dropped_bytes += len(item)
+            if data_seq is not None:
+                if self._lost_from is None:
+                    self._lost_from = data_seq
+                self._lost_to = data_seq + len(item)
             # ``ends_inside`` is the state *after* that frame. A frame that
             # leaves us outside a sequence is a safe cut point.
             if not ends_inside:
@@ -208,11 +231,28 @@ class WsClient:
         Losing frames is the lesser evil; losing them *silently* is not, which
         is the same rule the input path already follows for dropped keystrokes.
 
-        ``desync`` rather than a plain ``notice`` because the consequence is
-        specific and actionable: a full-screen program is now drawing from a
-        gapped stream, and the remedy is a resync (or the program's own
-        repaint) -- not an acknowledgement.
+        Protocol v2 clients get the **exact** lost range as a ``gap`` message
+        before the generic notice: "you lost bytes 123000..123456" is
+        actionable (take a snapshot, know what is missing), while "some output
+        was omitted" is not. The range is only sent once per burst, mirroring
+        the notice.
         """
+        if self._protocol_version >= 2 and self._lost_from is not None:
+            lost_from = self._lost_from
+            lost_to = self._lost_to if self._lost_to is not None else lost_from
+            self._lost_from = None
+            self._lost_to = None
+            with contextlib.suppress(Exception):
+                self._put_control(
+                    {
+                        "type": "gap",
+                        "from": lost_from,
+                        "to": lost_to,
+                        "reason": "shed",
+                    }
+                )
+                if self.on_gap is not None:
+                    self.on_gap(lost_from, lost_to)
         if self._shed_notice_open:
             return
         self._shed_notice_open = True
@@ -249,10 +289,53 @@ class WsClient:
             self._drop_oldest_control()
             if len(self._control) == before:
                 break
+        if self._protocol_version >= 2 and "v" not in message:
+            message = {**message, "v": 2}
         self._seq += 1
         self._control.append((self._seq, message))
         self._wakeup.set()
         return True
+
+    def ack(self, seq: int) -> None:
+        """Record an ACK from the client. Stale ACKs are ignored."""
+        if seq > self.last_acked_seq:
+            self.last_acked_seq = int(seq)
+
+    def put_data(self, seq: int, payload: bytes, flags: int = 0) -> None:
+        """Queue one sequenced terminal frame (protocol v2)."""
+        if self._closed:
+            raise ClientGone("连接已关闭")
+        if self._protocol_version < 2:
+            # The legacy endpoint speaks raw bytes. ``_put_data`` calls this
+            # method whenever the sink has it, and every ``WsClient`` does --
+            # so without this branch v1 viewers received a 10-byte v2 header
+            # before every PTY read and rendered it as garbage.
+            self.put(payload)
+            return
+        if flags & FLAG_SNAPSHOT and len(payload) > MAX_DATA_FRAME:
+            # A large screen (up to 1000×1000) can serialize to more than one
+            # protocol frame. The writer would otherwise raise inside
+            # ``encode_data`` and drop the connection. Chunks keep the same
+            # snapshot anchor: the client paints them in order and acknowledges
+            # the screen sequence, not the byte count.
+            for offset in range(0, len(payload), MAX_DATA_FRAME):
+                self.put_data(seq, payload[offset : offset + MAX_DATA_FRAME], flags)
+            return
+        ends_inside = self._tracker.feed(payload)
+        if self._max_bytes > 0 and len(payload) > self._max_bytes:
+            self.dropped_bytes += len(payload)
+            self.dropped_events += 1
+            note_shed_frames()
+            if self._lost_from is None:
+                self._lost_from = seq
+            self._lost_to = seq + len(payload)
+            self._announce_shed()
+            return
+        self._shed_for(len(payload))
+        self._pending_bytes += len(payload)
+        self._seq += 1
+        self._binary.append((self._seq, payload, ends_inside, int(seq), int(flags)))
+        self._wakeup.set()
 
     def put(self, item: bytes | dict[str, Any]) -> None:
         """Queue ``item``; terminal data is shed under pressure, never the link."""
@@ -290,7 +373,7 @@ class WsClient:
             self._shed_for(len(item))
             self._pending_bytes += len(item)
             self._seq += 1
-            self._binary.append((self._seq, item, ends_inside))
+            self._binary.append((self._seq, item, ends_inside, None, 0))
             self._wakeup.set()
         else:
             self._put_control(item)
@@ -332,9 +415,12 @@ class WsClient:
                     not self._control or self._binary[0][0] < self._control[0][0]
                 )
                 if use_binary:
-                    _seq, frame, _inside = self._binary.popleft()
+                    _seq, frame, _inside, data_seq, flags = self._binary.popleft()
                     self._pending_bytes = max(0, self._pending_bytes - len(frame))
-                    await self._ws.send_bytes(frame)
+                    if data_seq is None:
+                        await self._ws.send_bytes(frame)
+                    else:
+                        await self._ws.send_bytes(encode_data(data_seq, frame, flags))
                 else:
                     _seq, message = self._control.popleft()
                     await self._ws.send_json(message)

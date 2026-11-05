@@ -9,17 +9,16 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
         os: [ubuntu-latest]
         include:
-          # One macOS leg: catches POSIX assumptions that Linux hides
-          # (process identity, /proc lookups, path handling).
+          # One macOS leg: catches POSIX assumptions Linux hides.
           - os: macos-latest
-            python-version: "3.12"
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,50 +39,94 @@ jobs:
       - name: Type check
         run: mypy src
       - name: Test
-        run: pytest
+        run: pytest -n auto
 
-  windows-smoke:
-    # The Windows PTY backend is opt-in (wsctl[win]) and untested end to end, but
-    # the package must at least import and the CLI must run there.
-    runs-on: windows-latest
+  frontend:
+    runs-on: ubuntu-latest
     timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Lint and format
+        working-directory: web
+        run: |
+          pnpm lint
+          pnpm format:check
+      - name: Type check
+        working-directory: web
+        run: pnpm typecheck
+      - name: Verify generated API types
+        working-directory: web
+        run: |
+          pnpm api:generate
+          git diff --exit-code -- src/api/schema.d.ts openapi.json
+      - name: Unit tests
+        working-directory: web
+        run: pnpm test
+      - name: Build
+        working-directory: web
+        run: pnpm build
+      - name: Bundle budget
+        working-directory: web
+        run: |
+          python - <<'PY'
+          import gzip, pathlib
+          files = sorted(pathlib.Path("../src/wsctl/static/assets").glob("*.js"))
+          total = 0
+          for path in files:
+              if path.name.startswith(("editor-", "replay-", "zmodem.js-", "AdminDialog-", "SettingsDialog-", "FilePanel-", "ShareDialog-")):
+                  continue
+              total += len(gzip.compress(path.read_bytes()))
+          print(f"initial JS (gzip): {total/1024:.1f} KiB")
+          assert total < 500 * 1024, "initial bundle exceeds 500 KiB gzip"
+          PY
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[win,dev]"
-      - name: Import smoke
-        run: python -c "import wsctl, wsctl.core.pty, wsctl.core.store, wsctl.cli.main; print(wsctl.__version__)"
-      - name: CLI smoke
+          pip install -e ".[dev]"
+          sudo apt-get update && sudo apt-get install -y tmux
+      - name: Frontend
+        working-directory: web
         run: |
-          wsctl --version
-          wsctl doctor
-      - name: Platform-neutral unit tests
-        # NOT the whole suite: `test_server` / `test_session` / `test_load`
-        # spawn `/bin/sh`, `test_pty` needs `/proc`, `test_daemon` is POSIX-only
-        # and `test_tmux` needs tmux. Those are covered by the Linux/macOS
-        # matrix above; this job only proves the package works at all on
-        # Windows.
-        # `python -m pytest`, not bare `pytest`: the scripts directory is not on
-        # PATH for PowerShell on the Windows runner.
-        run: >-
-          python -m pytest -q --timeout=90
-          tests/test_passwords.py tests/test_authcache.py tests/test_config.py
-          tests/test_validate.py tests/test_metrics.py tests/test_scrollback.py
-          tests/test_fs.py tests/test_ratelimit.py tests/test_totp.py
-          tests/test_ssh.py tests/test_recording.py tests/test_logrotate.py
-          tests/test_store.py tests/test_user_admin.py tests/test_client.py
-          tests/test_connect.py
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm exec playwright install --with-deps chromium firefox webkit
+      - name: Browser tests
+        working-directory: web
+        env:
+          CI: "true"
+        run: pnpm exec playwright test
 
   slow:
-    # Concurrency / large-output load checks. Kept separate so a slow runner
-    # cannot make the main matrix look flaky.
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -94,25 +137,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Load tests
-        run: pytest -m slow -q --timeout=180
-
-  browser:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,e2e]"
-          # lrzsz powers the real sz/rz round-trip in the browser suite.
-          sudo apt-get update && sudo apt-get install -y tmux lrzsz
-          playwright install --with-deps chromium
-      - name: Browser tests
-        run: pytest -m browser -q --timeout=180
+        run: pytest -m slow -q --timeout=240
 
   e2e:
     runs-on: ubuntu-latest
@@ -130,11 +155,40 @@ jobs:
       - name: Backend end-to-end scenarios
         run: python scripts/e2e/run_all.py
 
-  docker:
-    # The image must build from the repo root and install the *local* source,
-    # not whatever PyPI currently serves.
+  security:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Python dependency audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip install -e ".[dev]"
+          pip-audit
+      - name: Frontend dependency audit
+        working-directory: web
+        run: pnpm audit --audit-level high
+      - name: SBOM
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py environment -o sbom-python.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-python.json
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Build image

@@ -62,9 +62,6 @@ class Options:
     def names(self) -> list[str]:
         return sorted(self._values)
 
-    def as_dict(self) -> dict[str, Any]:
-        return dict(self._values)
-
 
 @dataclass(frozen=True)
 class Rule:

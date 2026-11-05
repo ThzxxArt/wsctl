@@ -914,3 +914,28 @@ async def test_share_access_rejects_non_ascii_tokens_without_raising() -> None:
         )
     finally:
         await manager.shutdown()
+
+
+async def test_share_state_distinguishes_unknown_from_revoked() -> None:
+    """A cold cache must not be read as a revocation.
+
+    The broadcast filter runs synchronously for every chunk. When it treated a
+    cache miss as "revoked", an aged share entry silently detached the viewer
+    from the session's client set for the rest of the connection.
+    """
+    manager = SessionManager()
+    session = await manager.create(SessionSpec(name="s", argv=[SHELL]))
+    try:
+        session.set_external_share_resolver(lambda token: None, lambda token: False)
+        assert session.share_state("wss_unknown") is None
+        session.set_external_share_resolver(lambda token: "read", lambda token: True)
+        assert session.share_state("wss_known") is True
+        session.set_external_share_resolver(lambda token: None, lambda token: True)
+        assert session.share_state("wss_revoked") is False
+        # A legacy token that was rotated away is definitely invalid, even
+        # though the database resolver has never heard of it.
+        legacy = session.create_share()
+        session.revoke_share()
+        assert session.share_state(legacy) is False
+    finally:
+        await manager.shutdown()

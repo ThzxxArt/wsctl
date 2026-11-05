@@ -1,878 +1,329 @@
-# wsctl
-
-[![CI](https://github.com/ThzxxArt/wsctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ThzxxArt/wsctl/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/wsctl.svg)](https://pypi.org/project/wsctl/)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/ThzxxArt/wsctl/blob/main/LICENSE)
-
-> **单机部署的 Web 在线终端。** 一条命令起服务，浏览器或命令行得到完整 shell；
-> 终端**会话与连接解耦**——关掉笔记本不会杀掉 shell，重连即恢复屏幕。
-
-`wsctl` 是 [ttyd](https://github.com/tsl0922/ttyd) 的现代 Python 超集：保留
-「一条命令把终端搬上浏览器」的心智，并补齐**多会话、多用户 RBAC、审计、分享、
-录制、文件面板与可观测性**，`pip install` 零编译。
-
-```
-浏览器 (xterm.js) ─┐
-                   ├─ WebSocket ─┐
-CLI (wsctl connect)┘             │
-                       ┌─────────▼──────────┐        ┌──────────────┐
-                       │   SessionManager    │──PTY──▶  bash / ssh   │
-                       │  (asyncio, 1..N)    │        └──────────────┘
-                       │  scrollback replay  │
-                       └─────────────────────┘
-```
-
-## 目录
-
-- [wsctl 是什么](#wsctl-是什么)
-- [界面截图](#界面截图)
-- [环境要求](#环境要求)
-- [安装](#安装)
-- [升级](#升级)
-- [卸载](#卸载)
-- [快速开始](#快速开始)
-- [使用教程](#使用教程)
-- [后台运行（非 systemd）](#后台运行非-systemd)
-- [配置详解](#配置详解)
-- [CLI 命令参考](#cli-命令参考)
-- [部署](#部署)
-- [安全](#安全)
-- [常见问题与故障排查](#常见问题与故障排查)
-- [开发](#开发)
-- [许可](#许可)
-
-## wsctl 是什么
-
-一个进程托管 N 个终端会话，浏览器多标签或 CLI 均可接入；会话独立于连接，断线
-重连即回放屏幕。
-
-**核心能力**
-
-- **多会话 / 多标签**：一个服务托管多个终端，Web 端标签切换，CLI 可枚举与连接。
-- **分屏布局**：一个标签页里把 1..N 个会话并排（`Alt+\` / `Alt+Shift+\`），拖拽
-  调比例、移动焦点、关 pane 不杀会话；**刷新后布局原样恢复**。
-- **会话与连接解耦**：客户端断开不影响会话；关闭标签默认只**断开连接**。
-- **后台动静可见**：后台会话响铃 / 有输出 / 改标题 / 退出时，标签、页面标题、
-  favicon 与系统通知都会告诉你（系统通知需浏览器授权，可关）。
-- **连接自愈**：前端与 `wsctl connect` 断线自动重连并回放屏幕；退避重试期间状态栏
-  显示「重连中（Ns 后重试）」，点击可立即重连；服务端回收半开连接。
-- **跨重启恢复（可选 tmux 后端）**：shell 跑在 tmux 里，服务重启后自动重新挂载。
-- **多用户 + RBAC**：`admin` 管理全部；普通用户仅限自己的会话。
-- **分享**：只读/可写分享链接，带二维码、可设有效期、可撤销，**跨服务重启依然有效**。
-- **SSH 会话**：会话直接是到远程主机的 `ssh` 连接。
-- **文件面板**：在可配置根目录内浏览、新建目录、重命名、删除、预览与就地编辑文本、
-  **就地预览图片**、下载、上传（含拖拽到具体目录、进度条与取消）、按名称过滤与分页。
-- **录制与回放**：asciinema cast 录制，浏览器内回放。
-- **终端能力**：Sixel 图像、可选 ZMODEM（`sz`/`rz`）传输、终端搜索。
-- **审计与 Webhook**：登录、会话、文件、管理操作全量审计，可推送 Webhook。
-- **可观测**：`/healthz`、Prometheus `/metrics`、结构化 JSON 日志。
-- **资源有界**：保留策略、每用户会话配额、每会话内存上限与背压。
-- **后台生命周期**：`wsctl start/stop/restart/status/logs/reload`，无需 systemd。
-- **零停机重启**：`SO_REUSEPORT` 让新实例先接管端口再停旧实例。
-- **配置热更新**：大部分配置改动无需重启，`wsctl reload` 可主动触发。
-- **参数强校验**：互斥/依赖参数在启动前报错，绝不静默忽略其一。
-- **配置写错必报错**：热重载遇到非法值会原样打印错误并退出非零，绝不静默吞掉。
-- **密码策略**：新建/改密强制非空且至少 8 位（存量密码不强制修改，`doctor` 会提示）。
-- **Web 管理面**：概览仪表盘（实例 / 统计 / 最近事件）、用户管理（含 TOTP 二维码）、
-  审计日志、录制文件、**配置在线编辑**（保留行内注释，`restart` 类只读并说明原因）。
-- **会话历史**：已结束的会话（终止 / 过期 / 停止）保留在「会话 → 已结束」页签，
-  带**结束原因**（不只一个枚举值），可查看详情（含完整时间线）或用相同命令重新打开。
-- **全中文界面**：Web UI 与 CLI 输出均为中文。
-
-**与 ttyd 的差异**
-
-| 维度 | ttyd | wsctl |
-|---|---|---|
-| 会话模型 | 一进程 = 一会话 = 一端口 | 单服务托管 N 个会话 |
-| 多终端 | 多进程 / 依赖 tmux | 原生多会话 + 多标签 |
-| 用户体系 | 单一 basic-auth 凭据 | 多用户 + RBAC |
-| 审计 | 无 | 结构化审计日志 + Webhook |
-| 连接语义 | 与进程耦合 | 解耦，重连回放屏幕 |
-| 配置 | 命令行参数 | 配置文件 + CLI + 热更新 |
-| 可观测 | 基础日志 | `/healthz` · `/metrics` · JSON 日志 |
-| 语言 | C | Python |
-
-> **性能边界（诚实声明）**：`wsctl` 不在**原始吞吐**上对标 C + libuv 的 ttyd。
-> 纯 Python 转发在 `cat` 大文件、`yes` 刷屏这类场景打不过 C。`wsctl` 的稳定来自
-> **架构**——会话与连接解耦、输出背压、每会话隔离——而非单连接速度。
-
-## 界面截图
-
-| 登录 | 终端 | 文件面板 |
-|---|---|---|
-| ![登录](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/01-login.png) | ![终端](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/02-terminal.png) | ![文件](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/03-files.png) |
-
-| 会话列表 | 管理 · 用户 | 管理 · 审计 |
-|---|---|---|
-| ![会话](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/04-sessions.png) | ![用户](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/05-admin-users.png) | ![审计](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/06-admin-audit.png) |
-
-![设置](https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/07-settings.png)
-
-前端零构建（内嵌 xterm.js），并有一套轻量设计系统：设计令牌、统一 Modal（Esc/遮罩
-关闭 + 焦点陷阱）、Toast、图标化工具栏（窄屏折叠为「更多」）、主题色预览、空态与
-骨架屏、跟随系统的深/浅色主题、`:focus-visible` 焦点环与 `aria-label`。
-
-## 环境要求
-
-| 项 | 要求 |
-|---|---|
-| Python | **3.11 及以上**（3.11 / 3.12 / 3.13 均已在 CI 验证） |
-| 操作系统 | Linux（推荐）或 macOS；Windows 需 `wsctl[win]` |
-| 可选组件 | `tmux`（跨重启恢复）、`ssh` 客户端（SSH 会话）、`lrzsz`（ZMODEM） |
-
-> 没有 3.11+？可先用 [uv](https://docs.astral.sh/uv/) 安装独立 Python：
-> `uv python install 3.13`。**切勿删除发行版自带的 Python**（apt 等系统组件依赖它）。
-
-## 安装
-
-推荐用 **pipx** 或 **uv** 安装到隔离环境，避免污染系统 Python；想隔离到自建 venv
-也可用方式三。
-
-### 方式一：pipx（推荐）
-
-```bash
-# 安装 pipx（Debian/Ubuntu）
-sudo apt update && sudo apt install -y pipx
-# 或：python3 -m pip install --user pipx && python3 -m pipx ensurepath
-
-pipx install wsctl          # 安装并暴露 wsctl 到 PATH
-```
-
-### 方式二：uv（推荐，自带 Python 管理）
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-exec "$SHELL" -l
-
-uv python install 3.13      # 若系统 Python 太旧
-uv tool install wsctl
-```
-
-### 方式三：venv + pip（完全自控）
-
-```bash
-python3.11 -m venv /opt/wsctl/venv
-/opt/wsctl/venv/bin/pip install -U pip
-/opt/wsctl/venv/bin/pip install wsctl
-# 之后用绝对路径调用：/opt/wsctl/venv/bin/wsctl ...
-```
-
-> 不建议 `sudo pip install`。若必须，请加 `--user` 并处理 PATH。
-
-### 方式四：Docker
-
-仓库内提供 [`contrib/docker/Dockerfile`](contrib/docker/Dockerfile) 与
-[`contrib/docker/docker-compose.yml`](contrib/docker/docker-compose.yml)。
-
-> **必须在仓库根目录构建**（`-f contrib/docker/Dockerfile .`）：构建上下文是仓库根，
-> 这样装进去的是**本地源码**；在 `contrib/docker` 目录里构建只会装到 PyPI 上的旧版。
-
-```bash
-# 方式一：docker build
-docker build -t wsctl -f contrib/docker/Dockerfile .
-docker run -d --name wsctl --restart unless-stopped \
-  -p 127.0.0.1:7681:7681 -v "$PWD/data:/data" \
-  -e WSCTL_ADMIN_PASSWORD='改成你的强密码' wsctl
-
-# 方式二：docker compose（密码必须显式给出，否则直接报错退出）
-cd contrib/docker
-WSCTL_ADMIN_PASSWORD='改成你的强密码' docker compose up -d
-```
-
-镜像自带 `tmux`、`openssh-client`、`lrzsz`，因此 tmux 后端、SSH 后端与 ZMODEM
-传输开箱可用。不给 `WSCTL_ADMIN_PASSWORD` 时，首次启动会生成随机密码并打印在日志里。
-
-### 方式五：从源码
-
-```bash
-git clone https://github.com/ThzxxArt/wsctl.git
-cd wsctl
-python3.11 -m venv .venv && . .venv/bin/activate
-pip install ".[dev]"        # 含开发/测试工具；仅使用可改为 pip install .
-```
-
-### 验证安装
-
-```bash
-wsctl --version             # 例如 wsctl 0.1.14
-wsctl doctor                # 环境/配置/运行状态自检（--json 便于脚本消费）
-```
-
-`doctor` 会检查 Python 版本、数据目录可写、数据库、配置文件、默认 shell、
-`tmux`/`ssh`/`lrzsz`、`SO_REUSEPORT`、监听端口占用、后台启动能力、**磁盘剩余空间**、
-**密码策略**、**日志文件与轮转阈值**以及**系统时间**（TOTP 依赖时钟准确）。
-
-「服务器」一项**优先探测你正在跑的那个实例**，而不是 `wsctl login` 留下的缓存地址——
-后者指向早已下线的端口时，会把一台完全健康的机器报成「服务器失败」。显式传 `--url`
-则按你说的查；没有实例在跑时才回退到缓存地址，并注明来源与 `wsctl logout` 清理方式。
-
-> 想让 `wsctl <Tab>` 自动补全子命令与选项？见 [shell 补全](#shell-补全)。
-
-### 可选依赖（extras）
-
-| extra | 内容 | 用途 |
-|---|---|---|
-| `wsctl[win]` | `pywinpty` | Windows 下的 PTY 支持 |
-| `wsctl[e2e]` | `playwright` | 浏览器级端到端测试 |
-| `wsctl[dev]` | ruff / mypy / pytest 等 | 开发与测试 |
-
-## 升级
-
-先看当前版本，再升级，随后重启服务。
-
-```bash
-wsctl --version
-```
-
-**按安装方式选择**：
-
-```bash
-pipx upgrade wsctl                       # pipx
-uv tool upgrade wsctl                    # uv
-pip install -U wsctl                     # venv + pip
-```
-
-Docker：
-
-```bash
-docker pull wsctl            # 或重新 build
-docker rm -f wsctl && docker run -d ...  # 用新镜像重建容器（数据在 volume 中不受影响）
-```
-
-源码方式：
-
-```bash
-cd wsctl && git pull && pip install -U ".[dev]"
-```
-
-**升级后重启服务**：
-
-```bash
-wsctl restart --rolling      # 推荐：先起后停，不切断连接，可在 wsctl 自己的终端里执行
-sudo systemctl restart wsctl # systemd
-```
-
-> ⚠️ **不要在 wsctl 网页终端里执行 `wsctl stop` / `wsctl restart`（不带 `--rolling`）**。
-> 停止实例会结束它托管的会话——**执行命令的这个 shell 也在会话里**，命令的后半段
-> （例如 `&& wsctl start`）永远不会执行，服务停了就没人再拉起来。现在 CLI 会**拒绝**
-> 并说明后果；请改用 `wsctl restart --rolling`，或在 SSH / 物理终端执行。
->
-> **首次部署建议带上 `wsctl start --reuse-port`**：之后 `restart --rolling` 为**零停机**。
-> 未带时第一次滚动切换会有已告知的毫秒级窗口，此后同样零停机。
-
-**回退到旧版本**：
-
-```bash
-pipx install --force "wsctl==0.1.2"
-# 或 pip install "wsctl==0.1.2"
-```
-
-> 说明：升级是向前兼容的，数据库在启动时自动做幂等迁移（`PRAGMA table_info` +
-> `ALTER TABLE`）。若从小版本回退到大版本**之前**，请先备份（`wsctl backup`），
-> 因为新版本可能已写入旧版本不认识的列（例如 0.1.4 为分享持久化新增的
-> `share_*` 三列）。
->
-> **零停机升级**：配合 `reuse_port = true` 与 tmux 后端，可先起新实例再停旧实例，
-> 连会话都不中断。见 [零停机重启](#零停机重启)。
-
-## 卸载
-
-### 1. 先停止服务
-
-```bash
-wsctl stop                   # 后台生命周期启动的
-sudo systemctl stop wsctl    # systemd 管理的
-sudo systemctl disable wsctl
-```
-
-### 2. 卸载程序
-
-```bash
-pipx uninstall wsctl         # pipx
-uv tool uninstall wsctl      # uv
-pip uninstall wsctl          # venv + pip（在对应 venv 中执行）
-```
-
-Docker：
-
-```bash
-docker rm -f wsctl
-docker rmi wsctl
-```
-
-systemd：删除单元文件并重载。
-
-```bash
-sudo rm -f /etc/systemd/system/wsctl.service
-sudo systemctl daemon-reload
-```
-
-### 3. 清理数据与配置（可选）
-
-卸载程序**不会**删除你的数据与配置（数据库、录制、凭据）。确认不再需要后手动删除：
-
-```bash
-rm -rf ~/.local/share/wsctl          # 数据目录：wsctl.db + recordings + run/（pid、日志）
-rm -rf ~/.config/wsctl               # 配置文件 + CLI 凭据 credentials.json
-# 若自定义过 data_dir / file_root，请按配置删除对应目录
-```
-
-> 想保留历史？先备份：`wsctl backup ~/wsctl-backup.tar.gz --include-config`。
-
-### 4. 彻底清理清单
-
-- [ ] 停止并禁用服务（后台实例 / systemd）
-- [ ] 卸载程序（pipx / uv / pip / Docker / 源码 venv）
-- [ ] 删除数据目录与配置目录
-- [ ] 若用过反向代理，删除对应 `nginx` 站点并 `reload`
-- [ ] 若用过自定义用户，删除专用系统账号（如 `userdel wsctl`）
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/banner.svg" alt="wsctl — 单机部署的 Web 终端工作台" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/ThzxxArt/wsctl/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ThzxxArt/wsctl/ci.yml?branch=main&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white" alt="CI"></a>
+  <a href="https://pypi.org/project/wsctl/"><img src="https://img.shields.io/pypi/v/wsctl?style=flat-square&amp;logo=pypi&amp;logoColor=white" alt="PyPI"></a>
+  <a href="https://pypi.org/project/wsctl/"><img src="https://img.shields.io/pypi/pyversions/wsctl?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python"></a>
+  <a href="https://github.com/ThzxxArt/wsctl/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/protocol-v2-7c5cff?style=flat-square" alt="Protocol v2">
+  <img src="https://img.shields.io/badge/OpenAPI-3.1-10b981?style=flat-square&amp;logo=openapiinitiative&amp;logoColor=white" alt="OpenAPI 3.1">
+  <img src="https://img.shields.io/badge/SQLite-3-0ea5e9?style=flat-square&amp;logo=sqlite&amp;logoColor=white" alt="SQLite 3">
+</p>
+
+<p align="center">
+  <strong>一条命令，把完整的终端工作台搬进浏览器。</strong><br>
+  会话与连接解耦 · 断线精确续传或屏幕快照 · 多用户 RBAC · 审计 · 分享 · 录制
+</p>
+
+<p align="center">
+  <a href="#快速开始">🚀 快速开始</a> ·
+  <a href="#界面">🖼️ 界面</a> ·
+  <a href="#配置">⚙️ 配置</a> ·
+  <a href="#部署">📦 部署</a> ·
+  <a href="#文档">📚 文档</a>
+</p>
+
+---
+
+## 为什么是 wsctl
+
+| 🔁 会话与连接解耦 | 🪟 一个真正的终端工作台 | 🛡️ 从单人到团队 |
+| :--- | :--- | :--- |
+| 关掉笔记本不会杀掉 shell。重连时从断点**精确续传**；滚动缓冲已淘汰时自动取**屏幕快照**，快照不可用则回退到全量回放并让应用自身重绘。 | 标签、分屏、命令面板、命令块、终端搜索、文件编辑、主题、PWA 与移动端工具栏，都在一个页面里。 | 多用户 RBAC、TOTP、API Keys、分享链接、审计哈希链、Webhook 与 Prometheus 指标。 |
+
+`wsctl` 是单机部署的 Web 终端服务：一个进程托管 N 个会话，浏览器和 CLI 都是它的客户端。
+它不把“网页终端”做成一个 `<iframe>` 里的 shell，而是把**终端会话**当作一等对象——
+连接断了，会话还在；服务重启了，tmux 会话还能被接管；有人分享只读链接，权限边界也在。
+
+### 核心能力
+
+- **协议 v2**：`/ws/v2` 使用带序号的数据帧，协商 `wsctl.terminal.v2`；支持
+  `ack` / `resume` / `gap` / `snapshot`。慢客户端优先丢帧而不是立即断链，
+  失步后由应用自身重绘修复。
+- **多会话 / 多标签 / 分屏**：一个标签里可以并排或上下分屏，拖拽调比例、键盘换焦点、
+  刷新后布局恢复；关掉分屏只是拆掉视图，不会结束会话。
+- **多用户与权限**：`admin` / `user` 两级 RBAC；管理员可管理全部会话、用户、审计、录制；
+  普通用户只能看到自己的会话。
+- **分享**：一个会话多条链接，`read` / `write` / `control` 三种 scope，支持标签、
+  有效期、随时撤销与在线观众列表；`/s/<token>` 是干净 URL，链接跨服务重启有效。
+- **API Keys**：`wsctl_...` bearer token，只存 SHA-256 哈希；scope、过期时间、
+  最后使用时间；HTTP 与两个 WebSocket 端点都执行同一套 scope。
+- **HTTP API v2**：`/api/v2` 提供 RFC 9457 Problem Details、游标分页、
+  `Idempotency-Key`、ETag 与 OpenAPI 3.1；旧 `/api` 保留一版带 `Deprecation`
+  头的兼容别名。
+- **审计**：登录、会话、文件、分享、用户与配置操作全量记录；每条记录带
+  `prev_hash` / `hash`，`/api/v2/audit/verify` 可校验哈希链；支持 Webhook。
+- **文件工作区**：浏览、分页、过滤、上传（队列/进度/取消/409 覆盖确认）、下载、
+  新建目录、重命名、删除空目录、文本预览与原子编辑、图片按内容预览。
+- **录制与回放**：asciinema cast 录制，浏览器内回放；会话、状态、大小进入 SQLite
+  索引，可按会话下载，也可在管理员录制库中管理。
+- **终端能力**：xterm.js 6、Shell Integration（OSC 133/633）命令块、Sixel 图像、
+  可选 ZMODEM（`sz`/`rz`）、搜索、字号与主题导入。
+- **工作台状态**：布局可保存到服务端并在设备间加载；命令块、会话历史（结束原因 /
+  退出码 / 时间线 / 重新打开）、在线观众与后台动静提醒让“另一个标签里发生了什么”可见。
+- **PWA 与通知**：可安装为 PWA，离线时显示恢复提示；Web Push（VAPID，可选）、
+  移动端工具栏与窄屏堆叠布局。
+- **后端**：本地 PTY、tmux（跨重启恢复）、SSH（跳板）；`ssh -o` 选项有本地命令执行白名单。
+- **运维**：`wsctl start/stop/status/logs/restart/reload` 内置后台生命周期；
+  systemd、Docker、nginx 反向代理示例随仓库提供；`restart --rolling` 配合
+  `--reuse-port` 可零停机切换。
+- **可观测**：`/healthz`、`/readyz`、Prometheus `/metrics`、JSON 日志、请求 ID、
+  可选 OpenTelemetry；维护循环与事件循环延迟都进入指标。
+
+> **边界要诚实**：0.2.0 只支持 **SQLite**。PostgreSQL 在 0.3 提供，配置成其他
+> `database_url` 会在启动时明确拒绝，不会“半支持”。纯 Python 转发也不以原始吞吐
+> 对标 C/libuv 终端；wsctl 的稳定来自会话解耦、有界缓冲与背压，而不是单连接速度。
+
+## 界面
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/02-terminal.png" alt="wsctl 0.2.0 终端工作台：标签、分屏、命令块与会话侧栏" width="100%">
+  <br>
+  <sub>终端工作台 · 标签 / 分屏 / 命令块 / 会话侧栏 / 实时状态</sub>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/03-files.png" alt="文件面板" width="49%">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/04-sessions.png" alt="会话列表与历史" width="49%">
+  <br>
+  <sub>文件面板 · 会话列表 / 历史 / 结束原因 / 重新打开</sub>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/05-admin-users.png" alt="用户管理" width="49%">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/06-admin-audit.png" alt="审计日志" width="49%">
+  <br>
+  <sub>用户与 TOTP · 审计与哈希链校验</sub>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/01-login.png" alt="登录页" width="49%">
+  <img src="https://raw.githubusercontent.com/ThzxxArt/wsctl/main/docs/screenshots/07-settings.png" alt="设置" width="49%">
+  <br>
+  <sub>登录 · 主题 / 快捷键 / 服务器配置</sub>
+  <br>
+  <sub>以上截图均来自 wsctl 0.2.0 实际界面</sub>
+</p>
 
 ## 快速开始
 
-### 前台启动（首次试用）
+### 1. 安装
 
 ```bash
-wsctl serve
+pipx install wsctl
 ```
 
-首次运行会在 `~/.local/share/wsctl/` 建库并创建 `admin`，**随机密码打印在标准错误**；
-也可自行指定：
+没有 pipx？用 `uv` 或普通 venv 也可以，见[安装](#安装)。要求 **Python 3.12+**。
+
+### 2. 启动
 
 ```bash
-wsctl serve --admin-password '你的强密码'
+WSCTL_ADMIN_PASSWORD='换成你的强密码' wsctl start --reuse-port
 ```
 
-浏览器打开 <http://127.0.0.1:7681>，用 `admin` 登录即得到一个 shell。
+`--reuse-port` 让之后的 `wsctl restart --rolling` 可以零停机。首次运行会在
+`~/.local/share/wsctl/` 建库、创建 `admin`；不传密码环境变量时会生成随机密码，
+用 `wsctl logs` 查看。
 
-### 后台启动（常驻，无需 systemd）
+### 3. 打开浏览器
+
+```text
+http://127.0.0.1:7681
+```
+
+登录后即可新建终端。右上角的 `+`、命令面板（`Ctrl/Cmd+Shift+P`）或快捷键
+`Ctrl/Cmd+Shift+T` 都能创建会话。
+
+### 4. 从命令行接入
 
 ```bash
-wsctl start --admin-password '你的强密码'   # 后台运行
-wsctl status                                # 查看状态（--json 便于脚本）
-wsctl logs -f                               # 跟踪日志（首次密码也在这里）
-wsctl stop                                  # 停止
+wsctl login http://127.0.0.1:7681
+wsctl connect
 ```
 
-### 用命令行连上去
+`wsctl connect` 会断线自动重连；默认创建新会话，也可以 `-s <session-id>` 连接已有会话。
+
+### 5. 自检
 
 ```bash
-wsctl login http://127.0.0.1:7681     # 交互式输入密码，凭据缓存到本地
-wsctl connect                          # 在当前终端打开远程 shell（断线自动重连）
-wsctl logout                           # 清除本地缓存凭据
+wsctl doctor
+wsctl status
 ```
 
-启用了两步验证的账号同样可以从 CLI 登录：
+`doctor` 会检查 Python、数据目录、数据库、配置文件、shell、tmux/ssh、端口占用、
+磁盘空间、日志轮转与系统时间（TOTP 依赖时钟）；`--json` 适合脚本消费。
+
+## 0.2.0 亮点
+
+| 领域 | 0.2.0 |
+| :--- | :--- |
+| 前端 | 重写为 **Vue 3.5 + TypeScript 5.9 + Vite 8 + Pinia + Naive UI + xterm.js 6**；标签、分屏、命令面板、文件编辑、主题导入、PWA 与移动端工具栏 |
+| 协议 | **`/ws/v2` + `wsctl.terminal.v2`**；序号、ACK、精确续传、gap、屏幕快照；旧 `/ws` 保留一版兼容别名，但只发送原始字节 |
+| 数据 | **SQLAlchemy 2.1 + Alembic**；schema v6，head `0004_session_exit_code`；迁移前自动一致性备份；0.2.0 唯一支持 SQLite |
+| 配置 | 分节 TOML，支持 `"8MiB"` / `"12h"`；`wsctl config migrate` 保留注释并备份；热更新 / 仅新对象 / 需重启三档如实标注 |
+| 安全 | Argon2、TOTP、API Key scope、分享 token 哈希、Origin + scheme 校验、CSP/SRI、请求体上限、IP/登录限速、数据库与录制文件 `0600` |
+| 观测 | structlog、prometheus-client、OpenTelemetry（可选）、请求 ID、`/readyz`、审计哈希链、Webhook |
+| 质量 | pytest **718**、Vitest **34**、Playwright Chromium / Firefox / WebKit / 移动端、视觉回归、后端 e2e 全场景 |
+
+> 从 0.1.x 升级前请先备份并按 [迁移指南](https://github.com/ThzxxArt/wsctl/blob/main/docs/MIGRATION-0.2.0.md)
+> 执行 `config migrate` → `migrate --apply` → 启动演练。0.2.0 数据库不能直接回退到 0.1.x。
+
+## 架构
+
+```mermaid
+flowchart LR
+  B["浏览器<br/>Vue 3 + xterm.js 6"] -->|"/ws/v2"| A["FastAPI<br/>REST + WebSocket"]
+  C["wsctl connect"] -->|"/ws/v2"| A
+  A --> M["SessionManager<br/>SessionActor × N"]
+  M --> P["本地 PTY"]
+  M --> T["tmux"]
+  M --> S["SSH"]
+  A --> D[("SQLite<br/>schema v6")]
+  A --> R["录制<br/>asciinema cast"]
+  A --> AU["审计<br/>哈希链 + Webhook"]
+```
+
+**一个会话一个串行化 Actor。** 输出、attach、detach、stop 都进入同一个 mailbox，
+状态变更不再依赖“谁先抢到锁”。广播在会话锁内把数据追加到带字节序号的
+`Scrollback`，再按客户端各自的预算出队；慢查看者被丢帧而不是被断链，失步会收到
+精确的 `gap` 范围。
+
+## 安装
+
+| 方式 | 适合 | 命令 |
+| :--- | :--- | :--- |
+| **pipx** | 大多数用户，隔离且自动进 PATH | `pipx install wsctl` |
+| **uv** | 想顺便管理 Python 版本 | `uv tool install wsctl` |
+| **venv + pip** | 完全自控的部署 | 见下 |
+| **Docker** | 容器化 / 试跑 | 见[部署](#部署) |
+| **源码** | 开发与贡献 | `pip install -e ".[dev]"` |
 
 ```bash
-wsctl login http://host:7681 -u admin --totp 123456   # 直接传验证码
-wsctl login http://host:7681 -u admin                 # 省略 --totp，被要求时交互输入
-WSCTL_TOTP=123456 wsctl login http://host:7681        # 脚本里用环境变量
+# venv + pip
+python3.12 -m venv /opt/wsctl/venv
+/opt/wsctl/venv/bin/pip install -U pip wsctl
+
+# 源码
+git clone https://github.com/ThzxxArt/wsctl.git
+cd wsctl
+python3.12 -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
-## 使用教程
+可选依赖：`wsctl[win]` 提供 Windows PTY；`tmux`、`ssh`、`lrzsz` 是系统命令，
+按需安装。发布 wheel 已内置前端构建产物，**用户侧不需要 Node/pnpm**。
 
-### 1. 会话管理（Web 端）
+## 配置
 
-- 顶部 **`+`**：新建会话对话框——可填名称、命令、工作目录、选择后端
-  （local / tmux / ssh）；选 ssh 时展开结构化表单（主机 / 用户 / 端口 / 私钥 /
-  `ssh -o` 选项）。全部留空即创建默认 shell；`Alt+N` 则跳过对话框直接新建。
-- 点击标签：切换；**双击标签**：重命名。
-- 标签上的 **`×`**：**断开连接**（会话仍在服务器上运行，不会被杀掉）。
-- **右键标签**：菜单选择「关闭标签（保持会话）」或「终止会话」。
-- **分屏**：`Alt+\` 把当前会话向右分成两栏（新开一个默认 shell 并排），
-  `Alt+Shift+\` 向下分；终端右键菜单另有「与已有会话向右分屏…」可以把**已经开着**
-  的会话并进来（同样有向右 / 向下两个入口）。分隔条可**拖动**调比例、**双击**复位；
-  `Alt+Shift+←/→/↑/↓` 在分屏之间移动键盘焦点。**关掉一个分屏只是拆掉那一栏**，
-  会话照常运行；标签上的 `⧉N` 徽标写着这个标签里有几栏。布局（含比例与焦点）
-  **刷新后原样恢复**；某一栏的会话结束后，那一栏**保留为「会话已结束」占位**
-  （不会把半边窗口让给邻居），关闭占位即可让旁边占满。
-- 顶部 **`会话`**：会话列表，可重新打开已断开的会话，或终止任意会话；支持
-  **按名称筛选**与**全部断开**。
-- 顶部 **`搜索`**（或 `Ctrl+Shift+F`）：在回滚缓冲中查找，**全部命中同时高亮**并显示
-  实时命中计数，`Enter` 下一个、`Shift+Enter` 上一个；可切换**区分大小写 / 全词 / 正则**
-  三种匹配方式。
-- 断线后前端自动重连并回放屏幕，无需重新登录。
-- **后台动静**：后台标签有输出会亮呼吸点、响铃会带计数角标、会话退出会弹通知；
-  页面标题显示 `● N 会话名 — wsctl`，favicon 也带未读数——页面不在前台也看得见。
-  三者可在「设置 → 后台动静提醒」里分别关闭；系统通知需浏览器授权，未授权时
-  自动降级为标签角标与标题提示。
-
-> 默认快捷键：`Alt+N` 新建、`Alt+W` 断开标签、`Alt+Shift+W` 终止会话、
-> `Alt+→/←` 切换标签、`Alt+L` 会话列表、**`Alt+Shift+F` 文件**、`Alt+S` 设置、
-> **`Alt+Shift+H` 分享**、**`Alt+C` 复制选区、`Alt+Shift+V` 粘贴**、
-> **`Alt+=` / `Alt+-` 字号 ±**、`Alt+R` 清屏、
-> **`Alt+\` 向右分屏、`Alt+Shift+\` 向下分屏**、`Alt+Shift+←/→/↑/↓` 移动分屏焦点。
-> 按 **`Alt+?`** 随时打开快捷键一览表（终端未聚焦时单按 **`?`** 也可以）；
-> 表中会用 ✅/⚠️/❌ 标出每个组合键是否会被浏览器占用；全部快捷键可在「设置」中修改。
-> 键位按**物理键**匹配：macOS 上 `Option+C` 产出的是 `ç`、`Alt+?` 实际发出的是
-> `Alt+Shift+?`，这些以前都匹配不上，现在都能正常触发，无需改键。
->
-> **取舍说明**：`Alt+C` 会从 shell 手里接过这个键（bash/readline 的 `Alt+C` 是
-> 「首字母大写」，改绑后这一条就用不了了）。`Alt+Shift+V` 与 readline 的 `Alt+V`
-> 是两个不同的键，后者的绑定不受影响。
-> 这与既有 `Alt+N`/`Alt+W` 是同一取舍；若不能接受，**全部快捷键可在
-> 「设置」里改回**，或改用**终端右键菜单**与 `Ctrl/Shift+Insert`——它们不抢任何键。
-> 0.1.30 起默认键位避开了浏览器菜单栏/地址栏占用的 `Alt+F/E/V/H/D`
-> （旧默认只自动迁移一次，之后自己改过的键位不再被改写）。
->
-> 复制粘贴**不用 `Ctrl+Shift+C`**——那是 Chrome/Edge/Firefox 的 DevTools 检查器，
-> 浏览器在页面之前就截获了，拦不住。终端里**右键**会弹出操作菜单（复制/粘贴/全选/
-> 查找/清屏/字号/断开/终止），右键行为可在设置里改为「快捷复制粘贴」或「始终粘贴」。
-> 传统终端的 `Ctrl+Insert` / `Shift+Insert` 也可用。
-> 某个组合键按不动时，打开 **「设置 → 按键诊断」**：那里显示浏览器实际收到的
-> `key` / `code`、命中的动作，以及「焦点在输入框所以不拦截」这类原因。
-
-### 2. 从命令行使用
-
-```bash
-wsctl login http://host:7681 -u admin            # 缓存凭据
-wsctl connect http://host:7681                   # 连接（新会话）
-wsctl connect -s <session-id>                    # 连接已有会话
-wsctl connect --no-reconnect                     # 关闭断线自动重连
-
-wsctl session list
-wsctl session new --name build --command "bash -l"
-wsctl session rename <session-id> 构建
-wsctl session attach <session-id>
-wsctl session kill <session-id>
-```
-
-### 3. 会话后端：local / tmux / ssh
-
-- **local（默认）**：shell 是服务的直接子进程，服务退出即结束。
-- **tmux（跨重启恢复）**：shell 跑在 tmux 会话里，服务重启后自动重新挂载并重绘屏幕。
-
-```bash
-wsctl serve --backend tmux
-wsctl session new --backend tmux --command "htop"
-```
-
-需要主机安装 `tmux`。优雅关闭会保留 tmux 会话（`tmux_preserve_on_shutdown`），
-显式 kill 或空闲回收才会真正销毁。
-
-- **ssh（跳板）**：会话直接是到远程主机的 ssh 连接（参数结构化传入，无 shell 注入）。
-
-```bash
-wsctl session new --ssh user@example.com
-wsctl session new --ssh example.com --ssh-user root --ssh-port 2222 \
-  --ssh-identity ~/.ssh/id_ed25519 --ssh-option StrictHostKeyChecking=accept-new
-```
-
-### 4. 文件面板
-
-点击顶部 **文件** 打开右侧面板：在 `file_root`（默认当前用户家目录）内浏览目录、
-点击下载、上传（按钮或拖拽到**具体目录**）。
-
-> 提醒：能开 shell 的账号本就能访问文件系统，文件面板不额外扩大权限面。
-
-**完整文件管理**：
-
-- **右键任意条目**：打开/下载、预览/编辑、重命名、复制路径、删除。
-- **删除需输入名称确认**：不可逆操作不会只问「确定吗」——必须照提示把条目名称敲回去。
-- **新建目录**：工具栏按钮。
-- **预览 / 编辑**：文本文件直接看、直接改（上限 1 MB，写入是原子的）。
-  二进制与超大文件会明确拒绝预览。
-- **图片就地预览**：PNG / JPEG / GIF / WebP / BMP / AVIF 直接在面板里看（上限 8 MB，
-  只读）。**类型由文件开头的字节决定**，不是由文件名——把脚本改名成 `.png` 不会
-  变成图片，也不会被执行。SVG 是带脚本面的文档，按文本预览。
-- **过滤与分页**：按名称过滤、按类型过滤（全部 / 仅目录 / 仅文件）；条目多时分页浏览
-  （不再是「只显示前 2000 项」）。
-- **上传**：带进度条，可随时取消；遇到同名文件会**拒绝并弹出确认**（HTTP 409），
-  确认后才覆盖；不会静默替换。
-
-> **删除只允许文件或空目录**。递归删除是**刻意不提供**的：一次误点不能清空家目录。
-> 要删掉一个非空目录，需先进入目录逐项删除——这是两次刻意动作。
-
-### 5. 分享会话
-
-点击顶部 **分享**：
-
-- 默认生成**只读**链接（含二维码），任何人打开即可观看但**不能输入**。
-- 勾选「允许输入（可写）」生成**可写**链接。
-- 可选**有效期**（永久 / 10 分钟 / 1 小时 / 1 天），随时**撤销分享**。
-- 再次打开会**复用**现有链接；修改选项后点「生成新链接」才会替换（旧链接失效）。
-- **分享链接跨服务重启依然有效**（token 与会话一同持久化，重启后原样恢复、不轮换）；
-  重命名会话也不会让已分发的链接失效。
-
-分享链接形如 `http://host:7681/?session=<id>&share=<token>`，观看者无需账号。
-
-### 6. 录制与回放
-
-```bash
-wsctl session record <session-id>                    # 开始录制（asciinema cast）
-wsctl session record <session-id> --input            # 同时记录输入
-wsctl session record-stop <session-id>               # 停止
-wsctl session recording <session-id> -o out.cast     # 下载
-```
-
-Web 端点击 **录制** 开始/停止，**回放** 在浏览器内用 asciinema 播放器播放。
-设 `auto_record = true` 可让每个会话自动录制。
-
-### 7. 终端能力：Sixel 与 ZMODEM
-
-- **Sixel**：内嵌 `@xterm/addon-image`，远端输出 Sixel 图像即可显示（`img2sixel`、`lsix`）。
-- **ZMODEM**：点击 **传输** 启用后，远端 `sz 文件` 会在浏览器下载，`rz` 弹出上传选择框。
-  默认关闭以免干扰常规 I/O。
-
-### 8. 主题、字体与快捷键
-
-点击顶部 **设置**：
-
-- **主题**：内置 10 套终端主题（dracula、solarized、nord、gruvbox、monokai、
-  one-dark、tokyo-night 等），也可粘贴 JSON 自定义。
-- **字体**：字号 **12–18**（热键 `Alt+=`/`Alt+-` 与设置里的选择器是同一个范围），
-  字体族可选系统等宽 / JetBrains Mono / Fira Code 等。
-- **按键诊断**：最近 10 次按键的 `key`/`code`/修饰键/候选与命中动作。按不动某个
-  组合键时先看这里：能区分「浏览器没把键交给页面」和「页面收到了但没匹配绑定」。
-- **渲染器**：自动（WebGL → Canvas → DOM）或强制指定。**切换后立即生效**——就地
-  重建终端并自动重新同步屏幕，不需要刷新页面；设置里会实时显示当前实际用的是哪个。
-- **后台动静提醒**：响铃提示音 / 标题与图标角标 / 系统通知，三者可分别开关。
-  系统通知需要浏览器授权；未授权或被拒绝时自动降级为标签角标与标题提示。
-- **终端右键行为**：弹出菜单（推荐）/ 快捷复制粘贴 / 始终粘贴。
-- **快捷键**：可编辑，冲突会提示；偏好保存在浏览器本地。
-
-### 9. 用户、权限与二次验证
-
-```bash
-wsctl user add alice                       # 交互式设置密码
-wsctl user list
-wsctl user role alice admin                # 提升为管理员
-wsctl user passwd alice                    # 改密（同时吊销该用户已有登录态）
-wsctl user disable alice                   # 禁用（登录态立即失效）
-wsctl user enable alice
-wsctl user totp alice                      # 启用 TOTP 双因子（扫码确认）
-wsctl user totp alice --disable
-wsctl user del alice
-```
-
-- `admin`：可查看/管理所有会话与用户。
-- `user`：仅能操作自己的会话。
-- CLI 与 Web 都**不会允许移除最后一个管理员**，也不会让你禁用/删除自己。
-
-管理员也可在 Web 端顶部 **管理** 完成同样操作（新建/改角色/禁用/重置密码/启用 2FA
-并显示二维码），并查看审计、管理录制。
-
-> 注意：能登录并创建会话的账号，本质上就拥有以服务运行用户身份执行命令的能力。
-> RBAC 控制的是**会话可见性与管理权限**，不是命令级隔离；请像对待 SSH 一样对待它。
-
-### 10. 审计与 Webhook
-
-所有敏感操作（登录成功/失败、限速、IP 拒绝、会话创建/连接/断开/终止、文件上传、
-用户管理、配置重载）都会写入审计日志：
-
-```bash
-wsctl audit --limit 50          # 需管理员
-```
-
-也可通过 `webhook_url` 把每条审计事件以 JSON POST 到你的端点。
-
-### 11. 可观测性
-
-```bash
-curl http://127.0.0.1:7681/healthz
-curl http://127.0.0.1:7681/metrics      # Prometheus 文本格式
-```
-
-指标包含：运行状态、会话/客户端数、缓冲字节、会话创建数、WebSocket 连接数、上传数、
-登录结果分类、**审计丢弃数**、**审计写入失败数**、**维护循环滞后**、
-**PTY 输入丢弃数**（子进程不读了）、**超大输入帧拒绝数**（超过单帧上限被拒）。
-开启
-`log_json = true` 输出结构化 JSON 日志；用 `metrics_require_auth = true` 可要求登录
-后才能抓取 `/metrics`。
-
-> `wsctl_pty_input_dropped_total` 与 `wsctl_ws_oversized_input_frames_total` 是
-> **两个不同的数**：前者是「写给子进程被拒」，后者是「WebSocket 层就拒收了、根本
-> 没到 PTY」。0.1.23 及以前这两件事共用一个名字，`/metrics` 会打出两行同名不同值。
-
-### 12. Web 管理面（管理员）
-
-点击顶部 **管理**（仅管理员可见），五个页签：
-
-- **概览**：实例列表（PID / 主机 / 心跳）、会话与客户端统计、因内存释放的连接数、
-  最近结束的会话、最近 20 条审计事件。「这台机器健康吗」一眼可见。
-- **用户**：新建、切换角色、禁用/启用、重置密码（掩码输入）、启用两步验证（二维码）、
-  删除（需输入用户名确认）。列表支持**点击表头排序**与分页。
-- **审计**：按事件类型 / 用户 ID / IP 筛选，分页「加载更多」。
-- **录制**：列出所有录制（可排序、分页），可**回放**、下载、删除（需输入文件名确认）。
-- **配置**：**在线编辑**当前生效配置，每项标注生效方式，可就地**重载**并显示具体
-  变更项与解析错误。三档含义：
-
-  | 标注 | 含义 | 可在线写入 |
-  |---|---|---|
-  | **立即生效** | 下一个请求 / 连接 / 维护周期就用新值 | 是 |
-  | **新建时生效** | 此后**新建**的会话、录制或连接才用新值；已存在的不受影响 | 是 |
-  | **需重启** | 网络、TLS、数据目录、日志、Webhook 等 | 否（会说明原因） |
-
-  - 值改动后行内出现「**保存**」；写入走的和 `wsctl config set` 是**同一套代码**：
-    单项类型校验、**保留作者写的行内注释**、整文件校验、失败即回滚、原子落盘。
-  - **`需重启` 的项不接受在线写入**，并明说「需修改配置文件并重启服务后生效」——
-    而不是收下编辑然后什么都不做。
-  - 会**打开门**的改动（关认证、清空来源/IP 白名单、信任代理头等）保存前弹确认
-    并说明后果；**取消即不发送**，系统原样不动。
-  - 0.1.8 之前只有「热更新 / 需重启」两档，其中八项被标成「热更新」却只对新建对象
-    生效——改了 `session_memory_limit` 的人会以为已经生效。
-
-## 后台运行（非 systemd）
-
-不想用 systemd、也不想占用终端时，用内置生命周期：
-
-```bash
-wsctl start                       # 后台启动（子进程脱离终端）
-wsctl status                      # 查看状态（--json 便于脚本消费）
-wsctl logs -f                     # 跟踪日志（首次启动的 admin 密码在其中）
-wsctl restart                     # 重启
-wsctl reload                      # 让运行中的实例重载配置（SIGHUP）
-wsctl stop                        # 优雅停止（超时后用 --force 强制结束）
-```
-
-- pid 文件：`<data_dir>/run/wsctl-<port>.pid`；日志：`<data_dir>/run/wsctl-<port>.log`
-  （服务自身按大小轮转，保留 `log_backup_count` 份历史；`wsctl logs` 会**跨轮转文件**
-  取末尾若干行，所以刚切过日志也不会「丢历史」）。
-- `stop/status` 在发信号前会核对**进程身份**，不会误杀复用了同一 PID 的其他进程；
-  崩溃留下的陈旧或损坏的 pid 文件会被自动清理。
-- 已在运行时 `start` 会被拒绝：请用 `restart`、`start --force`（先停再启）或先 `stop`。
-- `start` 与 `serve` 接受同样的参数（`--port`、`--config`、`--backend` 等）；
-- **生命周期命令自动跟随正在运行的实例**：`stop`/`status`/`logs`/`reload`/`restart`/
-  `doctor` 会去找这个数据目录里真正跑着的那个，而不是盯着默认地址报「未在运行」。
-  传参只会**收窄**搜索、绝不放行：`--port` 只认该端口，`--host` 只认绑定在该地址的实例，
-  两者都给则取交集；候选多于一个时列出并让你选，一个都不匹配就明说「未在运行」。
-- `--daemon` 与 `--reuse-port` 互斥：多实例热切换请用 `--foreground` 或 systemd。
-- 后台启动仅支持 Linux/macOS；Windows 请用 NSSM/计划任务运行 `wsctl serve --foreground`。
-
-## 配置详解
-
-优先级：**命令行参数 > `WSCTL_*` 环境变量 > 配置文件**。
-配置文件默认位于 `~/.config/wsctl/config.toml`：
+配置文件默认在 `~/.config/wsctl/config.toml`。0.2.0 使用分节 TOML：
 
 ```toml
-# ---- 网络 ----
+[server]
 host = "127.0.0.1"
 port = 7681
-reuse_port = false            # SO_REUSEPORT：新实例先接管端口再停旧实例
+reuse_port = false
 
-# ---- 认证与安全 ----
-auth_required = true          # 是否强制登录（关闭仅供受信本地使用）
-session_ttl = 43200           # 登录态有效期（秒）
-session_sliding_ttl = false   # true 时活动中的登录态自动续期
-cookie_secure = false         # 走 HTTPS 时置 true
-trust_proxy = false           # 位于反向代理后时置 true，读取 X-Forwarded-For
-trusted_proxies = []          # 允许携带 XFF 的代理 CIDR（空 = 仅本机回环）
-allowed_origins = []          # 额外的同源白名单（WS 与 HTTP 写请求共用；空 = 仅同源）
-allowed_ips = []              # CIDR 白名单（空 = 允许全部）
-security_headers = true       # nosniff / frame-deny / CSP 等响应头
-login_rate_limit = 10         # 登录失败次数阈值（每个 ip:用户名；另有每 IP 预算 = 3×，最低 20，
-                              # 防止轮换用户名购买新预算；0 = 关闭限速）
-login_rate_window = 300       # 滑动窗口（秒）
-audit_input = false           # 是否审计提交的命令行
-totp_issuer = "wsctl"         # TOTP 认证器里的发行方名称
+[auth]
+auth_required = true
+session_ttl = "12h"
+cookie_secure = true          # 走 HTTPS 时开启
 
-# ---- 会话默认值 ----
-default_shell = "/bin/bash"   # 默认 shell（缺省用 $SHELL 或 /bin/bash）
-default_cwd = "/home/me"      # 新会话工作目录
-default_backend = "local"     # local / tmux
-tmux_preserve_on_shutdown = true
-idle_timeout = 3600           # 空闲多久回收会话（秒，可选）
-max_life = 86400              # 会话最长寿命（秒，可选）
-max_sessions = 64
-max_sessions_per_user = 0     # 每用户会话上限（0 = 不限）
-session_max_clients = 0       # 单会话最大客户端数（0 = 不限）
-session_memory_limit = 67108864  # 单会话缓冲上限（字节）
-client_max_bytes = 8388608    # 单客户端积压上限（字节）
-ws_max_connections = 512      # 全局终端 WebSocket 连接上限（0 = 不限）
-ws_max_connections_per_ip = 64  # 单个来源 IP 的连接上限（0 = 不限）
-input_rate_limit = 0          # 单连接输入速率（字节/秒，0 = 不限）
-input_rate_burst = 0          # 令牌桶容量（默认等于速率）
-scrollback_bytes = 4194304    # 回放缓冲上限（字节）
+[security]
+trust_proxy = false           # 在反向代理后设为 true
+trusted_proxies = []          # 非回环代理的 CIDR
+allowed_ips = []              # 空 = 不限制来源
 
-# ---- 文件面板 ----
-file_root = "/home/me"        # 面板根目录（默认当前用户家目录）
-file_max_upload = 104857600   # 单文件上传上限（字节）
+[terminal]
+default_shell = "/bin/bash"
+scrollback_bytes = "8MiB"
+snapshot_mode = "auto"        # auto | always | off
+shell_integration = true
 
-# ---- 录制 ----
-auto_record = false           # 自动录制每个会话
-record_input = false          # 录制是否包含输入
+[files]
+file_root = "/home/wsctl"
+file_max_upload = "100MiB"
 
-# ---- 可观测 / 日志 ----
+[observability]
 metrics_enabled = true
-metrics_require_auth = false  # true 时抓取 /metrics 需登录
-log_level = "info"
 log_json = false
-webhook_url = ""              # 审计事件 POST 目标（可选）
-# log_file = "/var/log/wsctl/wsctl.log"   # 启用按大小轮转的日志文件
-# log_max_bytes = 10485760               # 超过则轮转（copytruncate，保住追加型 fd）
-# log_backup_count = 3                   # 保留几份历史
-
-# ---- 多实例与保留策略 ----
-instance_ttl = 30             # 其他实例租约失联多久视为已死（秒）
-audit_retention_days = 30     # 审计日志保留天数（0 = 不清理）
-term_session_retention_days = 30  # 已结束会话记录保留天数（0 = 不清理）
-recordings_retention_days = 0     # 录制保留天数（0 = 不清理）
-recordings_max_bytes = 0          # 录制目录总大小上限（0 = 不限）
-
-# ---- 数据与 TLS ----
-data_dir = "/var/lib/wsctl"   # 数据库与录制存放目录
-ssl_cert = "/etc/wsctl/cert.pem"
-ssl_key = "/etc/wsctl/key.pem"
 ```
 
-每个键都有对应环境变量，例如 `WSCTL_PORT=9000`、`WSCTL_DATA_DIR=/data`、
-`WSCTL_ALLOWED_IPS='["10.0.0.0/8"]'`。
-
-### 修改与热更新
+优先级：**命令行参数 > `WSCTL_*` 环境变量 > 配置文件**。配置项支持
+`wsctl config set server.port 9000` / `wsctl config set auth.required false`
+这样的分节写法；值会先经过类型校验，整文件校验通过后才原子落盘，并保留行内注释。
 
 ```bash
-wsctl config show                       # 查看生效配置（--json 便于脚本）
-wsctl config get port                   # 打印单个配置项（未知项会给出最接近的候选）
-wsctl config path                       # 配置文件路径
-wsctl config edit                       # 用 $EDITOR 编辑（不存在则生成模板）
-wsctl config set port 9000              # 写入配置（校验键名、值类型与整个文件；保留行内注释）
-wsctl config validate                   # 校验配置文件
-wsctl config reload                     # 让运行中的服务重载配置（HTTP）
-wsctl reload                            # 同上，走 SIGHUP（无需已登录）
+wsctl config show                 # 查看生效配置（--json）
+wsctl config get port             # 查看单项
+wsctl config set server.port 9000
+wsctl config validate
+wsctl reload                      # 或 wsctl config reload
 ```
 
-`config set` 会保留被改那一行尾部的注释（`port = 7681  # 监听端口` 改完注释还在），
-也不会把注释掉的 `# port = 1234` 当成真配置项。
+Web 管理面的“配置”页签按**立即生效 / 仅新会话 / 需重启**三档标注，需重启项不会
+假装已保存。0.1.x 的扁平 TOML 可执行 `wsctl config migrate` 自动转换；详见
+[迁移指南](https://github.com/ThzxxArt/wsctl/blob/main/docs/MIGRATION-0.2.0.md)。
 
-**配置写错时不会静默忽略**——错误会原样打印出来：
+## CLI
 
-```console
-$ wsctl reload
-配置重载存在问题：
-  - 配置项无效，已保持原值：max_sessions
-    Input should be a valid integer, got 'not-an-int'
-已重载 配置；变更项：无
-$ echo $?
-1
-```
+| 命令 | 用途 |
+| :--- | :--- |
+| `wsctl serve` | 前台启动；`--daemon` 转后台 |
+| `wsctl start / stop / status / logs / restart / reload` | 内置后台生命周期，无需 systemd |
+| `wsctl restart --rolling` | 零停机滚动重启（首次启动需 `--reuse-port`） |
+| `wsctl doctor` | 环境、配置、依赖与实例自检 |
+| `wsctl connect [URL] [-s ID]` | 把当前终端接入远程会话，断线自动重连 |
+| `wsctl session list / new / rename / attach / kill` | 会话管理 |
+| `wsctl session record / record-stop / recording` | 录制、停止与下载 |
+| `wsctl user add / list / passwd / role / disable / enable / totp` | 用户与 TOTP |
+| `wsctl audit` | 查看审计日志（管理员） |
+| `wsctl config show / get / set / validate / reload` | 配置管理 |
+| `wsctl migrate --check / --apply` | 数据库迁移检查与执行 |
+| `wsctl backup / restore` | 一致性备份与恢复 |
+| `wsctl shell-integration install` | 安装 OSC 133/633 命令块脚本 |
+| `wsctl push keys` | 生成 Web Push VAPID 密钥 |
 
-服务也会监听配置文件修改时间自动重载。生效方式分三档，见上文「配置」页签的说明：**立即生效**（白名单、限速、会话上限、
-文件根目录、指标开关、`session_sliding_ttl` 等）、**新建时生效**（`default_shell`、
-`idle_timeout`、`max_life`、`scrollback_bytes`、`session_memory_limit`、
-`input_rate_*`、`audit_input` 等）、**需重启**（网络、TLS、数据目录、日志、Webhook）。
-Web 管理面的「配置」页签会逐项标注属于哪一档。
-
-## CLI 命令参考
-
-```
-wsctl serve                       启动服务（前台；--daemon 转后台）
-wsctl start|stop|restart|status|logs|reload
-                                  后台生命周期（非 systemd；status 支持 --json）
-wsctl doctor                      环境/配置/运行状态自检（--json；--host/--port 选定实例）
-wsctl backup FILE.tar.gz          一致性备份数据库与录制（--include-config）
-wsctl restore FILE.tar.gz         从备份恢复（须先 wsctl stop；--force 覆盖，原库另存 .bak）
-wsctl --version                   显示版本
-wsctl connect [URL] [-s ID]       把本地终端连接到服务（断线自动重连；--no-reconnect）
-wsctl login URL                   登录并缓存凭据（--totp CODE 支持两步验证）
-wsctl logout                      清除本地缓存凭据
-wsctl session list                列出会话（--json；显示用户名/后端/存活）
-wsctl session new                 新建会话（--name/--command/--cwd/--backend/--ssh…；--json）
-wsctl session rename ID NAME      重命名会话（--json）
-wsctl session attach ID           连接到已有会话
-wsctl session kill ID             终止会话
-wsctl session record ID           开始录制（--input）
-wsctl session record-stop ID      停止录制
-wsctl session recording ID        下载录制（-o FILE）
-wsctl user add|list|del|passwd|role|disable|enable|totp   （add/list 支持 --json）
-wsctl audit                       查看审计日志（管理员；--event/--user-id/--ip/--json）
-wsctl config show|get|path|edit|set|validate|reload      （show/get 支持 --json）
-wsctl completion install|show     安装/查看 shell 补全（bash/zsh/fish/powershell）
-wsctl version
-```
-
-`session` / `user` / `audit` / `config show` 都支持 `--json`，便于脚本消费：
-
-```console
-$ wsctl session list --json | jq -r '.[] | "\(.name)\t\(.owner)\t\(.backend)"'
-```
-
-> `wsctl config set` 会校验配置项名称与**值的类型**，并在写入前校验整个文件；非法值
-> 会被拒绝且不落盘。未知项会报错并给出最接近的候选。
->
-> 互斥或互相依赖的参数（如 `--daemon` 与 `--reuse-port`、`--ssl-cert` 与
-> `--ssl-key`、`--tls-self-signed` 与 `--ssl-cert`（它自己就是证书）、
-> `session new --ssh` 与 `--backend`）会以退出码 2 明确报错。
-
-### shell 补全
-
-`wsctl` 基于 Typer/Click，支持命令与选项的 Tab 补全。**bash** 下一键安装：
+**升级后推荐**：
 
 ```bash
-wsctl --install-completion        # 写入 ~/.bash_completions/wsctl.sh，并在 ~/.bashrc 追加 source
-exec "$SHELL" -l                  # 或重开终端使其生效
+wsctl restart --rolling
 ```
 
-查看补全脚本（可自行保存到任意位置 source）：
-
-```bash
-wsctl --show-completion
-```
-
-`--install-completion` 只覆盖 bash。**其余 shell 用 `wsctl completion`**，并按 `$SHELL`
-自动识别（也可显式指定）：
-
-```bash
-wsctl completion install            # 自动识别 $SHELL 并安装
-wsctl completion install zsh        # 显式指定：bash / zsh / fish / powershell
-wsctl completion install fish
-wsctl completion show zsh           # 只打印脚本，自行保存后 source
-```
-
-安装位置与生效方式：
-
-| shell | 脚本位置 | 生效 |
-|---|---|---|
-| bash | `~/.bash_completions/wsctl.sh`（并写入 `~/.bashrc` 的 `source`） | 重开终端 |
-| zsh | `~/.zfunc/_wsctl`（并写入 `fpath`/`compinit` 到 `~/.zshrc`） | 重开终端 |
-| fish | `~/.config/fish/completions/wsctl.fish` | 重开终端 |
-| PowerShell | 用户 profile 中的补全块 | 重开终端 |
-
-生效后输入 `wsctl <Tab>` 即可补全子命令（`session`、`user`、`config`…）与选项：
-
-```console
-$ wsctl ser<Tab>        →  serve
-$ wsctl session <Tab>   →  list  new  rename  kill  attach  record  record-stop  recording
-```
+不要在 wsctl 自己的网页终端里执行不带 `--rolling` 的 `stop` / `restart`：那会结束
+当前会话，也结束正在执行命令的 shell。CLI 会拒绝这种自断后路的操作。
 
 ## 部署
 
 ### systemd
 
-仓库内提供 [`contrib/systemd/wsctl.service`](contrib/systemd/wsctl.service)。把
-`ExecStart` 指向你的 wsctl（例如自建 venv 的绝对路径），令其仅监听本机、由反向代理
-终止 TLS：
+仓库提供 [`contrib/systemd/wsctl.service`](https://github.com/ThzxxArt/wsctl/blob/main/contrib/systemd/wsctl.service)。
+把 `ExecStart` 指向实际安装路径，默认只监听本机，由反向代理终止 TLS：
 
 ```ini
-[Unit]
-Description=wsctl 网页终端服务
-After=network-online.target
-
 [Service]
 User=wsctl
 Group=wsctl
 WorkingDirectory=/var/lib/wsctl
 ExecStart=/opt/wsctl/venv/bin/wsctl serve --host 127.0.0.1 --port 7681
 Restart=on-failure
-RestartSec=3
 KillSignal=SIGINT
 TimeoutStopSec=15
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=false
-
-[Install]
-WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl daemon-reload && sudo systemctl enable --now wsctl
+sudo systemctl daemon-reload
+sudo systemctl enable --now wsctl
 ```
 
-### nginx 反向代理（TLS 终止）
+### nginx 反向代理
 
-完整示例见 [`contrib/nginx/wsctl.conf`](contrib/nginx/wsctl.conf)。关键点：
+完整配置见 [`contrib/nginx/wsctl.conf`](https://github.com/ThzxxArt/wsctl/blob/main/contrib/nginx/wsctl.conf)，
+关键是保留 WebSocket 升级头与 `Host`：
 
 ```nginx
 location / {
@@ -882,201 +333,115 @@ location / {
     proxy_set_header Connection "upgrade";
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 3600s;
     proxy_buffering off;
 }
 ```
 
-位于代理后请设 `trust_proxy = true`，并把代理地址写进 `trusted_proxies`
-（例如 `trusted_proxies = ["10.0.0.0/8"]`；二者缺一，限速、IP 白名单与审计看到的
-就只是代理自己的地址）。
-> `X-Forwarded-For` 取的是**最右一个非受信跳**——该头会被每一跳代理**追加**（上面的
-> `proxy_add_x_forwarded_for` 正是如此），最左项是客户端自带、不可信。此语义假定
-> **单个**可信追加式代理；多跳链路需要另行约定。
->
-> 只有 `trusted_proxies` 里列出的对端**加上本机回环**携带的 `X-Forwarded-For` 才会被
-> 采信。**0.1.30 起 uvicorn 的 `proxy_headers` 已显式关闭**——它的默认值会在 wsctl
-> 看到请求之前就按该头改写 `scope["client"]`，导致 `trust_proxy = false` 形同虚设：
-> 本机任意进程都能带着 `X-Forwarded-For: 1.2.3.4` 通过 `allowed_ips` 或伪造审计 IP。
-> 反代在另一台机器上时，请把它的地址写进 `trusted_proxies`；不写则一律按真实对端处理。
->
-> 0.1.30 起 HTTP 的非 GET 请求还会校验 `Origin` 与 `Host` 是否同源（防 CSRF，文件上传
-> 尤其依赖它）。上面的配置**保留了 `proxy_set_header Host $host`**，这正是同源判断
-> 能通过的前提；`Host` 不带端口时，`Origin` 的端口不参与比较（否则 `https://host:8443`
-> 会被误判为跨站）；`Host` 明确带端口时则必须一致。`allowed_origins` 是**额外**受信集，
-> 不会取代同源判断——反代把 `Host` 改写成别的主机名时才需要它，例如
-> `allowed_origins = ["https://term.example.com"]`。
-生产环境请用 HTTPS/WSS 并设 `cookie_secure = true`。
+代理在另一台机器上时，把它的地址写进 `trusted_proxies`，并设置
+`trust_proxy = true`、`cookie_secure = true`。否则限速、IP 白名单和审计只能看到
+代理自己的地址。
 
-### 零停机重启
-
-`reuse_port = true`（或 `--reuse-port`）让监听 socket 带 `SO_REUSEPORT`，新实例可在
-旧实例退出前绑定同一端口，升级无「连接被拒」窗口：
+### Docker
 
 ```bash
-wsctl serve --reuse-port &      # 运行中的实例
-# 部署新版本后：
-wsctl serve --reuse-port &      # 新实例接管新连接
-kill <旧进程 PID>               # 旧实例排空后退出
+WSCTL_ADMIN_PASSWORD='换成你的强密码' \
+  docker compose -f contrib/docker/docker-compose.yml up -d
 ```
 
-两个实例短暂共享同一 `data_dir` 是安全的：每个实例通过 `instances` 租约表与
-`term_sessions.instance_id` 只管理自己的会话，绝不会把对方的活跃会话标记为停止；
-tmux 会话也按 `data_dir` 命名空间隔离。配合 **tmux 后端**，连会话本身也能跨重启存活。
+镜像包含 `tmux`、`openssh-client`、`lrzsz`；数据卷挂到 `/data`。也可以直接
+`docker build -t wsctl -f contrib/docker/Dockerfile .`，构建上下文必须是仓库根目录。
 
-### 备份与恢复
+### HTTPS
 
 ```bash
-wsctl backup ~/wsctl-$(date +%F).tar.gz --include-config   # 一致性快照（含 WAL 已提交数据）
-wsctl stop                                                # 服务在跑时恢复会被拒绝
-wsctl restore ~/wsctl-2026-01-01.tar.gz --force            # 覆盖前原库另存为 .bak（重名则加时间戳）
+wsctl serve --tls-self-signed
 ```
+
+浏览器只在安全上下文（HTTPS 或 localhost）提供剪贴板与系统通知。自签证书适合内网；
+公网请用正式证书或反向代理终止 TLS。
 
 ## 安全
 
 Web 终端本质上是**远程代码执行服务**，请像对待 SSH 一样对待它：
 
-- 默认开启认证，密码使用 Argon2 哈希；会话 token 仅存哈希。
-- 密码策略：新建/改密强制非空且至少 8 位（API 与 CLI 同源强制）。
-- 可选 TOTP 双因子（`wsctl user totp <用户>`，启用需输入一次验证码确认）。
-- 登录失败限速；`allowed_ips` 限制来源网段。
-- WebSocket 握手校验 Origin 白名单（防 CSWSH）；HTTP 的非 GET `/api/*` 也做同源校验
-  （含 multipart 上传，挡住同站跨源 CSRF）。
-- 分享链接不可猜测、可设有效期、可撤销；只读链接拒绝输入；链接跨服务重启仍有效
-  （token 与会话一同持久化）。
-- 文件面板防目录穿越（含符号链接），上传有大小限制。
-- 每会话连接数/内存/输入速率上限，防止资源耗尽。
-- 全量审计日志；CLI 与 API 同源的用户管理不变量（不会锁死最后一个管理员）。
-- **请务必使用 HTTPS/WSS**，并以最小权限用户运行。最省事的方式是一条命令：
+- 默认开启认证；密码用 Argon2 哈希，登录 token 与会话 token 只存哈希。
+- 支持 TOTP 双因子、登录失败限速、`allowed_ips` CIDR 白名单。
+- WebSocket 与 HTTP 写请求都校验 `Origin`（含 scheme）；认证 API 响应默认
+  `Cache-Control: no-store`（配置端点带 ETag，显式使用 `no-cache`）；CSP 禁止内联
+  脚本，静态入口资源带 SRI。
+- API Key 只存哈希；分享链接支持 scope / 有效期 / 撤销；只读链接拒绝输入。
+- 文件面板对路径做解析后校验，拒绝越界与符号链接写入；上传默认不覆盖，覆盖需显式确认。
+- SQLite、WAL/SHM、配置、录制与备份文件统一 `0600`；迁移前自动备份。
+- 每会话可配置连接数、内存与输入速率上限；慢客户端丢帧而不是拖垮服务端。
+- 审计哈希链可校验；保留策略清理旧记录时会把链头标记为 `truncated`，不误报篡改。
 
-  ```bash
-  wsctl serve --tls-self-signed   # 自动生成并复用自签证书，无需 openssl 知识
-  ```
+**不要**把 `--no-auth` 暴露到网络。RBAC 控制的是会话可见性与管理权限，不是命令级
+沙箱；能登录并创建会话的账号，本质上拥有以服务运行用户身份执行命令的能力。
 
-  **这不只是传输安全。** 浏览器只在**安全上下文**（HTTPS 或 localhost）下提供剪贴板
-  与系统通知接口；以 HTTP 通过 IP 访问时它们**根本不存在**，于是复制/粘贴与系统通知
-  会静默失效（详见[常见问题](#常见问题与故障排查)）。
+更多约定见 [SECURITY.md](https://github.com/ThzxxArt/wsctl/blob/main/SECURITY.md)。
 
-漏洞报告方式见 [SECURITY.md](https://github.com/ThzxxArt/wsctl/blob/main/SECURITY.md)。
+## 性能
 
-## 常见问题与故障排查
+开发机上的可重复 smoke 基线（真实 PTY + `/ws/v2`，Python 3.13）：
 
-**Q：首次运行没看到密码？**
-密码打印在标准错误；后台运行时在日志里（`wsctl logs`）。若已丢失，用
-`wsctl user passwd admin` 重设，或删除数据库后重启重新初始化。
+| 指标 | 0.2.0 |
+| :--- | ---: |
+| `seq 1 200000` 单会话 | **236 ms** |
+| 8 个会话各 20 万行 | **1758 ms** |
+| attach 到 `attached` | **91 ms** |
+| 断线续传（`last_seq` 命中） | **1.8 ms** |
+| 100 空闲会话 RSS 增量 | **0.3 MiB** |
+| 首屏 JS（gzip，不含懒加载） | **393.2 KiB** |
 
-**Q：开了两步验证后 CLI 全都登录不上？**
-0.1.4 起 CLI 支持 2FA：`wsctl login <url> --totp 123456`，或省略 `--totp` 在被要求时
-交互输入，脚本里可用 `WSCTL_TOTP` 环境变量。（0.1.3 及更早版本确实无法从 CLI 登录。）
-
-**Q：改了配置 `wsctl reload` 说「变更项：无」？**
-如果配置里有非法值，它会**明确报错**而不是假装没变化。看输出里的「配置重载存在问题」
-一栏，或服务端日志。合法但没生效的改动，请确认该项是「热更新」而不是「需重启」
-（Web 管理面的「配置」页签会逐项标注）。
-
-**Q：上传文件报「文件已存在」？**
-这是保护行为：同名文件默认拒绝（HTTP 409），在 Web 端弹窗确认后才会覆盖。
-
-**Q：浏览器连不上 / 一直重连？**
-检查反向代理是否转发 WebSocket（`Upgrade` / `Connection` 头）；若被判定未授权
-（HTTP 401 / 关闭码 4401），重新登录；TOTP 场景确认系统时间正确。断线后状态栏会
-显示「重连中（Ns 后重试）」，也可点击该状态**立即重连**；若输出过快被省略过，
-失步提示条上的「重新同步」会重放服务端仍持有的内容（服务端也丢掉的字节无法找回），
-随后**全屏程序会自动重绘**（服务端发出真实窗口尺寸变化，应用从自身模型重绘——这
-才是恢复的正解）；仍不完整时可再点一次「重新同步」。
-
-**Q：关闭标签后 shell 会结束吗？**
-不会。关闭标签默认只是**断开连接**，会话继续在服务器上运行。用标签右键菜单、
-顶部「会话」列表，或 `Alt+Shift+W` 才能真正终止。
-
-**Q：审计日志 / 数据库 / 录制文件会不会无限增长？**
-有保留策略：`audit_retention_days`（默认 30）清理审计日志，
-`term_session_retention_days`（默认 30）清理已结束的会话记录，
-`recordings_retention_days` 与 `recordings_max_bytes` 约束录制文件（默认关闭，
-0 表示不清理）。
-
-**Q：`wsctl connect` 报「缺少服务器地址」？**
-先 `wsctl login <url>`，或显式传 URL；token 也可用 `WSCTL_TOKEN` 提供。
-
-**Q：tmux 会话没有跨重启恢复？**
-确认主机安装了 `tmux`，且 `default_backend = "tmux"`（或创建时 `--backend tmux`）。
-无头环境建议保持 `TERM` 可用（wsctl 会为 tmux 会话默认设为 `xterm-256color`）。
-
-**Q：`rz`/`sz` 没反应？**
-需先在 Web 端点击 **传输** 启用；远端需装 `lrzsz`。
-
-**Q：如何只在本机使用、不要登录？**
-`wsctl serve --no-auth`（**不安全**，切勿暴露到网络）。
-
-**Q：不用 systemd，怎么让它后台常驻？**
-`wsctl start` 启动、`wsctl status` 查看、`wsctl logs -f` 看日志、`wsctl stop` 停止。
-详见[后台运行（非 systemd）](#后台运行非-systemd)。
-
-**Q：`wsctl start` 说「已在运行」？**
-同端口已有托管实例。用 `wsctl restart`、`start --force`（先停再启）或先 `wsctl stop`。
-崩溃残留的陈旧 pid 文件会被 `status` 自动识别并清理（会核对进程身份，不会误杀）。
-
-**Q：备份会不会漏掉刚写入的数据？恢复会覆盖现有数据吗？**
-不会漏：`wsctl backup` 使用 SQLite 在线备份 API 生成一致快照（含 WAL 中已提交的
-数据）。恢复**要求服务先停止**（运行中的进程持有数据库连接，运行中恢复会被拒绝，
-异常退出请等约 30 秒让实例租约过期）；数据库已存在时必须显式 `--force`，原库会先
-另存为 `.bak`（重名时加时间戳，不会覆盖上一次的备份）。
-
-**Q：上传大文件失败？**
-调整 `file_max_upload`；注意反向代理可能也有请求体大小限制。
-
-**Q：复制、粘贴没反应？右键菜单里的「复制选区 / 粘贴」也没用？**
-先排除**焦点**：分屏里点哪一栏，复制/搜索/录制就作用于哪一栏（0.1.30 起）；
-更早的版本点分屏只移动了浏览器焦点，`Alt+C` 会去另一台终端里找选区，于是
-「什么都没发生」——这与 HTTPS 无关。若仍然无效，再看地址栏：如果是
-`http://<IP>:端口`（既不是 `https://` 也不是 `localhost`），浏览器
-**不提供**剪贴板接口——不是权限没给，而是接口**根本不存在**，页面连"被拒绝"都无从得知。
-于是所有复制粘贴入口全都没反应，且一句提示都没有。
-
-- **复制**：wsctl 已用旧接口（`execCommand`）兜底，仍然可用；
-- **粘贴**：请直接按 **`Ctrl+V`**——xterm 的原生粘贴通道不依赖该接口，一直可用；
-- **彻底恢复**：改用 HTTPS。`wsctl serve --tls-self-signed` 一条命令即可
-  （首次浏览器里点一次「继续前往」）。
-
-**设置 → 运行环境** 里能看到当前地址到底拥有哪些能力，以及为什么。
-
-**Q：系统通知收不到？**
-同上：Notification 也是安全上下文接口，HTTP 下被浏览器禁用，会自动降级为标签角标
-与页面标题提示。改用 HTTPS 即可恢复。
+这些是 smoke baseline，不是跨机器硬门槛；复现命令与说明见
+[`docs/benchmarks/0.2.0.md`](https://github.com/ThzxxArt/wsctl/blob/main/docs/benchmarks/0.2.0.md)。
 
 ## 开发
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
+python3.12 -m venv .venv
+. .venv/bin/activate
 pip install -e ".[dev]"
 ruff check . && mypy src && pytest
 ```
 
-浏览器级测试（Playwright，无头 Chromium）：
+前端与浏览器测试：
 
 ```bash
-pip install -e ".[e2e]"
-playwright install chromium
-pytest -m browser
+cd web
+pnpm install
+pnpm typecheck && pnpm test
+pnpm exec playwright install --with-deps chromium firefox webkit
+WSCTL_PYTHON=../.venv/bin/python pnpm e2e
 ```
 
-后端端到端场景（server / CLI / connect / tmux / crash / multiplex / daemon / 零停机重启）：
+后端端到端场景（server / CLI / connect / tmux / crash / multiplex / daemon / 重启）：
 
 ```bash
 python scripts/e2e/run_all.py
 ```
 
-压测（并发 / 大输出）：
+前端目录、设计令牌与测试策略见
+[docs/FRONTEND.md](https://github.com/ThzxxArt/wsctl/blob/main/docs/FRONTEND.md)。
 
-```bash
-pytest -m slow
-```
+## 文档
 
-架构与路线图见 [DESIGN.md](https://github.com/ThzxxArt/wsctl/blob/main/DESIGN.md)。
+| 文档 | 内容 |
+| :--- | :--- |
+| [ROADMAP-0.2.0](https://github.com/ThzxxArt/wsctl/blob/main/docs/ROADMAP-0.2.0.md) | 0.2.0 范围、实施结果、审查修复与明确边界 |
+| [MIGRATION-0.2.0](https://github.com/ThzxxArt/wsctl/blob/main/docs/MIGRATION-0.2.0.md) | 0.1.x → 0.2.0 备份、配置、数据库与回退 |
+| [DESIGN](https://github.com/ThzxxArt/wsctl/blob/main/DESIGN.md) | 产品边界、架构与关键取舍 |
+| [SECURITY](https://github.com/ThzxxArt/wsctl/blob/main/SECURITY.md) | 威胁模型、凭据、分享、文件与部署约定 |
+| [ADR-0003](https://github.com/ThzxxArt/wsctl/blob/main/docs/ADR/0003-database.md) | 为什么 0.2.0 只支持 SQLite，PostgreSQL 推迟到 0.3 |
+| [FRONTEND](https://github.com/ThzxxArt/wsctl/blob/main/docs/FRONTEND.md) | Vue 工作台目录、构建、测试与发布约束 |
+| [CHANGELOG](https://github.com/ThzxxArt/wsctl/blob/main/CHANGELOG.md) | 版本变更与修复记录 |
+| [benchmarks](https://github.com/ThzxxArt/wsctl/blob/main/docs/benchmarks/0.2.0.md) | 性能基线、复现命令与测量环境 |
 
 ## 许可
 
 [MIT](https://github.com/ThzxxArt/wsctl/blob/main/LICENSE) © 2026 ThzxxArt
 
-内嵌的第三方前端资源（xterm.js、asciinema-player、zmodem.js）许可证见
+预构建前端与 Python 依赖的第三方许可证说明见
 [THIRD_PARTY_NOTICES.md](https://github.com/ThzxxArt/wsctl/blob/main/THIRD_PARTY_NOTICES.md)。

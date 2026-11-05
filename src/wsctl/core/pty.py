@@ -215,6 +215,10 @@ class PosixPty:
                 _dropped_input_total += 1
                 self._dropped += 1
                 self._write_buf.clear()
+                # An EIO master (child gone) stays readable for writes too:
+                # leaving the writer callback registered made the loop spin on
+                # a dead fd for the rest of the session's life.
+                self._unregister_writer()
                 return False
             del self._write_buf[:written]
         self._unregister_writer()

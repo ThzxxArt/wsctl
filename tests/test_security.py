@@ -12,7 +12,6 @@ def test_missing_origin_allowed_for_non_browser() -> None:
 def test_same_host_allowed() -> None:
     assert is_origin_allowed("http://example.com", "example.com", [])
 
-
 def test_cross_host_rejected() -> None:
     assert not is_origin_allowed("http://evil.com", "example.com", [])
 
@@ -224,3 +223,30 @@ def test_forwarded_proto_is_only_believed_from_a_trusted_proxy() -> None:
     assert forwarded_scheme(ProtoReq("127.0.0.1", "https"), untrusted) is None
     # Garbage is not a scheme.
     assert forwarded_scheme(ProtoReq("10.9.1.2", "javascript"), named) is None
+
+
+def test_origin_scheme_must_match_the_served_scheme() -> None:
+    """A missing Host port used to make ``http://host`` match an HTTPS panel.
+
+    ``Origin`` and ``Host`` agreed on the hostname, and with no port in Host the
+    port check was skipped entirely. Another service on port 80 of the same
+    hostname could then drive authenticated writes.
+    """
+    assert not is_origin_allowed(
+        "http://term.example.com", "term.example.com", [], scheme="https"
+    )
+    assert is_origin_allowed(
+        "https://term.example.com", "term.example.com", [], scheme="https"
+    )
+    # WebSocket schemes are normalised before comparison.
+    assert is_origin_allowed(
+        "https://term.example.com", "term.example.com", [], scheme="wss"
+    )
+    assert not is_origin_allowed(
+        "http://term.example.com", "term.example.com", [], scheme="wss"
+    )
+    # The operator's explicit allowlist is still additional to the same-origin
+    # rule; it does not get invalidated by a scheme mismatch.
+    assert is_origin_allowed(
+        "http://other.example", "term.example.com", ["http://other.example"], scheme="https"
+    )
