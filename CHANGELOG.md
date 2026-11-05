@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-05
+
+0.2.0 的补丁版本：修复 v2 重同步崩溃导致的“连接失败 / 重开标签无效”，并把
+17 处浏览器原生 `confirm` / `prompt` 统一为应用内弹窗。
+
+### 修复
+
+- **v2 重新同步崩溃**：`SessionActor.resync()` 没有接受 `last_seq`，而 `/ws/v2`
+  的 gap 修复和手动重同步总是传这个参数。每次重同步都会抛 `TypeError`，连接被
+  4500 关闭；重开标签会再次触发 gap，只有退出登录清空屏幕缓存才恢复。actor 现在
+  透传 `last_seq`，并新增 v2 重同步与 actor 透传回归测试。
+- **4500 改为可恢复**：服务端内部错误不再被浏览器/CLI 当成永久失败，而是按指数
+  退避自动重连，不再让标签永久停在“连接失败”。
+- **应用内弹窗**：17 处 `window.confirm` / `window.prompt` 统一为 Naive UI
+  `AppDialog`（Promise 队列、危险操作红色按钮、键盘焦点）；管理员重置密码改为
+  掩码输入 + 二次确认。
+
+### 测试
+
+- pytest **730 passed / 8 skipped**；slow **7 passed**。
+- Vitest **48 passed**。
+- Playwright **34 passed / 6 skipped**（Chromium / Firefox / WebKit / 移动端）。
+
 ## [0.2.0] - 2026-11-05
 
 **「从能连上的终端，到可以长期工作的终端工作台。」**
