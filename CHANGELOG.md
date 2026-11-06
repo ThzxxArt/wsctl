@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-11-06
+
+### 修复
+
+- **标签切换花屏**：切换标签时 Vue 会复用同一个 `TerminalPane`/xterm 实例，
+  只执行 `term.reset()`；WebGL/Canvas 上属于旧会话的像素不保证被完整重绘，
+  新会话只覆盖变化区域时就出现花屏。现在终端按「标签 + 分屏 + 会话」设置
+  `key`，切换标签或换绑会话都会像关闭再打开一样重建 xterm 实例，同时仍从
+  屏幕缓存恢复内容。
+- 新增双标签 Playwright 回归：两个会话各自输出标记，来回切换后标记仍正确，
+  且确认切回时拿到的是新的 xterm 实例，不是复用的旧画布。
+
+### 测试
+
+- pytest **737 passed / 8 skipped**；slow **7 passed**。
+- Vitest **52 passed**。
+- Playwright **46 passed / 10 skipped**。
+
 ## [0.2.5] - 2026-11-06
 
 ### 修复
