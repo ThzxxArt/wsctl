@@ -335,17 +335,22 @@ async function openShareFromUrl(): Promise<void> {
   }
 }
 
+const mountedAt = Date.now() / 1000;
 let autoBoundInitialSession = false;
 watch(
   () => sessions.initialized,
   (ready) => {
     if (!ready || autoBoundInitialSession) return;
     autoBoundInitialSession = true;
-    if (sessions.live.length === 0) return;
+    // Only a session that existed before this page mounted may fill the blank
+    // start tab. A session created from "new session" while the first refresh
+    // is still in flight must not be bound here *and* get its own new tab --
+    // that duplicate made a deleted session leave a second ghost tab behind.
+    const first = sessions.live.find((session) => session.created_at <= mountedAt);
+    if (!first) return;
     if (
       workspace.tabs.every((tab) => leavesOf(tab.root).every((leaf) => leaf.sessionId === null))
     ) {
-      const first = sessions.live[0];
       const leaf = workspace.allLeaves[0];
       if (leaf) workspace.setPaneSession(leaf.id, first.id, first.name);
     }
@@ -486,6 +491,7 @@ onBeforeUnmount(() => {
       >
         <TerminalPane
           v-if="maximizedLeaf"
+          :key="`max:${maximizedLeaf.id}:${maximizedLeaf.sessionId ?? 'empty'}`"
           :pane="maximizedLeaf"
           :tab-id="workspace.activeTab?.id ?? ''"
           :focused="true"
@@ -493,6 +499,7 @@ onBeforeUnmount(() => {
         />
         <SplitPane
           v-else-if="workspace.activeTab"
+          :key="workspace.activeTab.id"
           :node="workspace.activeTab.root"
           :tab-id="workspace.activeTab.id"
           :share-only="shareOnly"

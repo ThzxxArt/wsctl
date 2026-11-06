@@ -51,8 +51,8 @@ test.describe("terminal workspace", () => {
     await expect.poll(() => terminalText(page), { timeout: 15_000 }).toContain("E2E-MARKER");
   });
 
-  test("splits the focused pane", async ({ page }) => {
-    await page.getByTitle("新建会话").first().click();
+  test("splits the focused pane", async ({ page, browserName }) => {
+    await openSoloSession(page, `split-${browserName}-${Date.now()}`);
     await expect(page.locator(".ws-pane")).toHaveCount(1);
     await page.locator(".ws-pane").first().getByTitle("向右分屏").click();
     await expect(page.locator(".ws-pane")).toHaveCount(2);
@@ -110,16 +110,36 @@ test.describe("terminal workspace", () => {
     await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
   });
 
-  test("ended-session overlay buttons are clickable", async ({ page }) => {
-    const created = page.waitForResponse(
-      (response) =>
-        response.url().includes("/api/v2/sessions") && response.request().method() === "POST",
-    );
-    await page.getByTitle("新建会话").first().click();
-    const sid = (await (await created).json()).id;
-    const pane = page.locator(".ws-pane").first();
-    await expect(pane).toHaveAttribute("data-state", "connected");
+  async function openSoloSession(
+    page: import("@playwright/test").Page,
+    name: string,
+  ): Promise<string> {
+    const id = await page.evaluate(async (sessionName) => {
+      const response = await fetch("/api/v2/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: sessionName }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      return (await response.json()).id as string;
+    }, name);
+    await page.reload();
+    // The sidebar starts collapsed on narrow screens. Check the sidebar itself,
+    // not the row: an open sidebar whose list is still loading must not be
+    // toggled closed by a false-negative row check.
+    if ((await page.locator(".sidebar").count()) === 0) {
+      await page.locator(".sidebar-toggle").click();
+    }
+    const row = page.locator(".row").filter({ hasText: name }).first();
+    await expect(row).toBeVisible();
+    await row.click();
+    await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
+    return id;
+  }
 
+  test("ended-session overlay buttons are clickable", async ({ page, isMobile, browserName }) => {
+    test.skip(isMobile === true, "the session sidebar is an overlay on mobile");
+    const sid = await openSoloSession(page, `ghost-close-${browserName}-${Date.now()}`);
     await page.evaluate(async (id) => fetch(`/api/v2/sessions/${id}`, { method: "DELETE" }), sid);
     const ghost = page.locator(".pane-ghost");
     await expect(ghost).toBeVisible();
@@ -129,15 +149,13 @@ test.describe("terminal workspace", () => {
     await expect(ghost).toHaveCount(0);
   });
 
-  test("ended-session overlay can open the session picker", async ({ page }) => {
-    const created = page.waitForResponse(
-      (response) =>
-        response.url().includes("/api/v2/sessions") && response.request().method() === "POST",
-    );
-    await page.getByTitle("新建会话").first().click();
-    const sid = (await (await created).json()).id;
-    const pane = page.locator(".ws-pane").first();
-    await expect(pane).toHaveAttribute("data-state", "connected");
+  test("ended-session overlay can open the session picker", async ({
+    page,
+    isMobile,
+    browserName,
+  }) => {
+    test.skip(isMobile === true, "the session sidebar is an overlay on mobile");
+    const sid = await openSoloSession(page, `ghost-picker-${browserName}-${Date.now()}`);
     await page.evaluate(async (id) => fetch(`/api/v2/sessions/${id}`, { method: "DELETE" }), sid);
 
     const ghost = page.locator(".pane-ghost");
@@ -183,6 +201,86 @@ test.describe("terminal workspace", () => {
     await row.getByRole("button", { name: "删除", exact: true }).click();
     await dialog.getByRole("button", { name: "删除", exact: true }).click();
     await expect(row).toHaveCount(0);
+  });
+
+  test("switching tabs rebuilds the terminal and keeps each screen", async ({
+    page,
+    isMobile,
+    browserName,
+  }) => {
+    test.skip(isMobile === true, "desktop tab switching");
+    // Unique names: create is idempotent by request body, so reusing "alpha"
+    // across browser projects replayed an earlier (possibly deleted) session.
+    const suffix = `${browserName}-${Date.now()}`;
+    const made = await page.evaluate(async (tag) => {
+      const create = async (name: string) =>
+        (
+          await (
+            await fetch("/api/v2/sessions", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ name }),
+            })
+          ).json()
+        ).id;
+      return { alpha: await create(`alpha-${tag}`), beta: await create(`beta-${tag}`) };
+    }, suffix);
+    await page.evaluate(
+      (ids) =>
+        localStorage.setItem(
+          "wsctl-layout-v2",
+          JSON.stringify({
+            version: 2,
+            activeTabId: "t1",
+            tabs: [
+              {
+                id: "t1",
+                name: "alpha",
+                root: { type: "leaf", id: "p1", sessionId: ids.alpha, title: "alpha", share: null },
+                focus: "p1",
+              },
+              {
+                id: "t2",
+                name: "beta",
+                root: { type: "leaf", id: "p2", sessionId: ids.beta, title: "beta", share: null },
+                focus: "p2",
+              },
+            ],
+          }),
+        ),
+      made,
+    );
+    await page.reload();
+    const pane = page.locator(".ws-pane").first();
+    await expect(page.locator(".tab").filter({ hasText: "alpha" })).toBeVisible();
+    await expect(pane).toHaveAttribute("data-state", "connected");
+
+    const run = async (command: string, marker: string) => {
+      await pane.click();
+      await pane.locator("textarea.xterm-helper-textarea").focus();
+      await page.keyboard.type(command);
+      await page.keyboard.press("Enter");
+      await expect.poll(() => terminalText(page), { timeout: 10_000 }).toContain(marker);
+    };
+    await run("printf 'ALPHA-TAB-MARKER\\n'", "ALPHA-TAB-MARKER");
+    const alphaTerm = await page.evaluate(
+      () =>
+        (window as unknown as { __wsctlTerminals?: Record<string, unknown> }).__wsctlTerminals?.p1,
+    );
+
+    await page.locator(".tab").filter({ hasText: "beta" }).click();
+    await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
+    await run("printf 'BETA-TAB-MARKER\\n'", "BETA-TAB-MARKER");
+
+    await page.locator(".tab").filter({ hasText: "alpha" }).click();
+    await expect(page.locator(".ws-pane").first()).toHaveAttribute("data-state", "connected");
+    await expect.poll(() => terminalText(page)).toContain("ALPHA-TAB-MARKER");
+    const fresh = await page.evaluate((old) => {
+      const terms = (window as unknown as { __wsctlTerminals?: Record<string, unknown> })
+        .__wsctlTerminals;
+      return Boolean(old) && terms?.p1 !== old;
+    }, alphaTerm);
+    expect(fresh, "the tab switch must create a fresh xterm, not reuse stale pixels").toBe(true);
   });
 
   test("has no critical accessibility violations on the workspace", async ({ page }) => {

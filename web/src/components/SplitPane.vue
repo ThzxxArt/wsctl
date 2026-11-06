@@ -49,6 +49,7 @@ function onDoubleClick(event: MouseEvent): void {
 <template>
   <TerminalPane
     v-if="node.type === 'leaf'"
+    :key="`${tabId}:${node.id}:${node.sessionId ?? 'empty'}`"
     :pane="node"
     :tab-id="tabId"
     :share-only="shareOnly"
