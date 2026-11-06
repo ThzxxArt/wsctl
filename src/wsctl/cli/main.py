@@ -2087,7 +2087,7 @@ port = 7681
 [auth]
 # auth_required = true
 # session_ttl = "12h"
-# session_sliding_ttl = false
+# session_sliding_ttl = true
 # cookie_secure = false
 # totp_issuer = "wsctl"
 

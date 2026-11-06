@@ -62,7 +62,10 @@ class Settings(BaseSettings):
 
     auth_required: bool = True
     session_ttl: int = 12 * 3600
-    session_sliding_ttl: bool = False
+    #: Active terminal sessions should not be cut off at a fixed wall-clock
+    #: boundary. Sliding still expires an *idle* login after ``session_ttl``;
+    #: set this to false for a strict absolute-lifetime policy.
+    session_sliding_ttl: bool = True
     cookie_secure: bool = False
     trust_proxy: bool = False
     #: Only these peers may speak ``X-Forwarded-For``. Empty means "loopback

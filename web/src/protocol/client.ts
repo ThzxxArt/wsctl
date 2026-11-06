@@ -21,6 +21,8 @@ export interface TerminalHandlers {
   onControl: (message: ControlMessage) => void;
   onState: (state: ConnectionState, detail?: string) => void;
   onNotice: (message: string, level?: "info" | "warn" | "error") => void;
+  /** The server rejected the login token itself; retrying cannot help. */
+  onAuthExpired?: () => void;
 }
 
 export interface TerminalOptions {
@@ -167,6 +169,13 @@ export class TerminalSocket {
       this.stopHeartbeat();
       this.ws = null;
       if (this.closed) return;
+      if (event.code === 4401) {
+        // The cookie/token is gone or expired. Reconnecting with the same
+        // credential would loop forever; show the login page instead.
+        this.setState("failed", "登录已过期，请重新登录");
+        this.handlers.onAuthExpired?.();
+        return;
+      }
       if (event.code === 4404 || event.code === 4403) {
         this.setState("failed", `会话不可用（${event.code}）`);
       }

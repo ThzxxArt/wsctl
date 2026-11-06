@@ -2726,7 +2726,9 @@ def test_concurrent_same_name_uploads_publish_one_whole_file(tmp_path: Path) -> 
     assert leftovers == [], f"staging sidecars leaked: {leftovers}"
 
 
-def test_session_sliding_ttl_reload_reaches_the_store(tmp_path: Path) -> None:
+def test_session_sliding_ttl_reload_reaches_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reload must rewire the live mirror, not just the Settings object.
 
     ``sliding_ttl`` is read from ``Store`` on every token resolution. Updating
@@ -2745,6 +2747,9 @@ def test_session_sliding_ttl_reload_reaches_the_store(tmp_path: Path) -> None:
     config = tmp_path / "wsctl" / "config.toml"
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text("session_sliding_ttl = false\n", encoding="utf-8")
+    # The settings source reads ``WSCTL_CONFIG``; passing ``config_path`` only
+    # records the path on the instance and would leave the file unread.
+    monkeypatch.setenv("WSCTL_CONFIG", str(config))
     settings = load_settings(data_dir=tmp_path, config_path=config)
     store = Store(tmp_path / "db.sqlite")
     store.user_create("admin", "password123", role="admin")

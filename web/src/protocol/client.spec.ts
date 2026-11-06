@@ -27,7 +27,7 @@ class FakeWebSocket {
   close(): void {}
 }
 
-function makeSocket(states: string[]): TerminalSocket {
+function makeSocket(states: string[], onAuthExpired?: () => void): TerminalSocket {
   return new TerminalSocket({
     session: "s1",
     cols: 80,
@@ -37,6 +37,7 @@ function makeSocket(states: string[]): TerminalSocket {
       onControl: () => {},
       onState: (state) => states.push(state),
       onNotice: () => {},
+      onAuthExpired,
     },
   });
 }
@@ -75,6 +76,19 @@ describe("TerminalSocket close codes", () => {
     FakeWebSocket.instances[0].onclose?.({ code: 4401 });
     expect(states).toContain("failed");
 
+    vi.advanceTimersByTime(5_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    socket.close();
+  });
+
+  it("surfaces a 4401 as an expired login and never retries", () => {
+    const states: string[] = [];
+    let expired = 0;
+    const socket = makeSocket(states, () => (expired += 1));
+    socket.connect();
+    FakeWebSocket.instances[0].onclose?.({ code: 4401 });
+    expect(expired).toBe(1);
+    expect(states).toContain("failed");
     vi.advanceTimersByTime(5_000);
     expect(FakeWebSocket.instances).toHaveLength(1);
     socket.close();

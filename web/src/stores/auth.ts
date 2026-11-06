@@ -55,6 +55,18 @@ export const useAuthStore = defineStore("auth", () => {
     error.value = "";
   }
 
+  /**
+   * The server rejected our stored credential (WebSocket 4401 / HTTP 401).
+   * Drop the local identity immediately; the app shell then shows the login
+   * page with an explanation instead of a dead terminal and a retry button
+   * that can never succeed.
+   */
+  function expireSession(): void {
+    user.value = null;
+    totpRequired.value = false;
+    error.value = "登录已过期，请重新登录";
+  }
+
   async function logout(): Promise<void> {
     try {
       await auth.logout();
@@ -79,6 +91,7 @@ export const useAuthStore = defineStore("auth", () => {
     restore,
     login,
     clearTotpPrompt,
+    expireSession,
     logout,
   };
 });

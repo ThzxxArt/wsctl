@@ -17,6 +17,7 @@ import { useTerminalStore } from "@/stores/terminal";
 import { terminalFontFamily, usePrefsStore } from "@/stores/prefs";
 import { useUiStore } from "@/stores/ui";
 import { usePresenceStore } from "@/stores/presence";
+import { useAuthStore } from "@/stores/auth";
 import PaneContextMenu from "./PaneContextMenu.vue";
 import { TerminalSocket, type ConnectionState } from "@/protocol/client";
 import { readScreen, writeScreen } from "@/protocol/cache";
@@ -39,6 +40,7 @@ const terminalStore = useTerminalStore();
 const prefs = usePrefsStore();
 const ui = useUiStore();
 const presence = usePresenceStore();
+const auth = useAuthStore();
 const { t } = useI18n();
 
 const termHost = ref<HTMLDivElement | null>(null);
@@ -484,6 +486,9 @@ async function connect(): Promise<void> {
       onNotice: (message, level) => {
         if (socket !== ws) return;
         ui.notify(message, level === "error" ? "error" : level === "warn" ? "warning" : "info");
+      },
+      onAuthExpired: () => {
+        if (socket === ws) auth.expireSession();
       },
     },
   });

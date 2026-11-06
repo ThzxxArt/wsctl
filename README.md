@@ -231,6 +231,7 @@ reuse_port = false
 [auth]
 auth_required = true
 session_ttl = "12h"
+session_sliding_ttl = true     # 活跃会话自动顺延；闲置 12h 才过期
 cookie_secure = true          # 走 HTTPS 时开启
 
 [security]

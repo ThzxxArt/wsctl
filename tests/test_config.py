@@ -13,6 +13,8 @@ def test_defaults(tmp_path: Path, monkeypatch: object) -> None:
     assert settings.host == "127.0.0.1"
     assert settings.port == 7681
     assert settings.auth_required is True
+    # An active terminal must not be logged out at a fixed 12h boundary.
+    assert settings.session_sliding_ttl is True
 
 
 def test_overrides_win() -> None:
