@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-11-06
+
+### 改进
+
+- **TOTP 登录流程**：密码正确但缺少一次性验证码时，服务端返回
+  `X-Wsctl-Totp-Required: 1`，浏览器不再先显示“登录失败”红框，而是直接展示
+  验证码输入并自动聚焦；顶部提示说明该账号已开启两步验证。
+- **提前输入验证码**：登录页新增「使用两步验证码」入口，知道账号开启 2FA 的
+  用户可以在第一次提交前就把验证码填好。
+- 修改用户名会清除上一个账号的两步验证状态；修改密码或验证码会清除旧错误。
+
+### 测试
+
+- pytest **737 passed / 8 skipped**；slow **7 passed**。
+- Vitest **51 passed**。
+- Playwright **45 passed / 7 skipped**。
+
 ## [0.2.3] - 2026-11-06
 
 0.2.2 的补丁：修复瞬间退出会话被误报为“服务退出或实例崩溃”的历史行竞态，
