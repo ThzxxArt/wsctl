@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-11-06
+
+### 修复
+
+- **12 小时绝对过期导致的 4401**：登录 token 原先从登录时刻固定 12 小时过期，
+  长时间开着的终端会在半夜被重检关闭，重开标签仍带过期 cookie，只能重新登录。
+  现在 `session_sliding_ttl` 默认开启：活跃连接每次重检自动顺延，闲置 12 小时
+  才过期；需要严格绝对寿命的部署仍可显式设为 `false`。
+- **4401 自动回登录页**：WebSocket 收到 4401 时不再显示“连接已关闭(4401)”和
+  无效的重试按钮，而是直接清除本地身份、显示登录页并提示“登录已过期，请重新
+  登录”。
+
+### 测试
+
+- pytest **737 passed / 8 skipped**；slow **7 passed**。
+- Vitest **52 passed**。
+- Playwright **45 passed / 7 skipped**。
+
 ## [0.2.4] - 2026-11-06
 
 ### 改进
