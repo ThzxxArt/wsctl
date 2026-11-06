@@ -173,14 +173,20 @@ def test_totp_login_flow(tmp_path: Path) -> None:
         secret = pyotp.random_base32()
         app.state.store.user_set_totp("admin", secret)
 
-        # no code provided
-        assert client.post(
+        # no code provided: a second step, signalled so the browser can reveal
+        # the field without showing a red "password wrong" error.
+        missing = client.post(
             "/api/login", json={"username": "admin", "password": "adminpw123"}
-        ).status_code == 401
-        # wrong code
-        assert client.post(
+        )
+        assert missing.status_code == 401
+        assert missing.json()["detail"] == "请输入一次性验证码"
+        assert missing.headers["x-wsctl-totp-required"] == "1"
+        # wrong code: a real failure and no "required" marker
+        wrong = client.post(
             "/api/login", json={"username": "admin", "password": "adminpw123", "totp": "000000"}
-        ).status_code == 401
+        )
+        assert wrong.status_code == 401
+        assert "x-wsctl-totp-required" not in wrong.headers
         # valid code
         code = pyotp.TOTP(secret).now()
         assert client.post(

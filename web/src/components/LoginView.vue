@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { useAuthStore } from "@/stores/auth";
 import { useI18n } from "vue-i18n";
 
@@ -9,18 +9,57 @@ const username = ref("");
 const password = ref("");
 const totp = ref("");
 const showTotp = ref(false);
+const totpInput = ref<HTMLInputElement | null>(null);
+const formError = ref("");
+const totpVisible = computed(() => auth.totpRequired || showTotp.value);
+
+watch(
+  () => auth.totpRequired,
+  async (required) => {
+    if (!required) return;
+    await nextTick();
+    totpInput.value?.focus();
+  },
+);
+
+// A new username is a new account: do not carry the previous account's
+// "two-factor required" state or error into it.
+watch(username, () => {
+  auth.clearTotpPrompt();
+  showTotp.value = false;
+  formError.value = "";
+});
+
+watch([password, totp], () => {
+  formError.value = "";
+  auth.error = "";
+});
+
+async function toggleTotp(): Promise<void> {
+  showTotp.value = !showTotp.value;
+  if (showTotp.value) {
+    await nextTick();
+    totpInput.value?.focus();
+  }
+}
 
 async function submit(): Promise<void> {
+  formError.value = "";
   if (!username.value || !password.value) return;
+  if (totpVisible.value && !totp.value.trim()) {
+    formError.value = t("app.totpRequired");
+    totpInput.value?.focus();
+    return;
+  }
   const ok = await auth.login(
     username.value,
     password.value,
-    showTotp.value ? totp.value : undefined,
+    totpVisible.value ? totp.value.trim() : undefined,
   );
-  if (!ok && auth.error.includes("一次性验证码")) showTotp.value = true;
   if (ok) {
     password.value = "";
     totp.value = "";
+    showTotp.value = false;
   }
 }
 </script>
@@ -44,17 +83,29 @@ async function submit(): Promise<void> {
           <span>{{ t("app.password") }}</span>
           <input v-model="password" type="password" autocomplete="current-password" required />
         </label>
-        <label v-if="showTotp">
+        <label v-if="totpVisible">
           <span>{{ t("app.totp") }}</span>
-          <input v-model="totp" inputmode="numeric" autocomplete="one-time-code" />
+          <input
+            ref="totpInput"
+            v-model="totp"
+            inputmode="numeric"
+            maxlength="6"
+            pattern="[0-9]*"
+            autocomplete="one-time-code"
+            :placeholder="t('app.totpPlaceholder')"
+          />
         </label>
+        <p v-if="auth.totpRequired && !auth.error && !formError" class="hint" role="status">
+          {{ t("app.totpHint") }}
+        </p>
+        <p v-if="formError" class="error" role="alert">{{ formError }}</p>
         <p v-if="auth.error" class="error" role="alert">{{ auth.error }}</p>
         <button class="submit" type="submit" :disabled="auth.loading">
-          {{ auth.loading ? t("app.loading") : t("app.login") }}
+          {{ auth.loading ? t("app.loading") : totpVisible ? t("app.verify") : t("app.login") }}
         </button>
-      </form>
-      <form class="sr-only" @submit.prevent="showTotp = !showTotp">
-        <button type="submit">{{ t("app.totp") }}</button>
+        <button v-if="!auth.totpRequired" type="button" class="link" @click="toggleTotp">
+          {{ showTotp ? t("app.hideTotp") : t("app.useTotp") }}
+        </button>
       </form>
     </section>
   </main>
@@ -163,5 +214,25 @@ input:focus {
   background: color-mix(in srgb, var(--danger) 14%, transparent);
   color: var(--danger);
   font-size: 13px;
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.link {
+  align-self: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.link:hover {
+  text-decoration: underline;
 }
 </style>

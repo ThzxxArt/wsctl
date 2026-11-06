@@ -103,14 +103,27 @@ async def login(body: LoginRequest, request: Request, response: Response) -> dic
         )
 
     secret = await asyncio.to_thread(store.user_totp_secret, body.username)
-    if secret is not None and not totp.verify(secret, body.totp or ""):
-        limiter.record_failure(key)
-        ip_limiter.record_failure(ip_key)
-        metrics.inc("wsctl_logins_total", result="totp_failed")
-        audit.enqueue("login_totp_failed", user_id=user.id, ip=ip, payload=body.username)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="一次性验证码错误"
-        )
+    if secret is not None:
+        if not body.totp:
+            # This is a second step, not a failed credential. Tell the client
+            # explicitly so it can reveal the code field without painting a
+            # red "login failed" error over a perfectly good password.
+            metrics.inc("wsctl_logins_total", result="totp_required")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="请输入一次性验证码",
+                headers={"X-Wsctl-Totp-Required": "1"},
+            )
+        if not totp.verify(secret, body.totp):
+            limiter.record_failure(key)
+            ip_limiter.record_failure(ip_key)
+            metrics.inc("wsctl_logins_total", result="totp_failed")
+            audit.enqueue(
+                "login_totp_failed", user_id=user.id, ip=ip, payload=body.username
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="一次性验证码错误"
+            )
 
     limiter.reset(key)
     metrics.inc("wsctl_logins_total", result="ok")

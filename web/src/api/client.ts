@@ -3,12 +3,14 @@ const API = "/api/v2";
 export class ApiError extends Error {
   readonly status: number;
   readonly detail: string;
+  readonly headers?: Headers;
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, headers?: Headers) {
     super(detail);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
+    this.headers = headers;
   }
 }
 
@@ -31,7 +33,7 @@ async function parseError(response: Response): Promise<ApiError> {
   } catch {
     /* not JSON */
   }
-  return new ApiError(response.status, detail);
+  return new ApiError(response.status, detail, response.headers);
 }
 
 export async function upload(

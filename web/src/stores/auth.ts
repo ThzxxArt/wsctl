@@ -8,6 +8,7 @@ export const useAuthStore = defineStore("auth", () => {
   const user = ref<User | null>(null);
   const loading = ref(false);
   const error = ref("");
+  const totpRequired = ref(false);
   const initialized = ref(false);
 
   const isAuthenticated = computed(() => Boolean(user.value?.username));
@@ -32,8 +33,16 @@ export const useAuthStore = defineStore("auth", () => {
     try {
       const result = await auth.login(username, password, totp);
       user.value = result;
+      totpRequired.value = false;
       return true;
     } catch (err) {
+      if (err instanceof ApiError && err.headers?.get("x-wsctl-totp-required") === "1") {
+        // Correct password, second factor outstanding. This is a normal step,
+        // not an error message to show in red.
+        totpRequired.value = true;
+        error.value = "";
+        return false;
+      }
       error.value = (err as Error).message;
       return false;
     } finally {
@@ -41,11 +50,17 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
+  function clearTotpPrompt(): void {
+    totpRequired.value = false;
+    error.value = "";
+  }
+
   async function logout(): Promise<void> {
     try {
       await auth.logout();
     } finally {
       user.value = null;
+      totpRequired.value = false;
     }
   }
 
@@ -53,5 +68,17 @@ export const useAuthStore = defineStore("auth", () => {
     user.value = null;
   });
 
-  return { user, loading, error, initialized, isAuthenticated, isAdmin, restore, login, logout };
+  return {
+    user,
+    loading,
+    error,
+    totpRequired,
+    initialized,
+    isAuthenticated,
+    isAdmin,
+    restore,
+    login,
+    clearTotpPrompt,
+    logout,
+  };
 });

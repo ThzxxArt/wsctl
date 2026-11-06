@@ -40,7 +40,7 @@ async function unwrap<T>(request: Result): Promise<T> {
   const { data, error, response } = await request;
   if (response.status === 401) notifyUnauthorized();
   if (!response.ok || error !== undefined) {
-    throw new ApiError(response.status, detailOf(error, response));
+    throw new ApiError(response.status, detailOf(error, response), response.headers);
   }
   return data as T;
 }
